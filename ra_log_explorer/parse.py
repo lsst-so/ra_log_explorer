@@ -27,37 +27,79 @@ from typing import Iterable, Iterator
 
 # ----- pod flavor classification -------------------------------------------
 
-# Friendly grouping for the UI. Order matters for display priority.
-POD_GROUPS: list[tuple[str, str]] = [
-    ("head", "head-node"),
-    ("butler-watcher", "butler-watcher"),
-    ("sfm", "sfm-runner"),
-    # Order matters: more specific substrings must come first so that
-    # `step-1b-aos-worker` isn't mistakenly classified as plain `aos-worker`.
-    ("step1b-aos", "step-1b-aos-worker"),
-    ("step1b", "step-1b-worker"),
-    ("aos", "aos-worker"),
-    ("backlog", "backlog-worker"),
-    ("mosaic", "mosaic"),
-    ("one-off-exprecord", "one-off-exp-record"),
-    ("one-off-postisr", "one-off-post-isr"),
-    ("one-off-visitimage", "one-off-visit-image"),
-    ("guider", "guider-analysis"),
-    ("psf-plot", "psf-plotting"),
-    ("fwhm-plot", "fwhm-plotting"),
-    ("radial-plot", "radial-plotting"),
-    ("zernike-plot", "zernike-prediction-plotting"),
-    ("metadata-server", "metadata-server"),
-    ("cluster-mgr", "cluster-manager"),
-]
+# Pod-role map. Key is the short slug used for the CSS badge class
+# (`.badge-<slug>`); value is the full role prefix that appears in the
+# pod name AFTER the `s-<instrument>-run-` stem.
+#
+# Classification is anchored longest-prefix-match — neither dict iteration
+# order nor relative entry length affects correctness, so adding a new
+# more-specific role (e.g. `metadata-server-aos` next to the existing
+# `metadata-server`) doesn't risk the substring-collision footgun the
+# previous list-of-tuples form had.
+POD_GROUPS: dict[str, str] = {
+    "head": "head-node",
+    "butler-watcher": "butler-watcher",
+    "sfm": "sfm-runner",
+    "step1b": "step-1b-worker",
+    "step1b-aos": "step-1b-aos-worker",
+    "aos": "aos-worker",
+    "backlog": "backlog-worker",
+    "nightly-worker": "nightly-worker",
+    "mosaic": "mosaic",
+    "one-off-exprecord": "one-off-exp-record",
+    "one-off-postisr": "one-off-post-isr",
+    "one-off-visitimage": "one-off-visit-image",
+    "guider": "guider-analysis",
+    "plotter": "plotter",
+    "psf-plot": "psf-plotting",
+    "fwhm-plot": "fwhm-plotting",
+    "radial-plot": "radial-plotting",
+    "zernike-plot": "zernike-prediction-plotting",
+    "metadata-server": "metadata-server",
+    "metadata-server-aos": "metadata-server-aos",
+    "metadata-server-guiders": "metadata-server-guiders",
+    "metadata-server-ra-performance": "metadata-server-ra-performance",
+    "cluster-mgr": "cluster-manager",
+    "cleanup": "cleanup",
+    "performance-monitor": "performance-monitor",
+}
+
+# Strip this stem off the front of a pod name before doing the prefix match.
+# The full set of instruments we expect in this repo's logs.
+_RUN_PREFIX_RE = re.compile(r"^s-(?:lsstcam|latiss|lsstcomcam|lsstcomcamsim|misc)-run-")
 
 
 def podGroup(pod: str) -> str:
-    """Return a short label identifying the pod's role."""
-    for label, needle in POD_GROUPS:
-        if needle in pod:
-            return label
-    return "other"
+    """Return a short label identifying the pod's role.
+
+    Longest matching role prefix in :data:`POD_GROUPS` wins, so e.g. a
+    `metadata-server-aos-…` pod resolves to ``"metadata-server-aos"`` and
+    not the shorter ``"metadata-server"`` even though the latter is also
+    a valid prefix. Pods that don't match any known role fall into
+    ``"other"`` (intentionally surfaced in the UI as a safety net for
+    new/unrecognised roles).
+    """
+    stem = _RUN_PREFIX_RE.sub("", pod, count=1)
+    bestLabel: str | None = None
+    bestLen = -1
+    for label, prefix in POD_GROUPS.items():
+        if stem == prefix or stem.startswith(prefix + "-"):
+            if len(prefix) > bestLen:
+                bestLabel = label
+                bestLen = len(prefix)
+    return bestLabel or "other"
+
+
+def groupLabels() -> dict[str, str]:
+    """Map each short ``podGroup`` label to its full on-disk role prefix.
+
+    The frontend uses this for two cosmetic things at once: (1) showing the
+    role prefix on the group header / badge so it matches what users would
+    grep for in `kubectl get pods`, and (2) stripping that prefix from the
+    rendered pod name so e.g. `s-lsstcam-run-sfm-runner-workerset-094`
+    collapses to `workerset-094`.
+    """
+    return dict(POD_GROUPS)
 
 
 def podInstrument(pod: str) -> str | None:
@@ -579,3 +621,16 @@ def summarizeAll(cacheDir: Path) -> list[PodSummary]:
 def podsTouchingExp(summaries: Iterable[PodSummary], expId: int) -> list[PodSummary]:
     """Return the subset of pod summaries whose logs reference `expId`."""
     return [s for s in summaries if expId in s.expIdsSeen]
+
+
+def podsForTimeline(summaries: Iterable[PodSummary], expId: int) -> list[PodSummary]:
+    """Pods to include in the per-exposure timeline view.
+
+    Includes (a) every pod that explicitly mentioned ``expId`` in its logs
+    and (b) every pod that we couldn't classify against any known role
+    (``group == "other"``). The ``"other"`` rule is a deliberate safety
+    net so that an unknown / new / mis-named role still surfaces — if it
+    threw a traceback or warning during the window the user shouldn't have
+    to know to look elsewhere for it.
+    """
+    return [s for s in summaries if expId in s.expIdsSeen or s.group == "other"]

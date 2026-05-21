@@ -218,7 +218,7 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
 
 
 def _buildSummaryPayload(state: ServerState) -> dict:
-    matchingSummaries = parser.podsTouchingExp(state.summaries, state.expId)
+    matchingSummaries = parser.podsForTimeline(state.summaries, state.expId)
     refs = list(state.referencePoints)
     # Head node's first acknowledgement of this exposure — the moment
     # ButlerWatcher+head observed it as "ready to process". Useful for
@@ -260,6 +260,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "meta": _toJsonable(state.meta),
         "referencePoints": refs,
         "taskColors": taskColors,
+        "groupLabels": parser.groupLabels(),
         "pods": [_summaryToDict(s, state.tZero, state.expId) for s in matchingSummaries],
         "podsAll": [
             {"pod": s.pod, "group": s.group, "nLines": s.nLines, "nWarn": s.nWarn, "nError": s.nError}

@@ -85,11 +85,19 @@ function groupOrder() {
   return [
     'head', 'butler-watcher',
     'one-off-exprecord', 'one-off-postisr', 'one-off-visitimage',
-    'sfm', 'aos', 'backlog',
-    'step1b', 'step1b-aos',
-    'mosaic', 'psf-plot', 'fwhm-plot', 'radial-plot', 'zernike-plot',
+    // Each gather pairs with its per-detector workers: step1b consumes
+    // sfm output; step1b-aos consumes aos output. Render the gather
+    // directly beneath the workers so the dependency reads vertically.
+    'sfm', 'step1b',
+    'aos', 'step1b-aos',
+    'backlog',
+    'nightly-worker',
+    'mosaic', 'plotter', 'psf-plot', 'fwhm-plot', 'radial-plot', 'zernike-plot',
     'guider',
-    'metadata-server', 'cluster-mgr', 'other'
+    'metadata-server', 'metadata-server-aos', 'metadata-server-guiders',
+    'metadata-server-ra-performance',
+    'cluster-mgr', 'performance-monitor', 'cleanup',
+    'other'
   ];
 }
 
@@ -104,20 +112,13 @@ async function startExplore(loadedSummary) {
   summary = loadedSummary;
   document.getElementById('expId-display').textContent =
     `expId=${summary.expId}  ·  t₀=${summary.tZero}`;
-  const cb = summary.cacheBytes;
-  const meta = summary.meta || {};
-  const dl = meta.total_bytes || 0;
-  let cacheTag = ' (freshly downloaded)';
-  if (meta.cacheReuse === 'exact') cacheTag = ' (cache hit, exact)';
-  else if (meta.cacheReuse === 'superset') cacheTag = ' (cache hit, superset reuse)';
-  document.getElementById('cache-display').textContent =
-    `downloaded: ${humanBytes(dl)}${cacheTag}  ·  cache: ${humanBytes(cb)} @ ${summary.cacheDir}`;
   shutterUtcMs = new Date(summary.tZero).getTime();
   populateRefSelect();
   populateTaskLegend();
   autoCollapseLargeGroups();
   recomputeTimeRange();
   if (!exploreListenersWired) wireExploreListeners();
+  applyPodColumnWidth();
   render();
 }
 
@@ -212,7 +213,18 @@ function render() {
   for (const p of pods) {
     (grouped[p.group] || (grouped[p.group] = [])).push(p);
   }
-  for (const g of groupOrder()) {
+  // Anything in `grouped` that isn't named in groupOrder() (e.g. a new
+  // role landed in POD_GROUPS but groupOrder wasn't updated) renders at
+  // the end in alphabetical order, just before 'other'. Without this
+  // fallback such pods would disappear from the timeline silently.
+  const known = new Set(groupOrder());
+  const extras = Object.keys(grouped).filter(g => !known.has(g)).sort();
+  const orderedGroups = [
+    ...groupOrder().filter(g => g !== 'other'),
+    ...extras,
+    'other',
+  ];
+  for (const g of orderedGroups) {
     const ps = grouped[g];
     if (!ps || ps.length === 0) continue;
     ps.sort((a, b) => {
@@ -228,10 +240,28 @@ function render() {
       + (isCollapsed ? ' collapsed' : '')
       + (foldable ? '' : ' static');
     const arrow = foldable ? '<span class="tg-arrow"></span>' : '';
-    hdr.innerHTML = `${arrow}${g}  (${ps.length} pod${ps.length === 1 ? '' : 's'})${tbPill}`;
+    const groupName = groupDisplay(g);
+    hdr.innerHTML = `${arrow}${groupName}  (${ps.length} pod${ps.length === 1 ? '' : 's'})${tbPill}`;
     if (foldable) hdr.addEventListener('click', () => toggleGroup(g));
     tl.appendChild(hdr);
-    if (isCollapsed) continue;
+    if (isCollapsed) {
+      // Even when the group is folded, surface any pods that produced a
+      // traceback in this window — that's almost always what you opened
+      // the explorer to find, and hiding it behind a fold defeats the
+      // "scan down the left edge for red" workflow the README documents.
+      const tbPods = ps.filter(p => (p.nTraceback || 0) > 0);
+      for (const p of tbPods) tl.appendChild(renderPodRow(p));
+      const hidden = ps.length - tbPods.length;
+      if (hidden > 0) {
+        const more = document.createElement('div');
+        more.className = 'tl-group-more';
+        more.textContent =
+          `+ ${hidden} more pod${hidden === 1 ? '' : 's'} — click to expand`;
+        more.addEventListener('click', () => toggleGroup(g));
+        tl.appendChild(more);
+      }
+      continue;
+    }
     for (const p of ps) tl.appendChild(renderPodRow(p));
   }
 }
@@ -273,6 +303,11 @@ function renderAxis() {
   const spacer = document.createElement('div');
   spacer.className = 'tl-axis-spacer';
   spacer.innerHTML = `<span style="font-size:11px;padding-left:8px;line-height:28px;display:inline-block">${timeMinS}s ... ${timeMaxS}s  (zoom: <button onclick="setZoom(pxPerSecond/1.5);render();return false">-</button><button onclick="setZoom(pxPerSecond*1.5);render();return false">+</button>)</span>`;
+  const grip = document.createElement('div');
+  grip.className = 'tl-podcol-resize';
+  grip.title = 'drag to resize the pod-name column';
+  grip.addEventListener('mousedown', startPodColumnDrag);
+  spacer.appendChild(grip);
   row.appendChild(spacer);
   const svgNS = 'http://www.w3.org/2000/svg';
   const svg = document.createElementNS(svgNS, 'svg');
@@ -317,12 +352,13 @@ function renderPodRow(p) {
   if (p.nTraceback) row.classList.add('has-traceback');
   const name = document.createElement('div');
   name.className = 'tl-podname';
-  const badge = `<span class="badge">${p.group}</span>`;
-  const ordPart = p.ordinal != null ? `<span class="stat">·${p.ordinal}</span>` : '';
-  const warn = p.nWarn ? `<span class="stat warn">W:${p.nWarn}</span>` : '';
-  const err = p.nError ? `<span class="stat err">E:${p.nError}</span>` : '';
-  const tb = p.nTraceback ? `<span class="stat tb">TB ${p.nTraceback}</span>` : '';
-  name.innerHTML = `${badge}${shortenPod(p.pod)}${ordPart} ${warn} ${err} ${tb}`;
+  const groupName = groupDisplay(p.group);
+  const badge = `<span class="badge badge-${p.group}">${groupName}</span>`;
+  const warn = p.nWarn ? `<span class="stat warn" title="warnings in window">W:${p.nWarn}</span>` : '';
+  const err = p.nError ? `<span class="stat err" title="errors in window">E:${p.nError}</span>` : '';
+  const tb = p.nTraceback ? `<span class="stat tb" title="tracebacks in window">TB ${p.nTraceback}</span>` : '';
+  const label = `<span class="podlabel">${shortenPod(p.pod, p.group)}</span>`;
+  name.innerHTML = `${badge}${label}${warn}${err}${tb}`;
   name.title = p.pod;
   name.addEventListener('click', () => selectPod(p.pod));
   row.appendChild(name);
@@ -339,8 +375,30 @@ function renderPodRow(p) {
   return row;
 }
 
-function shortenPod(pod) {
-  return pod.replace(/^s-lsstcam-run-/, '').replace(/^s-latiss-run-/, 'la:');
+function shortenPod(pod, group) {
+  // Strip the StatefulSet's "s-<instrument>-run-" prefix and then the role
+  // prefix (e.g. "sfm-runner-") so a name like
+  // `s-lsstcam-run-sfm-runner-workerset-094` collapses to `workerset-094`.
+  // The role prefix is what's already in the badge to the left.
+  let stem = pod
+    .replace(/^s-lsstcam-run-/, '')
+    .replace(/^s-latiss-run-/, '')
+    .replace(/^s-lsstcomcamsim-run-/, '')
+    .replace(/^s-lsstcomcam-run-/, '');
+  const prefix = (summary && summary.groupLabels && summary.groupLabels[group]);
+  if (prefix && stem.startsWith(prefix + '-')) {
+    stem = stem.slice(prefix.length + 1);
+  } else if (prefix && stem === prefix) {
+    stem = '';
+  }
+  return stem;
+}
+
+function groupDisplay(group) {
+  if (summary && summary.groupLabels && summary.groupLabels[group]) {
+    return summary.groupLabels[group];
+  }
+  return group;
 }
 
 function makeEventNode(e) {
@@ -520,3 +578,40 @@ function setZoom(x) {
 }
 window.setZoom = setZoom;
 window.render = render;  // for the inline-onclick zoom buttons on the axis spacer
+
+// ----- pod-name column resize ----------------------------------------------
+
+const POD_COL_KEY = 'ra_log_explorer.podColWidth';
+const POD_COL_MIN = 140;
+const POD_COL_MAX = 720;
+
+function applyPodColumnWidth() {
+  const stored = parseInt(localStorage.getItem(POD_COL_KEY) || '', 10);
+  const w = Number.isFinite(stored) ? clampPodCol(stored) : 280;
+  document.documentElement.style.setProperty('--pod-col-width', w + 'px');
+}
+
+function clampPodCol(w) {
+  return Math.max(POD_COL_MIN, Math.min(POD_COL_MAX, w));
+}
+
+function startPodColumnDrag(ev) {
+  ev.preventDefault();
+  const startX = ev.clientX;
+  const rootStyle = getComputedStyle(document.documentElement);
+  const startW = parseInt(rootStyle.getPropertyValue('--pod-col-width'), 10) || 280;
+  document.body.classList.add('col-resizing');
+  function onMove(e) {
+    const w = clampPodCol(startW + (e.clientX - startX));
+    document.documentElement.style.setProperty('--pod-col-width', w + 'px');
+  }
+  function onUp() {
+    document.body.classList.remove('col-resizing');
+    document.removeEventListener('mousemove', onMove);
+    document.removeEventListener('mouseup', onUp);
+    const cur = parseInt(getComputedStyle(document.documentElement).getPropertyValue('--pod-col-width'), 10);
+    if (Number.isFinite(cur)) localStorage.setItem(POD_COL_KEY, String(cur));
+  }
+  document.addEventListener('mousemove', onMove);
+  document.addEventListener('mouseup', onUp);
+}

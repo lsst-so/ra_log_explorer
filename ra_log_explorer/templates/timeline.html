@@ -3,6 +3,9 @@
 <head>
   <meta charset="utf-8" />
   <title>Rapid Analysis Log Explorer</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -10,6 +13,7 @@
   <section id="home-view" hidden>
     <header id="topbar">
       <div class="title">
+        <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
@@ -133,11 +137,9 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="back-home" class="ghost mini">&larr; home</button>
+        <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span id="expId-display"></span>
-      </div>
-      <div class="cache">
-        <span id="cache-display"></span>
       </div>
     </header>
 
@@ -157,14 +159,14 @@
     <section id="legend">
       <div class="lg-block">
         <strong>events:</strong>
-        <span class="lg lg-pickup">▎pickup</span>
-        <span class="lg lg-qg">▭ QG build</span>
-        <span class="lg lg-binned">▎binned image</span>
-        <span class="lg lg-fanout">▎fanout</span>
-        <span class="lg lg-gather">▎gather dispatch</span>
-        <span class="lg lg-mosaic">▎mosaic dispatch</span>
-        <span class="lg lg-warn">▎WARN</span>
-        <span class="lg lg-error">▎ERROR</span>
+        <span class="lg lg-pickup">pickup</span>
+        <span class="lg lg-qg">QG build</span>
+        <span class="lg lg-binned">binned image</span>
+        <span class="lg lg-fanout">fanout</span>
+        <span class="lg lg-gather">gather dispatch</span>
+        <span class="lg lg-mosaic">mosaic dispatch</span>
+        <span class="lg lg-warn">WARN</span>
+        <span class="lg lg-error">ERROR</span>
       </div>
       <div class="lg-block">
         <strong>tasks:</strong>

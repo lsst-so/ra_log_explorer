@@ -229,6 +229,58 @@ def test_buildSummaryPayload_taskColors_collision_free_over_fixtures(
     assert len(set(tc.values())) == len(tc)
 
 
+def test_buildSummaryPayload_surfaces_other_pods_even_without_expId(sfmWorkerJsonl: Path) -> None:
+    """Pods classified as 'other' must show up in the timeline even if their
+    logs never mention the target dataId. This is the safety net so an
+    unknown / mis-classified role still surfaces its warnings instead of
+    being silently dropped.
+    """
+    sfm = parse.summarizePod(sfmWorkerJsonl)
+    sfm.expIdsSeen.add(2026051900722)
+    mystery = parse.PodSummary(
+        pod="something-we-dont-classify",
+        group="other",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=1,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen=set(),  # deliberately empty
+    )
+    state = server.ServerState(
+        cacheDir=sfmWorkerJsonl.parent,
+        cacheBytes=0,
+        meta={},
+        summaries=[sfm, mystery],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc),
+    )
+    payload = server._buildSummaryPayload(state)
+    podsInTimeline = {p["pod"] for p in payload["pods"]}
+    assert "something-we-dont-classify" in podsInTimeline
+
+
+def test_buildSummaryPayload_includes_groupLabels(sfmWorkerJsonl: Path) -> None:
+    """The frontend strips the role prefix from each pod name; for that it
+    needs the label → needle map from `parse.groupLabels()` in the payload."""
+    sfm = parse.summarizePod(sfmWorkerJsonl)
+    sfm.expIdsSeen.add(2026051900722)
+    state = server.ServerState(
+        cacheDir=sfmWorkerJsonl.parent,
+        cacheBytes=0,
+        meta={},
+        summaries=[sfm],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc),
+    )
+    payload = server._buildSummaryPayload(state)
+    assert payload["groupLabels"] == parse.groupLabels()
+    assert payload["groupLabels"]["sfm"] == "sfm-runner"
+
+
 # ----- _eventToDict -------------------------------------------------------
 
 

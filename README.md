@@ -158,7 +158,10 @@ Inside the explore view:
   timeline are coloured to match.
 - **Timeline** — one row per pod, grouped by role (head, sfm, aos,
   step1b, mosaic, plotters, …). Each event renders as a tick or a bar
-  with a hover tooltip showing the raw log line.
+  with a hover tooltip showing the raw log line. Pods are listed in
+  flow order: each gather sits directly beneath the per-detector
+  workers it consumes (`step1b` under `sfm`, `step1b-aos` under
+  `aos`).
   - **Group headers fold.** Click a header (e.g. `sfm  (189 pods)`)
     to collapse or expand that group; the arrow flips between ▼ and ▶.
     Groups with more than ten pods (typically `sfm` and sometimes
@@ -167,7 +170,11 @@ Inside the explore view:
     clickable header — there's nothing to hide. "collapse all" /
     "expand all" only affects the multi-pod groups too.
     If any pod in a collapsed group has a traceback, the header
-    surfaces a red `TB N` pill so you don't miss it.
+    surfaces a red `TB N` pill so you don't miss it. When a large
+    group is collapsed, any pod in it that produced a traceback
+    stays visible, with a "+ N more pods" footer for the rest. You
+    don't have to expand the group manually just to see the red
+    rows.
   - **Pods with tracebacks** in the window get a red left border and
     a red `TB N` pill in their row name. The cheapest visual scan
     for "where are things going wrong" is to look down the left

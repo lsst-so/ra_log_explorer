@@ -265,12 +265,53 @@ def test_classify_unrelated_warn_is_kept_with_bare_expid_when_visible() -> None:
         ("s-lsstcam-run-one-off-post-isr-6fb45f7c87-65kkb", "one-off-postisr"),
         ("s-lsstcam-run-one-off-visit-image-8575c4c56b-86k9h", "one-off-visitimage"),
         ("s-lsstcam-run-metadata-server-6d9df4df6f-64gzz", "metadata-server"),
+        # Longest-prefix-match: the more-specific metadata-server-* roles
+        # must NOT collapse into the plain `metadata-server` group.
+        ("s-lsstcam-run-metadata-server-aos-6f778fc678-lqsd9", "metadata-server-aos"),
+        ("s-lsstcam-run-metadata-server-guiders-576d464744-hb67x", "metadata-server-guiders"),
+        (
+            "s-lsstcam-run-metadata-server-ra-performance-5d787b5c5b-5ds9n",
+            "metadata-server-ra-performance",
+        ),
         ("s-lsstcam-run-cluster-manager-7769cd6bd4-99jrs", "cluster-mgr"),
+        ("s-lsstcam-run-cleanup-76577f69b4-qbjz6", "cleanup"),
+        ("s-lsstcam-run-performance-monitor-6ff7c4dd9-2xfp9", "performance-monitor"),
+        ("s-lsstcam-run-plotter-57d4c6d899-2cqmz", "plotter"),
+        ("s-lsstcam-run-nightly-worker-gatherrollupset-0", "nightly-worker"),
+        # 'misc' is a recognised instrument-like stem but no role prefix
+        # matches the rest, so these land in 'other' (the safety-net group).
+        ("s-misc-run-all-sky-68987c5f79-kt9cf", "other"),
+        ("s-misc-run-tma-telemetry-54567bbb6c-c7f8k", "other"),
+        # Infra pods with no `s-<inst>-run-` stem also fall to 'other'.
+        ("rapid-analysis-squid-55c7c86f5-wjsct", "other"),
+        ("redis-0", "other"),
         ("unrelated-pod", "other"),
     ],
 )
 def test_podGroup(pod: str, expected: str) -> None:
     assert parse.podGroup(pod) == expected
+
+
+def test_podGroup_is_order_independent() -> None:
+    """The classifier must give the same answer no matter how POD_GROUPS is
+    iterated. This is the regression test for the substring-collision footgun
+    that the old first-needle-wins design had.
+    """
+    pod = "s-lsstcam-run-metadata-server-aos-6f778fc678-lqsd9"
+    saved = parse.POD_GROUPS.copy()
+    try:
+        # Try multiple iteration orders by replacing the dict with reverse
+        # and an arbitrary shuffle. Longest-prefix-match should pin the
+        # answer regardless.
+        parse.POD_GROUPS.clear()
+        parse.POD_GROUPS.update(dict(reversed(list(saved.items()))))
+        assert parse.podGroup(pod) == "metadata-server-aos"
+        parse.POD_GROUPS.clear()
+        parse.POD_GROUPS.update(sorted(saved.items()))
+        assert parse.podGroup(pod) == "metadata-server-aos"
+    finally:
+        parse.POD_GROUPS.clear()
+        parse.POD_GROUPS.update(saved)
 
 
 @pytest.mark.parametrize(
@@ -299,6 +340,18 @@ def test_podOrdinal(pod: str, expected: int | None) -> None:
 )
 def test_podInstrument(pod: str, expected: str | None) -> None:
     assert parse.podInstrument(pod) == expected
+
+
+def test_groupLabels_round_trips_with_podGroup() -> None:
+    """Every (label, prefix) pair in POD_GROUPS appears in groupLabels(),
+    and applying `podGroup` to a pod name built from the prefix gives
+    back the label.
+    """
+    labels = parse.groupLabels()
+    assert labels == dict(parse.POD_GROUPS)
+    for label, prefix in parse.POD_GROUPS.items():
+        # A synthesised pod name with this prefix resolves to the same label.
+        assert parse.podGroup(f"s-lsstcam-run-{prefix}-abc") == label
 
 
 # ----- summarizePod -------------------------------------------------------
