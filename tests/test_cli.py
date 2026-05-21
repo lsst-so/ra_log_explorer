@@ -86,7 +86,12 @@ def test_build_parser_cache_flush_with_yes() -> None:
     assert ns.yes is True
 
 
-def test_main_returns_2_when_required_args_missing(capsys: pytest.CaptureFixture[str]) -> None:
-    # Implicit run mode without --exposure-id / --t-zero prints help and exits 2.
-    rc = cli.main([])
+def test_cmdRun_rejects_partial_args(capsys: pytest.CaptureFixture[str]) -> None:
+    """Supplying --exposure-id without --t-zero (or vice-versa) is an error."""
+    # We test cmdRun directly rather than main(): main([]) would start the
+    # server (home mode), which we don't want to do in a unit test.
+    args = cli.build_parser().parse_args(["run", "--exposure-id", "2026051900722"])
+    rc = cli.cmdRun(args)
     assert rc == 2
+    captured = capsys.readouterr()
+    assert "must be supplied together" in captured.err
