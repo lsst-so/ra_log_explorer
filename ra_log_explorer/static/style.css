@@ -194,6 +194,20 @@ button.ghost.mini.delete:disabled {
 #cache-table tbody tr:hover {
   background: #f7faff;
 }
+#cache-table tfoot tr.cache-total-row {
+  font-weight: 600;
+  color: #1b2230;
+}
+#cache-table tfoot tr.cache-total-row td {
+  border-top: 2px solid #c8ccd6;
+  border-bottom: none;
+  background: #f6f8fc;
+}
+#cache-table tfoot tr.cache-total-row td.total-label {
+  text-align: right;
+  font-variant: small-caps;
+  color: #5a6478;
+}
 .mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
 
 /* progress card */

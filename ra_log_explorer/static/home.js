@@ -233,10 +233,14 @@ async function refreshCache() {
 function renderCache(data) {
   document.getElementById('home-cache-info').textContent =
     `cache: ${humanBytes(data.root.totalBytes)} @ ${data.root.path}`;
+  const sumBytes = data.windows.reduce((acc, w) => acc + (w.sizeOnDisk || 0), 0);
   document.getElementById('cache-summary').textContent =
-    `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`;
+    `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`
+    + ` · ${humanBytes(sumBytes)} total`;
   const tbody = document.getElementById('cache-tbody');
   tbody.innerHTML = '';
+  const tfoot = document.getElementById('cache-tfoot');
+  tfoot.innerHTML = '';
   const deleteAll = document.getElementById('cache-delete-all');
   deleteAll.disabled = data.windows.length === 0;
   for (const w of data.windows) {
@@ -261,6 +265,16 @@ function renderCache(data) {
       deleteCacheWindow(w);
     });
     tbody.appendChild(tr);
+  }
+  if (data.windows.length > 0) {
+    const tr = document.createElement('tr');
+    tr.className = 'cache-total-row';
+    tr.innerHTML =
+      `<td colspan="3" class="total-label">total</td>`
+      + `<td>${data.windows.length}</td>`
+      + `<td>${humanBytes(sumBytes)}</td>`
+      + `<td></td>`;
+    tfoot.appendChild(tr);
   }
 }
 
