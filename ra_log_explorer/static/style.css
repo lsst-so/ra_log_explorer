@@ -21,8 +21,182 @@ html, body {
   color: #d5d9e3;
   border-bottom: 1px solid #0d1118;
 }
+#topbar .title { display: flex; align-items: center; gap: 8px; }
 #topbar .title strong { color: #fff; margin-right: 10px; }
+#topbar .title .muted { color: #a4abb9; font-weight: normal; font-size: 12px; }
 #topbar .cache { font-size: 12px; opacity: .8; }
+#topbar button.ghost {
+  background: transparent;
+  color: #d5d9e3;
+  border: 1px solid #4a5468;
+  padding: 2px 8px;
+  border-radius: 3px;
+  cursor: pointer;
+  font: inherit;
+}
+#topbar button.ghost:hover { background: #2b3548; }
+
+/* ===================== home view ===================== */
+
+#home-main {
+  max-width: 1000px;
+  margin: 14px auto;
+  padding: 0 14px 60px;
+}
+.home-card {
+  background: #fff;
+  border: 1px solid #dde1e8;
+  border-radius: 6px;
+  padding: 16px 18px;
+  margin-bottom: 14px;
+  box-shadow: 0 1px 2px rgba(0,0,0,0.03);
+}
+.home-card h2 {
+  font-size: 15px;
+  margin: 0 0 10px;
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.home-card h2 .muted {
+  font-size: 12px;
+  color: #6a7283;
+  font-weight: normal;
+}
+.home-card .row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin-bottom: 8px;
+}
+.home-card .row label {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 12px;
+  flex: 1 1 220px;
+}
+.home-card .row label.cb {
+  flex: 0 0 auto;
+  flex-direction: row;
+  align-items: center;
+  gap: 6px;
+  align-self: end;
+  padding-bottom: 4px;
+}
+.home-card .row .lbl {
+  font-weight: 600;
+  color: #1b2230;
+}
+.home-card .row .hint {
+  font-size: 11px;
+  color: #6a7283;
+}
+.home-card input[type=text],
+.home-card input[type=number],
+.home-card input[type=password] {
+  padding: 6px 8px;
+  border: 1px solid #c8ccd6;
+  border-radius: 3px;
+  font: inherit;
+}
+.home-card input:focus {
+  outline: none;
+  border-color: #1d6fb0;
+  box-shadow: 0 0 0 2px #1d6fb022;
+}
+.home-card details { margin-bottom: 8px; }
+.home-card details summary {
+  cursor: pointer;
+  font-size: 12px;
+  color: #5a6478;
+  padding: 4px 0;
+}
+.home-card .submit-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 6px;
+}
+.home-card button.primary {
+  background: #1d6fb0;
+  color: #fff;
+  border: 1px solid #1a5e96;
+  padding: 6px 14px;
+  border-radius: 3px;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+.home-card button.primary:hover { background: #195e96; }
+.home-card button.primary:disabled { background: #8aa5bd; cursor: progress; }
+.home-card button.ghost {
+  background: #fff;
+  color: #1d6fb0;
+  border: 1px solid #c8ccd6;
+  padding: 4px 10px;
+  border-radius: 3px;
+  font: inherit;
+  cursor: pointer;
+}
+.home-card button.ghost:hover { background: #f3f6fa; }
+.home-card button.ghost.mini { font-size: 11px; padding: 2px 6px; }
+
+.home-card #fetch-message { font-size: 12px; color: #4a5468; }
+.home-card #fetch-message.error { color: #c1252b; }
+
+/* cache table */
+#cache-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+#cache-table th, #cache-table td {
+  text-align: left;
+  padding: 5px 8px;
+  border-bottom: 1px solid #eaedf2;
+}
+#cache-table th {
+  background: #f1f3f8;
+  color: #4a5468;
+  font-weight: 600;
+}
+#cache-table tbody tr {
+  cursor: pointer;
+}
+#cache-table tbody tr:hover {
+  background: #f7faff;
+}
+.mono { font-family: ui-monospace, Menlo, monospace; font-size: 11px; }
+
+/* progress card */
+.progress-wrap { margin-bottom: 8px; }
+.progress-bar {
+  height: 10px;
+  background: #eef0f4;
+  border-radius: 5px;
+  overflow: hidden;
+  border: 1px solid #dde1e8;
+}
+#progress-fill {
+  height: 100%;
+  background: linear-gradient(to right, #1d6fb0, #1a9c8c);
+  width: 0%;
+  transition: width 0.15s linear;
+}
+#progress-text { margin-top: 6px; }
+.progress-log {
+  max-height: 280px;
+  overflow: auto;
+  background: #f4f6fa;
+  border: 1px solid #dde1e8;
+  border-radius: 3px;
+  padding: 8px 10px;
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 11px;
+  margin: 0;
+  white-space: pre-wrap;
+}
 
 #refs {
   display: flex;

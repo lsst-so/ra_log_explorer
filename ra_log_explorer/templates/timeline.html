@@ -6,64 +6,195 @@
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
-  <header id="topbar">
-    <div class="title">
-      <strong>ra-log-explorer</strong>
-      <span id="expId-display"></span>
-    </div>
-    <div class="cache">
-      <span id="cache-display"></span>
-    </div>
-  </header>
-
-  <section id="refs">
-    <label for="ref-select">t<sub>0</sub>:</label>
-    <select id="ref-select"></select>
-    <span class="muted" id="t0-info"></span>
-    <span class="spacer"></span>
-    <label for="search">filter:</label>
-    <input type="search" id="search" placeholder="text in raw line, pod, detector..." />
-    <label class="cb"><input type="checkbox" id="hide-quiet" /> hide pods with no events</label>
-    <label class="cb"><input type="checkbox" id="shutter-delta" /> times as &Delta;shutter</label>
-    <button id="groups-collapse-all" type="button" class="mini">collapse all</button>
-    <button id="groups-expand-all" type="button" class="mini">expand all</button>
-  </section>
-
-  <section id="legend">
-    <div class="lg-block">
-      <strong>events:</strong>
-      <span class="lg lg-pickup">▎pickup</span>
-      <span class="lg lg-qg">▭ QG build</span>
-      <span class="lg lg-binned">▎binned image</span>
-      <span class="lg lg-fanout">▎fanout</span>
-      <span class="lg lg-gather">▎gather dispatch</span>
-      <span class="lg lg-mosaic">▎mosaic dispatch</span>
-      <span class="lg lg-warn">▎WARN</span>
-      <span class="lg lg-error">▎ERROR</span>
-    </div>
-    <div class="lg-block">
-      <strong>tasks:</strong>
-      <span id="task-legend"></span>
-    </div>
-  </section>
-
-  <main id="timeline-wrap">
-    <div id="timeline"></div>
-  </main>
-
-  <aside id="detail" class="closed">
-    <header>
-      <span id="detail-title">click a pod row to see its full log</span>
-      <button id="detail-close">close</button>
+  <!-- ===================== HOME VIEW ===================== -->
+  <section id="home-view" hidden>
+    <header id="topbar">
+      <div class="title">
+        <strong>ra-log-explorer</strong>
+        <span class="muted">pick an exposure to explore</span>
+      </div>
+      <div class="cache">
+        <span id="home-cache-info"></span>
+      </div>
     </header>
-    <div id="detail-controls">
-      <label>filter: <input type="search" id="detail-search" /></label>
-      <label class="cb"><input type="checkbox" id="detail-only-relevant" checked /> only lines relevant to this dataId</label>
-      <label class="cb"><input type="checkbox" id="detail-warn-only" /> warn/error only</label>
-    </div>
-    <div id="detail-body"></div>
-  </aside>
 
+    <main id="home-main">
+      <section class="home-card">
+        <h2>Fetch an exposure</h2>
+        <form id="fetch-form">
+          <div class="row">
+            <label>
+              <span class="lbl">dataId / exposure id</span>
+              <input type="number" name="exposureId" required placeholder="e.g. 2026051900722" />
+            </label>
+            <label>
+              <span class="lbl">shutter close (t<sub>0</sub>)</span>
+              <input type="text" name="tZero" required placeholder="2026-05-20T08:46:16.267" />
+            </label>
+            <label class="cb">
+              <input type="checkbox" name="tZeroUtc" /> t<sub>0</sub> is already UTC
+              <span class="hint">(default: treated as TAI, -37 s applied)</span>
+            </label>
+          </div>
+
+          <details>
+            <summary>Advanced options</summary>
+            <div class="row">
+              <label>
+                <span class="lbl">cluster</span>
+                <input type="text" name="cluster" value="yagan" />
+              </label>
+              <label>
+                <span class="lbl">namespace</span>
+                <input type="text" name="namespace" value="rapid-analysis" />
+              </label>
+              <label>
+                <span class="lbl">workers (parallel fetches)</span>
+                <input type="number" name="workers" value="8" min="1" max="64" />
+              </label>
+            </div>
+            <div class="row">
+              <label>
+                <span class="lbl">window before t<sub>0</sub> (s)</span>
+                <input type="number" name="windowBefore" value="5" step="0.1" />
+              </label>
+              <label>
+                <span class="lbl">window after t<sub>0</sub> (s)</span>
+                <input type="number" name="windowAfter" value="300" step="1" />
+              </label>
+              <label>
+                <span class="lbl">Loki URL</span>
+                <input type="text" name="lokiAddr" value="https://loki-query.ls.lsst.org" />
+              </label>
+            </div>
+          </details>
+
+          <div class="row submit-row">
+            <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
+            <span id="fetch-message" class="hint"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="home-card">
+        <h2>Credentials <span class="muted" id="creds-state"></span></h2>
+        <form id="creds-form">
+          <div class="row">
+            <label>
+              <span class="lbl">Loki username</span>
+              <input type="text" name="username" value="merlin" />
+            </label>
+            <label>
+              <span class="lbl">Loki password</span>
+              <input type="password" name="password" placeholder="(falls back to LOKI_PASSWORD env)" autocomplete="off" />
+            </label>
+            <label class="cb">
+              <input type="checkbox" name="remember" /> remember in this browser
+              <span class="hint">(stored in localStorage, never sent anywhere but this server)</span>
+            </label>
+          </div>
+          <div class="row submit-row">
+            <button type="button" id="creds-forget" class="ghost">forget stored credentials</button>
+          </div>
+        </form>
+      </section>
+
+      <section class="home-card">
+        <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
+        <p class="hint">
+          Click a row to copy its cluster / namespace / window settings into the
+          fetch form above. A subsequent fetch with the same exposure id will
+          cache-hit instantly. <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+        </p>
+        <table id="cache-table">
+          <thead>
+            <tr>
+              <th>cluster / namespace</th>
+              <th>window</th>
+              <th>fetched</th>
+              <th>pods</th>
+              <th>size</th>
+            </tr>
+          </thead>
+          <tbody id="cache-tbody"></tbody>
+        </table>
+      </section>
+
+      <section class="home-card" id="progress-card" hidden>
+        <h2>Fetching</h2>
+        <div class="progress-wrap">
+          <div class="progress-bar"><div id="progress-fill"></div></div>
+          <div id="progress-text" class="hint"></div>
+        </div>
+        <pre id="progress-log" class="progress-log"></pre>
+      </section>
+    </main>
+  </section>
+
+  <!-- ===================== EXPLORE VIEW ===================== -->
+  <section id="explore-view" hidden>
+    <header id="topbar">
+      <div class="title">
+        <button type="button" id="back-home" class="ghost mini">&larr; home</button>
+        <strong>ra-log-explorer</strong>
+        <span id="expId-display"></span>
+      </div>
+      <div class="cache">
+        <span id="cache-display"></span>
+      </div>
+    </header>
+
+    <section id="refs">
+      <label for="ref-select">t<sub>0</sub>:</label>
+      <select id="ref-select"></select>
+      <span class="muted" id="t0-info"></span>
+      <span class="spacer"></span>
+      <label for="search">filter:</label>
+      <input type="search" id="search" placeholder="text in raw line, pod, detector..." />
+      <label class="cb"><input type="checkbox" id="hide-quiet" /> hide pods with no events</label>
+      <label class="cb"><input type="checkbox" id="shutter-delta" /> times as &Delta;shutter</label>
+      <button id="groups-collapse-all" type="button" class="mini">collapse all</button>
+      <button id="groups-expand-all" type="button" class="mini">expand all</button>
+    </section>
+
+    <section id="legend">
+      <div class="lg-block">
+        <strong>events:</strong>
+        <span class="lg lg-pickup">▎pickup</span>
+        <span class="lg lg-qg">▭ QG build</span>
+        <span class="lg lg-binned">▎binned image</span>
+        <span class="lg lg-fanout">▎fanout</span>
+        <span class="lg lg-gather">▎gather dispatch</span>
+        <span class="lg lg-mosaic">▎mosaic dispatch</span>
+        <span class="lg lg-warn">▎WARN</span>
+        <span class="lg lg-error">▎ERROR</span>
+      </div>
+      <div class="lg-block">
+        <strong>tasks:</strong>
+        <span id="task-legend"></span>
+      </div>
+    </section>
+
+    <main id="timeline-wrap">
+      <div id="timeline"></div>
+    </main>
+
+    <aside id="detail" class="closed">
+      <header>
+        <span id="detail-title">click a pod row to see its full log</span>
+        <button id="detail-close">close</button>
+      </header>
+      <div id="detail-controls">
+        <label>filter: <input type="search" id="detail-search" /></label>
+        <label class="cb"><input type="checkbox" id="detail-only-relevant" checked /> only lines relevant to this dataId</label>
+        <label class="cb"><input type="checkbox" id="detail-warn-only" /> warn/error only</label>
+      </div>
+      <div id="detail-body"></div>
+    </aside>
+  </section>
+
+  <script src="/static/explore.js"></script>
+  <script src="/static/home.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>
