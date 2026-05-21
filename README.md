@@ -67,7 +67,7 @@ Python 3.13. Create a venv and install the dev toolchain:
 
 ```
 python3.13 -m venv .venv
-.venv/bin/pip install pre-commit black isort flake8 flake8-bugbear mypy mypy-coverage
+.venv/bin/pip install pre-commit black isort flake8 flake8-bugbear mypy mypy-coverage pytest
 .venv/bin/pre-commit install
 ```
 
@@ -75,10 +75,14 @@ Validation loop before committing:
 
 ```
 .venv/bin/pre-commit run --all-files     # black, isort, flake8, whitespace
-.venv/bin/mypy                            # configured via mypy.ini, files=ra_log_explorer/
+.venv/bin/mypy                            # configured via mypy.ini (covers ra_log_explorer/ + tests/)
 .venv/bin/mypy-coverage                   # annotation coverage; aim for 100%
+.venv/bin/pytest -q                       # unit tests against the fixtures under tests/data/
 ```
 
+See [CLAUDE.md](CLAUDE.md) for the full contributor guide and
+[architecture/](architecture/) for design docs.
+
 The runtime itself uses stdlib only (no Flask/FastAPI/etc.); the venv is for
-the lint chain. `python3 -m ra_log_explorer.cli ...` will work against any
+the dev chain. `python3 -m ra_log_explorer.cli ...` will work against any
 Python that fromisoformat understands the Loki timestamp format (≥ 3.11).

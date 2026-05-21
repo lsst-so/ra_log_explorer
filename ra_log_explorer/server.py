@@ -73,15 +73,21 @@ def _assignTaskColors(tasks: list[str]) -> dict[str, str]:
     single run. We do not try to make the mapping stable across different
     *exposures* — pin the few important tasks in ``_TASK_COLOR_PINNED`` if
     cross-exposure consistency matters for that one.
+
+    Pinned palette entries are only excluded from the rotation when the
+    pinned task is actually present in ``tasks``; otherwise the full
+    palette is available, which matters when a view doesn't include
+    ``isr`` / ``calibrateImage``.
     """
     result: dict[str, str] = {}
-    available = _TASK_PALETTE[len(_TASK_COLOR_PINNED) :]
     others: list[str] = []
     for t in sorted(tasks):
         if t in _TASK_COLOR_PINNED:
             result[t] = _TASK_COLOR_PINNED[t]
         else:
             others.append(t)
+    usedPinned = set(result.values())
+    available = [c for c in _TASK_PALETTE if c not in usedPinned]
     for i, t in enumerate(others):
         result[t] = available[i % len(available)]
     return result

@@ -61,12 +61,17 @@ def podGroup(pod: str) -> str:
 
 
 def podInstrument(pod: str) -> str | None:
-    """Return 'LSSTCam', 'LATISS', etc. from the pod name, or None."""
+    """Return 'LSSTCam', 'LATISS', etc. from the pod name, or None.
+
+    Like ``POD_GROUPS``, order matters here because the match is "first
+    wins" — ``lsstcomcam`` is a substring of ``lsstcomcamsim``, so the
+    Sim variant must come first.
+    """
     for inst, needle in (
+        ("LSSTComCamSim", "lsstcomcamsim"),
+        ("LSSTComCam", "lsstcomcam"),
         ("LSSTCam", "lsstcam"),
         ("LATISS", "latiss"),
-        ("LSSTComCam", "lsstcomcam"),
-        ("LSSTComCamSim", "lsstcomcamsim"),
     ):
         if needle in pod:
             return inst

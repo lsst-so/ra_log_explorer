@@ -1,0 +1,7 @@
+{"labels": {"detected_level": "info"}, "line": "2026-05-20 08:45:50,123 lsst.rubintv.production.SingleCorePipelineRunner callback             INFO   Running pipeline for {instrument: 'LSSTCam', detector: 7, exposure: 2026051900722, band: 'u'}\n", "timestamp": "2026-05-20T08:45:50.123000000+00:00"}
+{"labels": {"detected_level": "error"}, "line": "2026-05-20 08:45:51,500 lsst.rubintv.production.SingleCorePipelineRunner callback             ERROR  Worker hit an unexpected exception while executing quantum for expId=2026051900722 det=7\n", "timestamp": "2026-05-20T08:45:51.500000000+00:00"}
+{"labels": {}, "line": "Traceback (most recent call last):\n", "timestamp": "2026-05-20T08:45:51.500100000+00:00"}
+{"labels": {}, "line": "  File \"/opt/lsst/.../singleQuantumExecutor.py\", line 200, in execute\n", "timestamp": "2026-05-20T08:45:51.500200000+00:00"}
+{"labels": {}, "line": "    return task.runQuantum(...)\n", "timestamp": "2026-05-20T08:45:51.500300000+00:00"}
+{"labels": {}, "line": "RuntimeError: synthetic failure for fixture\n", "timestamp": "2026-05-20T08:45:51.500400000+00:00"}
+{"labels": {"detected_level": "info"}, "line": "2026-05-20 08:45:51,600 lsst.rubintv.production.SingleCorePipelineRunner callback             INFO   Worker resumed after exception\n", "timestamp": "2026-05-20T08:45:51.600000000+00:00"}
