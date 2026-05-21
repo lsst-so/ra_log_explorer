@@ -1,28 +1,35 @@
 /* ra-log-explorer — home view: pick an exposure, configure credentials,
  * inspect the cache, watch a fetch happen.
  *
- * `startHome()` is the entry point; it's called by app.js when the server
- * reports no exposure is currently loaded. While a fetch job is running,
- * progress is streamed in via the SSE `/api/fetch/<id>/progress` endpoint
- * and rendered into the #progress-card region.
+ * The user types a dataId; the browser resolves it to its TAI shutter-
+ * close timestamp via /api/exposure-time/<dataId> and keeps that value
+ * in memory until submit. The user never types or sees a UTC/TAI
+ * choice — exposure timings always come from the same well-known
+ * service, which always returns TAI.
  */
 'use strict';
 
-// localStorage keys — namespaced so they don't collide with anything else.
 const LS = {
   username: 'ra_log_explorer.username',
   password: 'ra_log_explorer.password',
   remember: 'ra_log_explorer.remember',
-  lastRun: 'ra_log_explorer.lastRun',  // JSON {expId, tZero, tZeroUtc, cluster, namespace, ...}
+  lastRun: 'ra_log_explorer.lastRun',  // JSON {exposureId, cluster, namespace, ...} — no tZero, that's looked up each time
 };
 
 let homeListenersWired = false;
+let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
+let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
+let lookupTimer = null;         // debounce timer for the dataId input
+let lookupSeq = 0;              // sequence number to ignore stale lookup responses
 
 function startHome() {
   if (!homeListenersWired) wireHomeListeners();
   prefillForm();
   prefillCreds();
   refreshCache();
+  // If the form already has a dataId pre-filled from localStorage, kick
+  // a lookup so the submit button is ready to fire immediately.
+  triggerLookupIfReady();
 }
 window.startHome = startHome;
 
@@ -68,8 +75,6 @@ function saveCreds() {
     if (p) localStorage.setItem(LS.password, p);
     localStorage.setItem(LS.remember, '1');
   } else {
-    // Don't clear if the user hadn't typed anything; only clear when
-    // they explicitly hit the "forget" button.
     localStorage.removeItem(LS.remember);
   }
   updateCredsState();
@@ -87,8 +92,7 @@ function forgetCreds() {
 }
 
 function saveLastRun(values) {
-  // Don't persist credentials here; they have their own keys.
-  const { username, password, ...rest } = values;
+  const { username, password, tZero, ...rest } = values;  // tZero is looked up each time
   localStorage.setItem(LS.lastRun, JSON.stringify(rest));
 }
 
@@ -103,19 +107,99 @@ function readFormValues() {
   const fd = new FormData(form);
   const out = {};
   for (const [k, v] of fd.entries()) out[k] = v;
-  // FormData doesn't include unchecked checkboxes — fix tZeroUtc.
-  out.tZeroUtc = form.elements.tZeroUtc.checked;
-  // Numeric coercions for fields the server is fussy about.
   out.exposureId = parseInt(out.exposureId, 10);
   out.workers = parseInt(out.workers, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
-  // Folder credentials in from the creds form.
   const creds = document.getElementById('creds-form');
   out.username = creds.elements.username.value.trim();
   const password = creds.elements.password.value;
   if (password) out.password = password;
+  // Always TAI; the server applies the -37 s conversion. We deliberately
+  // never expose a UTC opt-out in the UI now that timings come from a
+  // service that's TAI by construction.
+  out.tZero = resolvedTZero;
   return out;
+}
+
+// ----- exposure-time lookup ------------------------------------------------
+
+function setTZeroStatus(text, kind /* 'info' | 'ok' | 'error' */) {
+  const el = document.getElementById('tzero-status');
+  el.textContent = text;
+  el.classList.remove('ok', 'error');
+  if (kind === 'ok') el.classList.add('ok');
+  if (kind === 'error') el.classList.add('error');
+  updateSubmitButton();
+}
+
+function clearResolvedTZero() {
+  resolvedTZero = null;
+  resolvedForExpId = null;
+}
+
+function updateSubmitButton() {
+  const submit = document.getElementById('fetch-submit');
+  // Allow re-submitting an already-typed dataId without forcing a refetch.
+  submit.disabled = !resolvedTZero;
+}
+
+function triggerLookupIfReady() {
+  const form = document.getElementById('fetch-form');
+  const raw = form.elements.exposureId.value.trim();
+  if (!raw) {
+    clearResolvedTZero();
+    setTZeroStatus('enter a dataId to resolve its shutter close time', 'info');
+    return;
+  }
+  const expId = parseInt(raw, 10);
+  if (!Number.isFinite(expId)) {
+    clearResolvedTZero();
+    setTZeroStatus('dataId must be an integer', 'error');
+    return;
+  }
+  // If we already resolved this exact dataId, don't re-request.
+  if (resolvedForExpId === expId && resolvedTZero) {
+    setTZeroStatus(`shutter close (TAI): ${resolvedTZero}`, 'ok');
+    return;
+  }
+  setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
+  const mySeq = ++lookupSeq;
+  fetch(`/api/exposure-time/${expId}`)
+    .then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      if (mySeq !== lookupSeq) return;  // stale; user typed something newer
+      if (r.ok && body.tZero) {
+        resolvedTZero = body.tZero;
+        resolvedForExpId = expId;
+        setTZeroStatus(`shutter close (TAI): ${body.tZero}`, 'ok');
+      } else if (r.status === 404) {
+        clearResolvedTZero();
+        setTZeroStatus(`no exposure-time record for ${expId}`, 'error');
+      } else if (r.status === 503) {
+        clearResolvedTZero();
+        setTZeroStatus(
+          'lookup service not configured on the server '
+          + '(set RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL)',
+          'error',
+        );
+      } else {
+        clearResolvedTZero();
+        setTZeroStatus(`lookup failed: ${body.error || r.status}`, 'error');
+      }
+    })
+    .catch((e) => {
+      if (mySeq !== lookupSeq) return;
+      clearResolvedTZero();
+      setTZeroStatus(`lookup failed: ${e}`, 'error');
+    });
+}
+
+function scheduleLookup() {
+  clearResolvedTZero();
+  setTZeroStatus('typing...', 'info');
+  if (lookupTimer) clearTimeout(lookupTimer);
+  lookupTimer = setTimeout(triggerLookupIfReady, 300);
 }
 
 // ----- cache list ----------------------------------------------------------
@@ -137,10 +221,11 @@ function renderCache(data) {
     `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`;
   const tbody = document.getElementById('cache-tbody');
   tbody.innerHTML = '';
+  const deleteAll = document.getElementById('cache-delete-all');
+  deleteAll.disabled = data.windows.length === 0;
   for (const w of data.windows) {
     const tr = document.createElement('tr');
     tr.title = 'click to copy these settings to the form above';
-    tr.addEventListener('click', () => useCacheSettings(w));
     const fromS = (w.fromIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const toS = (w.toIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const fetchedS = (w.fetchedAt || '').replace('T', ' ').replace(/\..*$/, '');
@@ -149,60 +234,96 @@ function renderCache(data) {
       <td><span class="mono">${fromS} → ${toS}</span></td>
       <td><span class="mono">${fetchedS}</span></td>
       <td>${w.podCount}</td>
-      <td>${humanBytes(w.sizeOnDisk)}</td>`;
+      <td>${humanBytes(w.sizeOnDisk)}</td>
+      <td><button type="button" class="ghost mini delete" title="delete this cached window">✕</button></td>`;
+    // Row click: copy settings into the form. The trailing ✕ button has
+    // its own handler that stopPropagation()s so it doesn't trigger this.
+    tr.addEventListener('click', () => useCacheSettings(w));
+    const delBtn = tr.querySelector('button.delete');
+    delBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      deleteCacheWindow(w);
+    });
     tbody.appendChild(tr);
   }
 }
 
+async function deleteCacheWindow(w) {
+  if (!window.confirm(
+    `Delete cached window?\n\n${w.cluster}/${w.namespace}/${w.windowDir}\n(${humanBytes(w.sizeOnDisk)})`,
+  )) return;
+  const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${encodeURIComponent(w.windowDir)}`;
+  try {
+    const r = await fetch(url, { method: 'DELETE' });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      alert(`Delete failed: ${body.error || r.status}`);
+      return;
+    }
+    const data = await r.json();
+    renderCache(data);
+  } catch (e) {
+    alert(`Delete failed: ${e}`);
+  }
+}
+
+async function deleteAllCache() {
+  // Read the current total off the visible summary so the confirm dialog
+  // is honest about how much disk we're about to free.
+  const info = document.getElementById('home-cache-info').textContent;
+  if (!window.confirm(`Delete EVERY cached window?\n\n${info}\n\nThis cannot be undone.`)) return;
+  try {
+    const r = await fetch('/api/cache', { method: 'DELETE' });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      alert(`Delete failed: ${body.error || r.status}`);
+      return;
+    }
+    const data = await r.json();
+    renderCache(data);
+  } catch (e) {
+    alert(`Delete failed: ${e}`);
+  }
+}
+
 function useCacheSettings(w) {
-  // Populate the cluster/namespace/window fields with this row's values
-  // so a subsequent fetch hits the same on-disk window.
   const form = document.getElementById('fetch-form');
   form.elements.cluster.value = w.cluster;
   form.elements.namespace.value = w.namespace;
-  // Try to infer windowBefore/After from the cached span and the user's
-  // current tZero. If they don't have a tZero typed yet, just leave the
-  // defaults — they can pick the cache row again after entering it.
-  const tZeroStr = form.elements.tZero.value;
-  if (tZeroStr && w.fromIso && w.toIso) {
+  // Recompute windowBefore/After to land on the same cached slug, *if*
+  // we've already resolved a shutter-close time for the current dataId.
+  if (resolvedTZero && w.fromIso && w.toIso) {
     try {
-      const tai = parseClientIso(tZeroStr);
-      const tZeroUtc = form.elements.tZeroUtc.checked ? tai : tai - 37_000;
+      const taiMs = Date.parse(resolvedTZero.endsWith('Z') ? resolvedTZero : resolvedTZero + 'Z');
+      const utcMs = taiMs - 37_000;
       const fromMs = Date.parse(w.fromIso);
       const toMs = Date.parse(w.toIso);
-      form.elements.windowBefore.value = ((tZeroUtc - fromMs) / 1000).toFixed(1);
-      form.elements.windowAfter.value = ((toMs - tZeroUtc) / 1000).toFixed(1);
+      form.elements.windowBefore.value = ((utcMs - fromMs) / 1000).toFixed(1);
+      form.elements.windowAfter.value = ((toMs - utcMs) / 1000).toFixed(1);
     } catch (_) { /* leave defaults */ }
   }
   const msg = document.getElementById('fetch-message');
-  msg.textContent = `Settings copied from ${w.windowDir}. Type a dataId + t₀ if you haven't already and hit Fetch.`;
+  msg.textContent = `Settings copied from ${w.windowDir}. ` +
+    (resolvedTZero
+      ? 'Hit Fetch to reopen.'
+      : 'Type a dataId so we can compute the matching window-before/after.');
 }
 
-function parseClientIso(s) {
-  // Loose ISO parser — accepts "YYYY-MM-DDTHH:MM:SS[.fff]" with optional Z.
-  // We hand the actual parsing to Date.parse but fall back to a manual
-  // path if the browser is stricter than expected.
-  if (!s.endsWith('Z') && !/[+-]\d\d:?\d\d$/.test(s)) s = s + 'Z';
-  const t = Date.parse(s);
-  if (!Number.isFinite(t)) throw new Error('bad ISO');
-  return t;
-}
-
-// ----- fetch + progress -----------------------------------------------------
+// ----- fetch + progress ---------------------------------------------------
 
 let activeJobId = null;
 let activeEventSource = null;
 
 async function startFetch(ev) {
   ev.preventDefault();
-  if (activeJobId) return;  // ignore double-submit
+  if (activeJobId) return;
   const values = readFormValues();
   if (!Number.isFinite(values.exposureId)) {
     showMessage('exposureId must be an integer.', true);
     return;
   }
   if (!values.tZero) {
-    showMessage('tZero is required.', true);
+    showMessage('Shutter close time has not been resolved yet.', true);
     return;
   }
   saveCreds();
@@ -226,7 +347,7 @@ async function startFetch(ev) {
     jobId = data.jobId;
   } catch (e) {
     showMessage(`Failed to start fetch: ${e.message || e}`, true);
-    submit.disabled = false;
+    updateSubmitButton();
     return;
   }
   activeJobId = jobId;
@@ -282,12 +403,11 @@ function openProgressStream(jobId) {
     } else if (ev.type === 'done') {
       logProgress(`done in ${ev.elapsedS.toFixed(1)}s — ${ev.podCount} pods (${humanBytes(ev.totalBytes)})`);
       document.getElementById('progress-fill').style.width = '100%';
-      document.getElementById('progress-text').textContent =
-        `done — opening explore view ...`;
+      document.getElementById('progress-text').textContent = `done — opening explore view ...`;
       es.close();
       activeEventSource = null;
       activeJobId = null;
-      document.getElementById('fetch-submit').disabled = false;
+      updateSubmitButton();
       transitionToExplore();
     } else if (ev.type === 'error') {
       logProgress(`ERROR: ${ev.error}`);
@@ -295,13 +415,10 @@ function openProgressStream(jobId) {
       es.close();
       activeEventSource = null;
       activeJobId = null;
-      document.getElementById('fetch-submit').disabled = false;
+      updateSubmitButton();
     }
   };
-  es.onerror = () => {
-    // EventSource auto-retries on network blips; we only force-close if
-    // the job has already finished.
-  };
+  es.onerror = () => {};
 }
 
 async function transitionToExplore() {
@@ -318,14 +435,16 @@ async function transitionToExplore() {
   }
 }
 
-// ----- wiring --------------------------------------------------------------
+// ----- wiring -------------------------------------------------------------
 
 function wireHomeListeners() {
   document.getElementById('fetch-form').addEventListener('submit', startFetch);
-  document.getElementById('creds-form').elements.remember.addEventListener('change', () => {
-    saveCreds();
-  });
+  const expIdInput = document.getElementById('fetch-form').elements.exposureId;
+  expIdInput.addEventListener('input', scheduleLookup);
+  document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
   document.getElementById('creds-forget').addEventListener('click', forgetCreds);
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
+  document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
   homeListenersWired = true;
+  updateSubmitButton();  // start with submit disabled until lookup resolves
 }

@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from ra_log_explorer import exposureTimes
 from ra_log_explorer import jobs as jobsModule
 from ra_log_explorer import server as serverModule
 from ra_log_explorer.config import FetchSpec
@@ -75,6 +76,19 @@ def _get(host: str, port: int, path: str) -> tuple[int, dict]:
 def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = {"_raw": text}
+    return resp.status, parsed
+
+
+def _delete(host: str, port: int, path: str) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request("DELETE", path)
     resp = conn.getresponse()
     text = resp.read().decode("utf-8")
     conn.close()
@@ -284,3 +298,154 @@ def test_buildSpecFromRequest_rejects_missing_tZero() -> None:
 def test_buildSpecFromRequest_rejects_bad_tZero() -> None:
     with pytest.raises(ValueError, match="ISO"):
         serverModule._buildSpecFromRequest({"exposureId": 1, "tZero": "not a date"})
+
+
+# ----- /api/exposure-time/<dataId> ----------------------------------------
+
+
+def _plantExposureTime(monkeypatch: pytest.MonkeyPatch, payload: dict[str, str] | None) -> None:
+    """Stub urlopen so queryIsot returns the values we want for one day."""
+    import io as _io
+    from urllib.error import HTTPError as _HTTPError
+
+    exposureTimes._loadDay.cache_clear()
+    monkeypatch.setenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, "https://stubbed/")
+
+    def fakeUrlopen(url: str) -> object:
+        if payload is None:
+            raise _HTTPError(url, 404, "not found", {}, None)  # type: ignore[arg-type]
+        return _io.BytesIO(json.dumps(payload).encode("utf-8"))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+
+
+def test_exposure_time_returns_isot(runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    _plantExposureTime(monkeypatch, {"2026051900722": "2026-05-20T08:46:16.267"})
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body == {"dataId": 2026051900722, "tZero": "2026-05-20T08:46:16.267", "scale": "TAI"}
+
+
+def test_exposure_time_404_for_unknown(runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch) -> None:
+    _plantExposureTime(monkeypatch, {"some-other-id": "..."})
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 404
+    assert "exposure-time" in body["error"]
+
+
+def test_exposure_time_404_for_unknown_day(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _plantExposureTime(monkeypatch, None)
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 404
+
+
+def test_exposure_time_503_when_url_not_set(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, raising=False)
+    exposureTimes._loadDay.cache_clear()
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 503
+    assert "EXPOSURE_TIMINGS_URL" in body["error"]
+
+
+# ----- DELETE /api/cache (single + all) -----------------------------------
+
+
+def _plantCacheDir(root: Path, cluster: str, namespace: str, slug: str) -> Path:
+    d = root / cluster / namespace / slug
+    (d / "pods").mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": cluster,
+                    "namespace": namespace,
+                    "fromIso": "2026-05-20T08:45:00Z",
+                    "toIso": "2026-05-20T08:50:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 0,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    return d
+
+
+def test_delete_single_cache_window(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    host, port, _ = runningServer
+    slug = "2026-05-20T084500Z__2026-05-20T085000Z"
+    d = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug)
+    assert d.exists()
+    status, body = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}")
+    assert status == 200
+    assert body["windows"] == []
+    assert not d.exists()
+
+
+def test_delete_unknown_cache_window(runningServer: RunningServer) -> None:
+    host, port, _ = runningServer
+    status, body = _delete(host, port, "/api/cache/yagan/rapid-analysis/nope")
+    assert status == 404
+
+
+def test_delete_rejects_path_traversal(runningServer: RunningServer) -> None:
+    host, port, _ = runningServer
+    # /api/cache/<cluster>/<ns>/<slug> route only matches safe components,
+    # but probe a few escape attempts to be sure.
+    for bad in [
+        "/api/cache/..%2F..%2F..%2Fetc/passwd/x",
+        "/api/cache/a/b/..",
+        "/api/cache/a/b/.",
+    ]:
+        status, _ = _delete(host, port, bad)
+        assert status == 404, bad
+
+
+def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    host, port, _ = runningServer
+    _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", "a__a")
+    _plantCacheDir(tmpCacheRoot, "other", "ns", "b__b")
+    status, body = _delete(host, port, "/api/cache")
+    assert status == 200
+    assert body["windows"] == []
+    # The root itself should still exist (we recreate it).
+    assert tmpCacheRoot.exists()
+
+
+def test_delete_cache_window_clears_loaded_state_if_match(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    host, port, ctx = runningServer
+    slug = "2026-05-20T084500Z__2026-05-20T085000Z"
+    d = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug)
+    # Pretend an exposure is loaded against this cache directory.
+    with ctx.jobs.stateLock:
+        ctx.state = serverModule.ServerState(
+            cacheDir=d,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            expId=1,
+            tZero=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        )
+    status, _ = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}")
+    assert status == 200
+    with ctx.jobs.stateLock:
+        assert ctx.state is None

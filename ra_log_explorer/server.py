@@ -10,14 +10,17 @@ The server runs against a long-lived :class:`ServerContext` that holds:
 
 HTTP surface (see ``architecture/architecture.md`` for the full schema):
 
-  GET  /                            timeline.html (home + explore SPA)
-  GET  /static/*                    static assets
-  GET  /api/summary                 current loaded exposure, or {state: null}
-  GET  /api/pod/<pod>               full parsed log for one pod
-  GET  /api/cache                   list of cached windows on disk
-  POST /api/fetch                   start a fetch; returns {jobId}
-  GET  /api/fetch/<id>/status       JSON snapshot of a fetch job
-  GET  /api/fetch/<id>/progress     SSE stream of fetch progress events
+  GET    /                                              timeline.html (home + explore SPA)
+  GET    /static/*                                       static assets
+  GET    /api/summary                                    current loaded exposure, or {state: null}
+  GET    /api/pod/<pod>                                  full parsed log for one pod
+  GET    /api/cache                                      list of cached windows on disk
+  DELETE /api/cache                                      delete the entire cache
+  DELETE /api/cache/<cluster>/<ns>/<slug>                delete one cached window
+  GET    /api/exposure-time/<dataId>                     dataId -> shutter-close (TAI) lookup
+  POST   /api/fetch                                      start a fetch; returns {jobId}
+  GET    /api/fetch/<id>/status                          JSON snapshot of a fetch job
+  GET    /api/fetch/<id>/progress                        SSE stream of fetch progress events
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from urllib.parse import urlparse
 
 from . import parse as parser
 from .config import FetchSpec, cache_root
+from .exposureTimes import exposureTimingsUrl, queryIsot
 from .fetch import cacheDuSizeBytes, loadPodLogPath
 from .jobs import FetchJob, JobManager
 
@@ -333,6 +337,67 @@ def _cacheRootInfo() -> dict:
     }
 
 
+# A cache path component must be a "safe" basename — no path separators,
+# no leading dot, no `..` traversal. The same pattern is also used to
+# validate pod names elsewhere so the choice is consistent.
+_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _safePathComponent(s: str) -> bool:
+    return bool(_PATH_COMPONENT_RE.match(s)) and s not in (".", "..")
+
+
+def _resolveCacheWindow(cluster: str, namespace: str, slug: str) -> Path | None:
+    """Return the cache directory for `(cluster, namespace, slug)` if it exists.
+
+    Validates the components first so an attacker can't escape `cache_root()`.
+    Returns ``None`` when any component is unsafe or the directory doesn't exist.
+    """
+    if not all(_safePathComponent(c) for c in (cluster, namespace, slug)):
+        return None
+    path = cache_root() / cluster / namespace / slug
+    if not path.exists() or not path.is_dir():
+        return None
+    # Final safety check: the resolved path must still live under cache_root.
+    try:
+        path.resolve().relative_to(cache_root().resolve())
+    except ValueError:
+        return None
+    return path
+
+
+def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
+    """Remove a single cache directory, clearing ServerState if it matched.
+
+    Empty parent directories (the per-cluster and per-namespace ones) are
+    also removed when they become empty, so a flush via repeated deletes
+    leaves the same clean state as `DELETE /api/cache` followed by ``ls``.
+    """
+    import shutil
+
+    with ctx.jobs.stateLock:
+        if ctx.state is not None and ctx.state.cacheDir.resolve() == target.resolve():
+            ctx.state = None
+    shutil.rmtree(target)
+    # Tidy up empty parents.
+    parent = target.parent
+    while parent != cache_root() and parent.exists() and not any(parent.iterdir()):
+        parent.rmdir()
+        parent = parent.parent
+
+
+def _deleteCacheRoot(ctx: "ServerContext") -> None:
+    """Wipe the entire cache and clear ServerState (which by definition uses it)."""
+    import shutil
+
+    with ctx.jobs.stateLock:
+        ctx.state = None
+    root = cache_root()
+    if root.exists():
+        shutil.rmtree(root)
+        root.mkdir(parents=True, exist_ok=True)
+
+
 # ----- request handling ----------------------------------------------------
 
 
@@ -484,6 +549,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
                 return
+            m = re.match(r"^/api/exposure-time/(\d+)$", path)
+            if m:
+                self._handle_exposure_time(int(m.group(1)))
+                return
             m = re.match(r"^/api/fetch/([A-Za-z0-9]+)/status$", path)
             if m:
                 job = ctx.jobs.getJob(m.group(1))
@@ -514,6 +583,46 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(404, "No such job")
                     return
                 self._send_sse(job)
+                return
+            self.send_error(404)
+
+        # ----- handler bodies (kept out of do_GET so they don't bloat it) -----
+
+        def _handle_exposure_time(self, dataId: int) -> None:
+            rootUrl = exposureTimingsUrl()
+            if not rootUrl:
+                self._send_error_json(
+                    503,
+                    "Exposure timings lookup is not configured "
+                    "(set the RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL env var).",
+                )
+                return
+            try:
+                isot = queryIsot(dataId, rootUrl)
+            except Exception as e:  # noqa: BLE001 — surface upstream failures verbatim
+                self._send_error_json(502, f"Lookup failed: {type(e).__name__}: {e}")
+                return
+            if isot is None:
+                self._send_error_json(404, f"No exposure-time record for dataId={dataId}")
+                return
+            self._send_json({"dataId": dataId, "tZero": isot, "scale": "TAI"})
+
+        def do_DELETE(self) -> None:  # noqa: N802
+            url = urlparse(self.path)
+            path = url.path
+            if path == "/api/cache":
+                _deleteCacheRoot(ctx)
+                self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
+                return
+            m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)$", path)
+            if m:
+                cluster, namespace, slug = m.group(1), m.group(2), m.group(3)
+                target = _resolveCacheWindow(cluster, namespace, slug)
+                if target is None:
+                    self._send_error_json(404, "No such cache directory")
+                    return
+                _deleteCacheDir(ctx, target)
+                self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
                 return
             self.send_error(404)
 

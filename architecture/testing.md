@@ -28,7 +28,8 @@ The unit tests target the deterministic pieces of the codebase:
 | Task palette       | `_assignTaskColors` collision-freeness up to palette length, stable order   | `tests/test_server.py`            |
 | JSON serialisation | `_toJsonable` for `datetime`, `set`, dataclass, nested containers          | `tests/test_server.py`            |
 | Job manager        | `FetchJob` event ordering, `JobManager.runJob` happy path + error, condvar wake | `tests/test_jobs.py`         |
-| HTTP endpoints     | `/api/summary` (empty/loaded), `/api/cache` (partial/no-meta), `/api/fetch` (body validation, 202 + status polling), `/api/pod` (404 when no state), `_buildSpecFromRequest` (TAI/UTC, password passthrough, validation errors) | `tests/test_server_endpoints.py` |
+| Exposure-time lookup | `queryIsot` happy path / 404 day / 404 dataId / propagated 500 / trailing-slash normalisation / lru_cache reuse; `exposureTimingsUrl` env-var read | `tests/test_exposure_times.py` |
+| HTTP endpoints     | `/api/summary` (empty/loaded), `/api/cache` (partial/no-meta), `/api/fetch` (body validation, 202 + status polling), `/api/pod` (404 when no state), `/api/exposure-time/<>` (200/404/503), `DELETE /api/cache` (all + single + traversal-rejection + state-cleared-when-matching), `_buildSpecFromRequest` (TAI/UTC, password passthrough, validation errors) | `tests/test_server_endpoints.py` |
 | CLI parsing        | `_parseIsoUtc` for `Z`, explicit offset, naive (assumed UTC); `cmdRun` rejects partial --exposure-id/--t-zero | `tests/test_cli.py`     |
 
 What we don't unit-test:

@@ -145,6 +145,33 @@ html, body {
 .home-card #fetch-message { font-size: 12px; color: #4a5468; }
 .home-card #fetch-message.error { color: #c1252b; }
 
+/* dataId -> shutter close inline lookup feedback */
+#tzero-status {
+  font-size: 12px;
+  color: #6a7283;
+  margin-top: 2px;
+}
+#tzero-status.ok    { color: #1a7a3f; font-family: ui-monospace, Menlo, monospace; }
+#tzero-status.error { color: #c1252b; }
+
+/* destructive variants of the ghost-mini button used in the cache table */
+.home-card button.ghost.delete,
+button.ghost.mini.delete {
+  color: #c1252b;
+  border-color: #e3b6b6;
+}
+.home-card button.ghost.delete:hover,
+button.ghost.mini.delete:hover {
+  background: #fff1f1;
+  border-color: #c1252b;
+}
+button.ghost.mini.delete:disabled {
+  color: #b58e8e;
+  border-color: #e3d6d6;
+  background: #f7f3f3;
+  cursor: not-allowed;
+}
+
 /* cache table */
 #cache-table {
   width: 100%;

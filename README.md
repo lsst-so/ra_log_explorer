@@ -1,11 +1,10 @@
-# ra_log_explorer
+# Rapid Analysis Log Explorer
 
 Interactive log exploration for the **rapid analysis** backend
-(Vera C. Rubin Observatory). Given an LSSTCam exposure id and the
-shutter-close time from its Butler `DimensionRecord`, it pulls every
-pod's logs from the cluster's Loki for a window around that time and
-serves a browser timeline that shows what each pod did, when, and where
-the warnings / errors / tracebacks landed.
+(Vera C. Rubin Observatory). Type a dataId; the tool resolves its
+shutter close time, pulls every pod's logs from the cluster's Loki for a
+window around that moment, and serves a browser timeline showing what
+each pod did, when, and where the warnings / errors / tracebacks landed.
 
 ![timeline placeholder]()
 
@@ -17,64 +16,85 @@ Designed for the typical question:
 It is **not** a streaming log tail; it works on snapshots of a fixed
 window. One exposure at a time.
 
-## What you need
+## Required environment variables
+
+The tool needs **three** things from your environment to fetch logs and
+resolve dataIds. Put these in your shell rc (`~/.zshrc`, `~/.bashrc`,
+…) so they survive across terminals:
+
+```sh
+# 1. Loki credentials — used by `logcli` to authenticate.
+export LOKI_PASSWORD='<the password>'
+
+# 2. Exposure-timing service base URL — used by the dataId -> shutter-
+#    close TAI lookup. Ask Merlin for the current URL.
+export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='https://...'
+```
+
+| Env var                                   | Required for                                  | What if it's missing                                 |
+|--------------------------------------------|------------------------------------------------|------------------------------------------------------|
+| `LOKI_PASSWORD`                            | Every Loki fetch                              | `logcli` refuses to run; fetches fail at submit time. |
+| `RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL`     | dataId → shutter-close auto-resolution        | Home form shows "lookup service not configured"; you can't submit a fetch from the UI until it's set. (The CLI's `--t-zero` flag still works as a manual override.) |
+| `RA_LOG_EXPLORER_CACHE`                    | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
+
+The username for `logcli` defaults to `merlin` and is overridable in the
+browser's Credentials card (or via the CLI's `--username` flag).
+
+## Other prerequisites
 
 | Requirement                       | Notes                                                                                |
 |-----------------------------------|---------------------------------------------------------------------------------------|
-| Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only (no `pip install` needed).        |
+| Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only.                                  |
 | `logcli` on your `$PATH`          | `brew install grafana/grafana/logcli` on macOS, or grab a binary from Grafana releases. |
-| `LOKI_PASSWORD` in your environment | Set it in your shell rc (e.g. `~/.zshrc`).                                          |
-| `git` to clone this repo          | There is no published PyPI package; you run it from a checkout.                       |
+| `git`                              | There is no PyPI package; you run from a checkout.                                  |
 | A browser                         | The tool opens `http://127.0.0.1:8765/` for you.                                      |
 
-## Install
+## Getting started — first run, step by step
 
-There's nothing to install besides the repo. The tool runs out of a
-checkout:
+```sh
+# 1. Install logcli (macOS; for Linux see the Grafana releases page).
+brew install grafana/grafana/logcli
+logcli --version    # sanity-check
 
-```
+# 2. Set the env vars (in this shell + ideally in ~/.zshrc).
+export LOKI_PASSWORD='ask-merlin'
+export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='ask-merlin'
+
+# 3. Clone the repo and cd into it.
 git clone git@github.com:lsst-so/ra_log_explorer.git
 cd ra_log_explorer
-export LOKI_PASSWORD=...     # ideally pinned in your shell rc
-```
 
-## Run
-
-There are two paths into the tool. Pick whichever is more comfortable.
-
-### Home mode (recommended)
-
-```
+# 4. Start the server. The runtime needs no pip installs (stdlib only).
 python3 -m ra_log_explorer.cli
 ```
 
-Starts the server with nothing loaded and opens the browser at
-`http://127.0.0.1:8765/`. From there you:
+That last command starts a local HTTP server and tries to open
+`http://127.0.0.1:8765/` in your default browser. If the browser doesn't
+open by itself, paste the URL by hand. To stop the server, press
+**Ctrl-C** in the terminal where you launched it.
 
-1. Type your **Loki username + password** in the credentials card
-   (leave password blank to fall back to `LOKI_PASSWORD` in the
-   environment). Tick "remember in this browser" if you'd like them
-   kept in `localStorage`. A "forget stored credentials" button
-   clears the slot any time.
-2. Type a **dataId** (e.g. `2026051900722`) and the **shutter-close
-   time** (e.g. `2026-05-20T08:46:16.267`).
-   The shutter-close defaults to being interpreted as **TAI** —
-   matching the Butler `DimensionRecord.timespan.end.isot` field;
-   tick "t₀ is already UTC" if you've already done the conversion.
+In the browser:
+
+1. The home page loads. Fill in your **Loki username + password** in
+   the *Credentials* card if you haven't already — tick "remember in
+   this browser" if you want them kept in `localStorage`. The password
+   field is optional; if you leave it blank the server falls back to
+   `LOKI_PASSWORD` from its environment.
+2. Type a **dataId** (e.g. `2026051900722`). After ~300 ms the tool
+   resolves the shutter close time and shows it inline under the input.
 3. Optionally open *Advanced options* to tweak cluster, namespace,
    worker count, or the pre-/post-shutter window padding.
-4. Click **Fetch & explore**.
+4. Click **Fetch & explore**. A progress bar follows the fetch live
+   (Server-Sent Events). When it's done the page switches to the
+   timeline view.
 
-A progress bar tracks per-pod completion as the fetch runs (live
-Server-Sent Events from the backend). When it finishes the page
-switches automatically to the timeline / explore view; the back-arrow
-button in the explore topbar returns you to the home page.
+The home page also lists every cached window on disk. Clicking a row
+copies its cluster / namespace / window settings into the fetch form so
+a subsequent submit cache-hits exactly. The ✕ button on each row
+deletes that one window; the "delete all" button under the table wipes
+the whole cache.
 
-The home page also lists every cached window on disk; clicking a row
-copies its cluster/namespace/window settings into the fetch form, so a
-subsequent fetch of the same exposure id cache-hits instantly.
-
-### Eager mode (CLI-driven, useful for scripting)
+## Eager mode (CLI-driven, useful for scripting)
 
 ```
 python3 -m ra_log_explorer.cli \
@@ -82,9 +102,13 @@ python3 -m ra_log_explorer.cli \
     --t-zero 2026-05-20T08:46:16.267
 ```
 
-Same TAI default as the home form (pass `--t-zero-utc` to opt out).
-Fetches + parses on the CLI side first, then opens the browser
-straight at the explore view for that exposure.
+Skips the home page — fetches + parses on the CLI side first, then opens
+the browser straight at the explore view. Useful when scripting or when
+you already have a shutter-close timestamp in hand.
+
+`--t-zero` is treated as **TAI** by default (matching the Butler
+`DimensionRecord.timespan.end.isot` convention). Pass `--t-zero-utc` if
+you've already done the conversion.
 
 By default this fetches **5 s before to 5 min after** the shutter close.
 A rapid analysis exposure usually finishes within ~90 s; the longer
@@ -192,6 +216,12 @@ Lists every cached window, its on-disk size, and whether it completed
 cleanly.
 
 ### Flush the cache
+
+Easiest: open the home page in the browser, hit the **delete all**
+button under the recent-runs table (or the **✕** on a single row to
+remove just one window).
+
+From the CLI:
 
 ```
 python3 -m ra_log_explorer.cli cache flush

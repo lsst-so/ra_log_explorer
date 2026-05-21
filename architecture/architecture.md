@@ -60,15 +60,16 @@ Sibling docs:
 
 ## Module Responsibilities
 
-| Module       | Responsibility                                                                |
-|--------------|--------------------------------------------------------------------------------|
-| `config.py`  | Defaults, `FetchSpec` dataclass, cache-path helpers.                          |
-| `fetch.py`   | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache, including superset reuse. |
-| `parse.py`   | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). |
-| `jobs.py`    | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off and watch fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the shared `ServerState` handover. |
-| `server.py`  | Stdlib `ThreadingHTTPServer` with the JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing `{jobs, state}`. Assembles the per-exposure summary payload (events, task colour palette, reference points) when `state` is set; returns `{loaded: false}` otherwise. |
-| `cli.py`     | Argument parsing + the optional "eager fetch" path. Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. |
-| `static/`    | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, view switching), `home.js` (landing page form + cache list + progress), `explore.js` (timeline + detail drawer). One HTML template (`templates/timeline.html`) holds both `#home-view` and `#explore-view` sections; the bootstrap shows whichever matches the server's `loaded` state. No build step. |
+| Module             | Responsibility                                                                |
+|--------------------|--------------------------------------------------------------------------------|
+| `config.py`        | Defaults, `FetchSpec` dataclass, cache-path helpers.                          |
+| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache, including superset reuse. |
+| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). |
+| `exposureTimes.py` | dataId → shutter-close (TAI) lookup. Reads from a JSON service whose base URL is supplied via the ``RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL`` env var. Per-day responses are cached in-process with `lru_cache`. |
+| `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off and watch fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the shared `ServerState` handover. |
+| `server.py`        | Stdlib `ThreadingHTTPServer` with the JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing `{jobs, state}`. Assembles the per-exposure summary payload (events, task colour palette, reference points) when `state` is set; returns `{loaded: false}` otherwise. Also owns cache-deletion endpoints. |
+| `cli.py`           | Argument parsing + the optional "eager fetch" path. Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, view switching), `home.js` (landing page form + cache list + progress), `explore.js` (timeline + detail drawer). One HTML template (`templates/timeline.html`) holds both `#home-view` and `#explore-view` sections; the bootstrap shows whichever matches the server's `loaded` state. No build step. |
 
 ## Key Concepts
 
@@ -161,6 +162,21 @@ Used by the detail drawer in the UI. `podName` is checked against a
 `[A-Za-z0-9._-]+` allowlist so it can't break out of `pods/`. Returns
 `404` when no exposure is loaded.
 
+### `GET /api/exposure-time/<dataId>`
+
+dataId → shutter-close ISOT lookup for the home form. The base URL of
+the upstream timings service comes from the
+``RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL`` env var (kept out of the repo
+deliberately).
+
+- `200 { "dataId": 2026051900722, "tZero": "2026-05-20T08:46:16.267", "scale": "TAI" }`
+- `404 { "error": "No exposure-time record for dataId=N" }` — the
+  day's JSON doesn't exist or doesn't contain that exposure.
+- `502 { "error": "Lookup failed: ..." }` — the upstream service
+  returned a non-404 HTTP error.
+- `503 { "error": "Exposure timings lookup is not configured ..." }`
+  — the env var is unset.
+
 ### `GET /api/cache`
 
 ```jsonc
@@ -181,6 +197,24 @@ Used by the detail drawer in the UI. `podName` is checked against a
 
 Sorted most-recently-fetched-first. Skips directories with a `.partial`
 flag or a missing `_meta.json`.
+
+### `DELETE /api/cache`
+
+Wipe the entire cache root. Always clears any loaded `ServerState`
+(since by definition that state references a cache directory under the
+root). Returns the same shape as `GET /api/cache` (so the client can
+update its table directly from the response). The cache root itself
+is recreated empty so subsequent fetches still work.
+
+### `DELETE /api/cache/<cluster>/<namespace>/<windowDir>`
+
+Remove one cached window. Each path component is validated against
+`[A-Za-z0-9._-]+` so the URL can't escape `cache_root()`. If the
+loaded `ServerState`'s `cacheDir` matches the directory being deleted,
+the state is cleared first (the user gets booted back to the home
+view on next `/api/summary`). Empty per-cluster / per-namespace parent
+directories are pruned. Returns the same shape as `GET /api/cache`.
+`404` if the path doesn't resolve.
 
 ### `POST /api/fetch`
 

@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>ra-log-explorer</title>
+  <title>Rapid Analysis Log Explorer</title>
   <link rel="stylesheet" href="/static/style.css" />
 </head>
 <body>
@@ -10,7 +10,7 @@
   <section id="home-view" hidden>
     <header id="topbar">
       <div class="title">
-        <strong>ra-log-explorer</strong>
+        <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
       <div class="cache">
@@ -26,14 +26,7 @@
             <label>
               <span class="lbl">dataId / exposure id</span>
               <input type="number" name="exposureId" required placeholder="e.g. 2026051900722" />
-            </label>
-            <label>
-              <span class="lbl">shutter close (t<sub>0</sub>)</span>
-              <input type="text" name="tZero" required placeholder="2026-05-20T08:46:16.267" />
-            </label>
-            <label class="cb">
-              <input type="checkbox" name="tZeroUtc" /> t<sub>0</sub> is already UTC
-              <span class="hint">(default: treated as TAI, -37 s applied)</span>
+              <span id="tzero-status" class="hint">enter a dataId to resolve its shutter close time</span>
             </label>
           </div>
 
@@ -103,8 +96,10 @@
         <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
         <p class="hint">
           Click a row to copy its cluster / namespace / window settings into the
-          fetch form above. A subsequent fetch with the same exposure id will
-          cache-hit instantly. <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+          fetch form above; the ✕ button on each row removes just that window
+          from disk.
+          <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+          <button type="button" id="cache-delete-all" class="ghost mini delete">delete all</button>
         </p>
         <table id="cache-table">
           <thead>
@@ -114,6 +109,7 @@
               <th>fetched</th>
               <th>pods</th>
               <th>size</th>
+              <th></th>
             </tr>
           </thead>
           <tbody id="cache-tbody"></tbody>
@@ -136,7 +132,7 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="back-home" class="ghost mini">&larr; home</button>
-        <strong>ra-log-explorer</strong>
+        <strong>Rapid Analysis Log Explorer</strong>
         <span id="expId-display"></span>
       </div>
       <div class="cache">

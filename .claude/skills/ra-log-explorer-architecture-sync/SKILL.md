@@ -33,7 +33,8 @@ commit as the code change** — don't leave it for later.
 | `POD_GROUPS` / `podOrdinal` / `podInstrument`                   | `architecture/parsing.md`                                           |
 | Cache directory layout, `.partial`, hit policy                  | `architecture/caching.md`                                           |
 | `FetchSpec`, `cache_root`, the env-override variable             | `architecture/caching.md`                                           |
-| Anything in `/api/summary`, `/api/pod/<>`, `/api/cache`, `/api/fetch*` | `architecture/architecture.md` (the JSON API section)         |
+| Anything in `/api/summary`, `/api/pod/<>`, `/api/cache`, `/api/fetch*`, `/api/exposure-time/<>`, `DELETE /api/cache*` | `architecture/architecture.md` (the JSON API section) |
+| The exposure-timings JSON shape, the env var name, or the per-day URL pattern | `architecture/architecture.md` (the `/api/exposure-time` entry) + README ("Required environment variables") |
 | The home-mode ⇄ explore-mode flow, or how `ServerContext` works | `architecture/architecture.md` ("Threading model", "Two startup modes") |
 | `jobs.py` event-kind names, `JobStatus`, or the SSE event schema | `architecture/architecture.md` (the SSE section)                  |
 | Module split / rename / new file under `ra_log_explorer/`         | `architecture/architecture.md` (the table + tree)                  |
