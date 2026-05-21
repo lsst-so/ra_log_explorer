@@ -225,13 +225,20 @@ function render() {
       if (a.ordinal != null && b.ordinal != null) return a.ordinal - b.ordinal;
       return a.pod.localeCompare(b.pod);
     });
-    const isCollapsed = collapsedGroups.has(g);
+    // Singleton groups can't usefully fold — hiding one row behind a
+    // collapse arrow is just noise. Render them as a flat, non-clickable
+    // header followed by the row.
+    const foldable = ps.length > 1;
+    const isCollapsed = foldable && collapsedGroups.has(g);
     const nTb = ps.reduce((acc, p) => acc + (p.nTraceback || 0), 0);
     const tbPill = nTb ? `<span class="tg-tb-pill">TB ${nTb}</span>` : '';
     const hdr = document.createElement('div');
-    hdr.className = 'tl-group-header' + (isCollapsed ? ' collapsed' : '');
-    hdr.innerHTML = `<span class="tg-arrow"></span>${g}  (${ps.length} pod${ps.length === 1 ? '' : 's'})${tbPill}`;
-    hdr.addEventListener('click', () => toggleGroup(g));
+    hdr.className = 'tl-group-header'
+      + (isCollapsed ? ' collapsed' : '')
+      + (foldable ? '' : ' static');
+    const arrow = foldable ? '<span class="tg-arrow"></span>' : '';
+    hdr.innerHTML = `${arrow}${g}  (${ps.length} pod${ps.length === 1 ? '' : 's'})${tbPill}`;
+    if (foldable) hdr.addEventListener('click', () => toggleGroup(g));
     tl.appendChild(hdr);
     if (isCollapsed) continue;
     for (const p of ps) tl.appendChild(renderPodRow(p));
@@ -245,7 +252,13 @@ function toggleGroup(g) {
 }
 
 function collapseAllGroups() {
-  for (const p of summary.pods) collapsedGroups.add(p.group);
+  // Only fold groups that actually have more than one pod; singletons
+  // stay open since folding them just hides one row behind an arrow.
+  const counts = {};
+  for (const p of summary.pods) counts[p.group] = (counts[p.group] || 0) + 1;
+  for (const [g, n] of Object.entries(counts)) {
+    if (n > 1) collapsedGroups.add(g);
+  }
   render();
 }
 

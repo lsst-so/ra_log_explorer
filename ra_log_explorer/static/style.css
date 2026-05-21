@@ -119,7 +119,13 @@ html, body {
   cursor: pointer;
   user-select: none;
 }
-.tl-group-header:hover { background: #dde2ec; }
+.tl-group-header:not(.static):hover { background: #dde2ec; }
+.tl-group-header.static {
+  cursor: default;
+  background: #eef1f6;
+  font-weight: 500;
+  color: #4a5468;
+}
 .tl-group-header .tg-arrow {
   display: inline-block;
   width: 14px;

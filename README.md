@@ -96,6 +96,9 @@ terminal stops the server.
     to collapse or expand that group; the arrow flips between ▼ and ▶.
     Groups with more than ten pods (typically `sfm` and sometimes
     `aos`) start collapsed so the page opens with a digestible view.
+    Single-pod groups (`head`, `step1b`, …) render as a flat, non-
+    clickable header — there's nothing to hide. "collapse all" /
+    "expand all" only affects the multi-pod groups too.
     If any pod in a collapsed group has a traceback, the header
     surfaces a red `TB N` pill so you don't miss it.
   - **Pods with tracebacks** in the window get a red left border and
