@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>ra-log-explorer</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header id="topbar">
+    <div class="title">
+      <strong>ra-log-explorer</strong>
+      <span id="expId-display"></span>
+    </div>
+    <div class="cache">
+      <span id="cache-display"></span>
+    </div>
+  </header>
+
+  <section id="refs">
+    <label for="ref-select">t<sub>0</sub>:</label>
+    <select id="ref-select"></select>
+    <span class="muted" id="t0-info"></span>
+    <span class="spacer"></span>
+    <label for="search">filter:</label>
+    <input type="search" id="search" placeholder="text in raw line, pod, detector..." />
+    <label class="cb"><input type="checkbox" id="hide-quiet" /> hide pods with no events</label>
+    <label class="cb"><input type="checkbox" id="hide-info" checked /> hide info-only rows in legend</label>
+  </section>
+
+  <section id="legend">
+    <span class="lg lg-pickup">▎pickup</span>
+    <span class="lg lg-qg">▎QG built</span>
+    <span class="lg lg-quantum">▭ quantum run</span>
+    <span class="lg lg-binned">▎binned image</span>
+    <span class="lg lg-fanout">▎fanout</span>
+    <span class="lg lg-gather">▎gather dispatch</span>
+    <span class="lg lg-mosaic">▎mosaic dispatch</span>
+    <span class="lg lg-warn">▎WARN</span>
+    <span class="lg lg-error">▎ERROR / traceback</span>
+  </section>
+
+  <main id="timeline-wrap">
+    <div id="timeline"></div>
+  </main>
+
+  <aside id="detail" class="closed">
+    <header>
+      <span id="detail-title">click a pod row to see its full log</span>
+      <button id="detail-close">close</button>
+    </header>
+    <div id="detail-controls">
+      <label>filter: <input type="search" id="detail-search" /></label>
+      <label class="cb"><input type="checkbox" id="detail-only-relevant" checked /> only lines relevant to this dataId</label>
+      <label class="cb"><input type="checkbox" id="detail-warn-only" /> warn/error only</label>
+    </div>
+    <div id="detail-body"></div>
+  </aside>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,232 @@
+"""Command-line entry point.
+
+Examples:
+
+    # Fetch logs around a known shutter-close time, parse, and open the UI.
+    python3 -m ra_log_explorer.cli \\
+        --exposure-id 2026051900722 \\
+        --t-zero 2026-05-20T08:46:05.336122
+
+    # Just fetch & cache, don't start the server.
+    python3 -m ra_log_explorer.cli --exposure-id ... --t-zero ... --no-serve
+
+    # Show cache info / flush.
+    python3 -m ra_log_explorer.cli cache info
+    python3 -m ra_log_explorer.cli cache flush
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import shutil
+import sys
+import webbrowser
+from pathlib import Path
+
+from . import parse as parser
+from .config import (
+    DEFAULT_CLUSTER,
+    DEFAULT_HTTP_PORT,
+    DEFAULT_LOKI_ADDR,
+    DEFAULT_NAMESPACE,
+    DEFAULT_USERNAME,
+    DEFAULT_WINDOW_AFTER_S,
+    DEFAULT_WINDOW_BEFORE_S,
+    DEFAULT_WORKERS,
+    FetchSpec,
+    cache_root,
+    window_cache_dir,
+)
+from .fetch import (
+    cacheDuSizeBytes,
+    fetchAll,
+    humanBytes,
+    stderrProgress,
+)
+from .server import ServerState, serve
+
+
+def _parseIsoUtc(s: str) -> dt.datetime:
+    """Parse user-supplied t-zero (no timezone assumed UTC)."""
+    s = s.strip()
+    if s.endswith("Z"):
+        s = s[:-1] + "+00:00"
+    if "+" not in s and "-" not in s[10:]:
+        # no offset given - assume UTC
+        s = s + "+00:00"
+    return dt.datetime.fromisoformat(s).astimezone(dt.timezone.utc)
+
+
+def _isoForLogcli(t: dt.datetime) -> str:
+    """Format a datetime for logcli --from/--to (RFC3339Nano UTC, with Z)."""
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _addCommonArgs(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--loki-addr", default=DEFAULT_LOKI_ADDR)
+    p.add_argument("--username", default=DEFAULT_USERNAME)
+    p.add_argument("--cluster", default=DEFAULT_CLUSTER)
+    p.add_argument("--namespace", default=DEFAULT_NAMESPACE)
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"Parallel download workers (default {DEFAULT_WORKERS})")
+    p.add_argument("--window-before", type=float, default=DEFAULT_WINDOW_BEFORE_S,
+                   help="Seconds before t-zero to start the fetch window")
+    p.add_argument("--window-after", type=float, default=DEFAULT_WINDOW_AFTER_S,
+                   help="Seconds after t-zero to end the fetch window")
+    p.add_argument("--force-refresh", action="store_true",
+                   help="Re-fetch even if cached results exist")
+
+
+def cmdRun(args: argparse.Namespace) -> int:
+    tZero = _parseIsoUtc(args.t_zero)
+    fromT = tZero - dt.timedelta(seconds=args.window_before)
+    toT = tZero + dt.timedelta(seconds=args.window_after)
+    spec = FetchSpec(
+        lokiAddr=args.loki_addr,
+        username=args.username,
+        cluster=args.cluster,
+        namespace=args.namespace,
+        fromIso=_isoForLogcli(fromT),
+        toIso=_isoForLogcli(toT),
+        workers=args.workers,
+    )
+    cacheDir = window_cache_dir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    print(f"Window: {spec.fromIso}  to  {spec.toIso}", file=sys.stderr)
+    print(f"Cache dir: {cacheDir}", file=sys.stderr)
+    meta = fetchAll(spec, progress=stderrProgress, forceRefresh=args.force_refresh)
+    if meta.get("fromCache"):
+        print(f"Loaded {meta['pod_count']} pods from cache "
+              f"({humanBytes(meta['total_bytes'])}).", file=sys.stderr)
+    else:
+        print(f"Downloaded {meta['pod_count']} pods, "
+              f"{humanBytes(meta['total_bytes'])} in {meta['elapsed_s']:.1f}s.",
+              file=sys.stderr)
+        if meta.get("errors"):
+            print(f"  WARNING: {len(meta['errors'])} pods failed; see {cacheDir}/_meta.json",
+                  file=sys.stderr)
+    cacheBytes = cacheDuSizeBytes(cache_root())
+    print(f"Total cache: {humanBytes(cacheBytes)} at {cache_root()}",
+          file=sys.stderr)
+
+    print("Parsing logs ...", file=sys.stderr)
+    summaries = parser.summarizeAll(cacheDir)
+    nRelevant = sum(1 for s in summaries if args.exposure_id in s.expIdsSeen)
+    print(f"  {len(summaries)} pods parsed, "
+          f"{nRelevant} touched expId={args.exposure_id}", file=sys.stderr)
+
+    if args.no_serve:
+        return 0
+
+    state = ServerState(
+        cacheDir=cacheDir,
+        cacheBytes=cacheBytes,
+        meta=meta,
+        summaries=summaries,
+        expId=args.exposure_id,
+        tZero=tZero,
+        referencePoints=[
+            {
+                "label": "shutter close (caller-supplied)",
+                "t": tZero.isoformat(),
+                "offsetS": 0.0,
+                "source": "shutter close",
+            }
+        ],
+    )
+    url = f"http://{args.host}:{args.port}/"
+    if not args.no_browser:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    serve(args.host, args.port, state)
+    return 0
+
+
+def cmdCacheInfo(args: argparse.Namespace) -> int:
+    root = cache_root()
+    total = cacheDuSizeBytes(root)
+    print(f"Cache root: {root}")
+    print(f"Total size: {humanBytes(total)}")
+    print()
+    print("Windows:")
+    if not any(root.iterdir()):
+        print("  (empty)")
+        return 0
+    for cluster in sorted(p for p in root.iterdir() if p.is_dir()):
+        for ns in sorted(p for p in cluster.iterdir() if p.is_dir()):
+            for window in sorted(p for p in ns.iterdir() if p.is_dir()):
+                size = cacheDuSizeBytes(window)
+                meta = window / "_meta.json"
+                tag = "ok " if meta.exists() else "partial"
+                print(f"  [{tag}] {humanBytes(size):>10}  "
+                      f"{cluster.name}/{ns.name}/{window.name}")
+    return 0
+
+
+def cmdCacheFlush(args: argparse.Namespace) -> int:
+    root = cache_root()
+    if not root.exists():
+        print("Nothing to flush.")
+        return 0
+    if args.yes or input(f"Delete entire cache at {root}? [y/N] ").lower() == "y":
+        shutil.rmtree(root)
+        print("Cache flushed.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="ra-log-explorer")
+    sub = p.add_subparsers(dest="cmd")
+
+    # default subcommand: run
+    runP = sub.add_parser("run", help="fetch logs and open the UI (default)")
+    runP.add_argument("--exposure-id", type=int, required=True,
+                      help="13-digit dataId, e.g. 2026051900722")
+    runP.add_argument("--t-zero", required=True,
+                      help="Shutter-close time, ISO-8601 UTC, e.g. "
+                           "2026-05-20T08:46:05.336122")
+    runP.add_argument("--host", default="127.0.0.1")
+    runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    runP.add_argument("--no-serve", action="store_true",
+                      help="Fetch + parse only, do not start the web UI")
+    runP.add_argument("--no-browser", action="store_true",
+                      help="Don't auto-open the browser")
+    _addCommonArgs(runP)
+    runP.set_defaults(fn=cmdRun)
+
+    cacheP = sub.add_parser("cache", help="inspect or flush the on-disk cache")
+    cacheSub = cacheP.add_subparsers(dest="cacheCmd")
+    infoP = cacheSub.add_parser("info", help="summarize cache contents")
+    infoP.set_defaults(fn=cmdCacheInfo)
+    flushP = cacheSub.add_parser("flush", help="delete the entire cache")
+    flushP.add_argument("--yes", action="store_true",
+                        help="Don't prompt for confirmation")
+    flushP.set_defaults(fn=cmdCacheFlush)
+
+    # allow invoking with the run flags directly, no subcommand
+    p.add_argument("--exposure-id", type=int)
+    p.add_argument("--t-zero")
+    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    p.add_argument("--no-serve", action="store_true")
+    p.add_argument("--no-browser", action="store_true")
+    _addCommonArgs(p)
+    return p
+
+
+def main(argv: list[str] | None = None) -> int:
+    p = build_parser()
+    args = p.parse_args(argv)
+    if getattr(args, "fn", None) is None:
+        # implicit run mode
+        if args.exposure_id is None or args.t_zero is None:
+            p.print_help()
+            return 2
+        args.fn = cmdRun
+    return args.fn(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
