@@ -42,6 +42,15 @@ html, body {
 #refs input[type=search] { width: 260px; }
 #refs .muted { color: #677; font-size: 12px; }
 #refs label.cb { font-size: 12px; }
+#refs button.mini {
+  font-size: 11px;
+  padding: 2px 8px;
+  border: 1px solid #c8ccd6;
+  border-radius: 3px;
+  background: #fff;
+  cursor: pointer;
+}
+#refs button.mini:hover { background: #f0f3f8; }
 
 #legend {
   display: flex;
@@ -107,15 +116,48 @@ html, body {
   font-weight: 600;
   color: #1b2230;
   z-index: 4;
+  cursor: pointer;
+  user-select: none;
+}
+.tl-group-header:hover { background: #dde2ec; }
+.tl-group-header .tg-arrow {
+  display: inline-block;
+  width: 14px;
+  font-weight: 400;
+  color: #5b6478;
+}
+.tl-group-header.collapsed .tg-arrow::before { content: "\25B6"; }      /* ▶ */
+.tl-group-header:not(.collapsed) .tg-arrow::before { content: "\25BC"; } /* ▼ */
+.tl-group-header .tg-tb-pill {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 0 6px;
+  border-radius: 8px;
+  background: #c1252b;
+  color: #fff;
+  font-size: 10px;
+  font-weight: 600;
 }
 .tl-row {
   display: grid;
   grid-template-columns: 280px 1fr;
   border-bottom: 1px solid #eaedf2;
   background: #fff;
+  border-left: 3px solid transparent;
 }
 .tl-row:hover { background: #f9faff; }
 .tl-row.selected { background: #fef9e2; }
+/* Pods that produced one or more tracebacks in the window are flagged
+   with a red left bar so they're easy to scan for. */
+.tl-row.has-traceback { border-left-color: #c1252b; }
+.tl-row.has-traceback .tl-podname { background: linear-gradient(to right, #fff1f1 0%, transparent 60%); }
+.tl-row.has-traceback .stat.tb {
+  background: #c1252b;
+  color: #fff;
+  padding: 1px 5px;
+  border-radius: 2px;
+  font-weight: 600;
+}
 .tl-podname {
   position: sticky;
   left: 0;

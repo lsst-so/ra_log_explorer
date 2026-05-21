@@ -77,6 +77,14 @@ terminal stops the server.
   zero of the timeline x-axis and of every `Δt₀` label.
 - **Search box / "hide pods with no events"** — narrow the rendered
   pods.
+- **"times as Δshutter" toggle** — when on, the inline timestamps
+  inside each raw log line (the leading `2026-05-20 08:45:46,216`
+  prefix) are replaced with their offset from shutter close — e.g.
+  `+6.949s` — both in the detail drawer and in event hover tooltips.
+  The Δ is **always relative to shutter close**, independent of the
+  t₀ selector above, so it stays consistent as a "real seconds after
+  the camera closed" reading.
+- **"collapse all" / "expand all"** — toggle every pod group at once.
 - **Events legend** — head-node / worker event icons.
 - **Tasks legend** — one colour swatch per pipeline task seen (`isr`,
   `calibrateImage`, `calcZernikesTask`, …). Quantum bars on the
@@ -84,10 +92,21 @@ terminal stops the server.
 - **Timeline** — one row per pod, grouped by role (head, sfm, aos,
   step1b, mosaic, plotters, …). Each event renders as a tick or a bar
   with a hover tooltip showing the raw log line.
+  - **Group headers fold.** Click a header (e.g. `sfm  (189 pods)`)
+    to collapse or expand that group; the arrow flips between ▼ and ▶.
+    Groups with more than ten pods (typically `sfm` and sometimes
+    `aos`) start collapsed so the page opens with a digestible view.
+    If any pod in a collapsed group has a traceback, the header
+    surfaces a red `TB N` pill so you don't miss it.
+  - **Pods with tracebacks** in the window get a red left border and
+    a red `TB N` pill in their row name. The cheapest visual scan
+    for "where are things going wrong" is to look down the left
+    edge of the timeline for red bars.
 - **Detail drawer** — click any pod's row to slide up its full parsed
   log, with Δt₀, level, and a filter / "warn-only" / "only lines
   containing this dataId" toggle. Tracebacks render as a contiguous
-  block.
+  block. With the **Δshutter toggle** on, the inline ISO timestamps
+  in this drawer are replaced with shutter-relative offsets too.
 
 ## Common workflows
 

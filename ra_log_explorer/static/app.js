@@ -10,6 +10,12 @@ let timeMaxS = 0;         // window end
 let pxPerSecond = 8;      // initial scale; user can adjust via zoom buttons
 let podDetailCache = {};  // pod -> full detail payload
 let selectedPod = null;
+let collapsedGroups = new Set();  // group labels the user has folded
+// Shutter-close UTC epoch ms; set from summary.tZero. This is the *fixed*
+// anchor used by the "times as Δshutter" toggle — deliberately separate
+// from the user-selectable t₀ used elsewhere.
+let shutterUtcMs = null;
+let largeGroupThreshold = 10;  // groups with > this many pods auto-collapse
 
 // ----- helpers ---------------------------------------------------------------
 
@@ -25,6 +31,28 @@ function fmtOffset(s) {
 
 function isoToDate(iso) {
   return new Date(iso);
+}
+
+// The standard LSST log line prefix: "YYYY-MM-DD HH:MM:SS,mmm ".
+// We use it to substitute the inline timestamp on raw lines with an
+// offset relative to shutter close, when the toggle is on.
+const LOG_TS_RE = /^(\d{4})-(\d{2})-(\d{2}) (\d{2}):(\d{2}):(\d{2}),(\d{3})\s/;
+
+function translateInlineTimestamp(raw) {
+  if (!showShutterDelta() || shutterUtcMs == null) return raw;
+  const m = LOG_TS_RE.exec(raw);
+  if (!m) return raw;
+  const t = Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6], +m[7]);
+  const deltaS = (t - shutterUtcMs) / 1000;
+  // pad so multi-line blocks (e.g. tracebacks) line up; 12 chars handles
+  // the widest "+MMmSS.SSSs" formats we ever produce.
+  const tag = fmtOffset(deltaS).padStart(12);
+  return tag + ' ' + raw.slice(m[0].length);
+}
+
+function showShutterDelta() {
+  const el = document.getElementById('shutter-delta');
+  return !!(el && el.checked);
 }
 
 function kindClass(kind, level) {
@@ -70,10 +98,26 @@ async function loadSummary() {
   else if (meta.cacheReuse === 'superset') cacheTag = ' (cache hit, superset reuse)';
   document.getElementById('cache-display').textContent =
     `downloaded: ${human(dl)}${cacheTag}  ·  cache: ${human(cb)} @ ${summary.cacheDir}`;
+  // The shutter-close moment is whatever ServerState.tZero is — the CLI
+  // has already done any TAI→UTC adjustment by this point.
+  shutterUtcMs = new Date(summary.tZero).getTime();
   populateRefSelect();
   populateTaskLegend();
+  autoCollapseLargeGroups();
   recomputeTimeRange();
   render();
+}
+
+function autoCollapseLargeGroups() {
+  // Count pods per group; any group with more than `largeGroupThreshold`
+  // members starts collapsed so the timeline opens with a digestible view
+  // (SFM has ~189 pods on a full LSSTCam run; nobody wants that all open
+  // by default).
+  const counts = {};
+  for (const p of summary.pods) counts[p.group] = (counts[p.group] || 0) + 1;
+  for (const [g, n] of Object.entries(counts)) {
+    if (n > largeGroupThreshold) collapsedGroups.add(g);
+  }
 }
 
 function populateTaskLegend() {
@@ -176,17 +220,38 @@ function render() {
   for (const g of groupOrder()) {
     const ps = grouped[g];
     if (!ps || ps.length === 0) continue;
-    const hdr = document.createElement('div');
-    hdr.className = 'tl-group-header';
-    hdr.textContent = `${g}  (${ps.length} pod${ps.length === 1 ? '' : 's'})`;
-    tl.appendChild(hdr);
     // sort within group by ordinal then name
     ps.sort((a, b) => {
       if (a.ordinal != null && b.ordinal != null) return a.ordinal - b.ordinal;
       return a.pod.localeCompare(b.pod);
     });
+    const isCollapsed = collapsedGroups.has(g);
+    const nTb = ps.reduce((acc, p) => acc + (p.nTraceback || 0), 0);
+    const tbPill = nTb ? `<span class="tg-tb-pill">TB ${nTb}</span>` : '';
+    const hdr = document.createElement('div');
+    hdr.className = 'tl-group-header' + (isCollapsed ? ' collapsed' : '');
+    hdr.innerHTML = `<span class="tg-arrow"></span>${g}  (${ps.length} pod${ps.length === 1 ? '' : 's'})${tbPill}`;
+    hdr.addEventListener('click', () => toggleGroup(g));
+    tl.appendChild(hdr);
+    if (isCollapsed) continue;
     for (const p of ps) tl.appendChild(renderPodRow(p));
   }
+}
+
+function toggleGroup(g) {
+  if (collapsedGroups.has(g)) collapsedGroups.delete(g);
+  else collapsedGroups.add(g);
+  render();
+}
+
+function collapseAllGroups() {
+  for (const p of summary.pods) collapsedGroups.add(p.group);
+  render();
+}
+
+function expandAllGroups() {
+  collapsedGroups.clear();
+  render();
 }
 
 function trackWidthPx() {
@@ -259,6 +324,7 @@ function renderPodRow(p) {
   const row = document.createElement('div');
   row.className = 'tl-row';
   if (selectedPod === p.pod) row.classList.add('selected');
+  if (p.nTraceback) row.classList.add('has-traceback');
 
   const name = document.createElement('div');
   name.className = 'tl-podname';
@@ -266,7 +332,8 @@ function renderPodRow(p) {
   const ordPart = p.ordinal != null ? `<span class="stat">·${p.ordinal}</span>` : '';
   const warn = p.nWarn ? `<span class="stat warn">W:${p.nWarn}</span>` : '';
   const err = p.nError ? `<span class="stat err">E:${p.nError}</span>` : '';
-  const tb = p.nTraceback ? `<span class="stat err">TB:${p.nTraceback}</span>` : '';
+  // Use a TB-specific class so the red pill styling in CSS picks it up.
+  const tb = p.nTraceback ? `<span class="stat tb">TB ${p.nTraceback}</span>` : '';
   name.innerHTML = `${badge}${shortenPod(p.pod)}${ordPart} ${warn} ${err} ${tb}`;
   name.title = p.pod;
   name.addEventListener('click', () => selectPod(p.pod));
@@ -357,7 +424,8 @@ function showTooltip(ev, e) {
   if (e.durationS != null) lines.push(`dur  = ${e.durationS}s`);
   if (e.flavor) lines.push(`flav = ${e.flavor}`);
   lines.push('---');
-  lines.push((e.raw || e.message || '').slice(0, 800));
+  const rawText = translateInlineTimestamp(e.raw || e.message || '');
+  lines.push(rawText.slice(0, 800));
   t.textContent = lines.join('\n');
   t.style.display = 'block';
   moveTooltip(ev);
@@ -435,7 +503,7 @@ function renderDetail() {
       <span class="offset">${fmtOffset(off)}</span>
       <span class="level">${(ln.level || '').toUpperCase()}</span>
       <span class="body"></span>`;
-    row.querySelector('.body').textContent = raw;
+    row.querySelector('.body').textContent = translateInlineTimestamp(raw);
     body.appendChild(row);
   }
 }
@@ -450,6 +518,13 @@ document.getElementById('detail-only-relevant').addEventListener('change', rende
 document.getElementById('detail-warn-only').addEventListener('change', renderDetail);
 document.getElementById('search').addEventListener('input', render);
 document.getElementById('hide-quiet').addEventListener('change', render);
+document.getElementById('shutter-delta').addEventListener('change', () => {
+  // Affects the detail rows (inline-timestamp substitution) and the
+  // tooltip text. Re-render the detail if it's open.
+  if (selectedPod) renderDetail();
+});
+document.getElementById('groups-collapse-all').addEventListener('click', collapseAllGroups);
+document.getElementById('groups-expand-all').addEventListener('click', expandAllGroups);
 
 function setZoom(x) {
   pxPerSecond = Math.max(0.5, Math.min(200, x));
