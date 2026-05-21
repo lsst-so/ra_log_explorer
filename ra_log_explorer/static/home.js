@@ -144,12 +144,28 @@ function updateSubmitButton() {
   submit.disabled = !resolvedTZero;
 }
 
+// dataIds are 13 digits: YYYYMMDDSSSSS. Anything shorter is still
+// mid-typing — firing a lookup at every keystroke produces a stream of
+// noisy "no exposure-time record for 20260" messages, which is worse
+// than just waiting. Anything longer is unambiguously a typo.
+const DATAID_LENGTH = 13;
+
 function triggerLookupIfReady() {
   const form = document.getElementById('fetch-form');
   const raw = form.elements.exposureId.value.trim();
   if (!raw) {
     clearResolvedTZero();
-    setTZeroStatus('enter a dataId to resolve its shutter close time', 'info');
+    setTZeroStatus('enter a 13-digit dataId to resolve its shutter close time', 'info');
+    return;
+  }
+  if (raw.length < DATAID_LENGTH) {
+    clearResolvedTZero();
+    setTZeroStatus(`keep typing — dataIds are ${DATAID_LENGTH} digits (have ${raw.length})`, 'info');
+    return;
+  }
+  if (raw.length > DATAID_LENGTH) {
+    clearResolvedTZero();
+    setTZeroStatus(`dataId too long — expected ${DATAID_LENGTH} digits (have ${raw.length})`, 'error');
     return;
   }
   const expId = parseInt(raw, 10);

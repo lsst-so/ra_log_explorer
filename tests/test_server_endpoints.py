@@ -308,7 +308,7 @@ def _plantExposureTime(monkeypatch: pytest.MonkeyPatch, payload: dict[str, str] 
     import io as _io
     from urllib.error import HTTPError as _HTTPError
 
-    exposureTimes._loadDay.cache_clear()
+    exposureTimes._fetchDayCached.cache_clear()
     monkeypatch.setenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, "https://stubbed/")
 
     def fakeUrlopen(url: str) -> object:
@@ -348,7 +348,7 @@ def test_exposure_time_503_when_url_not_set(
     runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, raising=False)
-    exposureTimes._loadDay.cache_clear()
+    exposureTimes._fetchDayCached.cache_clear()
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 503
