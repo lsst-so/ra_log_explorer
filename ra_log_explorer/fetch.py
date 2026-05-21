@@ -18,6 +18,13 @@ A cache hit re-uses the existing files iff:
 
 If the window extends into the future, we always re-fetch — otherwise we
 would silently return a snapshot from before the window finished.
+
+Superset reuse: when the requested window has no exact match but is fully
+contained within some other cached window for the same (cluster, namespace),
+that wider cache is reused instead of triggering a fetch. The cached series
+query for [C, D] catches every pod that emitted in [C, D], so anything that
+emitted in [A, B] ⊆ [C, D] is captured too. We deliberately pick the
+*smallest* superset to minimize unrelated content.
 """
 
 from __future__ import annotations
@@ -33,7 +40,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
-from .config import FetchSpec, window_cache_dir
+from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
 
 PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
@@ -126,33 +133,93 @@ def _fetchOnePod(
     return pod, len(out)
 
 
+def _parseIso(s: str) -> dt.datetime:
+    """Parse an ISO-8601 string into an aware UTC datetime."""
+    t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc)
+
+
+def findSupersetCache(cluster: str, namespace: str, fromIso: str, toIso: str) -> Path | None:
+    """Return the *smallest* cached window that fully contains [fromIso, toIso].
+
+    A cache directory is considered usable only if it has a valid ``_meta.json``
+    and no ``.partial`` flag. Returns ``None`` if no superset is on disk.
+    """
+    fromT = _parseIso(fromIso)
+    toT = _parseIso(toIso)
+    base = cache_root() / cluster / namespace
+    if not base.exists():
+        return None
+    candidates: list[tuple[dt.timedelta, Path]] = []
+    for window in base.iterdir():
+        if not window.is_dir():
+            continue
+        metaP = window / META_NAME
+        if not metaP.exists() or (window / PARTIAL_FLAG).exists():
+            continue
+        try:
+            meta = json.loads(metaP.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        specMeta = meta.get("spec") or {}
+        cFromIso = specMeta.get("fromIso")
+        cToIso = specMeta.get("toIso")
+        if not cFromIso or not cToIso:
+            continue
+        try:
+            cFrom = _parseIso(cFromIso)
+            cTo = _parseIso(cToIso)
+        except ValueError:
+            continue
+        if cFrom <= fromT and toT <= cTo:
+            candidates.append((cTo - cFrom, window))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0][1]
+
+
 def fetchAll(
     spec: FetchSpec,
     progress: Callable[[str, int, int], None] | None = None,
     forceRefresh: bool = False,
-) -> dict:
+) -> tuple[Path, dict]:
     """Fetch (or load from cache) the full log set for `spec`.
 
-    Returns the meta dict describing the cache directory.
+    Returns a ``(cacheDir, meta)`` tuple. ``cacheDir`` is the directory the
+    caller should read pod files from — typically the exact-spec dir, but on
+    a superset cache hit it points to whichever wider window we found.
     """
-    cacheDir = window_cache_dir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
-    metaPath = cacheDir / META_NAME
-    podsDir = cacheDir / PODS_DIR_NAME
-    podsListPath = cacheDir / PODS_LIST_NAME
-    partialPath = cacheDir / PARTIAL_FLAG
+    requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    metaPath = requestedDir / META_NAME
+    partialPath = requestedDir / PARTIAL_FLAG
 
-    windowEnd = dt.datetime.fromisoformat(spec.toIso.replace("Z", "+00:00"))
-    if windowEnd.tzinfo is None:
-        windowEnd = windowEnd.replace(tzinfo=dt.timezone.utc)
+    windowEnd = _parseIso(spec.toIso)
     now = dt.datetime.now(dt.timezone.utc)
     windowInPast = now > windowEnd
 
-    if not forceRefresh and windowInPast and metaPath.exists() and not partialPath.exists():
-        meta = json.loads(metaPath.read_text())
-        meta["fromCache"] = True
-        return meta
+    if not forceRefresh and windowInPast:
+        # Exact-spec cache hit?
+        if requestedDir.exists() and metaPath.exists() and not partialPath.exists():
+            meta = json.loads(metaPath.read_text())
+            meta["fromCache"] = True
+            meta["cacheReuse"] = "exact"
+            return requestedDir, meta
+        # Otherwise, look for a wider cached window that contains us.
+        superset = findSupersetCache(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+        if superset is not None:
+            meta = loadCacheMeta(superset)
+            meta["fromCache"] = True
+            meta["cacheReuse"] = "superset"
+            meta["cacheReusePath"] = str(superset)
+            return superset, meta
 
-    # Otherwise (re-)fetch. Mark partial.
+    # No usable cache — fetch fresh into the requested dir.
+    ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    podsDir = requestedDir / PODS_DIR_NAME
+    podsListPath = requestedDir / PODS_LIST_NAME
     partialPath.write_text("")
     podsDir.mkdir(parents=True, exist_ok=True)
 
@@ -189,10 +256,11 @@ def fetchAll(
         "errors": errors,
         "window_in_past": windowInPast,
         "fromCache": False,
+        "cacheReuse": "none",
     }
     metaPath.write_text(json.dumps(meta, indent=2))
     partialPath.unlink(missing_ok=True)
-    return meta
+    return requestedDir, meta
 
 
 def loadPodLogPath(cacheDir: Path, pod: str) -> Path:

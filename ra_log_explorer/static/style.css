@@ -45,24 +45,42 @@ html, body {
 
 #legend {
   display: flex;
-  gap: 10px;
+  gap: 14px;
   flex-wrap: wrap;
   padding: 4px 14px;
   background: #f0f2f6;
   border-bottom: 1px solid #dde1e8;
   font-size: 11px;
   color: #555;
+  align-items: baseline;
 }
+.lg-block {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.lg-block strong { color: #1b2230; font-weight: 600; margin-right: 2px; }
 .lg { white-space: nowrap; }
 .lg-pickup { color: #2266aa; }
 .lg-qg { color: #5b3a7e; }
-.lg-quantum { color: #228866; }
 .lg-binned { color: #a05f00; }
 .lg-fanout { color: #1d4f8f; }
 .lg-gather { color: #8b1ab3; }
 .lg-mosaic { color: #ad7300; }
 .lg-warn { color: #c47a00; }
 .lg-error { color: #c1252b; }
+.lg-task {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.lg-task .swatch {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
 
 #timeline-wrap {
   position: absolute;

@@ -28,6 +28,65 @@ STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 
 
+# Palette tuned to be visually distinguishable on white. The first two
+# entries are pinned to `isr` and `calibrateImage` so the most common bars
+# always get the same colour; everything else is assigned by position in
+# sorted order, guaranteeing zero collisions until we exceed the palette
+# size. The full LSSTCam SFM+AOS step1a/step1b pipeline graph today emits
+# ~16 distinct task labels, well under the 24 here.
+_TASK_PALETTE = [
+    "#d4801f",  # 0 orange (pinned: isr)
+    "#1a9c8c",  # 1 teal   (pinned: calibrateImage)
+    "#1d6fb0",  # 2 blue
+    "#6a4ea3",  # 3 purple
+    "#c1252b",  # 4 red
+    "#4d9221",  # 5 green
+    "#c41a85",  # 6 magenta
+    "#a05f00",  # 7 brown
+    "#168aad",  # 8 cyan
+    "#842cad",  # 9 violet
+    "#d4b500",  # 10 gold
+    "#8b1ab3",  # 11 deep purple
+    "#5b8a3f",  # 12 olive
+    "#306b6b",  # 13 dark teal
+    "#a52a2a",  # 14 dark red
+    "#d96a9d",  # 15 pink
+    "#005f73",  # 16 dark cyan
+    "#9b59b6",  # 17 mauve
+    "#27ae60",  # 18 emerald
+    "#e67e22",  # 19 amber
+    "#7f7f7f",  # 20 grey
+    "#2c3e50",  # 21 slate
+    "#16a085",  # 22 sea green
+    "#34495e",  # 23 charcoal
+]
+_TASK_COLOR_PINNED = {
+    "isr": _TASK_PALETTE[0],
+    "calibrateImage": _TASK_PALETTE[1],
+}
+
+
+def _assignTaskColors(tasks: list[str]) -> dict[str, str]:
+    """Return a deterministic {task: hex} mapping with no collisions.
+
+    Sort order is alphabetical for stability across re-renders within a
+    single run. We do not try to make the mapping stable across different
+    *exposures* — pin the few important tasks in ``_TASK_COLOR_PINNED`` if
+    cross-exposure consistency matters for that one.
+    """
+    result: dict[str, str] = {}
+    available = _TASK_PALETTE[len(_TASK_COLOR_PINNED) :]
+    others: list[str] = []
+    for t in sorted(tasks):
+        if t in _TASK_COLOR_PINNED:
+            result[t] = _TASK_COLOR_PINNED[t]
+        else:
+            others.append(t)
+    for i, t in enumerate(others):
+        result[t] = available[i % len(available)]
+    return result
+
+
 @dataclass
 class ServerState:
     cacheDir: Path
@@ -126,63 +185,36 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
 def _buildSummaryPayload(state: ServerState) -> dict:
     matchingSummaries = parser.podsTouchingExp(state.summaries, state.expId)
     refs = list(state.referencePoints)
-    # Derive additional reference points from the head node events if available.
+    # Head node's first acknowledgement of this exposure — the moment
+    # ButlerWatcher+head observed it as "ready to process". Useful for
+    # subtracting out readout + Butler ingest latency.
+    firstDefineVisit: parser.Event | None = None
     for s in matchingSummaries:
         if s.group != "head":
             continue
         for ev in s.events:
             if ev.expId != state.expId:
                 continue
-            if ev.kind in (
-                "HEAD_DEFINE_VISIT",
-                "HEAD_FANOUT_DONE",
-                "HEAD_GATHER_DISPATCH",
-                "HEAD_POSTISR_MOSAIC",
-                "HEAD_VISITIMAGE_MOSAIC",
-            ):
-                refs.append(
-                    {
-                        "label": f"{ev.kind} ({ev.who})" if ev.who else ev.kind,
-                        "t": ev.t.isoformat(),
-                        "offsetS": (ev.t - state.tZero).total_seconds(),
-                        "source": "head",
-                    }
-                )
-    # Derive "first ISR start" and "last visit-image written" across workers
-    firstIsr: parser.Event | None = None
-    lastVisitImg: parser.Event | None = None
+            if ev.kind == "HEAD_DEFINE_VISIT" and (firstDefineVisit is None or ev.t < firstDefineVisit.t):
+                firstDefineVisit = ev
+    if firstDefineVisit is not None:
+        refs.append(
+            {
+                "label": "head node first defined visit",
+                "t": firstDefineVisit.t.isoformat(),
+                "offsetS": (firstDefineVisit.t - state.tZero).total_seconds(),
+                "source": "head",
+            }
+        )
+
+    # Discover every distinct task label across the relevant pods so we can
+    # emit a collision-free colour map for the timeline + dynamic legend.
+    taskLabels: set[str] = set()
     for s in matchingSummaries:
         for ev in s.events:
-            if ev.expId != state.expId:
-                continue
-            if (
-                ev.kind == "QUANTUM_PREP"
-                and ev.taskLabel == "isr"
-                and (firstIsr is None or ev.t < firstIsr.t)
-            ):
-                firstIsr = ev
-            if ev.kind == "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE" and (
-                lastVisitImg is None or ev.t > lastVisitImg.t
-            ):
-                lastVisitImg = ev
-    if firstIsr is not None:
-        refs.append(
-            {
-                "label": "first ISR quantum start",
-                "t": firstIsr.t.isoformat(),
-                "offsetS": (firstIsr.t - state.tZero).total_seconds(),
-                "source": "derived",
-            }
-        )
-    if lastVisitImg is not None:
-        refs.append(
-            {
-                "label": "last preliminary_visit_image written",
-                "t": lastVisitImg.t.isoformat(),
-                "offsetS": (lastVisitImg.t - state.tZero).total_seconds(),
-                "source": "derived",
-            }
-        )
+            if ev.taskLabel:
+                taskLabels.add(ev.taskLabel)
+    taskColors = _assignTaskColors(sorted(taskLabels))
 
     return {
         "expId": state.expId,
@@ -191,6 +223,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "cacheBytes": state.cacheBytes,
         "meta": _toJsonable(state.meta),
         "referencePoints": refs,
+        "taskColors": taskColors,
         "pods": [_summaryToDict(s, state.tZero, state.expId) for s in matchingSummaries],
         "podsAll": [
             {"pod": s.pod, "group": s.group, "nLines": s.nLines, "nWarn": s.nWarn, "nError": s.nError}

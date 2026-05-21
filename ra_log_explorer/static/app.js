@@ -65,12 +65,33 @@ async function loadSummary() {
   const cb = summary.cacheBytes;
   const meta = summary.meta || {};
   const dl = meta.total_bytes || 0;
-  const fromCache = meta.fromCache ? ' (from cache)' : ' (freshly downloaded)';
+  let cacheTag = ' (freshly downloaded)';
+  if (meta.cacheReuse === 'exact') cacheTag = ' (cache hit, exact)';
+  else if (meta.cacheReuse === 'superset') cacheTag = ' (cache hit, superset reuse)';
   document.getElementById('cache-display').textContent =
-    `downloaded: ${human(dl)}${fromCache}  ·  cache: ${human(cb)} @ ${summary.cacheDir}`;
+    `downloaded: ${human(dl)}${cacheTag}  ·  cache: ${human(cb)} @ ${summary.cacheDir}`;
   populateRefSelect();
+  populateTaskLegend();
   recomputeTimeRange();
   render();
+}
+
+function populateTaskLegend() {
+  const target = document.getElementById('task-legend');
+  if (!target) return;
+  target.innerHTML = '';
+  const tc = summary.taskColors || {};
+  const tasks = Object.keys(tc).sort();
+  if (tasks.length === 0) {
+    target.innerHTML = '<span class="muted">(no quantum tasks in window)</span>';
+    return;
+  }
+  for (const t of tasks) {
+    const chip = document.createElement('span');
+    chip.className = 'lg-task';
+    chip.innerHTML = `<span class="swatch" style="background:${tc[t]}"></span>${t}`;
+    target.appendChild(chip);
+  }
 }
 
 function human(n) {
@@ -277,17 +298,30 @@ function shortenPod(pod) {
 function makeEventNode(e) {
   const n = document.createElement('div');
   n.className = 'tl-event ' + kindClass(e.kind, e.level);
-  if (e.durationS && (e.kind === 'QUANTUM_DONE')) {
+  const taskColor = (e.taskLabel && summary.taskColors)
+    ? summary.taskColors[e.taskLabel] : null;
+  if (e.durationS && e.kind === 'QUANTUM_DONE') {
     // draw quantum as a bar from start (offset - duration) to offset
     n.classList.add('bar');
     const startS = e.offsetS - e.durationS;
     n.style.left = xForOffset(startS) + 'px';
     n.style.width = Math.max(2, (e.durationS) * pxPerSecond) + 'px';
+    if (taskColor) n.style.background = taskColor;
+  } else if (e.kind === 'QUANTUM_PREP') {
+    // tiny tick at the start of the quantum, same colour as its bar
+    n.style.left = xForOffset(e.offsetS) + 'px';
+    if (taskColor) n.style.background = taskColor;
+  } else if (e.kind === 'WORKER_QG_BUILT' && e.durationS) {
+    // QG build can also be slow enough to be worth showing as a bar
+    n.classList.add('bar');
+    const startS = e.offsetS - e.durationS;
+    n.style.left = xForOffset(startS) + 'px';
+    n.style.width = Math.max(2, e.durationS * pxPerSecond) + 'px';
   } else if (e.kind === 'HEAD_LOOP_SLOW' && e.durationS) {
     n.classList.add('bar');
     const startS = e.offsetS - e.durationS;
     n.style.left = xForOffset(startS) + 'px';
-    n.style.width = Math.max(2, (e.durationS) * pxPerSecond) + 'px';
+    n.style.width = Math.max(2, e.durationS * pxPerSecond) + 'px';
   } else {
     n.style.left = xForOffset(e.offsetS) + 'px';
   }

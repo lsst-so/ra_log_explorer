@@ -11,12 +11,12 @@ DEFAULT_USERNAME = "merlin"
 DEFAULT_CLUSTER = "yagan"
 DEFAULT_NAMESPACE = "rapid-analysis"
 DEFAULT_WORKERS = 8
-# Window padding around the user's t-zero. We default to a generous 60 s
-# before because the user-supplied t-zero is typically the shutter-close
-# DimensionRecord time, which can be in TAI (37 s ahead of UTC) and which
-# in any case precedes the head node's "Defining visit" by however long
-# readout + Butler ingest takes. 60 s comfortably captures both.
-DEFAULT_WINDOW_BEFORE_S = 60.0
+# Window padding around the user's t-zero. The CLI applies the TAI→UTC
+# conversion internally so t-zero is the actual shutter-close UTC moment;
+# we shouldn't ever need to look at logs from before then for a given
+# dataId (if we do, that's a real anomaly, not a window-size problem).
+# A small pre-shutter buffer just covers clock skew between camera / cluster.
+DEFAULT_WINDOW_BEFORE_S = 5.0
 DEFAULT_WINDOW_AFTER_S = 5 * 60.0
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_LINE_LIMIT = 50_000  # per-pod safety cap; pods rarely emit this much
@@ -33,12 +33,21 @@ def cache_root() -> Path:
     return root
 
 
-def window_cache_dir(cluster: str, namespace: str, fromIso: str, toIso: str) -> Path:
-    """Return the cache directory for a specific (cluster, namespace, window)."""
+def windowCachePath(cluster: str, namespace: str, fromIso: str, toIso: str) -> Path:
+    """Return the cache directory path for a specific (cluster, namespace, window).
+
+    Pure path computation — no filesystem I/O. Call ``ensureWindowCacheDir``
+    when you actually need the directory to exist on disk.
+    """
     # Sanitize ISO strings: replace ':' (filesystem-unfriendly on some platforms)
     fromSlug = fromIso.replace(":", "").replace(".", "_")
     toSlug = toIso.replace(":", "").replace(".", "_")
-    path = cache_root() / cluster / namespace / f"{fromSlug}__{toSlug}"
+    return cache_root() / cluster / namespace / f"{fromSlug}__{toSlug}"
+
+
+def ensureWindowCacheDir(cluster: str, namespace: str, fromIso: str, toIso: str) -> Path:
+    """Return the cache directory, creating it if necessary."""
+    path = windowCachePath(cluster, namespace, fromIso, toIso)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

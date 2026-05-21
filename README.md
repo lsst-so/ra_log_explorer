@@ -39,11 +39,16 @@ up from the Butler `DimensionRecord` automatically.
 export LOKI_PASSWORD=...          # set in your shell rc
 python3 -m ra_log_explorer.cli \
     --exposure-id 2026051900722 \
-    --t-zero 2026-05-20T08:46:05.336122
+    --t-zero 2026-05-20T08:46:16.267    # shutter-close TAI from DimensionRecord
 ```
 
-This will fetch the logs (5-minute window by default, starting 2s before
-t=0), parse them, and open a browser at `http://localhost:8765`.
+This will fetch the logs (5-minute window after t=0, plus a small pre-shutter
+buffer), parse them, and open a browser at `http://localhost:8765`.
+
+`--t-zero` is interpreted as **TAI** by default (the Butler DimensionRecord
+convention). Internally we subtract 37 s to land on the real UTC shutter
+close before computing the log-fetch window and per-event offsets. Pass
+`--t-zero-utc` if your value is already in UTC.
 
 ## Cache
 

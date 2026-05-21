@@ -8,7 +8,7 @@ Examples:
     # timeline's t=0 line lands on the real shutter-close moment.
     python3 -m ra_log_explorer.cli \\
         --exposure-id 2026051900722 \\
-        --t-zero 2026-05-20T08:46:05.336122
+        --t-zero 2026-05-20T08:46:16.267
 
     # If the t-zero you have is already in UTC, opt out of the TAI offset:
     python3 -m ra_log_explorer.cli --exposure-id ... --t-zero ... --t-zero-utc
@@ -41,7 +41,6 @@ from .config import (
     DEFAULT_WORKERS,
     FetchSpec,
     cache_root,
-    window_cache_dir,
 )
 from .fetch import (
     cacheDuSizeBytes,
@@ -130,13 +129,19 @@ def cmdRun(args: argparse.Namespace) -> int:
         toIso=_isoForLogcli(toT),
         workers=args.workers,
     )
-    cacheDir = window_cache_dir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
     print(f"Window: {spec.fromIso}  to  {spec.toIso}", file=sys.stderr)
+    cacheDir, meta = fetchAll(spec, progress=stderrProgress, forceRefresh=args.force_refresh)
     print(f"Cache dir: {cacheDir}", file=sys.stderr)
-    meta = fetchAll(spec, progress=stderrProgress, forceRefresh=args.force_refresh)
-    if meta.get("fromCache"):
+    reuse = meta.get("cacheReuse", "none")
+    if reuse == "exact":
         print(
-            f"Loaded {meta['pod_count']} pods from cache " f"({humanBytes(meta['total_bytes'])}).",
+            f"Cache hit (exact): {meta['pod_count']} pods, " f"{humanBytes(meta['total_bytes'])}.",
+            file=sys.stderr,
+        )
+    elif reuse == "superset":
+        print(
+            f"Cache hit (superset reuse): {meta['pod_count']} pods, "
+            f"{humanBytes(meta['total_bytes'])} from {meta.get('cacheReusePath')}",
             file=sys.stderr,
         )
     else:
