@@ -16,6 +16,28 @@ Designed for the typical question:
 It is **not** a streaming log tail; it works on snapshots of a fixed
 window. One exposure at a time.
 
+## Quickstart
+
+```sh
+# Prerequisites: Python ≥ 3.11, git, and logcli on $PATH.
+# (`brew install grafana/grafana/logcli` on macOS.)
+
+# Two env vars — ask Merlin for the values:
+export LOKI_PASSWORD='...'
+export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='https://...'
+
+git clone git@github.com:lsst-so/ra_log_explorer.git
+cd ra_log_explorer
+python3 -m ra_log_explorer.cli
+```
+
+That starts a local server and opens `http://127.0.0.1:8765/` in your
+browser. Type a 13-digit dataId, click **Fetch & explore**, wait
+~60–90 s the first time (instant on a repeat). Stop with **Ctrl-C**.
+
+For everything else — what's required, where the cache lives, how to
+drive it from the CLI, troubleshooting — read on.
+
 ## Required environment variables
 
 The tool needs **three** things from your environment to fetch logs and
