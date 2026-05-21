@@ -35,6 +35,12 @@ ra_log_explorer/
   mypy.ini, .pre-commit-config.yaml   ← lint/type-check config
 ```
 
+The top-level [README.md](README.md) is the **end-user-facing** doc:
+install, run, CLI flags, common workflows, troubleshooting. Keep that
+in sync when your change is user-visible — the
+[ra-log-explorer-architecture-sync](.claude/skills/ra-log-explorer-architecture-sync/SKILL.md)
+skill has the rules.
+
 Detailed architecture docs are in [architecture/](architecture/):
 
 - [Architecture & data flow](architecture/architecture.md) — components,
@@ -120,9 +126,13 @@ when their triggering context matches:
   here, since nothing automates it.
 - **ra-log-explorer-code-style** — naming, formatting, type-annotation,
   and docstring conventions when writing or editing Python here.
-- **ra-log-explorer-architecture-sync** — keeping `architecture/*.md` in
-  step with code changes that touch the system's shape (event kinds,
-  cache key, JSON API, module layout).
+- **ra-log-explorer-architecture-sync** — keeping `architecture/*.md`
+  **and `README.md`** in step with code changes that touch the system's
+  shape (event kinds, cache key, JSON API, module layout, CLI flags,
+  user-visible UI behaviour, troubleshooting failure modes).
+- **ra-log-explorer-loki** — Loki / `logcli` conventions and gotchas
+  when editing the fetch path in `fetch.py` or writing one-off scripts
+  that hit the cluster's Loki.
 
 ## Working on the UI
 

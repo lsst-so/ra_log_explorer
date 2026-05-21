@@ -1,88 +1,209 @@
 # ra_log_explorer
 
-Interactive log exploration tool for the rapid analysis backend (Vera Rubin
-Observatory). Given a dataId and a `t=0` reference time (typically shutter
-close from the Butler `DimensionRecord`), it pulls every pod's logs from Loki
-for a configurable window around that time and presents them in a browser
-timeline so you can reconstruct what happened across the distributed pipeline.
+Interactive log exploration for the **rapid analysis** backend
+(Vera C. Rubin Observatory). Given an LSSTCam exposure id and the
+shutter-close time from its Butler `DimensionRecord`, it pulls every
+pod's logs from the cluster's Loki for a window around that time and
+serves a browser timeline that shows what each pod did, when, and where
+the warnings / errors / tracebacks landed.
 
-## What it does
+![timeline placeholder]()
 
-1. Lists every pod in the `rapid-analysis` namespace that was emitting logs
-   during the requested window (via `logcli series`).
-2. Downloads each pod's logs in parallel into a local cache. Cache keys are
-   the (cluster, namespace, from, to) tuple — re-running the same query hits
-   the cache rather than re-querying Loki, as long as the requested window is
-   entirely in the past (so the results are stable).
-3. Parses each line, extracting structured events for things like:
-   - head node: defineVisit, fanout, gather dispatch, mosaic dispatch
-   - workers: payload picked up, building quantum graph, quantum start/end,
-     binned image written, detector finished
-   - any line at WARNING / ERROR level
-   - tracebacks (multi-line)
-4. Filters to the pods that actually touched the requested dataId.
-5. Serves a single-page browser UI showing:
-   - a timeline of all relevant pods, with events as markers
-   - per-pod log view with deltas from a configurable t=0
-   - clickable reference times (shutter close, head node dispatch,
-     first ISR start, ...)
+Designed for the typical question:
 
-## Status
+> "Why was this exposure slow / why did this detector fail / where was the
+> hold-up between step1a finishing and step1b dispatching?"
 
-Prototype. Single instrument (LSSTCam). DataId -> shutter-close mapping
-must be supplied by the caller for now — the backlog item is to look it
-up from the Butler `DimensionRecord` automatically.
+It is **not** a streaming log tail; it works on snapshots of a fixed
+window. One exposure at a time.
 
-## Quick start
+## What you need
+
+| Requirement                       | Notes                                                                                |
+|-----------------------------------|---------------------------------------------------------------------------------------|
+| Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only (no `pip install` needed).        |
+| `logcli` on your `$PATH`          | `brew install grafana/grafana/logcli` on macOS, or grab a binary from Grafana releases. |
+| `LOKI_PASSWORD` in your environment | Set it in your shell rc (e.g. `~/.zshrc`).                                          |
+| `git` to clone this repo          | There is no published PyPI package; you run it from a checkout.                       |
+| A browser                         | The tool opens `http://127.0.0.1:8765/` for you.                                      |
+
+## Install
+
+There's nothing to install besides the repo. The tool runs out of a
+checkout:
 
 ```
-export LOKI_PASSWORD=...          # set in your shell rc
+git clone git@github.com:lsst-so/ra_log_explorer.git
+cd ra_log_explorer
+export LOKI_PASSWORD=...     # ideally pinned in your shell rc
+```
+
+## Run
+
+```
 python3 -m ra_log_explorer.cli \
     --exposure-id 2026051900722 \
-    --t-zero 2026-05-20T08:46:16.267    # shutter-close TAI from DimensionRecord
+    --t-zero 2026-05-20T08:46:16.267
 ```
 
-This will fetch the logs (5-minute window after t=0, plus a small pre-shutter
-buffer), parse them, and open a browser at `http://localhost:8765`.
-
-`--t-zero` is interpreted as **TAI** by default (the Butler DimensionRecord
-convention). Internally we subtract 37 s to land on the real UTC shutter
-close before computing the log-fetch window and per-event offsets. Pass
+`--t-zero` is the shutter-close time of the exposure, **in TAI** (the
+default; this matches the Butler `DimensionRecord.timespan.end.isot`
+field). Internally the tool subtracts 37 s to land on the UTC shutter-
+close moment before computing the log fetch window — that's why the
+timeline's `0s` line aligns with the real shutter close. Pass
 `--t-zero-utc` if your value is already in UTC.
 
-## Cache
+By default this fetches **5 s before to 5 min after** the shutter close.
+A rapid analysis exposure usually finishes within ~90 s; the longer
+default window gives you context on the next exposure's dispatch too.
 
-Logs live under `~/.cache/ra_log_explorer/`. The CLI prints the cache path
-and total size on every run. Flush with:
+While the fetch runs you'll see progress per pod on stderr; this takes
+~60–90 s the first time for a busy LSSTCam window (~430 pods, ~40 MiB).
+A second run for the same (or any overlapping) window is instant — see
+[Cache](#cache) below.
+
+When the fetch + parse are done the tool launches a local web server at
+`http://127.0.0.1:8765/` and opens it in your browser. Skip the open
+with `--no-browser`; change the port with `--port`. Ctrl-C in the
+terminal stops the server.
+
+## What the UI shows
+
+- **Top bar** — the dataId, the UTC t-zero, where the cache lives, and
+  how big the on-disk cache currently is.
+- **t₀ selector** — pick between the two reference points the tool
+  derives: shutter close (caller-supplied) and the head-node's first
+  `Defining visit` for this exposure. Whichever you pick becomes the
+  zero of the timeline x-axis and of every `Δt₀` label.
+- **Search box / "hide pods with no events"** — narrow the rendered
+  pods.
+- **Events legend** — head-node / worker event icons.
+- **Tasks legend** — one colour swatch per pipeline task seen (`isr`,
+  `calibrateImage`, `calcZernikesTask`, …). Quantum bars on the
+  timeline are coloured to match.
+- **Timeline** — one row per pod, grouped by role (head, sfm, aos,
+  step1b, mosaic, plotters, …). Each event renders as a tick or a bar
+  with a hover tooltip showing the raw log line.
+- **Detail drawer** — click any pod's row to slide up its full parsed
+  log, with Δt₀, level, and a filter / "warn-only" / "only lines
+  containing this dataId" toggle. Tracebacks render as a contiguous
+  block.
+
+## Common workflows
+
+### Investigate one specific exposure
+
+```
+python3 -m ra_log_explorer.cli \
+    --exposure-id 2026051900722 \
+    --t-zero 2026-05-20T08:46:16.267
+```
+
+Open the browser. Look at the head-node row first — does the
+fanout look healthy? Scan the SFM rows for anomalously long ISR
+bars (orange) or calibrateImage bars (teal). Click any pod whose
+row has a red WARN/ERROR tick to dig in.
+
+### Widen the window to see neighbouring exposures
+
+```
+python3 -m ra_log_explorer.cli \
+    --exposure-id 2026051900722 \
+    --t-zero 2026-05-20T08:46:16.267 \
+    --window-before 60 --window-after 600
+```
+
+The `Δt₀ = 0` reference stays on the same exposure; you just see more
+of the surrounding cluster activity. If a cached run already covers
+the wider window the subset is reused immediately — no re-fetch.
+
+### Inspect what's cached
+
+```
+python3 -m ra_log_explorer.cli cache info
+```
+
+Lists every cached window, its on-disk size, and whether it completed
+cleanly.
+
+### Flush the cache
 
 ```
 python3 -m ra_log_explorer.cli cache flush
 ```
 
-or just `rm -rf ~/.cache/ra_log_explorer`.
+Or just `rm -rf ~/.cache/ra_log_explorer`. The cache is purely a
+performance accelerator; flushing it costs you nothing but a re-fetch.
 
-## Development
-
-Python 3.13. Create a venv and install the dev toolchain:
-
-```
-python3.13 -m venv .venv
-.venv/bin/pip install pre-commit black isort flake8 flake8-bugbear mypy mypy-coverage pytest
-.venv/bin/pre-commit install
-```
-
-Validation loop before committing:
+## All CLI options
 
 ```
-.venv/bin/pre-commit run --all-files     # black, isort, flake8, whitespace
-.venv/bin/mypy                            # configured via mypy.ini (covers ra_log_explorer/ + tests/)
-.venv/bin/mypy-coverage                   # annotation coverage; aim for 100%
-.venv/bin/pytest -q                       # unit tests against the fixtures under tests/data/
+--exposure-id ID         13-digit dataId (required)
+--t-zero ISO             shutter-close timestamp; TAI by default
+--t-zero-utc             treat --t-zero as already-UTC
+--window-before SECONDS  pre-shutter pad (default 5)
+--window-after  SECONDS  post-shutter pad (default 300)
+--workers N              parallel log fetch threads (default 8)
+--cluster NAME           Loki cluster label (default yagan)
+--namespace NAME         Loki namespace label (default rapid-analysis)
+--loki-addr URL          Loki API base URL
+--username USER          Loki HTTP basic-auth user (default merlin)
+--force-refresh          ignore the cache and re-fetch
+--host HOST              bind address (default 127.0.0.1)
+--port PORT              HTTP port (default 8765)
+--no-serve               fetch + parse only; don't launch the UI
+--no-browser             launch the UI but don't open a browser tab
 ```
 
-See [CLAUDE.md](CLAUDE.md) for the full contributor guide and
-[architecture/](architecture/) for design docs.
+Run `python3 -m ra_log_explorer.cli --help` for the same list.
 
-The runtime itself uses stdlib only (no Flask/FastAPI/etc.); the venv is for
-the dev chain. `python3 -m ra_log_explorer.cli ...` will work against any
-Python that fromisoformat understands the Loki timestamp format (≥ 3.11).
+## Cache
+
+The tool caches per-pod Loki output under `~/.cache/ra_log_explorer/`
+(override with `$RA_LOG_EXPLORER_CACHE`). A second run with the same
+window — or any narrower window inside an existing cached one — is
+instant.
+
+The cache layout, reuse rules, and `.partial` flag are described in
+[architecture/caching.md](architecture/caching.md).
+
+## Troubleshooting
+
+**"`logcli` binary not found on PATH"** — install it
+(`brew install grafana/grafana/logcli`) and reopen your shell. The tool
+will not auto-install or fall back to a different client.
+
+**"LOKI_PASSWORD is not set in the environment"** — export it. Don't
+pass passwords on the command line.
+
+**A few pods show 0 events but the exposure obviously touched them** —
+look at the pod's `.jsonl` directly under the cache directory. If the
+file is empty, that's Loki returning nothing for the window — usually a
+transient series-index gap. Re-run with `--force-refresh` to pull again.
+
+**Cache hit when you didn't expect one** — the tool reuses any
+*superset* of the requested window. If you specifically want to refetch,
+pass `--force-refresh`.
+
+**Timeline shows events from the previous exposure** — the cached
+window is wider than the one you asked for (because of superset reuse).
+The events are still correctly placed in time; if it bothers you, run
+with `--force-refresh` to write a tighter cache directory and reload.
+
+**Browser opens but the page is blank / JS error** — check the terminal
+for a Python traceback from the server. Re-run with `--port` set to a
+free port if 8765 is in use.
+
+## For developers / contributors
+
+The contributor guide and coding conventions live in
+[CLAUDE.md](CLAUDE.md). Design and implementation docs are under
+[architecture/](architecture/). The validation loop (pre-commit, mypy,
+mypy-coverage, pytest) is summarised in the
+[validation skill](.claude/skills/ra-log-explorer-validation/SKILL.md).
+
+If your change is user-visible — a new CLI flag, a new browser feature,
+a change in the cache flush command, a new troubleshooting failure mode
+— update this README in the same commit (the
+[architecture-sync skill](.claude/skills/ra-log-explorer-architecture-sync/SKILL.md)
+calls this out).

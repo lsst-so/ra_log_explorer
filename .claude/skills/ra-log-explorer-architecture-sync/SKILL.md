@@ -18,6 +18,7 @@ commit as the code change** — don't leave it for later.
 
 | File                                           | Source-of-truth for                                                 |
 |------------------------------------------------|----------------------------------------------------------------------|
+| [README.md](../../../README.md)                                       | End-user install/run instructions, CLI flag table, common workflows, troubleshooting |
 | [architecture/architecture.md](../../../architecture/architecture.md) | Module responsibilities, top-level data flow, JSON API surface |
 | [architecture/parsing.md](../../../architecture/parsing.md)           | The complete event-kind taxonomy, the `_PYLOG_RE` shape, pod classification |
 | [architecture/caching.md](../../../architecture/caching.md)           | On-disk layout, cache-hit policy (exact/superset/none), `.partial` flag |
@@ -25,17 +26,20 @@ commit as the code change** — don't leave it for later.
 
 ## Which doc to update for which change
 
-| If you change…                                          | Update…                              |
-|----------------------------------------------------------|---------------------------------------|
-| A regex in `parse.py`                                   | `architecture/parsing.md` (the table) |
-| The Event dataclass shape                               | `architecture/parsing.md`             |
-| `POD_GROUPS` / `podOrdinal` / `podInstrument`           | `architecture/parsing.md`             |
-| Cache directory layout, `.partial`, hit policy          | `architecture/caching.md`             |
-| `FetchSpec`, `cache_root`, the env-override variable     | `architecture/caching.md`             |
-| Anything in `/api/summary` or `/api/pod/<>`             | `architecture/architecture.md` (the JSON example) |
-| Module split / rename / new file under `ra_log_explorer/` | `architecture/architecture.md` (the table + tree) |
-| Default window size, TAI/UTC handling                   | `architecture/architecture.md` ("Key Concepts") + README |
-| New unit-test category or new fixture                   | `architecture/testing.md`             |
+| If you change…                                                  | Update…                                                            |
+|------------------------------------------------------------------|---------------------------------------------------------------------|
+| A regex in `parse.py`                                           | `architecture/parsing.md` (the table)                              |
+| The Event dataclass shape                                       | `architecture/parsing.md`                                           |
+| `POD_GROUPS` / `podOrdinal` / `podInstrument`                   | `architecture/parsing.md`                                           |
+| Cache directory layout, `.partial`, hit policy                  | `architecture/caching.md`                                           |
+| `FetchSpec`, `cache_root`, the env-override variable             | `architecture/caching.md`                                           |
+| Anything in `/api/summary` or `/api/pod/<>`                     | `architecture/architecture.md` (the JSON example)                  |
+| Module split / rename / new file under `ra_log_explorer/`         | `architecture/architecture.md` (the table + tree)                  |
+| Default window size, TAI/UTC handling                           | `architecture/architecture.md` ("Key Concepts") **and** README     |
+| New unit-test category or new fixture                           | `architecture/testing.md`                                           |
+| New CLI flag, renamed flag, or changed default                  | **README** (CLI options + workflow examples)                       |
+| New UI feature, browser-visible behaviour, or shipped style change | **README** ("What the UI shows" / "Common workflows")           |
+| New troubleshooting failure mode or new env-var dependency      | **README** ("Troubleshooting" / "What you need")                   |
 
 ## What doesn't need a doc update
 
@@ -57,9 +61,14 @@ Before you commit, ask yourself:
 3. Did I add or change a JSON field a client reads? → `architecture.md`
 4. Did I add a new module or move code between modules? → `architecture.md`
 5. Did I add a new test category? → `testing.md`
+6. Did I add a CLI flag, rename one, change a default, or alter
+   user-visible UI behaviour? → `README.md`
+7. Did I introduce a new failure mode an end-user might hit
+   (missing binary, new env var, new error)? → `README.md`
+   (Troubleshooting section)
 
 If you answered "yes" to any of those and your commit doesn't touch the
-matching `.md` file, you almost certainly have drift to fix.
+matching file, you almost certainly have drift to fix.
 
 ## How to flag a deliberate gap
 
