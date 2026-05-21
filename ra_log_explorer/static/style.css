@@ -564,7 +564,16 @@ button.ghost.mini.delete:disabled {
 .lg-warn   { color: #b15a00; }
 .lg-error  { color: var(--err); }
 
-/* Task chips (rendered by populateTaskLegend) */
+/* Task chips (rendered by populateTaskLegend). The chips are appended as
+   direct children of #task-legend with no separator, so make the
+   container itself a flex row with a real gap — otherwise the chips
+   run into each other. */
+#task-legend {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
 .lg-task {
   display: inline-flex;
   align-items: center;
@@ -705,6 +714,25 @@ button.ghost.mini.delete:disabled {
 .tl-row.has-traceback { border-left-color: var(--err); }
 .tl-row.has-traceback .tl-podname {
   background: linear-gradient(to right, #fdebea 0%, transparent 50%);
+}
+
+/* "Window probably too narrow for this pod" — flagged when the pod's
+   relevance for this dataId reaches the very edge of what we captured,
+   i.e. we likely missed the pickup or the completion. Bold amber
+   border-left + a soft tint on the pod-name cell. Yields to the red
+   .has-traceback border but switches to dashed when both apply so the
+   "truncated" signal isn't lost behind the "has traceback" signal. */
+.tl-row.window-truncated { border-left-color: var(--warn); }
+.tl-row.window-truncated .tl-podname {
+  background: linear-gradient(to right, #fff3da 0%, transparent 55%);
+}
+.tl-row.window-truncated.has-traceback {
+  border-left-color: var(--err);
+  border-left-style: dashed;
+}
+.tl-podname .stat.trunc {
+  background: var(--warn-soft);
+  color: var(--warn);
 }
 
 .tl-podname {

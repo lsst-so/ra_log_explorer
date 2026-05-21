@@ -166,6 +166,18 @@ def _eventToDict(ev: parser.Event, tZero: dt.datetime) -> dict:
     }
 
 
+# Worker groups we expect to emit a canonical finish event (QUANTUM_DONE
+# / WORKER_REPORT_* / WORKER_BINNED_*) for the dataId they processed.
+# Only these get the "window too short" flag — for plotters / one-offs /
+# gather workers / control-plane pods the finish pattern varies or
+# isn't emitted at all, so flagging would just be guessing.
+#
+# We don't check for a "truncated start" at all: the fetch window opens
+# strictly before shutter close, processing cannot start before then,
+# so by construction the pickup is always inside the window.
+_FINISH_EXPECTED_GROUPS: frozenset[str] = frozenset({"sfm", "aos", "step1b", "step1b-aos", "backlog"})
+
+
 def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict:
     """Build the per-pod payload for the timeline view.
 
@@ -202,6 +214,42 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
         elif window[0] <= ev.t <= window[1]:
             relevant.append(ev)
 
+    # ----- per-pod summary stats for the hover tooltip ---------------------
+    firstRelevant = s.expIdFirstLast.get(expId)
+    firstRelOffsetS: float | None = None
+    lastRelOffsetS: float | None = None
+    relevantDurationS: float | None = None
+    if firstRelevant is not None:
+        firstRelOffsetS = (firstRelevant[0] - tZero).total_seconds()
+        lastRelOffsetS = (firstRelevant[1] - tZero).total_seconds()
+        relevantDurationS = (firstRelevant[1] - firstRelevant[0]).total_seconds()
+
+    qgBuildSeconds: float | None = None
+    for ev in s.events:
+        if ev.expId == expId and ev.kind == "WORKER_QG_BUILT" and ev.durationS is not None:
+            qgBuildSeconds = ev.durationS
+            break
+
+    waitSeconds = s.expIdWaitSeconds.get(expId)
+
+    # "Window too short" heuristic — event-based. A worker pod that
+    # processed this dataId should emit at least one canonical finish
+    # event (QUANTUM_DONE / WORKER_REPORT_* / any WORKER_BINNED_*). If
+    # the pod has the dataId in its log but no finish event for it, the
+    # fetch window probably cut off before the work completed.
+    looksTruncatedEnd = False
+    if s.group in _FINISH_EXPECTED_GROUPS and expId in s.expIdsSeen:
+        hasFinish = any(
+            ev.expId == expId
+            and (
+                ev.kind == "QUANTUM_DONE"
+                or ev.kind.startswith("WORKER_REPORT_")
+                or ev.kind.startswith("WORKER_BINNED_")
+            )
+            for ev in s.events
+        )
+        looksTruncatedEnd = not hasFinish
+
     return {
         "pod": s.pod,
         "group": s.group,
@@ -213,6 +261,12 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
         "nTraceback": s.nTraceback,
         "firstTs": s.firstTs.isoformat() if s.firstTs else None,
         "lastTs": s.lastTs.isoformat() if s.lastTs else None,
+        "firstRelevantOffsetS": firstRelOffsetS,
+        "lastRelevantOffsetS": lastRelOffsetS,
+        "relevantDurationS": relevantDurationS,
+        "qgBuildSeconds": qgBuildSeconds,
+        "waitSeconds": waitSeconds,
+        "looksTruncatedEnd": looksTruncatedEnd,
         "events": [_eventToDict(ev, tZero) for ev in relevant],
     }
 

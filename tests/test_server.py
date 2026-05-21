@@ -229,6 +229,146 @@ def test_buildSummaryPayload_taskColors_collision_free_over_fixtures(
     assert len(set(tc.values())) == len(tc)
 
 
+def test_summaryToDict_emits_per_pod_stats() -> None:
+    """The per-pod payload includes start / duration / QG-build / wait
+    stats that the UI's hover-tooltip consumes.
+    """
+    tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    firstT = tZero + dt.timedelta(seconds=40)
+    lastT = tZero + dt.timedelta(seconds=72)
+    qgBuiltEv = parse.Event(
+        pod="p",
+        t=firstT + dt.timedelta(seconds=2),
+        kind="WORKER_QG_BUILT",
+        level="info",
+        expId=2026051900722,
+        durationS=1.4,
+    )
+    finishEv = parse.Event(
+        pod="p",
+        t=lastT,
+        kind="QUANTUM_DONE",
+        level="info",
+        expId=2026051900722,
+        durationS=2.0,
+    )
+    summary = parse.PodSummary(
+        pod="s-lsstcam-run-sfm-runner-workerset-5",
+        group="sfm",
+        instrument="LSSTCam",
+        ordinal=5,
+        nLines=100,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=firstT - dt.timedelta(seconds=5),
+        lastTs=lastT + dt.timedelta(seconds=10),
+        expIdsSeen={2026051900722},
+        events=[qgBuiltEv, finishEv],
+        expIdFirstLast={2026051900722: (firstT, lastT)},
+        expIdWaitSeconds={2026051900722: 0.36},
+    )
+    out = server._summaryToDict(summary, tZero, 2026051900722)
+    assert out["firstRelevantOffsetS"] == pytest.approx(40.0)
+    assert out["lastRelevantOffsetS"] == pytest.approx(72.0)
+    assert out["relevantDurationS"] == pytest.approx(32.0)
+    assert out["qgBuildSeconds"] == pytest.approx(1.4)
+    assert out["waitSeconds"] == pytest.approx(0.36)
+    # Clean SFM run: a finish event is present, so not flagged. The
+    # 'looksTruncatedStart' field is intentionally absent — processing
+    # cannot start before shutter close, which is inside the fetch
+    # window by construction.
+    assert "looksTruncatedStart" not in out
+    assert out["looksTruncatedEnd"] is False
+
+
+def test_summaryToDict_flags_truncated_end_when_worker_has_no_finish_event() -> None:
+    """For sfm/aos/step1b/step1b-aos/backlog workers, absence of any
+    canonical finish event (QUANTUM_DONE / WORKER_REPORT_* /
+    WORKER_BINNED_*) for this expId means we likely cut off before the
+    pod finished. A clean run with a finish event must NOT be flagged.
+    """
+    tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    firstT = tZero + dt.timedelta(seconds=40)
+    lastT = tZero + dt.timedelta(seconds=72)
+    summaryNoFinish = parse.PodSummary(
+        pod="s-lsstcam-run-sfm-runner-workerset-9",
+        group="sfm",
+        instrument="LSSTCam",
+        ordinal=9,
+        nLines=10,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=firstT,
+        lastTs=lastT,
+        expIdsSeen={2026051900722},
+        events=[],
+        expIdFirstLast={2026051900722: (firstT, lastT)},
+    )
+    out = server._summaryToDict(summaryNoFinish, tZero, 2026051900722)
+    assert out["looksTruncatedEnd"] is True
+
+    # A QUANTUM_DONE for this expId is enough to clear the flag — even
+    # if it's at the very last line. (The previous timestamp-edge
+    # heuristic would have false-positived here.)
+    finish = parse.Event(
+        pod="p", t=lastT, kind="QUANTUM_DONE", level="info", expId=2026051900722, durationS=1.2
+    )
+    summaryClean = parse.PodSummary(
+        pod="s-lsstcam-run-sfm-runner-workerset-9",
+        group="sfm",
+        instrument="LSSTCam",
+        ordinal=9,
+        nLines=10,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=firstT,
+        lastTs=lastT,
+        expIdsSeen={2026051900722},
+        events=[finish],
+        expIdFirstLast={2026051900722: (firstT, lastT)},
+    )
+    out = server._summaryToDict(summaryClean, tZero, 2026051900722)
+    assert out["looksTruncatedEnd"] is False
+
+
+def test_summaryToDict_does_not_flag_truncation_outside_worker_groups() -> None:
+    """Head / metadata-server / cluster-mgr / plotter / one-off pods are
+    NEVER flagged truncated — there's no canonical finish event we can
+    expect from them, so we don't guess.
+    """
+    tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    firstT = tZero + dt.timedelta(seconds=40)
+    lastT = tZero + dt.timedelta(seconds=72)
+    for group, pod in [
+        ("head", "s-lsstcam-run-head-node-abc-xyz"),
+        ("metadata-server", "s-lsstcam-run-metadata-server-abc"),
+        ("plotter", "s-lsstcam-run-plotter-abc"),
+        ("psf-plot", "s-lsstcam-run-psf-plotting-abc"),
+        ("one-off-postisr", "s-lsstcam-run-one-off-post-isr-abc"),
+        ("other", "redis-0"),
+    ]:
+        summary = parse.PodSummary(
+            pod=pod,
+            group=group,
+            instrument=None,
+            ordinal=None,
+            nLines=10,
+            nWarn=0,
+            nError=0,
+            nTraceback=0,
+            firstTs=firstT,
+            lastTs=lastT,
+            expIdsSeen={2026051900722},
+            events=[],
+            expIdFirstLast={2026051900722: (firstT, lastT)},
+        )
+        out = server._summaryToDict(summary, tZero, 2026051900722)
+        assert out["looksTruncatedEnd"] is False, f"{group} mis-flagged"
+
+
 def test_buildSummaryPayload_surfaces_other_pods_even_without_expId(sfmWorkerJsonl: Path) -> None:
     """Pods classified as 'other' must show up in the timeline even if their
     logs never mention the target dataId. This is the safety net so an

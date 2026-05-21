@@ -437,6 +437,89 @@ def test_tagLinesWithExpId_leading_orphan_lines_remain_None() -> None:
     assert tagged == [None, None, 2026051900722, 2026051900722]
 
 
+def test_summarizePod_records_per_expId_first_last_and_wait(tmp_path: Path) -> None:
+    """A worker pod accumulates per-expId first/last timestamps (carryover
+    aware) and a per-expId wait-seconds total.
+    """
+    p = tmp_path / "s-lsstcam-run-sfm-runner-workerset-7.jsonl"
+    lines = [
+        # Pickup: line 1 establishes 2026051900722. Carryover applies.
+        (
+            "2026-05-20T08:46:20.000+00:00",
+            "2026-05-20 08:46:20,000 lsst.daf.butler some_func INFO   "
+            "Running pipeline for 2026051900722 on detector 5",
+        ),
+        # Silent middle line — should still be attributed to 722.
+        (
+            "2026-05-20T08:46:25.000+00:00",
+            "2026-05-20 08:46:25,000 lsst.pipe.base run INFO   Doing some work",
+        ),
+        # Wait pattern — counts toward 722's wait total.
+        (
+            "2026-05-20T08:46:27.500+00:00",
+            "2026-05-20 08:46:27,500 lsst.daf.butler load INFO   "
+            "Spent 0.36 seconds waiting for the raw exposure",
+        ),
+        # Last line attributable to 722.
+        (
+            "2026-05-20T08:46:30.000+00:00",
+            "2026-05-20 08:46:30,000 lsst.pipe.base run INFO   Reporting SFM "
+            "finished for detector 5 of exposure 2026051900722",
+        ),
+    ]
+    with open(p, "w") as fh:
+        for ts, raw in lines:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": "info"}, "line": raw + "\n"}) + "\n"
+            )
+    s = parse.summarizePod(p)
+    assert s.group == "sfm"
+    assert 2026051900722 in s.expIdsSeen
+    firstLast = s.expIdFirstLast[2026051900722]
+    assert firstLast[0] == dt.datetime(2026, 5, 20, 8, 46, 20, tzinfo=dt.timezone.utc)
+    assert firstLast[1] == dt.datetime(2026, 5, 20, 8, 46, 30, tzinfo=dt.timezone.utc)
+    assert s.expIdWaitSeconds[2026051900722] == pytest.approx(0.36)
+
+
+def test_summarizePod_no_carryover_for_head_node_first_last(tmp_path: Path) -> None:
+    """For the head node, only lines that explicitly mention a dataId set
+    the first/last range; the silent intervening lines don't extend it.
+    """
+    p = tmp_path / "s-lsstcam-run-head-node-abc-xyz.jsonl"
+    lines = [
+        (
+            "2026-05-20T08:46:00.000+00:00",
+            "2026-05-20 08:46:00,000 lsst.rubintv.production.processControl head_fn INFO   "
+            "Defining visit for 2026051900722",
+        ),
+        (
+            "2026-05-20T08:46:05.000+00:00",
+            "2026-05-20 08:46:05,000 some.logger fn INFO   loop tick",
+        ),
+        (
+            "2026-05-20T08:46:10.000+00:00",
+            "2026-05-20 08:46:10,000 lsst.rubintv.production.processControl head_fn INFO   "
+            "New exposure record for 2026051900722",
+        ),
+        (
+            "2026-05-20T08:46:15.000+00:00",
+            "2026-05-20 08:46:15,000 some.logger fn INFO   another tick",
+        ),
+    ]
+    with open(p, "w") as fh:
+        for ts, raw in lines:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": "info"}, "line": raw + "\n"}) + "\n"
+            )
+    s = parse.summarizePod(p)
+    assert s.group == "head"
+    # Only the two lines that explicitly mention 722 bound the range —
+    # the silent lines in between don't extend it (no carryover).
+    firstLast = s.expIdFirstLast[2026051900722]
+    assert firstLast[0] == dt.datetime(2026, 5, 20, 8, 46, 0, tzinfo=dt.timezone.utc)
+    assert firstLast[1] == dt.datetime(2026, 5, 20, 8, 46, 10, tzinfo=dt.timezone.utc)
+
+
 def test_summarizePod_recognises_split_dayObs_seqNum_form(tmp_path: Path) -> None:
     """A pod whose log only ever uses day_obs / seq_num (no bare 13-digit
     form) must still resolve to the right exposure in ``expIdsSeen``.

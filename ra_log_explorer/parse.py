@@ -339,6 +339,12 @@ def carryoverGroups() -> frozenset[str]:
     return _CARRYOVER_GROUPS
 
 
+# "Spent 0.36 seconds waiting for the raw image data" — generic pattern
+# across worker pods for "blocked on an external load". Captured per
+# inferred-expId and summed for the per-pod summary stats.
+_WAIT_RE = re.compile(r"Spent\s+(\d+(?:\.\d+)?)\s+seconds\s+waiting\s+for\s+the\b")
+
+
 def tagLinesWithExpId(rawLines: Iterable[str], group: str) -> Iterator[int | None]:
     """Yield one inferred dataId per input line.
 
@@ -645,6 +651,15 @@ class PodSummary:
     lastTs: dt.datetime | None
     expIdsSeen: set[int] = field(default_factory=set)
     events: list[Event] = field(default_factory=list)
+    # First / last log-line timestamps per inferred dataId, computed using
+    # the carryover rule for worker pods. Drives the per-pod "start" and
+    # "duration" stats and the "window too narrow" truncation flags
+    # (truncated if first/last == firstTs/lastTs of the whole pod log,
+    # i.e. the relevance reaches the very edge of what we captured).
+    expIdFirstLast: dict[int, tuple[dt.datetime, dt.datetime]] = field(default_factory=dict)
+    # Total seconds spent in "Spent N seconds waiting for the …" lines,
+    # keyed by inferred dataId. Carryover-aware.
+    expIdWaitSeconds: dict[int, float] = field(default_factory=dict)
 
 
 # Worker payloads are deserialized in a noisy way; detect tracebacks by the
@@ -655,9 +670,10 @@ _TRACEBACK_LEAD = "Traceback (most recent call last):"
 
 def summarizePod(podLogPath: Path) -> PodSummary:
     pod = podLogPath.stem
+    group = podGroup(pod)
     summary = PodSummary(
         pod=pod,
-        group=podGroup(pod),
+        group=group,
         instrument=podInstrument(pod),
         ordinal=podOrdinal(pod),
         nLines=0,
@@ -667,6 +683,8 @@ def summarizePod(podLogPath: Path) -> PodSummary:
         firstTs=None,
         lastTs=None,
     )
+    isCarryover = group in _CARRYOVER_GROUPS
+    currentExpId: int | None = None
     for ln in iterPodLines(podLogPath):
         summary.nLines += 1
         if summary.firstTs is None:
@@ -678,9 +696,21 @@ def summarizePod(podLogPath: Path) -> PodSummary:
             summary.nError += 1
         if _TRACEBACK_LEAD in ln.raw:
             summary.nTraceback += 1
-        expId = extractExpId(ln.raw)
-        if expId is not None:
-            summary.expIdsSeen.add(expId)
+        found = extractExpId(ln.raw)
+        if found is not None:
+            summary.expIdsSeen.add(found)
+            currentExpId = found
+        inferred = currentExpId if isCarryover else found
+        if inferred is not None:
+            firstLast = summary.expIdFirstLast.get(inferred)
+            if firstLast is None:
+                summary.expIdFirstLast[inferred] = (ln.timestamp, ln.timestamp)
+            else:
+                summary.expIdFirstLast[inferred] = (firstLast[0], ln.timestamp)
+            if m := _WAIT_RE.search(ln.raw):
+                summary.expIdWaitSeconds[inferred] = summary.expIdWaitSeconds.get(inferred, 0.0) + float(
+                    m.group(1)
+                )
         ev = classify(ln)
         if ev is not None:
             summary.events.append(ev)

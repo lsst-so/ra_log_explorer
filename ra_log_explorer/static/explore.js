@@ -350,6 +350,8 @@ function renderPodRow(p) {
   row.className = 'tl-row';
   if (selectedPod === p.pod) row.classList.add('selected');
   if (p.nTraceback) row.classList.add('has-traceback');
+  const truncated = !!p.looksTruncatedEnd;
+  if (truncated) row.classList.add('window-truncated');
   const name = document.createElement('div');
   name.className = 'tl-podname';
   const groupName = groupDisplay(p.group);
@@ -357,10 +359,17 @@ function renderPodRow(p) {
   const warn = p.nWarn ? `<span class="stat warn" title="warnings in window">W:${p.nWarn}</span>` : '';
   const err = p.nError ? `<span class="stat err" title="errors in window">E:${p.nError}</span>` : '';
   const tb = p.nTraceback ? `<span class="stat tb" title="tracebacks in window">TB ${p.nTraceback}</span>` : '';
+  const trunc = truncated
+    ? `<span class="stat trunc" title="${truncationTooltipText(p)}">⚠ window</span>`
+    : '';
   const label = `<span class="podlabel">${shortenPod(p.pod, p.group)}</span>`;
-  name.innerHTML = `${badge}${label}${warn}${err}${tb}`;
-  name.title = p.pod;
+  name.innerHTML = `${badge}${label}${warn}${err}${tb}${trunc}`;
   name.addEventListener('click', () => selectPod(p.pod));
+  // Rich hover tooltip with the pod's per-dataId timing stats. Reuses
+  // the same floating #tooltip element used for events on the track.
+  name.addEventListener('mouseenter', (ev) => showPodTooltip(ev, p));
+  name.addEventListener('mousemove', moveTooltip);
+  name.addEventListener('mouseleave', hideTooltip);
   row.appendChild(name);
   const track = document.createElement('div');
   track.className = 'tl-track';
@@ -445,6 +454,41 @@ function ensureTooltip() {
   }
   return tooltipEl;
 }
+function showPodTooltip(ev, p) {
+  const t = ensureTooltip();
+  const lines = [p.pod];
+  const fmt = (s) => (s == null ? null : fmtOffset(s));
+  const dur = (s) => (s == null ? null : `${s.toFixed(2)}s`);
+  const stats = [];
+  if (p.firstRelevantOffsetS != null) {
+    stats.push(`start (Δshutter) = ${fmt(p.firstRelevantOffsetS)}`);
+  }
+  if (p.relevantDurationS != null) {
+    stats.push(`total duration  = ${dur(p.relevantDurationS)}`);
+  }
+  if (p.qgBuildSeconds != null) {
+    stats.push(`QG build        = ${dur(p.qgBuildSeconds)}`);
+  }
+  if (p.waitSeconds != null) {
+    stats.push(`waiting for load = ${dur(p.waitSeconds)}`);
+  }
+  if (stats.length > 0) {
+    lines.push('---');
+    lines.push(...stats);
+  }
+  if (p.looksTruncatedEnd) {
+    lines.push('---');
+    lines.push(truncationTooltipText(p));
+  }
+  t.textContent = lines.join('\n');
+  t.style.display = 'block';
+  moveTooltip(ev);
+}
+
+function truncationTooltipText(_p) {
+  return "⚠ fetch window probably ended before this pod finished its work";
+}
+
 function showTooltip(ev, e) {
   const t = ensureTooltip();
   const lines = [
