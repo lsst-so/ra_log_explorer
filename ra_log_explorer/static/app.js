@@ -291,7 +291,9 @@ function makeEventNode(e) {
   } else {
     n.style.left = xForOffset(e.offsetS) + 'px';
   }
-  n.title = `${fmtOffset(e.offsetS - refOffsetS)}  ${e.kind}  ${e.taskLabel || ''} ${e.who || ''}  det=${e.detector ?? ''}\n${e.raw}`;
+  // We deliberately don't set `n.title` here — the custom dark tooltip
+  // (showTooltip) already presents this info richly, and the browser's
+  // default title-attribute tooltip would render a duplicate on top of it.
   n.addEventListener('mouseenter', (ev) => showTooltip(ev, e));
   n.addEventListener('mousemove', moveTooltip);
   n.addEventListener('mouseleave', hideTooltip);

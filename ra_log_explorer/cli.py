@@ -3,9 +3,15 @@
 Examples:
 
     # Fetch logs around a known shutter-close time, parse, and open the UI.
+    # By default the supplied t-zero is interpreted as TAI (the Butler
+    # DimensionRecord convention); the tool internally converts to UTC so the
+    # timeline's t=0 line lands on the real shutter-close moment.
     python3 -m ra_log_explorer.cli \\
         --exposure-id 2026051900722 \\
         --t-zero 2026-05-20T08:46:05.336122
+
+    # If the t-zero you have is already in UTC, opt out of the TAI offset:
+    python3 -m ra_log_explorer.cli --exposure-id ... --t-zero ... --t-zero-utc
 
     # Just fetch & cache, don't start the server.
     python3 -m ra_log_explorer.cli --exposure-id ... --t-zero ... --no-serve
@@ -45,9 +51,21 @@ from .fetch import (
 )
 from .server import ServerState, serve
 
+# TAI is ahead of UTC by 37 seconds (since 2017-01-01; no further leap
+# seconds have been added). Butler `DimensionRecord` timestamps are TAI,
+# so by default we subtract this when converting the user's t-zero into
+# UTC. Override with --t-zero-utc.
+TAI_MINUS_UTC_S = 37.0
+
 
 def _parseIsoUtc(s: str) -> dt.datetime:
-    """Parse user-supplied t-zero (no timezone assumed UTC)."""
+    """Parse an ISO-8601 string into a UTC `datetime`.
+
+    A trailing 'Z' is honoured; an explicit ``+HH:MM`` / ``-HH:MM`` offset is
+    honoured; otherwise the string is assumed to be in the timezone of its
+    domain (UTC for log timestamps, TAI for Butler DimensionRecords — the
+    caller is responsible for any TAI→UTC adjustment before passing it here).
+    """
     s = s.strip()
     if s.endswith("Z"):
         s = s[:-1] + "+00:00"
@@ -89,7 +107,18 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
 
 
 def cmdRun(args: argparse.Namespace) -> int:
-    tZero = _parseIsoUtc(args.t_zero)
+    tZeroInput = _parseIsoUtc(args.t_zero)
+    if args.t_zero_utc:
+        tZero = tZeroInput
+        tZeroScale = "UTC"
+    else:
+        tZero = tZeroInput - dt.timedelta(seconds=TAI_MINUS_UTC_S)
+        tZeroScale = "TAI"
+    print(
+        f"t-zero (input, {tZeroScale}): {tZeroInput.isoformat()}\n"
+        f"t-zero (used, UTC):     {tZero.isoformat()}",
+        file=sys.stderr,
+    )
     fromT = tZero - dt.timedelta(seconds=args.window_before)
     toT = tZero + dt.timedelta(seconds=args.window_after)
     spec = FetchSpec(
@@ -140,7 +169,7 @@ def cmdRun(args: argparse.Namespace) -> int:
         tZero=tZero,
         referencePoints=[
             {
-                "label": "shutter close (caller-supplied)",
+                "label": (f"shutter close (caller-supplied, " f"{tZeroScale} input)"),
                 "t": tZero.isoformat(),
                 "offsetS": 0.0,
                 "source": "shutter close",
@@ -196,7 +225,17 @@ def build_parser() -> argparse.ArgumentParser:
     runP = sub.add_parser("run", help="fetch logs and open the UI (default)")
     runP.add_argument("--exposure-id", type=int, required=True, help="13-digit dataId, e.g. 2026051900722")
     runP.add_argument(
-        "--t-zero", required=True, help="Shutter-close time, ISO-8601 UTC, e.g. " "2026-05-20T08:46:05.336122"
+        "--t-zero",
+        required=True,
+        help="Shutter-close time, ISO-8601, e.g. 2026-05-20T08:46:05.336122. "
+        "Treated as TAI by default (Butler DimensionRecord convention); "
+        "pass --t-zero-utc if your value is already in UTC.",
+    )
+    runP.add_argument(
+        "--t-zero-utc",
+        action="store_true",
+        help="Treat --t-zero as already-UTC instead of TAI (default off; "
+        f"the default subtracts {int(TAI_MINUS_UTC_S)} s from the input).",
     )
     runP.add_argument("--host", default="127.0.0.1")
     runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
@@ -216,6 +255,7 @@ def build_parser() -> argparse.ArgumentParser:
     # allow invoking with the run flags directly, no subcommand
     p.add_argument("--exposure-id", type=int)
     p.add_argument("--t-zero")
+    p.add_argument("--t-zero-utc", action="store_true")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     p.add_argument("--no-serve", action="store_true")
