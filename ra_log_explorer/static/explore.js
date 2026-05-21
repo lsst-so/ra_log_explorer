@@ -504,7 +504,7 @@ function renderDetail() {
   const filter = (document.getElementById('detail-search').value || '').toLowerCase();
   const onlyRelevant = document.getElementById('detail-only-relevant').checked;
   const warnOnly = document.getElementById('detail-warn-only').checked;
-  const targetExpId = String(summary.expId);
+  const targetExpId = summary.expId;
   let inTraceback = false;
   for (const ln of detail.lines) {
     const raw = ln.raw || '';
@@ -518,7 +518,11 @@ function renderDetail() {
     const isTraceback = looksLikeTbStart || isPyTbCont;
     if (!isTraceback) {
       if (warnOnly && !(ln.level === 'warn' || ln.level === 'error')) continue;
-      if (onlyRelevant && !raw.includes(targetExpId)) continue;
+      // ln.expId is the dataId the server inferred for this line — either
+      // the id explicitly on the line, or (for carryover-group pods) the
+      // id last seen. A line with no inferred id is dropped here, which
+      // is what we want: "lines we can't attribute to this dataId".
+      if (onlyRelevant && ln.expId !== targetExpId) continue;
     }
     if (filter && !raw.toLowerCase().includes(filter)) continue;
     const row = document.createElement('div');

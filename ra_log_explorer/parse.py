@@ -273,6 +273,92 @@ _DATAID_VISIT_RE = re.compile(r"visit:\s*(\d+)")
 _DATAID_DET_RE = re.compile(r"detector:\s*(\d+)")
 _BARE_EXPID_RE = re.compile(r"\b(202\d{10})\b")  # 13-digit YYYYMMDDSSSSS
 
+# Split dayObs / seqNum form, accepting camelCase / snake_case / squashed
+# spellings as they all turn up in real LSST logs. We pair these on a
+# per-line basis (both must appear on the same line to count); the
+# combined value is `dayObs * 100000 + seqNum`, matching the canonical
+# 13-digit id form.
+# Allow up to a few non-digit characters between the key and value so that
+# the quoted-dict spelling (`'day_obs': 20260519`) and the plain
+# `dayObs=20260519` spelling both match without needing two regexes.
+_DAYOBS_RE = re.compile(r"day[_-]?obs[^0-9]{1,5}(\d{8})", re.IGNORECASE)
+_SEQNUM_RE = re.compile(r"seq[_-]?num[^0-9]{1,5}(\d{1,6})", re.IGNORECASE)
+
+
+def extractExpId(raw: str) -> int | None:
+    """Pull the dataId out of `raw`, or return ``None`` if absent.
+
+    Accepts both the bare 13-digit form (`2026051900722`) and the split
+    form (`day_obs: 20260519` + `seq_num: 722` on the same line, in any
+    of the camelCase / snake_case / squashed spellings). When both are
+    present the bare 13-digit form wins.
+    """
+    m = _BARE_EXPID_RE.search(raw)
+    if m:
+        return int(m.group(1))
+    dM = _DAYOBS_RE.search(raw)
+    sM = _SEQNUM_RE.search(raw)
+    if dM and sM:
+        return int(dM.group(1)) * 100000 + int(sM.group(1))
+    return None
+
+
+# Pod groups where a worker is processing one dataId at a time: once the
+# id has been logged, every subsequent line in that pod's stream belongs
+# to that same id until a new id appears. The control-plane / cluster-
+# wide pods (head node, butler watcher, metadata servers, cluster
+# manager, cleanup, performance monitor) interleave many dataIds and
+# are deliberately excluded — attributing their "next line" to the
+# "previous id" would silently misclassify everything.
+_CARRYOVER_GROUPS: frozenset[str] = frozenset(
+    {
+        "sfm",
+        "aos",
+        "step1b",
+        "step1b-aos",
+        "backlog",
+        "nightly-worker",
+        "mosaic",
+        "guider",
+        "plotter",
+        "psf-plot",
+        "fwhm-plot",
+        "radial-plot",
+        "zernike-plot",
+        "one-off-exprecord",
+        "one-off-postisr",
+        "one-off-visitimage",
+    }
+)
+
+
+def carryoverGroups() -> frozenset[str]:
+    """Return the set of pod-group labels for which the per-line dataId
+    carryover rule applies (see :data:`_CARRYOVER_GROUPS`).
+    """
+    return _CARRYOVER_GROUPS
+
+
+def tagLinesWithExpId(rawLines: Iterable[str], group: str) -> Iterator[int | None]:
+    """Yield one inferred dataId per input line.
+
+    For groups in :func:`carryoverGroups`, lines that don't explicitly
+    mention a dataId inherit the most-recently-seen one — matching the
+    real-world worker behaviour where, once a dataId is picked up, the
+    rest of that pod's logs belong to it until the next pickup. For
+    other groups (head node, metadata servers, etc.) only lines that
+    explicitly contain a dataId get tagged; everything else yields
+    ``None``.
+    """
+    isCarryover = group in _CARRYOVER_GROUPS
+    current: int | None = None
+    for raw in rawLines:
+        found = extractExpId(raw)
+        if found is not None:
+            current = found
+        yield current if isCarryover else found
+
+
 # head node messages
 _HEAD_DEFINE_RE = re.compile(r"Defining visit \(if needed\) for (\d+)")
 _HEAD_PIPELINE_RE = re.compile(r"Sending (\d+) imageType='(?P<image>[^']+)' for (?P<rest>.+?)$")
@@ -592,11 +678,9 @@ def summarizePod(podLogPath: Path) -> PodSummary:
             summary.nError += 1
         if _TRACEBACK_LEAD in ln.raw:
             summary.nTraceback += 1
-        if m := _BARE_EXPID_RE.search(ln.raw):
-            try:
-                summary.expIdsSeen.add(int(m.group(1)))
-            except ValueError:
-                pass
+        expId = extractExpId(ln.raw)
+        if expId is not None:
+            summary.expIdsSeen.add(expId)
         ev = classify(ln)
         if ev is not None:
             summary.events.append(ev)

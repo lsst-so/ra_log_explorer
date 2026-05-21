@@ -181,9 +181,20 @@ Inside the explore view:
     edge of the timeline for red bars.
 - **Detail drawer** — click any pod's row to slide up its full parsed
   log, with Δt₀, level, and a filter / "warn-only" / "only lines
-  containing this dataId" toggle. Tracebacks render as a contiguous
-  block. With the **Δshutter toggle** on, the inline ISO timestamps
-  in this drawer are replaced with shutter-relative offsets too.
+  relevant to this dataId" toggle. The relevance check is smarter than
+  a substring search: for worker pods (sfm, aos, step1b, etc.), once a
+  dataId has been logged every subsequent line is considered to belong
+  to it until a new dataId arrives — matching how those pods actually
+  process one exposure at a time. The dataId itself is recognised in
+  both the bare 13-digit form (`2026051900722`) and the split form
+  (`day_obs=20260519` + `seq_num=722` on the same line, in any of the
+  camelCase / snake_case / squashed spellings). Control-plane pods
+  (head node, butler-watcher, metadata servers, etc.) interleave many
+  dataIds so the toggle there falls back to "lines that explicitly
+  mention this id". Tracebacks render as a contiguous block regardless
+  of the toggle. With the **Δshutter toggle** on, the inline ISO
+  timestamps in this drawer are replaced with shutter-relative
+  offsets too.
 
 ## Common workflows
 

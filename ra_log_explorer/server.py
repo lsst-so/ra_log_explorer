@@ -271,8 +271,18 @@ def _buildSummaryPayload(state: ServerState) -> dict:
 
 def _podDetail(state: ServerState, pod: str) -> dict:
     logPath = loadPodLogPath(state.cacheDir, pod)
+    group = parser.podGroup(pod)
+    isCarryover = group in parser.carryoverGroups()
+    currentExpId: int | None = None
     lines: list[dict] = []
     for ln in parser.iterPodLines(logPath):
+        found = parser.extractExpId(ln.raw)
+        if found is not None:
+            currentExpId = found
+        # Non-carryover pods (head, metadata-server*, butler-watcher, ...)
+        # report only the id explicitly present on this line, since they
+        # interleave many dataIds in a single stream.
+        inferred = currentExpId if isCarryover else found
         lines.append(
             {
                 "t": ln.timestamp.isoformat(),
@@ -282,6 +292,7 @@ def _podDetail(state: ServerState, pod: str) -> dict:
                 "function": ln.function,
                 "message": ln.message,
                 "raw": ln.raw,
+                "expId": inferred,
             }
         )
     return {"pod": pod, "lines": lines}

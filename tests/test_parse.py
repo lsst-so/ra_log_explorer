@@ -342,6 +342,116 @@ def test_podInstrument(pod: str, expected: str | None) -> None:
     assert parse.podInstrument(pod) == expected
 
 
+# ----- extractExpId / tagLinesWithExpId -----------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        # Bare 13-digit form.
+        ("Running pipeline for 2026051900722 on detector 5", 2026051900722),
+        # Split form, snake_case.
+        ("dataId={'day_obs': 20260519, 'seq_num': 722, 'detector': 5}", 2026051900722),
+        # Split form, camelCase.
+        ("processing dayObs=20260519 seqNum=722", 2026051900722),
+        # Split form, squashed (no separator).
+        ("dayobs:20260519 seqnum:722 ...", 2026051900722),
+        # Mixed case with hyphen variants.
+        ("Day-Obs: 20260519, Seq-Num: 722", 2026051900722),
+        # Bare form wins outright when both are present.
+        ("dataId: {2026051900722, day_obs: 20260520, seq_num: 999}", 2026051900722),
+        # Neither form present.
+        ("Connecting to redis at host=localhost port=6379", None),
+        # Only dayObs (no seqNum) — not enough to form an id.
+        ("Working on day_obs 20260519 across detectors", None),
+        # Only seqNum.
+        ("seq_num=722 detector=5", None),
+        # Truncated dataId-like number (12 digits) — not matched.
+        ("garbled 202605190072 in middle", None),
+    ],
+)
+def test_extractExpId(raw: str, expected: int | None) -> None:
+    assert parse.extractExpId(raw) == expected
+
+
+def test_carryoverGroups_includes_workers_excludes_control_plane() -> None:
+    co = parse.carryoverGroups()
+    # Workers that process one dataId at a time.
+    assert "sfm" in co
+    assert "aos" in co
+    assert "step1b" in co
+    assert "step1b-aos" in co
+    assert "backlog" in co
+    assert "psf-plot" in co
+    # Control-plane / cluster-wide pods must NOT carry over.
+    for excluded in (
+        "head",
+        "butler-watcher",
+        "metadata-server",
+        "metadata-server-aos",
+        "metadata-server-guiders",
+        "metadata-server-ra-performance",
+        "cluster-mgr",
+        "cleanup",
+        "performance-monitor",
+        "other",
+    ):
+        assert excluded not in co, f"{excluded} must not be a carryover group"
+
+
+def test_tagLinesWithExpId_carryover_for_worker_groups() -> None:
+    lines = [
+        "Running pipeline for 2026051900722 on detector 5",
+        "Doing some sub-step (no id mentioned)",
+        "Another mid-task log line",
+        "Pipeline done; picking up day_obs=20260519 seq_num=723",
+        "Continuing the new task",
+    ]
+    tagged = list(parse.tagLinesWithExpId(lines, "sfm"))
+    assert tagged == [2026051900722, 2026051900722, 2026051900722, 2026051900723, 2026051900723]
+
+
+def test_tagLinesWithExpId_no_carryover_for_head_node() -> None:
+    lines = [
+        "Defining visit for 2026051900722",
+        "Event loop tick",
+        "Fanning out to 189 detectors",
+        "Sending signal for 2026051900723",
+    ]
+    tagged = list(parse.tagLinesWithExpId(lines, "head"))
+    # Only lines that explicitly mention an id get one; carryover is off.
+    assert tagged == [2026051900722, None, None, 2026051900723]
+
+
+def test_tagLinesWithExpId_leading_orphan_lines_remain_None() -> None:
+    """Lines before the first dataId mention can't be retroactively
+    attributed — they yield ``None`` even in a carryover group.
+    """
+    lines = [
+        "Pod started",
+        "Initialising butler",
+        "Running pipeline for 2026051900722",
+        "Sub-step continues",
+    ]
+    tagged = list(parse.tagLinesWithExpId(lines, "sfm"))
+    assert tagged == [None, None, 2026051900722, 2026051900722]
+
+
+def test_summarizePod_recognises_split_dayObs_seqNum_form(tmp_path: Path) -> None:
+    """A pod whose log only ever uses day_obs / seq_num (no bare 13-digit
+    form) must still resolve to the right exposure in ``expIdsSeen``.
+    """
+    p = tmp_path / "fake-pod.jsonl"
+    p.write_text(
+        '{"timestamp": "2026-05-20T08:46:20.000+00:00", "labels": {"detected_level": "info"}, '
+        '"line": "2026-05-20 08:46:20,000 lsst.pipe.base.runner runQuantum INFO   '
+        "Running task for dataId={instrument: 'LSSTCam', day_obs: 20260519, seq_num: 722, "
+        'detector: 5}\\n"}\n'
+    )
+    s = parse.summarizePod(p)
+    assert 2026051900722 in s.expIdsSeen
+
+
 def test_groupLabels_round_trips_with_podGroup() -> None:
     """Every (label, prefix) pair in POD_GROUPS appears in groupLabels(),
     and applying `podGroup` to a pod name built from the prefix gives
