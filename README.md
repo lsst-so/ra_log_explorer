@@ -40,18 +40,51 @@ export LOKI_PASSWORD=...     # ideally pinned in your shell rc
 
 ## Run
 
+There are two paths into the tool. Pick whichever is more comfortable.
+
+### Home mode (recommended)
+
+```
+python3 -m ra_log_explorer.cli
+```
+
+Starts the server with nothing loaded and opens the browser at
+`http://127.0.0.1:8765/`. From there you:
+
+1. Type your **Loki username + password** in the credentials card
+   (leave password blank to fall back to `LOKI_PASSWORD` in the
+   environment). Tick "remember in this browser" if you'd like them
+   kept in `localStorage`. A "forget stored credentials" button
+   clears the slot any time.
+2. Type a **dataId** (e.g. `2026051900722`) and the **shutter-close
+   time** (e.g. `2026-05-20T08:46:16.267`).
+   The shutter-close defaults to being interpreted as **TAI** —
+   matching the Butler `DimensionRecord.timespan.end.isot` field;
+   tick "t₀ is already UTC" if you've already done the conversion.
+3. Optionally open *Advanced options* to tweak cluster, namespace,
+   worker count, or the pre-/post-shutter window padding.
+4. Click **Fetch & explore**.
+
+A progress bar tracks per-pod completion as the fetch runs (live
+Server-Sent Events from the backend). When it finishes the page
+switches automatically to the timeline / explore view; the back-arrow
+button in the explore topbar returns you to the home page.
+
+The home page also lists every cached window on disk; clicking a row
+copies its cluster/namespace/window settings into the fetch form, so a
+subsequent fetch of the same exposure id cache-hits instantly.
+
+### Eager mode (CLI-driven, useful for scripting)
+
 ```
 python3 -m ra_log_explorer.cli \
     --exposure-id 2026051900722 \
     --t-zero 2026-05-20T08:46:16.267
 ```
 
-`--t-zero` is the shutter-close time of the exposure, **in TAI** (the
-default; this matches the Butler `DimensionRecord.timespan.end.isot`
-field). Internally the tool subtracts 37 s to land on the UTC shutter-
-close moment before computing the log fetch window — that's why the
-timeline's `0s` line aligns with the real shutter close. Pass
-`--t-zero-utc` if your value is already in UTC.
+Same TAI default as the home form (pass `--t-zero-utc` to opt out).
+Fetches + parses on the CLI side first, then opens the browser
+straight at the explore view for that exposure.
 
 By default this fetches **5 s before to 5 min after** the shutter close.
 A rapid analysis exposure usually finishes within ~90 s; the longer
@@ -62,12 +95,22 @@ While the fetch runs you'll see progress per pod on stderr; this takes
 A second run for the same (or any overlapping) window is instant — see
 [Cache](#cache) below.
 
-When the fetch + parse are done the tool launches a local web server at
-`http://127.0.0.1:8765/` and opens it in your browser. Skip the open
-with `--no-browser`; change the port with `--port`. Ctrl-C in the
-terminal stops the server.
+`--no-browser` skips the browser auto-open; `--port` changes the bind
+port. Ctrl-C in the terminal stops the server.
 
 ## What the UI shows
+
+The browser app has two views:
+
+- **Home view** — the landing page when no exposure is loaded.
+  Hosts the fetch form, the credentials panel, the cached-runs table,
+  and the live progress bar for an in-flight fetch.
+- **Explore view** — the timeline + detail drawer for one loaded
+  exposure. Click the **← home** button in its topbar to return to
+  the home view (the loaded state stays in memory; the back arrow is
+  a navigation, not a reset).
+
+Inside the explore view:
 
 - **Top bar** — the dataId, the UTC t-zero, where the cache lives, and
   how big the on-disk cache currently is.
@@ -160,9 +203,9 @@ performance accelerator; flushing it costs you nothing but a re-fetch.
 ## All CLI options
 
 ```
---exposure-id ID         13-digit dataId (required)
---t-zero ISO             shutter-close timestamp; TAI by default
---t-zero-utc             treat --t-zero as already-UTC
+--exposure-id ID         13-digit dataId (optional; pair with --t-zero)
+--t-zero ISO             shutter-close timestamp (optional; pair with --exposure-id)
+--t-zero-utc             treat --t-zero as already-UTC instead of TAI
 --window-before SECONDS  pre-shutter pad (default 5)
 --window-after  SECONDS  post-shutter pad (default 300)
 --workers N              parallel log fetch threads (default 8)
@@ -173,9 +216,12 @@ performance accelerator; flushing it costs you nothing but a re-fetch.
 --force-refresh          ignore the cache and re-fetch
 --host HOST              bind address (default 127.0.0.1)
 --port PORT              HTTP port (default 8765)
---no-serve               fetch + parse only; don't launch the UI
---no-browser             launch the UI but don't open a browser tab
+--no-serve               with --exposure-id: fetch + parse only, no UI
+--no-browser             launch the UI but don't auto-open a browser tab
 ```
+
+Omit `--exposure-id` / `--t-zero` for **home mode** (server starts at the
+landing page; pick your exposure in the browser).
 
 Run `python3 -m ra_log_explorer.cli --help` for the same list.
 

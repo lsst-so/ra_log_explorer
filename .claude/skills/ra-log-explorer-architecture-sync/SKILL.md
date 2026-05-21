@@ -33,7 +33,9 @@ commit as the code change** — don't leave it for later.
 | `POD_GROUPS` / `podOrdinal` / `podInstrument`                   | `architecture/parsing.md`                                           |
 | Cache directory layout, `.partial`, hit policy                  | `architecture/caching.md`                                           |
 | `FetchSpec`, `cache_root`, the env-override variable             | `architecture/caching.md`                                           |
-| Anything in `/api/summary` or `/api/pod/<>`                     | `architecture/architecture.md` (the JSON example)                  |
+| Anything in `/api/summary`, `/api/pod/<>`, `/api/cache`, `/api/fetch*` | `architecture/architecture.md` (the JSON API section)         |
+| The home-mode ⇄ explore-mode flow, or how `ServerContext` works | `architecture/architecture.md` ("Threading model", "Two startup modes") |
+| `jobs.py` event-kind names, `JobStatus`, or the SSE event schema | `architecture/architecture.md` (the SSE section)                  |
 | Module split / rename / new file under `ra_log_explorer/`         | `architecture/architecture.md` (the table + tree)                  |
 | Default window size, TAI/UTC handling                           | `architecture/architecture.md` ("Key Concepts") **and** README     |
 | New unit-test category or new fixture                           | `architecture/testing.md`                                           |

@@ -31,20 +31,31 @@ Sibling docs:
               │ list[PodSummary]
               ▼
     ┌────────────────────────┐
-    │   cli.py               │  composes fetch + parse + ServerState,
-    │                        │  applies TAI→UTC for t-zero, launches server
+    │   jobs.py              │  FetchJob + JobManager; one daemon thread per
+    │   (in-process worker)  │  fetch, append-only event log with condvar
     └─────────┬──────────────┘
-              │
+              │ ServerState (via stateLock)
               ▼
-    ┌────────────────────────┐         GET /
-    │   server.py            │ ◄────── GET /static/*       browser
-    │   (stdlib HTTP)        │ ◄────── GET /api/summary
+    ┌────────────────────────┐         GET /                 (home or explore)
+    │   server.py            │ ◄────── GET /static/*
+    │   (stdlib HTTP + SSE)  │ ◄────── GET /api/summary
     │                        │ ◄────── GET /api/pod/<pod>
+    │                        │ ◄────── GET /api/cache
+    │                        │ ◄────── POST /api/fetch       (browser side)
+    │                        │ ◄────── GET /api/fetch/<id>/status
+    │                        │ ◄────── GET /api/fetch/<id>/progress (SSE)
     └────────────────────────┘
                   ▲
                   │ HTML / CSS / JS (vanilla)
                   │
-              static/  templates/
+       static/    │           templates/
+       ├─ app.js (bootstrap)  └─ timeline.html (home + explore SPA)
+       ├─ home.js
+       └─ explore.js
+
+       cli.py    optional "eager mode" — fetch + parse on the CLI before
+                 the server starts; populates ServerState ahead of time.
+                 Home mode just constructs an empty ServerContext.
 ```
 
 ## Module Responsibilities
@@ -54,9 +65,10 @@ Sibling docs:
 | `config.py`  | Defaults, `FetchSpec` dataclass, cache-path helpers.                          |
 | `fetch.py`   | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache, including superset reuse. |
 | `parse.py`   | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). |
-| `server.py`  | Stdlib `ThreadingHTTPServer` with two JSON endpoints + static files. Assembles the per-exposure summary payload, including the task colour palette. |
-| `cli.py`     | Argument parsing, TAI→UTC adjustment on `--t-zero`, window calculation, calls into `fetch` + `parse`, hands a `ServerState` to `server.serve()`. |
-| `static/`    | Single-page vanilla JS UI (`app.js`, `style.css`) and the HTML template (`templates/timeline.html`). No build step. |
+| `jobs.py`    | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off and watch fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the shared `ServerState` handover. |
+| `server.py`  | Stdlib `ThreadingHTTPServer` with the JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing `{jobs, state}`. Assembles the per-exposure summary payload (events, task colour palette, reference points) when `state` is set; returns `{loaded: false}` otherwise. |
+| `cli.py`     | Argument parsing + the optional "eager fetch" path. Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. |
+| `static/`    | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, view switching), `home.js` (landing page form + cache list + progress), `explore.js` (timeline + detail drawer). One HTML template (`templates/timeline.html`) holds both `#home-view` and `#explore-view` sections; the bootstrap shows whichever matches the server's `loaded` state. No build step. |
 
 ## Key Concepts
 
@@ -93,20 +105,30 @@ Sibling docs:
 
 ## JSON API
 
-The server exposes two endpoints; both return JSON.
-
 ### `GET /api/summary`
+
+When no exposure is loaded (home mode):
 
 ```jsonc
 {
+  "loaded": false,
+  "cache": { "path": "/Users/.../ra_log_explorer", "totalBytes": 42330276 }
+}
+```
+
+When an exposure is loaded:
+
+```jsonc
+{
+  "loaded": true,
   "expId": 2026051900722,
   "tZero": "2026-05-20T08:45:39.267000+00:00",
   "cacheDir": "/Users/.../yagan/rapid-analysis/<window-slug>",
   "cacheBytes": 84115620,
   "meta": { ...fetch metadata, including cacheReuse: "exact"|"superset"|"none"... },
   "referencePoints": [
-    { "label": "shutter close (caller-supplied, TAI input)", "offsetS": 0.0, ... },
-    { "label": "head node first defined visit",              "offsetS": 6.95, ... }
+    { "label": "shutter close (caller-supplied)", "offsetS": 0.0, ... },
+    { "label": "head node first defined visit",   "offsetS": 6.95, ... }
   ],
   "taskColors": { "isr": "#d4801f", "calibrateImage": "#1a9c8c", ... },
   "pods":    [ { "pod": "...", "group": "sfm", "ordinal": 0, "nLines": 541,
@@ -136,16 +158,124 @@ Returns every parsed `LogLine` from that pod's JSONL file:
 ```
 
 Used by the detail drawer in the UI. `podName` is checked against a
-`[A-Za-z0-9._-]+` allowlist so it can't break out of `pods/`.
+`[A-Za-z0-9._-]+` allowlist so it can't break out of `pods/`. Returns
+`404` when no exposure is loaded.
+
+### `GET /api/cache`
+
+```jsonc
+{
+  "root":    { "path": ".../ra_log_explorer", "totalBytes": 42330276 },
+  "windows": [
+    {
+      "cluster": "yagan", "namespace": "rapid-analysis",
+      "windowDir": "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z",
+      "fromIso":   "2026-05-20T08:45:34.267000Z",
+      "toIso":     "2026-05-20T08:50:39.267000Z",
+      "fetchedAt": "2026-05-21T15:00:00+00:00",
+      "podCount":  432, "totalBytes": 42289444, "sizeOnDisk": 42330276
+    }, ...
+  ]
+}
+```
+
+Sorted most-recently-fetched-first. Skips directories with a `.partial`
+flag or a missing `_meta.json`.
+
+### `POST /api/fetch`
+
+Request body (all defaults match the CLI; the password is consumed by the
+fetch worker and never echoed back in any response):
+
+```jsonc
+{
+  "exposureId": 2026051900722,         // required, integer
+  "tZero":      "2026-05-20T08:46:16.267",  // required, ISO-8601
+  "tZeroUtc":   false,                 // optional; default false (treat as TAI)
+  "username":   "merlin", "password": "...",
+  "cluster":    "yagan", "namespace": "rapid-analysis",
+  "lokiAddr":   "https://loki-query.ls.lsst.org",
+  "workers":    8,
+  "windowBefore": 5.0, "windowAfter": 300.0
+}
+```
+
+Response: `202 Accepted`, `{"jobId": "<12-char hex>"}`. Validation errors
+return `400` with `{"error": "..."}`.
+
+### `GET /api/fetch/<jobId>/status`
+
+JSON snapshot of one job:
+
+```jsonc
+{
+  "jobId": "8970db79c0a6",
+  "status": "running" | "parsing" | "done" | "error",
+  "expId": 2026051900722, "tZero": "...",
+  "fromIso": "...", "toIso": "...",
+  "startedAt": "...", "finishedAt": "...",
+  "cacheDir": "...", "cacheReuse": "exact"|"superset"|"none"|null,
+  "error": null | "...",
+  "eventCount": 5
+}
+```
+
+### `GET /api/fetch/<jobId>/progress`  (Server-Sent Events)
+
+`text/event-stream` of one job's progress events. Each `data:` line is
+one JSON event (`{"type": ...}`):
+
+- `start`: `{ fromIso, toIso }` — once at job kick-off.
+- `pod-done`: `{ pod, i, total }` — once per fetched pod.
+- `parsing`: `{ cacheReuse, podCount, totalBytes }` — after the fetch
+  finishes, before `summarizeAll` runs.
+- `done`: `{ expId, tZero, cacheDir, cacheReuse, podCount, totalBytes,
+  elapsedS }` — after the server's `ServerState` has been swapped in.
+- `error`: `{ error }` — terminal; the job failed.
+
+History is replayable: the SSE handler emits every event already in the
+job's log on connection, then waits for new ones. Multiple concurrent
+readers are fine — each iterates the log independently.
+
+Keepalive comments (`: keepalive\n\n`) are emitted every 15 s so
+intermediate proxies don't time the stream out.
 
 ## Threading model
 
-`server.serve()` uses `ThreadingHTTPServer`. Both endpoints read shared
-`ServerState` but never mutate it after the CLI assembles it, so no locks
-are needed. Pod detail responses re-read the JSONL files from disk on each
-request rather than buffering them in memory — the cache for one exposure
-is typically ~40 MiB so this stays cheap, and lets the user delete files
+`server.serve()` runs a `ThreadingHTTPServer`; one thread per request.
+The shared `ServerContext` is mutated only while holding `ctx.jobs.stateLock`,
+which guards:
+
+- replacing `ctx.state` after a fetch completes (worker thread → ✓ swap-in);
+- reading `ctx.state` to render `/api/summary` or `/api/pod/<>` (request
+  threads → read-only snapshot).
+
+Each fetch runs on its own daemon thread spawned by `JobManager.startJob`.
+SSE handlers block on `FetchJob.condition.wait()` to be notified when
+new events arrive in the per-job event log.
+
+Pod detail responses re-read the JSONL files from disk on each request
+rather than buffering them in memory — the cache for one exposure is
+typically ~40 MiB so this stays cheap, and lets the user delete files
 between requests without confusing the running server.
+
+## Two startup modes
+
+1. **Home mode** — `python3 -m ra_log_explorer.cli` with no
+   `--exposure-id`/`--t-zero`. CLI just spins up a fresh `JobManager`
+   and an empty `ServerContext`, hands it to `server.serve()`, and the
+   user picks an exposure in the browser. Every fetch from then on
+   goes through `POST /api/fetch` and the SSE progress endpoint.
+
+2. **Eager fetch mode** — `--exposure-id` + `--t-zero` supplied. CLI
+   runs the same TAI-adjustment + `fetch.fetchAll` + `parse.summarizeAll`
+   pipeline that the worker thread runs in home mode, but on the main
+   thread before the server starts. A populated `ServerContext` is
+   handed to `serve()`, so the browser lands directly on the explore
+   view. Useful for scripting.
+
+Both modes share `server.py`, `jobs.py`, the JSON API surface, and the
+SPA. The difference is only *who first wrote* the initial `ServerState`.
 
 ## Non-goals
 
