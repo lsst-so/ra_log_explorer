@@ -6,7 +6,6 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-
 DEFAULT_LOKI_ADDR = "https://loki-query.ls.lsst.org"
 DEFAULT_USERNAME = "merlin"
 DEFAULT_CLUSTER = "yagan"

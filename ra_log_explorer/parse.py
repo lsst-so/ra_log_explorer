@@ -25,7 +25,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Iterator
 
-
 # ----- pod flavor classification -------------------------------------------
 
 # Friendly grouping for the UI. Order matters for display priority.
@@ -229,24 +228,16 @@ _BARE_EXPID_RE = re.compile(r"\b(202\d{10})\b")  # 13-digit YYYYMMDDSSSSS
 
 # head node messages
 _HEAD_DEFINE_RE = re.compile(r"Defining visit \(if needed\) for (\d+)")
-_HEAD_PIPELINE_RE = re.compile(
-    r"Sending (\d+) imageType='(?P<image>[^']+)' for (?P<rest>.+?)$"
-)
-_HEAD_FANOUT_RE = re.compile(
-    r"Fanning (?P<inst>\S+) out to (?P<n>\d+) detectors of (?P<m>\d+) enabled"
-)
+_HEAD_PIPELINE_RE = re.compile(r"Sending (\d+) imageType='(?P<image>[^']+)' for (?P<rest>.+?)$")
+_HEAD_FANOUT_RE = re.compile(r"Fanning (?P<inst>\S+) out to (?P<n>\d+) detectors of (?P<m>\d+) enabled")
 _HEAD_SENT_PAYLOADS_RE = re.compile(
     r"Sent (?P<n>\d+) payloads to free workers, (?P<m>\d+) to busy workers for (?P<who>\S+)"
 )
 _HEAD_GATHER_DISPATCH_RE = re.compile(
     r"Dispatching step1b for (?P<who>\S+) with complete inputs:.*visit:\s*(?P<visit>\d+)"
 )
-_HEAD_POSTISR_MOSAIC_RE = re.compile(
-    r"Dispatching complete post_isr_image mosaic for expId=(\d+)"
-)
-_HEAD_VISITIMAGE_MOSAIC_RE = re.compile(
-    r"Dispatching complete preliminary_visit_image mosaic for (\d+)"
-)
+_HEAD_POSTISR_MOSAIC_RE = re.compile(r"Dispatching complete post_isr_image mosaic for expId=(\d+)")
+_HEAD_VISITIMAGE_MOSAIC_RE = re.compile(r"Dispatching complete preliminary_visit_image mosaic for (\d+)")
 _HEAD_ONEOFF_RE = re.compile(
     r"Sending signal to one-off processor for "
     r"(?P<inst>\S+?)-(?P<dayObs>\d{8})-(?P<seq>\d+)\+PodFlavor\.(?P<flavor>\S+)"
@@ -268,15 +259,11 @@ _WORKER_QG_BUILT_RE = re.compile(
 _WORKER_QUANTUM_PREP_RE = re.compile(
     r"Preparing execution of quantum for label=(?P<task>\S+) dataId=\{(?P<body>[^}]+)\}"
 )
-_WORKER_QUANTUM_RUN_RE = re.compile(
-    r"Constructing task and executing quantum for label=(?P<task>\S+)"
-)
+_WORKER_QUANTUM_RUN_RE = re.compile(r"Constructing task and executing quantum for label=(?P<task>\S+)")
 _WORKER_QUANTUM_DONE_RE = re.compile(
     r"Execution of task '(?P<task>[^']+)' on quantum \{(?P<body>[^}]+)\} took (?P<dur>[\d.]+) seconds"
 )
-_WORKER_WROTE_BINNED_RE = re.compile(
-    r"Wrote binned (?P<kind>\S+) for \{(?P<body>[^}]+)\}"
-)
+_WORKER_WROTE_BINNED_RE = re.compile(r"Wrote binned (?P<kind>\S+) for \{(?P<body>[^}]+)\}")
 _WORKER_REPORT_FINISHED_RE = re.compile(
     r"Reporting (?P<who>\S+) (?P<status>finished|failed) for detector (?P<det>\d+) of exposure (?P<exp>\d+)"
 )
@@ -310,93 +297,184 @@ def classify(line: LogLine) -> Event | None:
     # ----- head node patterns -----
     if "HeadProcessController" in line.logger or "processControl" in line.logger:
         if m := _HEAD_DEFINE_RE.search(msg):
-            return Event(pod, t, "HEAD_DEFINE_VISIT", line.level, expId=int(m.group(1)),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod, t, "HEAD_DEFINE_VISIT", line.level, expId=int(m.group(1)), message=msg, raw=line.raw
+            )
         if m := _HEAD_PIPELINE_RE.search(msg):
-            return Event(pod, t, "HEAD_PIPELINE_DECIDED", line.level,
-                         expId=int(m.group(1)),
-                         who=m.group("rest").strip(),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "HEAD_PIPELINE_DECIDED",
+                line.level,
+                expId=int(m.group(1)),
+                who=m.group("rest").strip(),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _HEAD_FANOUT_RE.search(msg):
-            return Event(pod, t, "HEAD_FANOUT_START", line.level,
-                         message=msg, raw=line.raw)
+            return Event(pod, t, "HEAD_FANOUT_START", line.level, message=msg, raw=line.raw)
         if m := _HEAD_SENT_PAYLOADS_RE.search(msg):
-            return Event(pod, t, "HEAD_FANOUT_DONE", line.level,
-                         who=m.group("who"), message=msg, raw=line.raw)
+            return Event(
+                pod, t, "HEAD_FANOUT_DONE", line.level, who=m.group("who"), message=msg, raw=line.raw
+            )
         if m := _HEAD_GATHER_DISPATCH_RE.search(msg):
-            return Event(pod, t, "HEAD_GATHER_DISPATCH", line.level,
-                         visit=int(m.group("visit")), expId=int(m.group("visit")),
-                         who=m.group("who"), message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "HEAD_GATHER_DISPATCH",
+                line.level,
+                visit=int(m.group("visit")),
+                expId=int(m.group("visit")),
+                who=m.group("who"),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _HEAD_POSTISR_MOSAIC_RE.search(msg):
-            return Event(pod, t, "HEAD_POSTISR_MOSAIC", line.level,
-                         expId=int(m.group(1)), message=msg, raw=line.raw)
+            return Event(
+                pod, t, "HEAD_POSTISR_MOSAIC", line.level, expId=int(m.group(1)), message=msg, raw=line.raw
+            )
         if m := _HEAD_VISITIMAGE_MOSAIC_RE.search(msg):
-            return Event(pod, t, "HEAD_VISITIMAGE_MOSAIC", line.level,
-                         expId=int(m.group(1)), message=msg, raw=line.raw)
+            return Event(
+                pod, t, "HEAD_VISITIMAGE_MOSAIC", line.level, expId=int(m.group(1)), message=msg, raw=line.raw
+            )
         if m := _HEAD_ONEOFF_RE.search(msg):
             # `<inst>-<dayObs>-<seq>` — reconstruct expId as <dayObs><seq zero-padded>
             dayObs = int(m.group("dayObs"))
             seq = int(m.group("seq"))
             expId = dayObs * 100000 + seq  # YYYYMMDDSSSSS - dayObs is YYYYMMDD,
             # but the log uses inst-YYYYMMDD-N where N is the seqNum (no zero-padding)
-            return Event(pod, t, "HEAD_ONEOFF", line.level,
-                         expId=expId, flavor=m.group("flavor"),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "HEAD_ONEOFF",
+                line.level,
+                expId=expId,
+                flavor=m.group("flavor"),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _HEAD_LOOP_SLOW_RE.search(msg):
-            return Event(pod, t, "HEAD_LOOP_SLOW", line.level,
-                         durationS=float(m.group("wall")),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "HEAD_LOOP_SLOW",
+                line.level,
+                durationS=float(m.group("wall")),
+                message=msg,
+                raw=line.raw,
+            )
 
     # ----- worker patterns -----
     if "SingleCorePipelineRunner" in line.logger:
         if m := _WORKER_PICKUP_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "WORKER_PICKUP", line.level,
-                         expId=exp, visit=vis, detector=det,
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_PICKUP",
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_WAIT_RAW_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "WORKER_WAIT_RAW", line.level,
-                         expId=exp, visit=vis, detector=det,
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_WAIT_RAW",
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_QG_START_RE.search(msg):
-            return Event(pod, t, "WORKER_QG_START", line.level,
-                         expId=int(m.group("exp")), who=m.group("who"),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_QG_START",
+                line.level,
+                expId=int(m.group("exp")),
+                who=m.group("who"),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_QG_BUILT_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "WORKER_QG_BUILT", line.level,
-                         expId=exp, visit=vis, detector=det,
-                         who=m.group("who"), durationS=float(m.group("dur")),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_QG_BUILT",
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                who=m.group("who"),
+                durationS=float(m.group("dur")),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_WROTE_BINNED_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "WORKER_BINNED_" + m.group("kind").upper(),
-                         line.level, expId=exp, visit=vis, detector=det,
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_BINNED_" + m.group("kind").upper(),
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_REPORT_FINISHED_RE.search(msg):
-            return Event(pod, t,
-                         "WORKER_REPORT_" + m.group("status").upper(),
-                         line.level,
-                         expId=int(m.group("exp")), detector=int(m.group("det")),
-                         who=m.group("who"),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "WORKER_REPORT_" + m.group("status").upper(),
+                line.level,
+                expId=int(m.group("exp")),
+                detector=int(m.group("det")),
+                who=m.group("who"),
+                message=msg,
+                raw=line.raw,
+            )
 
     # quantum start/end via the single_quantum_executor
     if "single_quantum_executor" in line.logger:
         if m := _WORKER_QUANTUM_PREP_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "QUANTUM_PREP", line.level,
-                         expId=exp, visit=vis, detector=det,
-                         taskLabel=m.group("task"),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "QUANTUM_PREP",
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                taskLabel=m.group("task"),
+                message=msg,
+                raw=line.raw,
+            )
         if m := _WORKER_QUANTUM_DONE_RE.search(msg):
             exp, vis, det = _dataIdFields(m.group("body"))
-            return Event(pod, t, "QUANTUM_DONE", line.level,
-                         expId=exp, visit=vis, detector=det,
-                         taskLabel=m.group("task"),
-                         durationS=float(m.group("dur")),
-                         message=msg, raw=line.raw)
+            return Event(
+                pod,
+                t,
+                "QUANTUM_DONE",
+                line.level,
+                expId=exp,
+                visit=vis,
+                detector=det,
+                taskLabel=m.group("task"),
+                durationS=float(m.group("dur")),
+                message=msg,
+                raw=line.raw,
+            )
 
     # generic warning / error fallthrough — only escalated through detected_level
     if line.level in ("warn", "error") and line.logger:
@@ -404,9 +482,15 @@ def classify(line: LogLine) -> Event | None:
         exp = None
         if m := _BARE_EXPID_RE.search(line.raw):
             exp = int(m.group(1))
-        return Event(pod, t, "WARN" if line.level == "warn" else "ERROR",
-                     line.level, expId=exp,
-                     message=msg, raw=line.raw)
+        return Event(
+            pod,
+            t,
+            "WARN" if line.level == "warn" else "ERROR",
+            line.level,
+            expId=exp,
+            message=msg,
+            raw=line.raw,
+        )
 
     return None
 

@@ -19,11 +19,10 @@ from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import urlparse
 
 from . import parse as parser
 from .fetch import loadPodLogPath
-
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -45,7 +44,7 @@ def _toJsonable(obj: Any) -> Any:
         return obj.isoformat()
     if isinstance(obj, set):
         return sorted(obj)
-    if is_dataclass(obj):
+    if is_dataclass(obj) and not isinstance(obj, type):
         return _toJsonable(asdict(obj))
     if isinstance(obj, dict):
         return {k: _toJsonable(v) for k, v in obj.items()}
@@ -73,9 +72,7 @@ def _eventToDict(ev: parser.Event, tZero: dt.datetime) -> dict:
     }
 
 
-def _summaryToDict(
-    s: parser.PodSummary, tZero: dt.datetime, expId: int
-) -> dict:
+def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict:
     """Build the per-pod payload for the timeline view.
 
     Events that explicitly reference `expId` are always included. Generic
@@ -87,14 +84,12 @@ def _summaryToDict(
     cluttering the per-pod timeline.
     """
     targeted = [ev for ev in s.events if ev.expId == expId]
+    window: tuple[dt.datetime, dt.datetime] | None = None
     if targeted:
-        firstT = targeted[0].t
-        lastT = targeted[-1].t
-        windowStart = firstT - dt.timedelta(seconds=3)
-        windowEnd = lastT + dt.timedelta(seconds=3)
-    else:
-        windowStart = None
-        windowEnd = None
+        window = (
+            targeted[0].t - dt.timedelta(seconds=3),
+            targeted[-1].t + dt.timedelta(seconds=3),
+        )
 
     relevant: list[parser.Event] = []
     for ev in s.events:
@@ -105,12 +100,12 @@ def _summaryToDict(
             continue  # explicitly tagged to a different exposure
         # Untagged event (typically a generic WARN/ERROR). Keep iff it
         # falls inside this pod's working window for the target exposure.
-        if windowStart is None:
+        if window is None:
             # Pod has no explicit target events at all (e.g. head node only
             # references the exposure transitively via expRecord). Keep
             # untagged events so the user can still see warnings.
             relevant.append(ev)
-        elif windowStart <= ev.t <= windowEnd:
+        elif window[0] <= ev.t <= window[1]:
             relevant.append(ev)
 
     return {
@@ -166,9 +161,8 @@ def _buildSummaryPayload(state: ServerState) -> dict:
                 and (firstIsr is None or ev.t < firstIsr.t)
             ):
                 firstIsr = ev
-            if (
-                ev.kind == "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE"
-                and (lastVisitImg is None or ev.t > lastVisitImg.t)
+            if ev.kind == "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE" and (
+                lastVisitImg is None or ev.t > lastVisitImg.t
             ):
                 lastVisitImg = ev
     if firstIsr is not None:
@@ -197,13 +191,9 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "cacheBytes": state.cacheBytes,
         "meta": _toJsonable(state.meta),
         "referencePoints": refs,
-        "pods": [
-            _summaryToDict(s, state.tZero, state.expId)
-            for s in matchingSummaries
-        ],
+        "pods": [_summaryToDict(s, state.tZero, state.expId) for s in matchingSummaries],
         "podsAll": [
-            {"pod": s.pod, "group": s.group, "nLines": s.nLines,
-             "nWarn": s.nWarn, "nError": s.nError}
+            {"pod": s.pod, "group": s.group, "nLines": s.nLines, "nWarn": s.nWarn, "nError": s.nError}
             for s in state.summaries
         ],
     }
@@ -227,7 +217,7 @@ def _podDetail(state: ServerState, pod: str) -> dict:
     return {"pod": pod, "lines": lines}
 
 
-def _makeHandler(state: ServerState):
+def _makeHandler(state: ServerState) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         def _send_json(self, payload: Any, status: int = 200) -> None:
             body = json.dumps(payload, default=str).encode("utf-8")
@@ -251,7 +241,7 @@ def _makeHandler(state: ServerState):
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, format: str, *args) -> None:  # noqa: A003
+        def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             # silence the default access log; uncomment for debugging.
             return
 
@@ -262,7 +252,7 @@ def _makeHandler(state: ServerState):
                 self._send_file(TEMPLATES_DIR / "timeline.html")
                 return
             if path.startswith("/static/"):
-                rel = path[len("/static/"):]
+                rel = path[len("/static/") :]
                 # disallow path traversal
                 if ".." in rel.split("/"):
                     self.send_error(400)
@@ -273,7 +263,7 @@ def _makeHandler(state: ServerState):
                 self._send_json(_buildSummaryPayload(state))
                 return
             if path.startswith("/api/pod/"):
-                pod = path[len("/api/pod/"):]
+                pod = path[len("/api/pod/") :]
                 pod = pod.split("?")[0]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
                     self.send_error(400, "Invalid pod name")

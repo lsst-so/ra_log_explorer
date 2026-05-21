@@ -35,7 +35,6 @@ from typing import Callable
 
 from .config import FetchSpec, window_cache_dir
 
-
 PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
 PODS_LIST_NAME = "pods.txt"
@@ -73,8 +72,7 @@ def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -
         raise FetchError("logcli binary not found on PATH") from e
     except subprocess.CalledProcessError as e:
         raise FetchError(
-            f"logcli failed (rc={e.returncode}): "
-            f"{e.stderr.decode('utf-8', 'replace').strip()[:500]}"
+            f"logcli failed (rc={e.returncode}): " f"{e.stderr.decode('utf-8', 'replace').strip()[:500]}"
         ) from e
     except subprocess.TimeoutExpired as e:
         raise FetchError(f"logcli timed out after {timeout}s") from e
@@ -107,11 +105,7 @@ def _fetchOnePod(
     outPath: Path,
 ) -> tuple[str, int]:
     """Fetch logs for a single pod; return (pod, bytes_written)."""
-    matcher = (
-        '{cluster="' + spec.cluster
-        + '",namespace="' + spec.namespace
-        + '",pod="' + pod + '"}'
-    )
+    matcher = '{cluster="' + spec.cluster + '",namespace="' + spec.namespace + '",pod="' + pod + '"}'
     # `--forward` => time-ordered ascending output; `-o jsonl` => one Loki API
     # JSON object per line which keeps labels (esp. detected_level) intact.
     out = _run_logcli(
@@ -153,12 +147,7 @@ def fetchAll(
     now = dt.datetime.now(dt.timezone.utc)
     windowInPast = now > windowEnd
 
-    if (
-        not forceRefresh
-        and windowInPast
-        and metaPath.exists()
-        and not partialPath.exists()
-    ):
+    if not forceRefresh and windowInPast and metaPath.exists() and not partialPath.exists():
         meta = json.loads(metaPath.read_text())
         meta["fromCache"] = True
         return meta
@@ -176,10 +165,7 @@ def fetchAll(
     errors: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=spec.workers) as ex:
-        futures = {
-            ex.submit(_fetchOnePod, spec, pod, podsDir / f"{pod}.jsonl"): pod
-            for pod in pods
-        }
+        futures = {ex.submit(_fetchOnePod, spec, pod, podsDir / f"{pod}.jsonl"): pod for pod in pods}
         for i, fut in enumerate(as_completed(futures), 1):
             pod = futures[fut]
             try:

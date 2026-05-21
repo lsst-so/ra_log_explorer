@@ -22,7 +22,6 @@ import datetime as dt
 import shutil
 import sys
 import webbrowser
-from pathlib import Path
 
 from . import parse as parser
 from .config import (
@@ -68,14 +67,25 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
     p.add_argument("--username", default=DEFAULT_USERNAME)
     p.add_argument("--cluster", default=DEFAULT_CLUSTER)
     p.add_argument("--namespace", default=DEFAULT_NAMESPACE)
-    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
-                   help=f"Parallel download workers (default {DEFAULT_WORKERS})")
-    p.add_argument("--window-before", type=float, default=DEFAULT_WINDOW_BEFORE_S,
-                   help="Seconds before t-zero to start the fetch window")
-    p.add_argument("--window-after", type=float, default=DEFAULT_WINDOW_AFTER_S,
-                   help="Seconds after t-zero to end the fetch window")
-    p.add_argument("--force-refresh", action="store_true",
-                   help="Re-fetch even if cached results exist")
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=f"Parallel download workers (default {DEFAULT_WORKERS})",
+    )
+    p.add_argument(
+        "--window-before",
+        type=float,
+        default=DEFAULT_WINDOW_BEFORE_S,
+        help="Seconds before t-zero to start the fetch window",
+    )
+    p.add_argument(
+        "--window-after",
+        type=float,
+        default=DEFAULT_WINDOW_AFTER_S,
+        help="Seconds after t-zero to end the fetch window",
+    )
+    p.add_argument("--force-refresh", action="store_true", help="Re-fetch even if cached results exist")
 
 
 def cmdRun(args: argparse.Namespace) -> int:
@@ -96,24 +106,27 @@ def cmdRun(args: argparse.Namespace) -> int:
     print(f"Cache dir: {cacheDir}", file=sys.stderr)
     meta = fetchAll(spec, progress=stderrProgress, forceRefresh=args.force_refresh)
     if meta.get("fromCache"):
-        print(f"Loaded {meta['pod_count']} pods from cache "
-              f"({humanBytes(meta['total_bytes'])}).", file=sys.stderr)
+        print(
+            f"Loaded {meta['pod_count']} pods from cache " f"({humanBytes(meta['total_bytes'])}).",
+            file=sys.stderr,
+        )
     else:
-        print(f"Downloaded {meta['pod_count']} pods, "
-              f"{humanBytes(meta['total_bytes'])} in {meta['elapsed_s']:.1f}s.",
-              file=sys.stderr)
+        print(
+            f"Downloaded {meta['pod_count']} pods, "
+            f"{humanBytes(meta['total_bytes'])} in {meta['elapsed_s']:.1f}s.",
+            file=sys.stderr,
+        )
         if meta.get("errors"):
-            print(f"  WARNING: {len(meta['errors'])} pods failed; see {cacheDir}/_meta.json",
-                  file=sys.stderr)
+            print(f"  WARNING: {len(meta['errors'])} pods failed; see {cacheDir}/_meta.json", file=sys.stderr)
     cacheBytes = cacheDuSizeBytes(cache_root())
-    print(f"Total cache: {humanBytes(cacheBytes)} at {cache_root()}",
-          file=sys.stderr)
+    print(f"Total cache: {humanBytes(cacheBytes)} at {cache_root()}", file=sys.stderr)
 
     print("Parsing logs ...", file=sys.stderr)
     summaries = parser.summarizeAll(cacheDir)
     nRelevant = sum(1 for s in summaries if args.exposure_id in s.expIdsSeen)
-    print(f"  {len(summaries)} pods parsed, "
-          f"{nRelevant} touched expId={args.exposure_id}", file=sys.stderr)
+    print(
+        f"  {len(summaries)} pods parsed, " f"{nRelevant} touched expId={args.exposure_id}", file=sys.stderr
+    )
 
     if args.no_serve:
         return 0
@@ -160,8 +173,7 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
                 size = cacheDuSizeBytes(window)
                 meta = window / "_meta.json"
                 tag = "ok " if meta.exists() else "partial"
-                print(f"  [{tag}] {humanBytes(size):>10}  "
-                      f"{cluster.name}/{ns.name}/{window.name}")
+                print(f"  [{tag}] {humanBytes(size):>10}  " f"{cluster.name}/{ns.name}/{window.name}")
     return 0
 
 
@@ -182,17 +194,14 @@ def build_parser() -> argparse.ArgumentParser:
 
     # default subcommand: run
     runP = sub.add_parser("run", help="fetch logs and open the UI (default)")
-    runP.add_argument("--exposure-id", type=int, required=True,
-                      help="13-digit dataId, e.g. 2026051900722")
-    runP.add_argument("--t-zero", required=True,
-                      help="Shutter-close time, ISO-8601 UTC, e.g. "
-                           "2026-05-20T08:46:05.336122")
+    runP.add_argument("--exposure-id", type=int, required=True, help="13-digit dataId, e.g. 2026051900722")
+    runP.add_argument(
+        "--t-zero", required=True, help="Shutter-close time, ISO-8601 UTC, e.g. " "2026-05-20T08:46:05.336122"
+    )
     runP.add_argument("--host", default="127.0.0.1")
     runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
-    runP.add_argument("--no-serve", action="store_true",
-                      help="Fetch + parse only, do not start the web UI")
-    runP.add_argument("--no-browser", action="store_true",
-                      help="Don't auto-open the browser")
+    runP.add_argument("--no-serve", action="store_true", help="Fetch + parse only, do not start the web UI")
+    runP.add_argument("--no-browser", action="store_true", help="Don't auto-open the browser")
     _addCommonArgs(runP)
     runP.set_defaults(fn=cmdRun)
 
@@ -201,8 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     infoP = cacheSub.add_parser("info", help="summarize cache contents")
     infoP.set_defaults(fn=cmdCacheInfo)
     flushP = cacheSub.add_parser("flush", help="delete the entire cache")
-    flushP.add_argument("--yes", action="store_true",
-                        help="Don't prompt for confirmation")
+    flushP.add_argument("--yes", action="store_true", help="Don't prompt for confirmation")
     flushP.set_defaults(fn=cmdCacheFlush)
 
     # allow invoking with the run flags directly, no subcommand
