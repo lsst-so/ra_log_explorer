@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import datetime
 import io
 import json
+from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
 
@@ -12,185 +12,257 @@ import pytest
 
 from ra_log_explorer import exposureTimes
 
-# A dataId whose dayObs (20200101) is definitely in the past for any
-# realistic test run — use this whenever we want the cached path to be
-# selected without monkeypatching the clock.
-PAST_DATAID = 2020010100001
-PAST_DAYOBS = PAST_DATAID // 100000
 
-
-def _stubResponse(payload: dict[str, str]) -> io.BytesIO:
-    """Return a file-like object that mimics what `urlopen` yields."""
+def _stubResponse(payload: dict) -> io.BytesIO:
+    """Return a file-like that mimics what `urlopen` yields."""
     return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
 
-def _clearCaches() -> None:
-    exposureTimes._fetchDayCached.cache_clear()
+# ----- rspTokenFilePath -----------------------------------------------------
 
 
-def test_exposureTimingsUrl_reads_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, "https://x/")
-    assert exposureTimes.exposureTimingsUrl() == "https://x/"
+def test_rspTokenFilePath_uses_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
+    assert exposureTimes.rspTokenFilePath() == exposureTimes.DEFAULT_RSP_TOKEN_FILE
 
 
-def test_exposureTimingsUrl_is_None_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, raising=False)
-    assert exposureTimes.exposureTimingsUrl() is None
+def test_rspTokenFilePath_reads_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    p = tmp_path / "tok"
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(p))
+    assert exposureTimes.rspTokenFilePath() == p
 
 
-# ----- queryIsot --------------------------------------------------------------
+def test_rspTokenFilePath_override_wins_over_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    envP = tmp_path / "env"
+    overP = tmp_path / "override"
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(envP))
+    assert exposureTimes.rspTokenFilePath(str(overP)) == overP
 
 
-def test_queryIsot_returns_isot_for_known_dataId(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clearCaches()
-    seen: list[str] = []
-
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        seen.append(url)
-        return _stubResponse({str(PAST_DATAID): "2020-01-02T03:04:05.067"})
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    isot = exposureTimes.queryIsot(PAST_DATAID, "https://x/")
-    assert isot == "2020-01-02T03:04:05.067"
-    assert seen == [f"https://x/{PAST_DAYOBS}.json"]
+def test_rspTokenFilePath_expands_tilde(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
+    out = exposureTimes.rspTokenFilePath("~/some/token")
+    # ~ must be expanded; the resulting path shouldn't start with `~`.
+    assert not str(out).startswith("~")
+    assert str(out).endswith("/some/token")
 
 
-def test_queryIsot_returns_None_when_day_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clearCaches()
-
-    def fakeUrlopen(url: str) -> Any:
-        raise HTTPError(url, 404, "not found", {}, None)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    assert exposureTimes.queryIsot(PAST_DATAID, "https://x/") is None
+# ----- readRspToken ---------------------------------------------------------
 
 
-def test_queryIsot_returns_None_when_dataId_missing_in_day(
+def test_readRspToken_strips_whitespace(tmp_path: Path) -> None:
+    p = tmp_path / "tok"
+    p.write_text("  abc-def\n")
+    assert exposureTimes.readRspToken(p) == "abc-def"
+
+
+def test_readRspToken_returns_empty_for_whitespace_only(tmp_path: Path) -> None:
+    p = tmp_path / "tok"
+    p.write_text("   \n  ")
+    assert exposureTimes.readRspToken(p) == ""
+
+
+def test_readRspToken_raises_for_missing_file(tmp_path: Path) -> None:
+    with pytest.raises(OSError):
+        exposureTimes.readRspToken(tmp_path / "nope")
+
+
+# ----- queryIsot ------------------------------------------------------------
+
+
+def test_queryIsot_returns_obs_end_on_first_instrument_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _clearCaches()
+    seen: list[Any] = []
 
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        return _stubResponse({"some-other-id": "..."})
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    assert exposureTimes.queryIsot(PAST_DATAID, "https://x/") is None
-
-
-def test_queryIsot_propagates_non_404_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clearCaches()
-
-    def fakeUrlopen(url: str) -> Any:
-        raise HTTPError(url, 500, "server error", {}, None)  # type: ignore[arg-type]
+    def fakeUrlopen(req: Any) -> Any:
+        seen.append((req.get_full_url(), req.data, dict(req.header_items())))
+        return _stubResponse({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    with pytest.raises(HTTPError):
-        exposureTimes.queryIsot(PAST_DATAID, "https://x/")
+    iso = exposureTimes.queryIsot(2026051900722, "TOKEN")
+    assert iso == "2026-05-20T08:46:16.267000"
+    # Only one HTTP call needed: the lsstcam table matched first.
+    assert len(seen) == 1
+    url, body, headers = seen[0]
+    assert url == exposureTimes.CONSDB_URL
+    parsedBody = json.loads(body.decode("utf-8"))
+    assert "cdb_lsstcam.exposure" in parsedBody["query"]
+    assert "2026051900722" in parsedBody["query"]
+    # Token must travel as a Bearer auth header — never in the URL or body.
+    assert headers["Authorization"] == "Bearer TOKEN"
+    assert "TOKEN" not in url
+    assert "TOKEN" not in body.decode("utf-8")
 
 
-def test_queryIsot_strips_trailing_slash(monkeypatch: pytest.MonkeyPatch) -> None:
-    _clearCaches()
+def test_queryIsot_falls_through_instruments_until_a_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the first instrument's table returns no rows, the loop falls
+    through to the next. Here we make lsstcam return empty and latiss
+    return the row."""
+    seen: list[str] = []
+    payloads: Any = iter(
+        [
+            {"columns": ["obs_end"], "data": []},  # lsstcam — empty
+            {"columns": ["obs_end"], "data": [["2026-05-20T09:00:00.000"]]},  # latiss
+        ]
+    )
+
+    def fakeUrlopen(req: Any) -> Any:
+        seen.append(json.loads(req.data.decode("utf-8"))["query"])
+        return _stubResponse(next(payloads))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    iso = exposureTimes.queryIsot(2026052000100, "TOKEN")
+    assert iso == "2026-05-20T09:00:00.000"
+    assert "cdb_lsstcam.exposure" in seen[0]
+    assert "cdb_latiss.exposure" in seen[1]
+
+
+def test_queryIsot_returns_None_when_all_instruments_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fakeUrlopen(req: Any) -> Any:
+        return _stubResponse({"columns": ["obs_end"], "data": []})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    assert exposureTimes.queryIsot(2026051900722, "TOKEN") is None
+
+
+def test_queryIsot_uses_only_the_given_instrument_when_specified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     seen: list[str] = []
 
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        seen.append(url)
-        return _stubResponse({})
+    def fakeUrlopen(req: Any) -> Any:
+        seen.append(json.loads(req.data.decode("utf-8"))["query"])
+        return _stubResponse({"columns": ["obs_end"], "data": [["x"]]})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    _clearCaches()
-    exposureTimes.queryIsot(PAST_DATAID, "https://x/")
-    _clearCaches()
-    exposureTimes.queryIsot(PAST_DATAID, "https://x")
-    assert seen == [f"https://x/{PAST_DAYOBS}.json"] * 2
+    exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="latiss")
+    assert len(seen) == 1
+    assert "cdb_latiss.exposure" in seen[0]
 
 
-def test_queryIsot_caches_past_days(monkeypatch: pytest.MonkeyPatch) -> None:
-    """For past dayObs values the cached fetch path is used."""
-    _clearCaches()
-    calls: list[str] = []
-
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        calls.append(url)
-        return _stubResponse({str(PAST_DATAID): "2020-01-02T03:04:05.067"})
+def test_queryIsot_returns_None_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fakeUrlopen(req: Any) -> Any:
+        raise HTTPError(req.get_full_url(), 404, "not found", {}, None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    exposureTimes.queryIsot(PAST_DATAID, "https://x/")
-    exposureTimes.queryIsot(PAST_DATAID, "https://x/")
-    exposureTimes.queryIsot(PAST_DAYOBS * 100000 + 99, "https://x/")
-    # Three queries against the same day_obs; one HTTP request.
-    assert calls == [f"https://x/{PAST_DAYOBS}.json"]
+    assert exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam") is None
 
 
-def test_queryIsot_bypasses_cache_for_current_day(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The current dayObs is fetched fresh every time — the file is still being written."""
-    _clearCaches()
-    monkeypatch.setattr(exposureTimes, "getCurrentDayObsInt", lambda: 20260520)
-    calls: list[str] = []
-
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        calls.append(url)
-        return _stubResponse({"2026052000001": "2026-05-20T20:00:00.000"})
+def test_queryIsot_raises_ConsDbError_for_other_HTTP_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fakeUrlopen(req: Any) -> Any:
+        raise HTTPError(req.get_full_url(), 500, "server error", {}, None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    exposureTimes.queryIsot(2026052000001, "https://x/")
-    exposureTimes.queryIsot(2026052000001, "https://x/")
-    # Two queries for the current dayObs => two HTTP requests, no caching.
-    assert calls == ["https://x/20260520.json", "https://x/20260520.json"]
+    with pytest.raises(exposureTimes.ConsDbError):
+        exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam")
 
 
-def test_queryIsot_bypasses_cache_for_future_day(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Future dayObs (clock-skew guard) also bypasses the cache."""
-    _clearCaches()
-    monkeypatch.setattr(exposureTimes, "getCurrentDayObsInt", lambda: 20260520)
-    calls: list[str] = []
+def test_queryIsot_treats_500_UndefinedTable_as_no_row(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ConsDB returns HTTP 500 with a psycopg2 ``UndefinedTable`` body
+    when an instrument's schema doesn't exist. We must skip to the next
+    instrument rather than blowing up the whole lookup."""
+    seen: list[str] = []
+    undefBody = b'{"message":"(psycopg2.errors.UndefinedTable) relation does not exist"}'
+    payloads = iter(
+        [
+            ("undefined", undefBody),
+            ("hit", json.dumps({"columns": ["obs_end"], "data": [["x"]]}).encode("utf-8")),
+        ]
+    )
 
-    def fakeUrlopen(url: str) -> io.BytesIO:
-        calls.append(url)
-        return _stubResponse({})
+    def fakeUrlopen(req: Any) -> Any:
+        kind, body = next(payloads)
+        seen.append(json.loads(req.data.decode("utf-8"))["query"])
+        if kind == "undefined":
+            raise HTTPError(
+                req.get_full_url(),
+                500,
+                "Internal Server Error",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(body),
+            )
+        return io.BytesIO(body)
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    exposureTimes.queryIsot(2026052100001, "https://x/")
-    exposureTimes.queryIsot(2026052100001, "https://x/")
-    assert calls == ["https://x/20260521.json", "https://x/20260521.json"]
+    iso = exposureTimes.queryIsot(2026051900722, "TOKEN")
+    assert iso == "x"
+    assert len(seen) == 2  # lsstcam 500 -> latiss hit
 
 
-# ----- getCurrentDayObs --------------------------------------------------------
+def test_queryIsot_raises_for_500_that_is_not_UndefinedTable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Generic ConsDB 500s — DB down, transient outage, etc. — bubble
+    up rather than being silently swallowed. Otherwise a real outage
+    looks identical to 'dataId not found anywhere'."""
+
+    def fakeUrlopen(req: Any) -> Any:
+        raise HTTPError(
+            req.get_full_url(),
+            500,
+            "Internal Server Error",
+            {},  # type: ignore[arg-type]
+            io.BytesIO(b'{"message":"connection refused"}'),
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    with pytest.raises(exposureTimes.ConsDbError):
+        exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam")
 
 
-def test_getCurrentDayObsDatetime_returns_a_date() -> None:
-    out = exposureTimes.getCurrentDayObsDatetime()
-    assert isinstance(out, datetime.date)
+# ----- on-disk cache -------------------------------------------------------
 
 
-def test_getCurrentDayObsInt_is_8_digit_yyyymmdd() -> None:
-    n = exposureTimes.getCurrentDayObsInt()
-    assert 19000000 < n < 30000000
-    # Reconstruct the date from the int — if the format is right this round-trips.
-    asDate = datetime.datetime.strptime(str(n), "%Y%m%d").date()
-    assert asDate == exposureTimes.getCurrentDayObsDatetime()
+def test_lookupCached_returns_None_when_file_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    assert exposureTimes.lookupCached(2026051900722) is None
 
 
-def test_getCurrentDayObs_rolls_at_utc_minus_12(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Just before noon UTC the day_obs is still yesterday's date."""
-
-    class FrozenDatetime(datetime.datetime):
-        @classmethod
-        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:  # type: ignore[override]
-            # 2026-05-20T11:59:00Z — just before the UTC-12 rollover
-            # (which lands at 12:00:00 UTC) — so day_obs is still 20260519.
-            return datetime.datetime(2026, 5, 20, 11, 59, 0, tzinfo=tz or datetime.timezone.utc)
-
-    monkeypatch.setattr(exposureTimes.datetime, "datetime", FrozenDatetime)
-    assert exposureTimes.getCurrentDayObsInt() == 20260519
+def test_storeCached_then_lookupCached_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
+    assert exposureTimes.lookupCached(2026051900722) == "2026-05-20T08:46:16.267000"
 
 
-def test_getCurrentDayObs_rolls_at_noon_utc(monkeypatch: pytest.MonkeyPatch) -> None:
-    """At noon UTC the day_obs has advanced to today's UTC date."""
+def test_storeCached_appends_without_clobbering(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCached(2026051900722, "iso-a")
+    exposureTimes.storeCached(2026051900723, "iso-b")
+    assert exposureTimes.lookupCached(2026051900722) == "iso-a"
+    assert exposureTimes.lookupCached(2026051900723) == "iso-b"
 
-    class FrozenDatetime(datetime.datetime):
-        @classmethod
-        def now(cls, tz: datetime.tzinfo | None = None) -> datetime.datetime:  # type: ignore[override]
-            return datetime.datetime(2026, 5, 20, 12, 0, 0, tzinfo=tz or datetime.timezone.utc)
 
-    monkeypatch.setattr(exposureTimes.datetime, "datetime", FrozenDatetime)
-    assert exposureTimes.getCurrentDayObsInt() == 20260520
+def test_lookupCached_tolerates_corrupt_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("not-json{")
+    assert exposureTimes.lookupCached(2026051900722) is None
+
+
+def test_lookupCached_tolerates_unexpected_schema(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(["not", "a", "dict"]))
+    assert exposureTimes.lookupCached(2026051900722) is None
+
+
+def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the response schema unexpectedly omits the obs_end column we
+    return None rather than crashing."""
+
+    def fakeUrlopen(req: Any) -> Any:
+        return _stubResponse({"columns": ["something_else"], "data": [["x"]]})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    assert exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam") is None

@@ -303,56 +303,143 @@ def test_buildSpecFromRequest_rejects_bad_tZero() -> None:
 # ----- /api/exposure-time/<dataId> ----------------------------------------
 
 
-def _plantExposureTime(monkeypatch: pytest.MonkeyPatch, payload: dict[str, str] | None) -> None:
-    """Stub urlopen so queryIsot returns the values we want for one day."""
+def _plantExposureTime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    obsEnd: str | None,
+) -> Path:
+    """Drop a fake token file in `tmp_path`, point the env at it, and stub
+    `urlopen` so queryIsot returns ``obsEnd`` (or ``None`` if no row).
+    """
+    tokFile = tmp_path / "tok"
+    tokFile.write_text("fake-token")
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tokFile))
+
     import io as _io
-    from urllib.error import HTTPError as _HTTPError
 
-    exposureTimes._fetchDayCached.cache_clear()
-    monkeypatch.setenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, "https://stubbed/")
-
-    def fakeUrlopen(url: str) -> object:
-        if payload is None:
-            raise _HTTPError(url, 404, "not found", {}, None)  # type: ignore[arg-type]
+    def fakeUrlopen(req: object) -> object:
+        payload = (
+            {"columns": ["obs_end"], "data": [[obsEnd]]}
+            if obsEnd is not None
+            else {"columns": ["obs_end"], "data": []}
+        )
         return _io.BytesIO(json.dumps(payload).encode("utf-8"))
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    return tokFile
 
 
-def test_exposure_time_returns_isot(runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch) -> None:
-    _plantExposureTime(monkeypatch, {"2026051900722": "2026-05-20T08:46:16.267"})
+def test_exposure_time_returns_isot(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Steer the cache file into a tmp path so this run doesn't pollute
+    # (or accidentally read from) the developer's real cache.
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path / "cache"))
+    _plantExposureTime(monkeypatch, tmp_path, "2026-05-20T08:46:16.267000")
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 200
-    assert body == {"dataId": 2026051900722, "tZero": "2026-05-20T08:46:16.267", "scale": "TAI"}
+    assert body == {
+        "dataId": 2026051900722,
+        "tZero": "2026-05-20T08:46:16.267000",
+        "scale": "TAI",
+        "fromCache": False,
+    }
 
 
-def test_exposure_time_404_for_unknown(runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch) -> None:
-    _plantExposureTime(monkeypatch, {"some-other-id": "..."})
+def test_exposure_time_404_when_no_row_anywhere(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _plantExposureTime(monkeypatch, tmp_path, None)
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 404
     assert "exposure-time" in body["error"]
 
 
-def test_exposure_time_404_for_unknown_day(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+def test_exposure_time_503_when_token_file_missing(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    _plantExposureTime(monkeypatch, None)
-    host, port, _ = runningServer
-    status, body = _get(host, port, "/api/exposure-time/2026051900722")
-    assert status == 404
-
-
-def test_exposure_time_503_when_url_not_set(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.delenv(exposureTimes.EXPOSURE_TIMINGS_URL_ENV, raising=False)
-    exposureTimes._fetchDayCached.cache_clear()
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tmp_path / "nope"))
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 503
-    assert "EXPOSURE_TIMINGS_URL" in body["error"]
+    assert "RSP token file not found" in body["error"]
+
+
+def test_exposure_time_503_when_token_file_empty(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    tokFile = tmp_path / "tok"
+    tokFile.write_text("   \n")
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tokFile))
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 503
+    assert "empty" in body["error"]
+
+
+def test_exposure_time_returns_cached_without_calling_consdb(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the dataId is already in the on-disk cache, the endpoint must
+    short-circuit: no token needed, no ConsDB call. The cache is
+    immutable (exposure end-times never change once recorded)."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
+
+    def blowUp(*_args: object, **_kw: object) -> object:
+        raise AssertionError("urlopen should not be reached on a cache hit")
+
+    monkeypatch.setattr(exposureTimes, "urlopen", blowUp)
+    # No RSP_TOKEN_FILE_ENV either — the cache hit should remove the need.
+    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
+
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"
+    assert body["fromCache"] is True
+
+
+def test_exposure_time_writes_to_cache_on_consdb_hit(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A successful ConsDB lookup persists the result so the next call
+    is instant. The original `fromCache` is False to surface that the
+    network was hit; subsequent calls report True."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    _plantExposureTime(monkeypatch, tmp_path, "2026-05-20T08:46:16.267000")
+    host, port, _ = runningServer
+    status1, body1 = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status1 == 200
+    assert body1["fromCache"] is False
+    # Cache file now exists with the entry persisted.
+    assert exposureTimes.lookupCached(2026051900722) == "2026-05-20T08:46:16.267000"
+
+
+def test_exposure_time_accepts_tokenFile_query_param_override(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The env var points at a missing file but the UI sends a working
+    path via ?tokenFile=... — the override must win."""
+    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tmp_path / "nope"))
+    overFile = tmp_path / "real-tok"
+    overFile.write_text("fake-token")
+
+    import io as _io
+
+    def fakeUrlopen(req: object) -> object:
+        return _io.BytesIO(
+            json.dumps({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]}).encode("utf-8")
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    host, port, _ = runningServer
+    qs = f"?tokenFile={overFile}"
+    status, body = _get(host, port, f"/api/exposure-time/2026051900722{qs}")
+    assert status == 200
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"
 
 
 # ----- DELETE /api/cache (single + all) -----------------------------------

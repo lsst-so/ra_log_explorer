@@ -13,6 +13,7 @@ const LS = {
   username: 'ra_log_explorer.username',
   password: 'ra_log_explorer.password',
   remember: 'ra_log_explorer.remember',
+  rspTokenFile: 'ra_log_explorer.rspTokenFile',
   lastRun: 'ra_log_explorer.lastRun',  // JSON {exposureId, cluster, namespace, ...} — no tZero, that's looked up each time
 };
 
@@ -50,8 +51,13 @@ function prefillCreds() {
   const remember = localStorage.getItem(LS.remember) === '1';
   const u = localStorage.getItem(LS.username);
   const p = localStorage.getItem(LS.password);
+  const tk = localStorage.getItem(LS.rspTokenFile);
   if (u != null) form.elements.username.value = u;
   if (p != null) form.elements.password.value = p;
+  // The RSP token path is non-secret (it's a file path, not the token
+  // itself), so we persist it unconditionally — no "remember" toggle
+  // needed.
+  if (tk != null) form.elements.rspTokenFile.value = tk;
   form.elements.remember.checked = remember;
   updateCredsState();
 }
@@ -69,6 +75,7 @@ function saveCreds() {
   const form = document.getElementById('creds-form');
   const u = form.elements.username.value.trim();
   const p = form.elements.password.value;
+  const tk = form.elements.rspTokenFile.value.trim();
   const remember = form.elements.remember.checked;
   if (remember) {
     if (u) localStorage.setItem(LS.username, u);
@@ -77,6 +84,8 @@ function saveCreds() {
   } else {
     localStorage.removeItem(LS.remember);
   }
+  if (tk) localStorage.setItem(LS.rspTokenFile, tk);
+  else localStorage.removeItem(LS.rspTokenFile);
   updateCredsState();
 }
 
@@ -84,9 +93,11 @@ function forgetCreds() {
   localStorage.removeItem(LS.username);
   localStorage.removeItem(LS.password);
   localStorage.removeItem(LS.remember);
+  localStorage.removeItem(LS.rspTokenFile);
   const form = document.getElementById('creds-form');
   form.elements.username.value = 'merlin';
   form.elements.password.value = '';
+  form.elements.rspTokenFile.value = '';
   form.elements.remember.checked = false;
   updateCredsState();
 }
@@ -181,7 +192,9 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  fetch(`/api/exposure-time/${expId}`)
+  const tokenFile = document.getElementById('creds-form').elements.rspTokenFile.value.trim();
+  const qs = tokenFile ? `?tokenFile=${encodeURIComponent(tokenFile)}` : '';
+  fetch(`/api/exposure-time/${expId}${qs}`)
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer
@@ -194,11 +207,7 @@ function triggerLookupIfReady() {
         setTZeroStatus(`no exposure-time record for ${expId}`, 'error');
       } else if (r.status === 503) {
         clearResolvedTZero();
-        setTZeroStatus(
-          'lookup service not configured on the server '
-          + '(set RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL)',
-          'error',
-        );
+        setTZeroStatus(body.error || 'RSP token / ConsDB lookup not configured', 'error');
       } else {
         clearResolvedTZero();
         setTZeroStatus(`lookup failed: ${body.error || r.status}`, 'error');
@@ -472,6 +481,14 @@ function wireHomeListeners() {
   const expIdInput = document.getElementById('fetch-form').elements.exposureId;
   expIdInput.addEventListener('input', scheduleLookup);
   document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
+  // RSP token path is non-secret — persist it as the user types so
+  // the next lookup uses the right path without an explicit save.
+  document.getElementById('creds-form').elements.rspTokenFile.addEventListener('input', () => {
+    saveCreds();
+    // The user may have just supplied a token after a failed lookup —
+    // retry it.
+    triggerLookupIfReady();
+  });
   document.getElementById('creds-forget').addEventListener('click', forgetCreds);
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
   document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);

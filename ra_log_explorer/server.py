@@ -35,9 +35,9 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from . import exposureTimes
 from . import parse as parser
 from .config import FetchSpec, cache_root
-from .exposureTimes import exposureTimingsUrl, queryIsot
 from .fetch import cacheDuSizeBytes, loadPodLogPath
 from .jobs import FetchJob, JobManager
 
@@ -617,7 +617,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
-                self._handle_exposure_time(int(m.group(1)))
+                from urllib.parse import parse_qs
+
+                qs = parse_qs(url.query)
+                tokenFileValues = qs.get("tokenFile")
+                tokenFileOverride: str | None = tokenFileValues[0] if tokenFileValues else None
+                self._handle_exposure_time(int(m.group(1)), tokenFileOverride)
                 return
             m = re.match(r"^/api/fetch/([A-Za-z0-9]+)/status$", path)
             if m:
@@ -654,24 +659,46 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         # ----- handler bodies (kept out of do_GET so they don't bloat it) -----
 
-        def _handle_exposure_time(self, dataId: int) -> None:
-            rootUrl = exposureTimingsUrl()
-            if not rootUrl:
+        def _handle_exposure_time(self, dataId: int, tokenFileOverride: str | None) -> None:
+            # Cache check first: exposure end-times are immutable once
+            # they exist, so a hit lets us skip the token + network call
+            # entirely. This also means a user with no RSP token can
+            # still resolve any dataId they (or anyone) previously
+            # looked up on this machine.
+            cached = exposureTimes.lookupCached(dataId)
+            if cached is not None:
+                self._send_json({"dataId": dataId, "tZero": cached, "scale": "TAI", "fromCache": True})
+                return
+            path = exposureTimes.rspTokenFilePath(tokenFileOverride)
+            if not path.exists():
                 self._send_error_json(
                     503,
-                    "Exposure timings lookup is not configured "
-                    "(set the RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL env var).",
+                    f"RSP token file not found at {path}. "
+                    f"Set the path in the home page Credentials card "
+                    f"or via the {exposureTimes.RSP_TOKEN_FILE_ENV} env var.",
                 )
                 return
             try:
-                isot = queryIsot(dataId, rootUrl)
-            except Exception as e:  # noqa: BLE001 — surface upstream failures verbatim
-                self._send_error_json(502, f"Lookup failed: {type(e).__name__}: {e}")
+                token = exposureTimes.readRspToken(path)
+            except OSError as e:
+                self._send_error_json(503, f"Could not read RSP token file: {e}")
+                return
+            if not token:
+                self._send_error_json(503, f"RSP token file is empty: {path}")
+                return
+            try:
+                isot = exposureTimes.queryIsot(dataId, token)
+            except exposureTimes.ConsDbError as e:
+                self._send_error_json(502, f"ConsDB query failed: {e}")
+                return
+            except OSError as e:
+                self._send_error_json(503, f"Could not reach ConsDB: {e}")
                 return
             if isot is None:
                 self._send_error_json(404, f"No exposure-time record for dataId={dataId}")
                 return
-            self._send_json({"dataId": dataId, "tZero": isot, "scale": "TAI"})
+            exposureTimes.storeCached(dataId, isot)
+            self._send_json({"dataId": dataId, "tZero": isot, "scale": "TAI", "fromCache": False})
 
         def do_DELETE(self) -> None:  # noqa: N802
             url = urlparse(self.path)

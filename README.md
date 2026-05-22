@@ -22,9 +22,12 @@ window. One exposure at a time.
 # Prerequisites: Python ≥ 3.11, git, and logcli on $PATH.
 # (`brew install grafana/grafana/logcli` on macOS.)
 
-# Two env vars — ask Merlin for the values:
+# Loki password — ask Merlin for the value.
 export LOKI_PASSWORD='...'
-export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='https://...'
+
+# RSP bearer token for the ConsDB shutter-close lookup. Get one at
+# https://usdf-rsp.slac.stanford.edu/auth/tokens/ and drop it in:
+mkdir -p ~/.lsst && cat > ~/.lsst/log-browser-token.txt   # paste, then Ctrl-D
 
 git clone git@github.com:lsst-so/ra_log_explorer.git
 cd ra_log_explorer
@@ -38,26 +41,39 @@ browser. Type a 13-digit dataId, click **Fetch & explore**, wait
 For everything else — what's required, where the cache lives, how to
 drive it from the CLI, troubleshooting — read on.
 
-## Required environment variables
+## Required environment + credentials
 
-The tool needs **three** things from your environment to fetch logs and
-resolve dataIds. Put these in your shell rc (`~/.zshrc`, `~/.bashrc`,
-…) so they survive across terminals:
+The tool needs **one env var** and **one token file** to fetch logs
+and resolve dataIds. Put the env var in your shell rc (`~/.zshrc`,
+`~/.bashrc`, …) so it survives across terminals:
 
 ```sh
-# 1. Loki credentials — used by `logcli` to authenticate.
+# 1. Loki credentials — used by `logcli` to authenticate against the
+#    summit Loki cluster.
 export LOKI_PASSWORD='<the password>'
-
-# 2. Exposure-timing service base URL — used by the dataId -> shutter-
-#    close TAI lookup. Ask Merlin for the current URL.
-export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='https://...'
 ```
 
-| Env var                                   | Required for                                  | What if it's missing                                 |
+```sh
+# 2. RSP bearer token — used to query the ConsDB shutter-close
+#    timestamp for each dataId. Get a token at
+#    https://usdf-rsp.slac.stanford.edu/auth/tokens/ and save it as:
+mkdir -p ~/.lsst
+echo '<paste-token-here>' > ~/.lsst/log-browser-token.txt
+chmod 600 ~/.lsst/log-browser-token.txt
+```
+
+Once a dataId has been resolved on this machine it is cached on
+disk (under `~/.cache/ra_log_explorer/exposure-times.json`), so
+subsequent lookups for the same id work without the token. Exposure
+end-times are immutable once recorded, so the cache never goes
+stale.
+
+| Setting                                   | Required for                                  | What if it's missing                                 |
 |--------------------------------------------|------------------------------------------------|------------------------------------------------------|
-| `LOKI_PASSWORD`                            | Every Loki fetch                              | `logcli` refuses to run; fetches fail at submit time. |
-| `RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL`     | dataId → shutter-close auto-resolution        | Home form shows "lookup service not configured"; you can't submit a fetch from the UI until it's set. (The CLI's `--t-zero` flag still works as a manual override.) |
-| `RA_LOG_EXPLORER_CACHE`                    | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
+| `LOKI_PASSWORD` (env var)                  | Every Loki fetch                              | `logcli` refuses to run; fetches fail at submit time. |
+| `~/.lsst/log-browser-token.txt` (file)     | dataId → shutter-close auto-resolution        | The home form shows "RSP token file not found"; cached dataIds still resolve. The CLI's `--t-zero` flag is also a manual override. |
+| `RA_LOG_EXPLORER_RSP_TOKEN_FILE` (env var) | *Optional* — overrides the token file path    | Defaults to `~/.lsst/log-browser-token.txt`. Also overridable per-session in the home page Credentials card. |
+| `RA_LOG_EXPLORER_CACHE` (env var)          | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
 
 The username for `logcli` defaults to `merlin` and is overridable in the
 browser's Credentials card (or via the CLI's `--username` flag).
@@ -78,15 +94,19 @@ browser's Credentials card (or via the CLI's `--username` flag).
 brew install grafana/grafana/logcli
 logcli --version    # sanity-check
 
-# 2. Set the env vars (in this shell + ideally in ~/.zshrc).
+# 2. Set the Loki password env var (in this shell + ideally in ~/.zshrc).
 export LOKI_PASSWORD='ask-merlin'
-export RA_LOG_EXPLORER_EXPOSURE_TIMINGS_URL='ask-merlin'
 
-# 3. Clone the repo and cd into it.
+# 3. Drop your RSP bearer token in ~/.lsst/log-browser-token.txt.
+mkdir -p ~/.lsst
+echo '<paste-rsp-token>' > ~/.lsst/log-browser-token.txt
+chmod 600 ~/.lsst/log-browser-token.txt
+
+# 4. Clone the repo and cd into it.
 git clone git@github.com:lsst-so/ra_log_explorer.git
 cd ra_log_explorer
 
-# 4. Start the server. The runtime needs no pip installs (stdlib only).
+# 5. Start the server. The runtime needs no pip installs (stdlib only).
 python3 -m ra_log_explorer.cli
 ```
 

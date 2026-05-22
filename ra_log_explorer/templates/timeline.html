@@ -90,6 +90,13 @@
               <span class="hint">(stored in localStorage, never sent anywhere but this server)</span>
             </label>
           </div>
+          <div class="row">
+            <label>
+              <span class="lbl">RSP token file</span>
+              <input type="text" name="rspTokenFile" placeholder="~/.lsst/log-browser-token.txt" autocomplete="off" />
+              <span class="hint">used for ConsDB shutter-close lookups; falls back to RA_LOG_EXPLORER_RSP_TOKEN_FILE env</span>
+            </label>
+          </div>
           <div class="row submit-row">
             <button type="button" id="creds-forget" class="ghost">forget stored credentials</button>
           </div>
