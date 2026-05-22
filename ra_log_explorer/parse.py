@@ -686,13 +686,34 @@ class TracebackRecord:
 
 
 # How many lines / characters to capture for each traceback body. Bodies
-# longer than this just get truncated — the drilldown explicitly tells
-# the user when this happens.
-_TRACEBACK_MAX_LINES = 80
-_TRACEBACK_MAX_CHARS = 8_000
-# Exception class line: "ModuleError: details" or just "ModuleError"
+# longer than this just get truncated for the drilldown view, but the
+# class-line scan keeps running until the traceback ends so we still
+# tag the right exception even when the body would otherwise overflow.
+# 250 lines is generous: Python 3.13 includes caret lines for each frame
+# (~2 lines per frame), so a 30-frame traceback runs 60+ lines just for
+# frames, plus chained exception blocks ("During handling …") and the
+# final ExceptionClass line. Worst-case real tracebacks we've seen run
+# ~130 lines; 250 leaves room without exploding memory.
+_TRACEBACK_MAX_LINES = 250
+_TRACEBACK_MAX_CHARS = 32_000
+# Exception class line. Tries to match shapes like:
+#
+#   RuntimeError: ...
+#   KeyboardInterrupt
+#   galsim.errors.GalSimRangeError: ...        ← lowercase module prefix
+#   lsst.daf.butler.DatasetTypeError: ...      ← lowercase module prefix
+#
+# Many third-party libraries (galsim, lsst, …) raise fully-qualified
+# exceptions whose module path is all lowercase. The earlier regex
+# required the entire line to start with a capital, which silently
+# missed those — every such traceback got tagged "<unknown>".
 _EXC_CLASS_RE = re.compile(
-    r"^(?P<cls>[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*"
+    # Optional dotted lowercase module prefix, e.g. `galsim.errors.`.
+    r"^(?:[a-z_][a-z0-9_]*\.)*"
+    # Capital-led class name, allowing nested dotted suffixes
+    # (`Foo.SubError`), ending with one of the canonical class suffixes.
+    r"(?P<cls>[A-Z][A-Za-z0-9_]*"
+    r"(?:\.[A-Za-z][A-Za-z0-9_]*)*"
     r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
     r"(?:\s*:\s*(?P<msg>.*))?$"
 )
@@ -764,8 +785,13 @@ def summarizePod(podLogPath: Path) -> PodSummary:
             tbLines = [ln.raw]
             summary.nTraceback += 1
         elif activeTb is not None:
-            if _isTracebackBodyLine(ln.raw) and len(tbLines) < _TRACEBACK_MAX_LINES:
-                tbLines.append(ln.raw)
+            if _isTracebackBodyLine(ln.raw):
+                # Body capture has its own cap; class detection
+                # continues to the end of the traceback so we still
+                # tag the right exception when a long stack would
+                # otherwise overflow the body buffer.
+                if len(tbLines) < _TRACEBACK_MAX_LINES:
+                    tbLines.append(ln.raw)
                 m = _EXC_CLASS_RE.match(ln.raw)
                 if m and activeTb.excClass == "<unknown>":
                     activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]

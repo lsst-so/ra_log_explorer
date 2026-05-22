@@ -569,10 +569,15 @@ def _buildNightPayload(state: NightState) -> dict:
 def _listCacheWindows() -> list[dict]:
     """Inspect the cache root and summarise each completed window.
 
-    Skips directories without `_meta.json` (uninitialised) and those that
-    still have a `.partial` flag (a crashed fetch). The result is sorted
-    most-recent-fetched-first so the home page's "recent runs" list reads
-    chronologically.
+    Walks two depths:
+
+    * exposure-mode caches at ``<root>/<cluster>/<ns>/<window>/``
+    * night-mode caches at ``<root>/<cluster>/<ns>/<window>/pods=<slug>/``
+
+    Both are returned as rows. The ``podFilter`` field is the regex
+    string from the cached spec (or ``None`` for unfiltered exposure
+    caches); the ``relPath`` joins ``<window>`` and ``pods=<slug>`` when
+    relevant so the JS can DELETE the right sub-path.
     """
     root = cache_root()
     rows: list[dict] = []
@@ -581,29 +586,48 @@ def _listCacheWindows() -> list[dict]:
     for cluster in sorted(p for p in root.iterdir() if p.is_dir()):
         for ns in sorted(p for p in cluster.iterdir() if p.is_dir()):
             for window in sorted(p for p in ns.iterdir() if p.is_dir()):
-                metaPath = window / "_meta.json"
-                if not metaPath.exists() or (window / ".partial").exists():
-                    continue
-                try:
-                    meta = json.loads(metaPath.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                spec = meta.get("spec") or {}
-                rows.append(
-                    {
-                        "cluster": cluster.name,
-                        "namespace": ns.name,
-                        "windowDir": window.name,
-                        "fromIso": spec.get("fromIso"),
-                        "toIso": spec.get("toIso"),
-                        "fetchedAt": meta.get("fetched_at"),
-                        "podCount": meta.get("pod_count", 0),
-                        "totalBytes": meta.get("total_bytes", 0),
-                        "sizeOnDisk": cacheDuSizeBytes(window),
-                    }
-                )
+                _appendCacheRow(rows, cluster.name, ns.name, window, relPath=window.name)
+                # Night-mode caches nest one level deeper under
+                # `pods=<slug>/`. List them alongside the top-level
+                # window so the user can manage them independently.
+                for inner in sorted(p for p in window.iterdir() if p.is_dir()):
+                    if inner.name.startswith("pods="):
+                        _appendCacheRow(
+                            rows,
+                            cluster.name,
+                            ns.name,
+                            inner,
+                            relPath=f"{window.name}/{inner.name}",
+                        )
     rows.sort(key=lambda r: r.get("fetchedAt") or "", reverse=True)
     return rows
+
+
+def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, relPath: str) -> None:
+    metaPath = window / "_meta.json"
+    if not metaPath.exists() or (window / ".partial").exists():
+        return
+    try:
+        meta = json.loads(metaPath.read_text())
+    except (OSError, json.JSONDecodeError):
+        return
+    spec = meta.get("spec") or {}
+    rows.append(
+        {
+            "cluster": cluster,
+            "namespace": ns,
+            "windowDir": window.name,
+            "relPath": relPath,
+            "podFilter": spec.get("podRegex"),
+            "kind": "night" if spec.get("podRegex") else "exposure",
+            "fromIso": spec.get("fromIso"),
+            "toIso": spec.get("toIso"),
+            "fetchedAt": meta.get("fetched_at"),
+            "podCount": meta.get("pod_count", 0),
+            "totalBytes": meta.get("total_bytes", 0),
+            "sizeOnDisk": cacheDuSizeBytes(window),
+        }
+    )
 
 
 def _cacheRootInfo() -> dict:
@@ -617,22 +641,34 @@ def _cacheRootInfo() -> dict:
 # A cache path component must be a "safe" basename — no path separators,
 # no leading dot, no `..` traversal. The same pattern is also used to
 # validate pod names elsewhere so the choice is consistent.
-_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# Path components in the cache layout. Allows `=` so the night-mode
+# ``pods=<slug>`` subdir name is accepted; everything else is the
+# previous filesystem-friendly safe set.
+_PATH_COMPONENT_RE = re.compile(r"^[A-Za-z0-9._=-]+$")
 
 
 def _safePathComponent(s: str) -> bool:
     return bool(_PATH_COMPONENT_RE.match(s)) and s not in (".", "..")
 
 
-def _resolveCacheWindow(cluster: str, namespace: str, slug: str) -> Path | None:
-    """Return the cache directory for `(cluster, namespace, slug)` if it exists.
+def _resolveCacheWindow(cluster: str, namespace: str, slug: str, podsSub: str | None = None) -> Path | None:
+    """Return the cache directory for ``(cluster, namespace, slug[, podsSub])``.
 
-    Validates the components first so an attacker can't escape `cache_root()`.
+    Validates the components first so an attacker can't escape ``cache_root()``.
     Returns ``None`` when any component is unsafe or the directory doesn't exist.
+
+    ``podsSub`` is the optional 4th URL segment used for night-mode caches
+    (e.g. ``"pods=__aos__"``). Required to start with ``pods=`` so the
+    URL space stays unambiguous.
     """
-    if not all(_safePathComponent(c) for c in (cluster, namespace, slug)):
+    components = [cluster, namespace, slug]
+    if podsSub is not None:
+        if not podsSub.startswith("pods="):
+            return None
+        components.append(podsSub)
+    if not all(_safePathComponent(c) for c in components):
         return None
-    path = cache_root() / cluster / namespace / slug
+    path = cache_root().joinpath(*components)
     if not path.exists() or not path.is_dir():
         return None
     # Final safety check: the resolved path must still live under cache_root.
@@ -968,10 +1004,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 _deleteCacheRoot(ctx)
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
                 return
-            m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)$", path)
+            m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)(?:/([^/]+))?$", path)
             if m:
                 cluster, namespace, slug = m.group(1), m.group(2), m.group(3)
-                target = _resolveCacheWindow(cluster, namespace, slug)
+                podsSub = m.group(4)  # optional `pods=<slug>` segment
+                target = _resolveCacheWindow(cluster, namespace, slug, podsSub)
                 if target is None:
                     self._send_error_json(404, "No such cache directory")
                     return

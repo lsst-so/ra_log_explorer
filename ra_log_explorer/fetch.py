@@ -240,7 +240,15 @@ def fetchAll(
     now = dt.datetime.now(dt.timezone.utc)
     windowInPast = now > windowEnd
 
-    if not forceRefresh and windowInPast:
+    # Night-mode (filtered) fetches always trust an existing cache. The
+    # 24h dayObs window is post-hoc analysis, and there's no benefit to
+    # re-pulling 100MB of logs just because the window's nominal end
+    # (noon UTC tomorrow) is technically still in the future. Exposure
+    # mode keeps the conservative "window must be in the past before we
+    # cache-hit" rule because a fresh fetch a few seconds after a
+    # 5-minute window's end could still pick up late log lines.
+    cacheEligible = (not forceRefresh) and (windowInPast or spec.podRegex is not None)
+    if cacheEligible:
         # Exact-spec cache hit?
         if requestedDir.exists() and metaPath.exists() and not partialPath.exists():
             meta = json.loads(metaPath.read_text())

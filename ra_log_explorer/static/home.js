@@ -254,12 +254,18 @@ function renderCache(data) {
   deleteAll.disabled = data.windows.length === 0;
   for (const w of data.windows) {
     const tr = document.createElement('tr');
-    tr.title = 'click to copy these settings to the form above';
+    const isNight = w.kind === 'night';
+    tr.title = isNight
+      ? 'click to copy the dayObs into the Investigate night form'
+      : 'click to copy these settings to the form above';
     const fromS = (w.fromIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const toS = (w.toIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const fetchedS = (w.fetchedAt || '').replace('T', ' ').replace(/\..*$/, '');
+    const kindBadge = isNight
+      ? `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night ${escapeHtml(w.podFilter || '')}</span>`
+      : '';
     tr.innerHTML = `
-      <td>${w.cluster} / ${w.namespace}</td>
+      <td>${w.cluster} / ${w.namespace} ${kindBadge}</td>
       <td><span class="mono">${fromS} → ${toS}</span></td>
       <td><span class="mono">${fetchedS}</span></td>
       <td>${w.podCount}</td>
@@ -288,10 +294,15 @@ function renderCache(data) {
 }
 
 async function deleteCacheWindow(w) {
+  const subPath = w.relPath || w.windowDir;
   if (!window.confirm(
-    `Delete cached window?\n\n${w.cluster}/${w.namespace}/${w.windowDir}\n(${humanBytes(w.sizeOnDisk)})`,
+    `Delete cached window?\n\n${w.cluster}/${w.namespace}/${subPath}\n(${humanBytes(w.sizeOnDisk)})`,
   )) return;
-  const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${encodeURIComponent(w.windowDir)}`;
+  // For night-mode caches relPath is `<window>/<pods=…>` — we need two
+  // URL segments rather than one. encodeURIComponent each segment so
+  // the `=` in `pods=__aos__` survives intact.
+  const segments = subPath.split('/').map(encodeURIComponent).join('/');
+  const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`;
   try {
     const r = await fetch(url, { method: 'DELETE' });
     if (!r.ok) {
@@ -325,7 +336,32 @@ async function deleteAllCache() {
   }
 }
 
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+  ));
+}
+
+function dayObsFromIso(fromIso) {
+  // The night window starts at noon UTC on dayObs. Pull the YYYY-MM-DD
+  // out of the from-ISO and pack it back into a YYYYMMDD integer.
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(fromIso || '');
+  if (!m) return null;
+  return parseInt(`${m[1]}${m[2]}${m[3]}`, 10);
+}
+
 function useCacheSettings(w) {
+  if (w.kind === 'night') {
+    const nightForm = document.getElementById('night-form');
+    nightForm.elements.cluster.value = w.cluster;
+    nightForm.elements.namespace.value = w.namespace;
+    const dayObs = dayObsFromIso(w.fromIso);
+    if (dayObs != null) nightForm.elements.dayObs.value = dayObs;
+    document.getElementById('night-message').textContent =
+      `Settings copied from cached night ${dayObs || w.windowDir}. Submit to reopen instantly.`;
+    document.getElementById('night-message').classList.remove('error');
+    return;
+  }
   const form = document.getElementById('fetch-form');
   form.elements.cluster.value = w.cluster;
   form.elements.namespace.value = w.namespace;

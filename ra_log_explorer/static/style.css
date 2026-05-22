@@ -1246,6 +1246,24 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
   padding: 0;
   border-bottom: 1px solid var(--border);
 }
+/* Cache-row "night" badge */
+.cache-kind {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-family: var(--font-sans);
+  vertical-align: middle;
+}
+.cache-kind-night {
+  background: #ede4fb;
+  color: #6b3df0;
+}
+
 .night-tb-body {
   font-family: var(--font-mono);
   font-size: 11px;
