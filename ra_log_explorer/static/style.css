@@ -1264,14 +1264,36 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
   color: #6b3df0;
 }
 
+.night-tb-context { padding: 0; }
+.night-tb-header {
+  padding: 8px 14px;
+  font-size: 12px;
+  color: var(--text-2);
+  background: #f4ecdd;
+  border-bottom: 1px solid var(--border);
+}
+.night-tb-header .mono { font-family: var(--font-mono); color: var(--text); }
+.night-tb-truncated { color: var(--warn); font-weight: 600; }
 .night-tb-body {
   font-family: var(--font-mono);
   font-size: 11px;
-  color: #6b1414;
+  color: var(--text);
   white-space: pre-wrap;
-  max-height: 360px;
+  word-break: break-all;
+  max-height: 460px;
   overflow: auto;
   padding: 10px 14px;
   margin: 0;
   background: #fdf6ec;
+  line-height: 1.4;
 }
+.night-tb-body .tb-ts {
+  color: var(--text-muted);
+  user-select: none;
+}
+.night-tb-body .tb-lvl {
+  color: var(--text-muted);
+  font-weight: 600;
+}
+.night-tb-body .tb-lvl.tb-warn  { color: var(--warn); }
+.night-tb-body .tb-lvl.tb-error { color: var(--err); }

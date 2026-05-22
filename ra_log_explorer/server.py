@@ -563,6 +563,95 @@ def _buildNightPayload(state: NightState) -> dict:
     }
 
 
+# How much surrounding context to ship with a single traceback. A busy
+# AOS quantum can emit ~hundreds of lines per dataId; this is a sanity
+# cap so the drilldown doesn't have to render a multi-megabyte
+# response. Bumped if real bodies routinely exceed it; truncation is
+# explicitly reported to the UI.
+_TB_CONTEXT_MAX_LINES = 4_000
+_TB_CONTEXT_MAX_CHARS = 600_000
+# When the traceback couldn't be attributed to a dataId (e.g. carryover
+# was off, or it fired before the first dataId mention), fall back to a
+# fixed pre-window of N seconds so the drilldown still has *some*
+# context to show.
+_TB_NO_EXPID_LOOKBACK_S = 30.0
+_TB_NO_EXPID_LOOKAHEAD_S = 5.0
+
+
+def _tracebackContextForNight(state: NightState, bodyKey: str) -> dict | None:
+    """Return the pod's log lines from a dataId's pickup through the
+    traceback (and through the end of that dataId's processing block).
+
+    This is what the night-view drilldown fetches when the user clicks
+    a failure row. The point is to give surrounding context — what was
+    the worker doing right before it crashed — without making the user
+    open the full per-pod log to scroll back.
+    """
+    targetSummary: parser.PodSummary | None = None
+    targetTb: parser.TracebackRecord | None = None
+    for s in state.summaries:
+        for tb in s.tracebacks:
+            if night._bodyKey(s.pod, tb.t) == bodyKey:
+                targetSummary, targetTb = s, tb
+                break
+        if targetSummary is not None:
+            break
+    if targetSummary is None or targetTb is None:
+        return None
+
+    startTs: dt.datetime
+    endTs: dt.datetime
+    contextSource: str
+    if targetTb.expId is not None and targetTb.expId in targetSummary.expIdFirstLast:
+        startTs, endTs = targetSummary.expIdFirstLast[targetTb.expId]
+        contextSource = "dataId-block"
+    else:
+        # No carryover-attributed dataId — fall back to a fixed pre-window.
+        startTs = targetTb.t - dt.timedelta(seconds=_TB_NO_EXPID_LOOKBACK_S)
+        endTs = targetTb.t + dt.timedelta(seconds=_TB_NO_EXPID_LOOKAHEAD_S)
+        contextSource = "time-window"
+
+    logPath = loadPodLogPath(state.cacheDir, targetSummary.pod)
+    lines: list[dict] = []
+    truncated = False
+    totalChars = 0
+    for ln in parser.iterPodLines(logPath):
+        if ln.timestamp < startTs:
+            continue
+        if ln.timestamp > endTs:
+            break
+        if len(lines) >= _TB_CONTEXT_MAX_LINES or totalChars >= _TB_CONTEXT_MAX_CHARS:
+            truncated = True
+            break
+        lines.append(
+            {
+                "t": ln.timestamp.isoformat(),
+                "level": ln.level,
+                "raw": ln.raw,
+            }
+        )
+        totalChars += len(ln.raw)
+
+    return {
+        "bodyKey": bodyKey,
+        "pod": targetSummary.pod,
+        "group": targetSummary.group,
+        "expId": targetTb.expId,
+        "excClass": targetTb.excClass,
+        "excMessage": targetTb.excMessage,
+        "firstTs": startTs.isoformat(),
+        "lastTs": endTs.isoformat(),
+        "tracebackTs": targetTb.t.isoformat(),
+        "contextSource": contextSource,
+        "lines": lines,
+        "truncated": truncated,
+        # The captured traceback body is still handy when context lookup
+        # is degenerate (e.g. the cache dir is missing). Ship it as a
+        # backup the UI can fall through to.
+        "body": targetTb.body,
+    }
+
+
 # ----- cache listing --------------------------------------------------------
 
 
@@ -885,11 +974,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 from urllib.parse import unquote
 
                 key = unquote(path[len("/api/night/traceback/") :])
-                body = night.tracebackBody(nightState.summaries, key)
-                if body is None:
+                payload = _tracebackContextForNight(nightState, key)
+                if payload is None:
                     self._send_error_json(404, f"No traceback with key {key}")
                     return
-                self._send_json({"bodyKey": key, "body": body})
+                self._send_json(payload)
                 return
             if path.startswith("/api/pod/"):
                 with ctx.jobs.stateLock:

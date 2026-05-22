@@ -604,6 +604,101 @@ def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> N
     assert tmpCacheRoot.exists()
 
 
+def test_night_traceback_endpoint_returns_dataId_block(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Clicking a failure row should get back lines from the dataId's
+    pickup through the end of its processing block, not just the
+    captured traceback body."""
+    import datetime as _dt
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    # Plant a one-pod night cache with a known dataId block + traceback.
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "win" / "pods=__aos__"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    rawLines = [
+        # 3 lines BEFORE the dataId is first mentioned — should be excluded.
+        ("2026-05-21T22:46:00.000+00:00", "info", "warming up"),
+        ("2026-05-21T22:46:05.000+00:00", "info", "still warming up"),
+        # First line that mentions the dataId — the context window starts here.
+        (
+            "2026-05-21T22:47:00.000+00:00",
+            "info",
+            "2026-05-21 22:47:00,000 worker fn INFO   Running pipeline for 2026052100012 detector 5",
+        ),
+        (
+            "2026-05-21T22:47:05.000+00:00",
+            "info",
+            "2026-05-21 22:47:05,000 worker fn INFO   isr started",
+        ),
+        ("2026-05-21T22:47:10.000+00:00", "error", "Traceback (most recent call last):"),
+        ("2026-05-21T22:47:10.001+00:00", "error", '  File "/x/run.py", line 7, in run'),
+        ("2026-05-21T22:47:10.002+00:00", "error", "RuntimeError: bang"),
+        # A new dataId is picked up — carryover advances, so anything
+        # from here on belongs to 2026052100013 and is OUT of this
+        # traceback's context.
+        (
+            "2026-05-21T22:48:00.000+00:00",
+            "info",
+            "2026-05-21 22:48:00,000 worker fn INFO   Running pipeline for 2026052100013 detector 5",
+        ),
+        ("2026-05-21T22:48:01.000+00:00", "info", "doing the next thing"),
+    ]
+    podPath = podsDir / f"{podName}.jsonl"
+    with open(podPath, "w") as fh:
+        for ts, level, raw in rawLines:
+            fh.write(
+                json.dumps(
+                    {
+                        "timestamp": ts,
+                        "labels": {"detected_level": level},
+                        "line": raw + "\n",
+                    }
+                )
+                + "\n"
+            )
+    summaries = _parse.summarizeAll(cacheDir)
+    assert len(summaries) == 1
+    s = summaries[0]
+    assert s.tracebacks  # the parser found the RuntimeError
+    bodyKey = f"{s.pod}@{s.tracebacks[0].t.isoformat()}"
+
+    with ctx.jobs.stateLock:
+        ctx.nightState = NightState(
+            cacheDir=cacheDir,
+            cacheBytes=0,
+            meta={},
+            summaries=summaries,
+            dayObs=20260521,
+            startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+            endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+        )
+    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}")
+    assert status == 200, body
+    assert body["pod"] == podName
+    assert body["expId"] == 2026052100012
+    assert body["excClass"] == "RuntimeError"
+    assert body["contextSource"] == "dataId-block"
+    # We expect 5 lines: the 3 pickup-onwards lines (incl. isr started)
+    # plus the 3 traceback lines, minus the post-block "next pickup".
+    rawTexts = [ln["raw"] for ln in body["lines"]]
+    assert any("Running pipeline for 2026052100012" in r for r in rawTexts)
+    assert any("isr started" in r for r in rawTexts)
+    assert any("Traceback" in r for r in rawTexts)
+    assert any("RuntimeError: bang" in r for r in rawTexts)
+    # Pre-block and post-block lines (carryover advances on the next
+    # pickup, so doing-the-next-thing belongs to 2026052100013) are
+    # excluded.
+    assert not any("warming up" in r for r in rawTexts)
+    assert not any("doing the next thing" in r for r in rawTexts)
+    assert not any("2026052100013" in r for r in rawTexts)
+
+
 def test_delete_cache_window_clears_loaded_state_if_match(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:

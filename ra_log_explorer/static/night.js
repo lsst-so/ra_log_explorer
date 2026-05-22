@@ -246,7 +246,7 @@ function formatTimeHM(iso) {
 }
 
 async function toggleFailureExpansion(tr, row) {
-  // The expanded body row lives directly below the trigger row. Toggle
+  // The expanded detail row lives directly below the trigger row. Toggle
   // by inserting / removing it.
   const next = tr.nextElementSibling;
   if (next && next.classList.contains('night-failure-detail')) {
@@ -257,7 +257,7 @@ async function toggleFailureExpansion(tr, row) {
   detail.className = 'night-failure-detail';
   const td = document.createElement('td');
   td.colSpan = 7;
-  td.innerHTML = '<pre class="night-tb-body">loading…</pre>';
+  td.innerHTML = '<div class="night-tb-context">loading…</div>';
   detail.appendChild(td);
   tr.parentNode.insertBefore(detail, tr.nextSibling);
   try {
@@ -267,8 +267,82 @@ async function toggleFailureExpansion(tr, row) {
       return;
     }
     const data = await r.json();
-    td.firstChild.textContent = data.body || '(empty body)';
+    renderTracebackContext(td.firstChild, data);
   } catch (e) {
     td.firstChild.textContent = `(failed to load: ${e})`;
   }
+}
+
+function renderTracebackContext(container, data) {
+  // Header summarising what's about to be shown — pod, dataId, source
+  // of context (whole dataId block vs fixed time-window fallback), and
+  // a truncation warning if the body buffer was capped.
+  container.innerHTML = '';
+  const header = document.createElement('div');
+  header.className = 'night-tb-header';
+  const idLabel = data.expId == null ? '(no dataId)' : `dataId=${data.expId}`;
+  const contextLabel = data.contextSource === 'dataId-block'
+    ? `lines from dataId pickup through end of its processing block`
+    : `lines in a ±${Math.round(data.firstTs && data.lastTs ? 30 : 0)} s window around the traceback`;
+  header.innerHTML =
+    `<span class="mono">${escapeHtml(data.pod)}</span>`
+    + ` · <span class="mono">${escapeHtml(idLabel)}</span>`
+    + ` · ${escapeHtml(contextLabel)}`
+    + (data.truncated ? ` <span class="night-tb-truncated">(truncated)</span>` : '');
+  container.appendChild(header);
+
+  // Body: each log line on its own row, formatted as
+  // `HH:MM:SS.fff  LEVEL  <raw>`. The line that starts the traceback
+  // gets a leading divider so it's easy to find by eye.
+  const body = document.createElement('pre');
+  body.className = 'night-tb-body';
+  const tbStartT = data.tracebackTs;
+  const fragments = [];
+  let firstTracebackLineSeen = false;
+  if (!data.lines || data.lines.length === 0) {
+    // Fall back to the captured traceback body if the line list is empty
+    // (e.g. cache file vanished between fetch and click).
+    body.textContent = data.body || '(no context available)';
+    container.appendChild(body);
+    return;
+  }
+  for (const ln of data.lines) {
+    const t = formatLineTs(ln.t);
+    // Traceback continuation lines parse as level=unknown — display
+    // blank rather than a noisy "UNKNO" tag.
+    const levRaw = (ln.level === 'unknown' ? '' : (ln.level || ''));
+    const lev = levRaw.toUpperCase().padEnd(5);
+    const lvlClass = ln.level === 'warn' ? 'tb-warn'
+      : ln.level === 'error' ? 'tb-error'
+      : '';
+    let prefix = '';
+    // Visual marker on the first line whose timestamp >= tracebackTs —
+    // that's the start of the traceback. Render it after a blank line
+    // and an arrow so the eye lands on it.
+    if (!firstTracebackLineSeen && tbStartT && ln.t >= tbStartT) {
+      firstTracebackLineSeen = true;
+      prefix = '\n--- traceback below ---\n';
+    }
+    const safe = escapeHtml(ln.raw);
+    fragments.push(
+      prefix
+      + `<span class="tb-ts">${t}</span>`
+      + ` <span class="tb-lvl ${lvlClass}">${lev}</span>`
+      + ` ${safe}`
+    );
+  }
+  body.innerHTML = fragments.join('\n');
+  container.appendChild(body);
+}
+
+function formatLineTs(iso) {
+  // "2026-05-21T22:47:25.646000+00:00" -> "22:47:25.646"
+  const m = /T(\d\d:\d\d:\d\d(?:\.\d{1,3})?)/.exec(iso || '');
+  return m ? m[1] : iso || '';
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
+  ));
 }
