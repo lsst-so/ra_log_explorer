@@ -340,7 +340,10 @@ async function toggleFailureExpansion(tr, row) {
   detail.appendChild(td);
   tr.parentNode.insertBefore(detail, tr.nextSibling);
   try {
-    const r = await fetch(`/api/night/traceback/${encodeURIComponent(row.bodyKey)}`);
+    const r = await fetch(
+      `/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
+      + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`,
+    );
     if (!r.ok) {
       td.firstChild.textContent = `(failed to load: HTTP ${r.status})`;
       return;

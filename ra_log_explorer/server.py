@@ -29,12 +29,13 @@ import datetime as dt
 import json
 import mimetypes
 import re
+from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import exposureTimes, night
 from . import parse as parser
@@ -146,17 +147,65 @@ class NightState:
     shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
 
 
+# How many parsed exposures / nights we keep loaded in memory at once.
+# Big enough to support a handful of open tabs, small enough that we
+# don't accumulate megabytes per loaded state. Oldest by last-access
+# wins eviction when we go over.
+_MAX_LOADED_STATES = 8
+
+
 @dataclass
 class ServerContext:
     """Long-lived per-process state shared between the handler threads.
 
-    At most one of ``state`` and ``nightState`` is non-None at a time —
-    a fresh fetch in either mode clears the other.
+    Multiple exposures and nights can be loaded at once — one per open
+    tab. Each maps a key (exposureId / dayObs) to its parsed state.
+    Access is LRU-ordered so the least-recently-used entries are first
+    to be evicted when we go over :data:`_MAX_LOADED_STATES`.
     """
 
     jobs: JobManager
-    state: ServerState | None = None
-    nightState: NightState | None = None
+    exposureStates: "OrderedDict[int, ServerState]" = field(default_factory=OrderedDict)
+    nightStates: "OrderedDict[int, NightState]" = field(default_factory=OrderedDict)
+
+    def getExposureState(self, expId: int) -> ServerState | None:
+        s = self.exposureStates.get(expId)
+        if s is not None:
+            self.exposureStates.move_to_end(expId)
+        return s
+
+    def getNightState(self, dayObs: int) -> NightState | None:
+        s = self.nightStates.get(dayObs)
+        if s is not None:
+            self.nightStates.move_to_end(dayObs)
+        return s
+
+    def putExposureState(self, state: ServerState) -> None:
+        self.exposureStates[state.expId] = state
+        self.exposureStates.move_to_end(state.expId)
+        while len(self.exposureStates) > _MAX_LOADED_STATES:
+            self.exposureStates.popitem(last=False)
+
+    def putNightState(self, state: NightState) -> None:
+        self.nightStates[state.dayObs] = state
+        self.nightStates.move_to_end(state.dayObs)
+        while len(self.nightStates) > _MAX_LOADED_STATES:
+            self.nightStates.popitem(last=False)
+
+    def evictByCacheDir(self, target: Path) -> None:
+        """Evict any loaded state whose cacheDir matches ``target``.
+
+        Used when a cache window is deleted from disk — keeping the
+        stale parse around would surface 404s and stale data to any
+        tab still pointed at that key.
+        """
+        targetR = target.resolve()
+        staleExp = [k for k, v in self.exposureStates.items() if v.cacheDir.resolve() == targetR]
+        for k in staleExp:
+            del self.exposureStates[k]
+        staleNight = [k for k, v in self.nightStates.items() if v.cacheDir.resolve() == targetR]
+        for k in staleNight:
+            del self.nightStates[k]
 
 
 def _toJsonable(obj: Any) -> Any:
@@ -779,7 +828,8 @@ def _resolveCacheWindow(cluster: str, namespace: str, slug: str, podsSub: str | 
 
 
 def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
-    """Remove a single cache directory, clearing ServerState if it matched.
+    """Remove a single cache directory, evicting any loaded state that
+    used it.
 
     Empty parent directories (the per-cluster and per-namespace ones) are
     also removed when they become empty, so a flush via repeated deletes
@@ -788,8 +838,7 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     import shutil
 
     with ctx.jobs.stateLock:
-        if ctx.state is not None and ctx.state.cacheDir.resolve() == target.resolve():
-            ctx.state = None
+        ctx.evictByCacheDir(target)
     shutil.rmtree(target)
     # Tidy up empty parents.
     parent = target.parent
@@ -799,11 +848,13 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
 
 
 def _deleteCacheRoot(ctx: "ServerContext") -> None:
-    """Wipe the entire cache and clear ServerState (which by definition uses it)."""
+    """Wipe the entire cache and clear every loaded state (all of which
+    by definition referenced the now-gone cache)."""
     import shutil
 
     with ctx.jobs.stateLock:
-        ctx.state = None
+        ctx.exposureStates.clear()
+        ctx.nightStates.clear()
     root = cache_root()
     if root.exists():
         shutil.rmtree(root)
@@ -822,8 +873,12 @@ def _readJsonBody(handler: BaseHTTPRequestHandler) -> Any:
 
 
 def _onFetchComplete(ctx: ServerContext) -> Any:
-    """Return a callback that swaps in a new ServerState / NightState
-    (depending on ``job.kind``) after a fetch."""
+    """Return a callback that inserts the new ServerState / NightState
+    into the context's keyed-state dict after a fetch.
+
+    Other loaded states (other exposures, other nights) are left alone —
+    a fetch in one tab doesn't disturb another tab's view.
+    """
 
     def cb(job: FetchJob) -> None:
         if job.cacheDir is None:
@@ -840,16 +895,15 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 startTime=dayObsStartUtc(job.dayObs),
                 endTime=dayObsEndUtc(job.dayObs),
             )
-            # Resolve shutter closes for every dataId we'll need
-            # before publishing the state, so the /api/summary
-            # response is instant and the histograms are populated
-            # on first paint. This can take a few seconds for a busy
-            # night (hundreds of dataIds), so we report progress to
-            # the SSE stream while we work.
+            # Resolve shutter closes for every dataId we'll need before
+            # publishing the state, so the /api/summary response is
+            # instant and the histograms are populated on first paint.
+            # This can take a few seconds for a busy night (hundreds of
+            # dataIds), so we report progress to the SSE stream while
+            # we work.
             _prefetchNightShutterCloses(newNight, summaries, job)
             with ctx.jobs.stateLock:
-                ctx.state = None
-                ctx.nightState = newNight
+                ctx.putNightState(newNight)
             return
         assert job.expId is not None and job.tZero is not None
         newState = ServerState(
@@ -869,8 +923,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             ],
         )
         with ctx.jobs.stateLock:
-            ctx.nightState = None
-            ctx.state = newState
+            ctx.putExposureState(newState)
 
     return cb
 
@@ -964,22 +1017,53 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 self._send_file(STATIC_DIR / rel)
                 return
             if path == "/api/summary":
-                with ctx.jobs.stateLock:
-                    state = ctx.state
-                    nightState = ctx.nightState
-                if state is not None:
-                    self._send_json(_buildSummaryPayload(state))
+                # ?dataId=<int> selects a loaded exposure; ?dayObs=<int>
+                # selects a loaded night; no params -> home view shape.
+                qs = parse_qs(url.query)
+                dataIdRaw = qs.get("dataId", [""])[0] or None
+                dayObsRaw = qs.get("dayObs", [""])[0] or None
+                if dataIdRaw is not None:
+                    try:
+                        dataId = int(dataIdRaw)
+                    except ValueError:
+                        self._send_error_json(400, "dataId must be an integer")
+                        return
+                    with ctx.jobs.stateLock:
+                        state = ctx.getExposureState(dataId)
+                    if state is not None:
+                        self._send_json(_buildSummaryPayload(state))
+                        return
+                    self._send_json({"loaded": False, "cache": _cacheRootInfo()})
                     return
-                if nightState is not None:
-                    self._send_json(_buildNightPayload(nightState))
+                if dayObsRaw is not None:
+                    try:
+                        dayObs = int(dayObsRaw)
+                    except ValueError:
+                        self._send_error_json(400, "dayObs must be an integer")
+                        return
+                    with ctx.jobs.stateLock:
+                        nightState = ctx.getNightState(dayObs)
+                    if nightState is not None:
+                        self._send_json(_buildNightPayload(nightState))
+                        return
+                    self._send_json({"loaded": False, "cache": _cacheRootInfo()})
                     return
                 self._send_json({"loaded": False, "cache": _cacheRootInfo()})
                 return
             if path.startswith("/api/night/traceback/"):
-                with ctx.jobs.stateLock:
-                    nightState = ctx.nightState
+                qs = parse_qs(url.query)
+                dayObsRaw = qs.get("dayObs", [""])[0] or None
+                nightState = None
+                if dayObsRaw is not None:
+                    try:
+                        dayObs = int(dayObsRaw)
+                    except ValueError:
+                        self._send_error_json(400, "dayObs must be an integer")
+                        return
+                    with ctx.jobs.stateLock:
+                        nightState = ctx.getNightState(dayObs)
                 if nightState is None:
-                    self._send_error_json(404, "No night loaded")
+                    self._send_error_json(404, "No night loaded for the requested dayObs")
                     return
                 from urllib.parse import unquote
 
@@ -991,28 +1075,46 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 self._send_json(payload)
                 return
             if path.startswith("/api/pod/"):
-                with ctx.jobs.stateLock:
-                    state = ctx.state
-                    nightState = ctx.nightState
-                pod = path[len("/api/pod/") :].split("?")[0]
+                qs = parse_qs(url.query)
+                dataIdRaw = qs.get("dataId", [""])[0] or None
+                dayObsRaw = qs.get("dayObs", [""])[0] or None
+                pod = path[len("/api/pod/") :]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
                     self.send_error(400, "Invalid pod name")
                     return
-                if state is not None:
+                if dataIdRaw is not None:
+                    try:
+                        dataId = int(dataIdRaw)
+                    except ValueError:
+                        self._send_error_json(400, "dataId must be an integer")
+                        return
+                    with ctx.jobs.stateLock:
+                        state = ctx.getExposureState(dataId)
+                    if state is None:
+                        self._send_error_json(404, f"No exposure loaded for dataId {dataId}")
+                        return
                     self._send_json(_podDetail(state, pod))
                     return
-                if nightState is not None:
+                if dayObsRaw is not None:
+                    try:
+                        dayObs = int(dayObsRaw)
+                    except ValueError:
+                        self._send_error_json(400, "dayObs must be an integer")
+                        return
+                    with ctx.jobs.stateLock:
+                        nightState = ctx.getNightState(dayObs)
+                    if nightState is None:
+                        self._send_error_json(404, f"No night loaded for dayObs {dayObs}")
+                        return
                     self._send_json(_podDetailForNight(nightState, pod))
                     return
-                self._send_error_json(404, "Nothing loaded")
+                self._send_error_json(400, "Provide ?dataId=<int> or ?dayObs=<int>")
                 return
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
-                from urllib.parse import parse_qs
-
                 qs = parse_qs(url.query)
                 tokenFileValues = qs.get("tokenFile")
                 tokenFileOverride: str | None = tokenFileValues[0] if tokenFileValues else None

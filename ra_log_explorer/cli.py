@@ -212,7 +212,9 @@ def cmdRun(args: argparse.Namespace) -> int:
     else:
         print("Starting in home mode — pick an exposure in the browser.", file=sys.stderr)
 
-    ctx = ServerContext(jobs=JobManager(), state=state)
+    ctx = ServerContext(jobs=JobManager())
+    if state is not None:
+        ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}/"
     if not args.no_browser:
         try:

@@ -28,16 +28,19 @@ function startHome() {
   prefillForm();
   prefillCreds();
   refreshCache();
-  // URL-driven entry: night-mode bar drilldown produces links of the
-  // form /?dataId=<id>&autoFetch=1 that open in a fresh tab. If those
-  // params are present, override the form's prefilled dataId and (if
-  // autoFetch is set) kick the fetch automatically once the shutter-
-  // close lookup resolves.
+  // URL-driven entry. We land here either via a deep-link
+  // (/?dataId=…&autoFetch=1) or because the URL points at a key the
+  // server hasn't loaded yet — in both cases we want the form
+  // prefilled so a one-click fetch reproduces what the URL implies.
   const params = new URLSearchParams(window.location.search);
   const urlDataId = params.get('dataId');
+  const urlDayObs = params.get('dayObs');
   const urlAutoFetch = params.get('autoFetch') === '1';
   if (urlDataId) {
     document.getElementById('fetch-form').elements.exposureId.value = urlDataId;
+  }
+  if (urlDayObs) {
+    document.getElementById('night-form').elements.dayObs.value = urlDayObs;
   }
   // If the form already has a dataId pre-filled from localStorage, kick
   // a lookup so the submit button is ready to fire immediately.
@@ -538,7 +541,7 @@ function openProgressStream(jobId) {
       activeJobId = null;
       updateSubmitButton();
       document.getElementById('night-submit').disabled = false;
-      transitionToExplore();
+      transitionToExplore({ kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs });
     } else if (ev.type === 'error') {
       logProgress(`ERROR: ${ev.error}`);
       showMessage(`Fetch failed: ${ev.error.split('\n')[0]}`, true);
@@ -557,14 +560,26 @@ function openProgressStream(jobId) {
   es.onerror = () => {};
 }
 
-async function transitionToExplore() {
+async function transitionToExplore(activeJob) {
+  // The completed job carries the key we need — read it before asking
+  // /api/summary so we route to the right loaded state on the server.
+  // Without this the request would be context-less and the server
+  // couldn't tell us which exposure / night to summarise.
+  const params = activeJob && activeJob.kind === 'night'
+    ? `dayObs=${encodeURIComponent(activeJob.dayObs)}`
+    : `dataId=${encodeURIComponent(activeJob.expId)}`;
   try {
-    const r = await fetch('/api/summary');
+    const r = await fetch(`/api/summary?${params}`);
     const summary = await r.json();
     if (!summary.loaded) {
       showMessage('Fetch finished but the server reports no loaded data?', true);
       return;
     }
+    // Reflect the loaded state in the URL so a refresh / bookmark
+    // lands on the same view, and so opening this URL in a new tab
+    // independently routes to it.
+    const newUrl = `${window.location.pathname}?${params}`;
+    window.history.replaceState({}, '', newUrl);
     if (summary.mode === 'night' && window.showNight) {
       window.showNight(summary);
     } else if (window.showExplore) {

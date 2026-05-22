@@ -532,7 +532,7 @@ async function selectPod(pod) {
   document.getElementById('detail-title').textContent = pod;
   document.getElementById('detail-body').textContent = 'loading...';
   if (!podDetailCache[pod]) {
-    const r = await fetch(`/api/pod/${pod}`);
+    const r = await fetch(`/api/pod/${pod}?dataId=${encodeURIComponent(summary.expId)}`);
     podDetailCache[pod] = await r.json();
   }
   renderDetail();

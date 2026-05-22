@@ -436,3 +436,97 @@ def test_eventToDict_emits_offsetS_relative_to_tZero() -> None:
     assert d["offsetS"] == pytest.approx(5.25)
     assert d["kind"] == "WORKER_PICKUP"
     assert d["pod"] == "p"
+
+
+# ----- ServerContext keyed-state helpers ----------------------------------
+
+
+def _makeExposureState(expId: int, *, cacheDir: Path | None = None) -> server.ServerState:
+    """Minimal ServerState for keyed-storage tests — content doesn't matter."""
+    return server.ServerState(
+        cacheDir=cacheDir or Path(f"/tmp/cache-{expId}"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=expId,
+        tZero=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+    )
+
+
+def _makeNightState(dayObs: int, *, cacheDir: Path | None = None) -> server.NightState:
+    return server.NightState(
+        cacheDir=cacheDir or Path(f"/tmp/night-{dayObs}"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=dayObs,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+    )
+
+
+def _emptyCtx() -> server.ServerContext:
+    from ra_log_explorer.jobs import JobManager
+
+    return server.ServerContext(jobs=JobManager())
+
+
+def test_put_then_get_exposure_state_roundtrips() -> None:
+    ctx = _emptyCtx()
+    s = _makeExposureState(2026051900001)
+    ctx.putExposureState(s)
+    assert ctx.getExposureState(2026051900001) is s
+
+
+def test_get_exposure_state_returns_None_when_unknown() -> None:
+    ctx = _emptyCtx()
+    assert ctx.getExposureState(2026051900001) is None
+
+
+def test_put_then_get_night_state_roundtrips() -> None:
+    ctx = _emptyCtx()
+    n = _makeNightState(20260521)
+    ctx.putNightState(n)
+    assert ctx.getNightState(20260521) is n
+
+
+def test_two_exposures_coexist_independently() -> None:
+    """The multi-tab promise: loading exposure A doesn't evict exposure B."""
+    ctx = _emptyCtx()
+    a = _makeExposureState(2026051900001)
+    b = _makeExposureState(2026051900002)
+    ctx.putExposureState(a)
+    ctx.putExposureState(b)
+    assert ctx.getExposureState(2026051900001) is a
+    assert ctx.getExposureState(2026051900002) is b
+
+
+def test_lru_eviction_at_max_states(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Putting more than MAX states evicts the oldest by last-access."""
+    monkeypatch.setattr(server, "_MAX_LOADED_STATES", 3)
+    ctx = _emptyCtx()
+    for eid in (1, 2, 3):
+        ctx.putExposureState(_makeExposureState(eid))
+    # Touch 1 so it becomes most-recently-used; 2 is oldest.
+    ctx.getExposureState(1)
+    ctx.putExposureState(_makeExposureState(4))
+    assert ctx.getExposureState(2) is None  # evicted
+    assert ctx.getExposureState(1) is not None
+    assert ctx.getExposureState(3) is not None
+    assert ctx.getExposureState(4) is not None
+
+
+def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
+    """Deleting a cache window drops any state pointed at it."""
+    ctx = _emptyCtx()
+    cdA = tmp_path / "cache-A"
+    cdA.mkdir()
+    cdB = tmp_path / "cache-B"
+    cdB.mkdir()
+    ctx.putExposureState(_makeExposureState(1, cacheDir=cdA))
+    ctx.putExposureState(_makeExposureState(2, cacheDir=cdB))
+    ctx.putNightState(_makeNightState(20260521, cacheDir=cdA))
+    ctx.evictByCacheDir(cdA)
+    assert ctx.getExposureState(1) is None  # matched, evicted
+    assert ctx.getExposureState(2) is not None  # unrelated, kept
+    assert ctx.getNightState(20260521) is None  # matched, evicted

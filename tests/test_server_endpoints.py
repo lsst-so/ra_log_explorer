@@ -239,8 +239,9 @@ def test_fetch_starts_job_and_completes(
 
     # Server's ServerState should now be populated.
     with ctx.jobs.stateLock:
-        assert ctx.state is not None
-        assert ctx.state.expId == 2026051900722
+        loaded = ctx.getExposureState(2026051900722)
+        assert loaded is not None
+        assert loaded.expId == 2026051900722
 
 
 def test_night_fetch_validates_dayObs(runningServer: RunningServer) -> None:
@@ -295,9 +296,9 @@ def test_night_fetch_starts_job_and_populates_NightState(
     assert body["dayObs"] == 20260521
 
     with ctx.jobs.stateLock:
-        assert ctx.state is None
-        assert ctx.nightState is not None
-        assert ctx.nightState.dayObs == 20260521
+        loaded = ctx.getNightState(20260521)
+        assert loaded is not None
+        assert loaded.dayObs == 20260521
 
 
 def test_summary_mode_field_distinguishes_exposure_from_night(
@@ -311,18 +312,20 @@ def test_summary_mode_field_distinguishes_exposure_from_night(
     cacheDir = tmpCacheRoot / "fake-night"
     (cacheDir / "pods").mkdir(parents=True)
     with ctx.jobs.stateLock:
-        ctx.nightState = NightState(
-            cacheDir=cacheDir,
-            cacheBytes=0,
-            meta={},
-            summaries=[],
-            dayObs=20260521,
-            startTime=serverModule.dayObsStartUtc(20260521),
-            endTime=serverModule.dayObsEndUtc(20260521),
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260521,
+                startTime=serverModule.dayObsStartUtc(20260521),
+                endTime=serverModule.dayObsEndUtc(20260521),
+            )
         )
     # Block the token lookup so the histogram code falls back to empty.
     monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
-    status, body = _get(host, port, "/api/summary")
+    status, body = _get(host, port, "/api/summary?dayObs=20260521")
     assert status == 200
     assert body["loaded"] is True
     assert body["mode"] == "night"
@@ -337,10 +340,20 @@ def test_fetch_status_404_for_unknown_job(runningServer: RunningServer) -> None:
     assert "error" in body
 
 
-def test_pod_endpoint_404_when_no_state_loaded(runningServer: RunningServer) -> None:
+def test_pod_endpoint_400_when_no_key_supplied(runningServer: RunningServer) -> None:
+    """/api/pod/<pod> with no ?dataId / ?dayObs is a bad request — the
+    server has no way to know which loaded state to read from."""
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/pod/anything")
+    assert status == 400
+    assert "error" in body
+
+
+def test_pod_endpoint_404_when_dataId_not_loaded(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/pod/anything?dataId=2099999900000")
     assert status == 404
+    assert "error" in body
 
 
 # ----- _buildSpecFromRequest unit-level coverage --------------------------
@@ -669,16 +682,18 @@ def test_night_traceback_endpoint_returns_dataId_block(
     bodyKey = f"{s.pod}@{s.tracebacks[0].t.isoformat()}"
 
     with ctx.jobs.stateLock:
-        ctx.nightState = NightState(
-            cacheDir=cacheDir,
-            cacheBytes=0,
-            meta={},
-            summaries=summaries,
-            dayObs=20260521,
-            startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
-            endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=summaries,
+                dayObs=20260521,
+                startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+                endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+            )
         )
-    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}")
+    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs=20260521")
     assert status == 200, body
     assert body["pod"] == podName
     assert body["expId"] == 2026052100012
@@ -707,15 +722,187 @@ def test_delete_cache_window_clears_loaded_state_if_match(
     d = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug)
     # Pretend an exposure is loaded against this cache directory.
     with ctx.jobs.stateLock:
-        ctx.state = serverModule.ServerState(
-            cacheDir=d,
-            cacheBytes=0,
-            meta={},
-            summaries=[],
-            expId=1,
-            tZero=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=d,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                expId=1,
+                tZero=__import__("datetime").datetime.now(__import__("datetime").timezone.utc),
+            )
         )
     status, _ = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}")
     assert status == 200
     with ctx.jobs.stateLock:
-        assert ctx.state is None
+        assert ctx.getExposureState(1) is None
+
+
+# ----- multi-tab / keyed-state contract -----------------------------------
+
+
+def test_summary_returns_exposure_by_dataId_query(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """/api/summary?dataId=X returns exposure X's payload."""
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "cache-A"
+    (cacheDir / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                expId=2026051900001,
+                tZero=__import__("datetime").datetime(
+                    2026, 5, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc
+                ),
+            )
+        )
+    status, body = _get(host, port, "/api/summary?dataId=2026051900001")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["expId"] == 2026051900001
+
+
+def test_summary_returns_unloaded_when_dataId_unknown(runningServer: RunningServer) -> None:
+    """/api/summary?dataId=X returns {loaded: false} when X isn't loaded."""
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/summary?dataId=2099999900000")
+    assert status == 200
+    assert body["loaded"] is False
+
+
+def test_summary_returns_night_by_dayObs_query(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """/api/summary?dayObs=Y returns night Y's payload."""
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "night-1"
+    (cacheDir / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260521,
+                startTime=serverModule.dayObsStartUtc(20260521),
+                endTime=serverModule.dayObsEndUtc(20260521),
+            )
+        )
+    status, body = _get(host, port, "/api/summary?dayObs=20260521")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["mode"] == "night"
+    assert body["dayObs"] == 20260521
+
+
+def test_two_exposures_coexist_via_endpoint(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """The multi-tab promise: two loaded exposures are reachable independently."""
+    host, port, ctx = runningServer
+    cdA = tmpCacheRoot / "cache-A"
+    (cdA / "pods").mkdir(parents=True)
+    cdB = tmpCacheRoot / "cache-B"
+    (cdB / "pods").mkdir(parents=True)
+    tZ = __import__("datetime").datetime(2026, 5, 21, 12, 0, tzinfo=__import__("datetime").timezone.utc)
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(cacheDir=cdA, cacheBytes=0, meta={}, summaries=[], expId=111, tZero=tZ)
+        )
+        ctx.putExposureState(
+            serverModule.ServerState(cacheDir=cdB, cacheBytes=0, meta={}, summaries=[], expId=222, tZero=tZ)
+        )
+    sA, bA = _get(host, port, "/api/summary?dataId=111")
+    sB, bB = _get(host, port, "/api/summary?dataId=222")
+    assert sA == 200 and bA["expId"] == 111
+    assert sB == 200 and bB["expId"] == 222
+
+
+def test_two_nights_coexist_via_endpoint(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cdA = tmpCacheRoot / "night-A"
+    (cdA / "pods").mkdir(parents=True)
+    cdB = tmpCacheRoot / "night-B"
+    (cdB / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.putNightState(
+            NightState(
+                cacheDir=cdA,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260521,
+                startTime=serverModule.dayObsStartUtc(20260521),
+                endTime=serverModule.dayObsEndUtc(20260521),
+            )
+        )
+        ctx.putNightState(
+            NightState(
+                cacheDir=cdB,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260522,
+                startTime=serverModule.dayObsStartUtc(20260522),
+                endTime=serverModule.dayObsEndUtc(20260522),
+            )
+        )
+    sA, bA = _get(host, port, "/api/summary?dayObs=20260521")
+    sB, bB = _get(host, port, "/api/summary?dayObs=20260522")
+    assert bA["dayObs"] == 20260521
+    assert bB["dayObs"] == 20260522
+
+
+def test_pod_endpoint_routes_by_dataId_query(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """/api/pod/<pod>?dataId=X reads from exposure X's cache, not the most-recently loaded."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+
+    host, port, ctx = runningServer
+    cdA = tmpCacheRoot / "cache-A"
+    (cdA / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-sfm-runner-sfmworkerset-0"
+    (cdA / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-21T13:00:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "first exposure log line\n",
+            }
+        )
+        + "\n"
+    )
+    summariesA = _parse.summarizeAll(cdA)
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=cdA,
+                cacheBytes=0,
+                meta={},
+                summaries=summariesA,
+                expId=111,
+                tZero=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+            )
+        )
+        # A different exposure also loaded — without the dataId query
+        # param the server has no way to know which to use.
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=tmpCacheRoot / "cache-B",
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                expId=222,
+                tZero=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+            )
+        )
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=111")
+    assert status == 200, body
+    # If the routing worked we got the loaded pod's events back.
+    assert body["pod"] == podName

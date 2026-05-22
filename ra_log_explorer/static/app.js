@@ -9,31 +9,55 @@
 'use strict';
 
 async function bootstrap() {
-  // ?dataId=… is the night-view bar-drilldown deep-link. When present we
-  // always land on the home view (which reads the same param and kicks
-  // an auto-fetch) — otherwise the server's existing state would
-  // hijack the new tab into showing the previously-loaded view.
+  // URL is the source of truth for which view to render:
+  //
+  //   /                    -> home
+  //   /?dataId=X           -> explore view for exposure X (or home + auto-fetch)
+  //   /?dataId=X&autoFetch=1 -> home with the form pre-submitted (deep-link
+  //                            from a night-view bar drilldown)
+  //   /?dayObs=Y           -> night view for night Y (or home if not loaded)
+  //
+  // Each tab carries its own URL, so opening / refreshing different
+  // tabs hits the server state for *that tab's* key without disturbing
+  // the others.
   const urlParams = new URLSearchParams(window.location.search);
-  if (urlParams.get('dataId')) {
+  const urlDataId = urlParams.get('dataId');
+  const urlDayObs = urlParams.get('dayObs');
+  const urlAutoFetch = urlParams.get('autoFetch') === '1';
+
+  if (urlAutoFetch && urlDataId) {
+    // Deep-link with explicit auto-fetch request: always land on home
+    // and let it fire the fetch. Never try to load existing state.
     window.showHome();
     return;
   }
-  let summary;
-  try {
-    const r = await fetch('/api/summary');
-    summary = await r.json();
-  } catch (e) {
-    document.body.innerHTML =
-      `<pre style="padding:14px;color:#c1252b">Error loading /api/summary: ${e}</pre>`;
+  if (urlDataId) {
+    let summary;
+    try {
+      const r = await fetch(`/api/summary?dataId=${encodeURIComponent(urlDataId)}`);
+      summary = await r.json();
+    } catch (e) { /* fall through to home */ }
+    if (summary && summary.loaded) {
+      window.showExplore(summary);
+    } else {
+      window.showHome();
+    }
     return;
   }
-  if (summary.loaded && summary.mode === 'night') {
-    window.showNight(summary);
-  } else if (summary.loaded) {
-    window.showExplore(summary);
-  } else {
-    window.showHome();
+  if (urlDayObs) {
+    let summary;
+    try {
+      const r = await fetch(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`);
+      summary = await r.json();
+    } catch (e) { /* fall through to home */ }
+    if (summary && summary.loaded) {
+      window.showNight(summary);
+    } else {
+      window.showHome();
+    }
+    return;
   }
+  window.showHome();
 }
 
 function hideAllViews() {
