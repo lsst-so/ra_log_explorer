@@ -195,6 +195,47 @@ def test_cacheDuSizeBytes_empty_tree(tmp_path: Path) -> None:
     assert fetch.cacheDuSizeBytes(tmp_path) == 0
 
 
+# ----- addExposureToCache / getCacheExposureIds ---------------------------
+
+
+def test_getCacheExposureIds_returns_empty_when_no_sidecar(tmp_path: Path) -> None:
+    assert fetch.getCacheExposureIds(tmp_path) == []
+
+
+def test_addExposureToCache_then_get_roundtrips(tmp_path: Path) -> None:
+    fetch.addExposureToCache(tmp_path, 2026051900722)
+    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+
+
+def test_addExposureToCache_accumulates_distinct_ids_sorted(tmp_path: Path) -> None:
+    # Same cache, multiple triggering dataIds (the superset-reuse case).
+    fetch.addExposureToCache(tmp_path, 2026051900723)
+    fetch.addExposureToCache(tmp_path, 2026051900722)
+    fetch.addExposureToCache(tmp_path, 2026051900724)
+    assert fetch.getCacheExposureIds(tmp_path) == [
+        2026051900722,
+        2026051900723,
+        2026051900724,
+    ]
+
+
+def test_addExposureToCache_dedupes_repeated_ids(tmp_path: Path) -> None:
+    fetch.addExposureToCache(tmp_path, 2026051900722)
+    fetch.addExposureToCache(tmp_path, 2026051900722)
+    fetch.addExposureToCache(tmp_path, 2026051900722)
+    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+
+
+def test_addExposureToCache_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
+    # No raise.
+    fetch.addExposureToCache(tmp_path / "does-not-exist", 2026051900722)
+
+
+def test_getCacheExposureIds_skips_unparseable_lines(tmp_path: Path) -> None:
+    (tmp_path / fetch.EXPOSURE_IDS_NAME).write_text("2026051900722\nnot-a-number\n2026051900723\n")
+    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722, 2026051900723]
+
+
 # ----- markCacheViewed / getCacheLastViewed -------------------------------
 
 

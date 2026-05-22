@@ -959,6 +959,51 @@ def test_cache_list_includes_lastViewedAt_and_dayObs(
     assert w["lastViewedAt"].startswith("2026-05-22T14:00")
 
 
+def test_cache_list_includes_exposureIds_for_exposure_caches(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """An exposure cache row carries the dataIds that triggered fetches
+    landing on it, so the UI can render them as deep-links back to the
+    per-visit view."""
+    from ra_log_explorer.fetch import addExposureToCache
+
+    host, port, _ctx = runningServer
+    # Plant an exposure cache + record two triggering dataIds.
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z"
+    (d / "pods").mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:45:34.267000Z",
+                    "toIso": "2026-05-20T08:50:39.267000Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    addExposureToCache(d, 2026051900722)
+    addExposureToCache(d, 2026051900723)
+    status, body = _get(host, port, "/api/cache")
+    assert status == 200
+    rows = [w for w in body["windows"] if w["kind"] == "exposure"]
+    assert len(rows) == 1
+    assert rows[0]["exposureIds"] == [2026051900722, 2026051900723]
+
+
 def test_summary_get_bumps_lastViewedAt(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
     """A successful /api/summary?dataId=X touches the cache's LRU sidecar."""
     import datetime as _dt

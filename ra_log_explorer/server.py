@@ -47,8 +47,10 @@ from .config import (
     dayObsStartUtc,
 )
 from .fetch import (
+    addExposureToCache,
     cacheDuSizeBytes,
     evictToFit,
+    getCacheExposureIds,
     getCacheLastViewed,
     loadPodLogPath,
     markCacheViewed,
@@ -768,6 +770,9 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
     spec = meta.get("spec") or {}
     kind = "night" if spec.get("podRegex") else "exposure"
     lastViewed = getCacheLastViewed(window)
+    # Only exposure caches carry the dataId sidecar (night caches are
+    # keyed by dayObs already, recoverable below).
+    exposureIds: list[int] = [] if kind == "night" else getCacheExposureIds(window)
     # For night caches the dayObs is recoverable from the window start
     # (noon UTC of dayObs). For exposure caches there's no single
     # dataId in the meta — the UI looks it up against the loaded state
@@ -792,6 +797,7 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             "podFilter": spec.get("podRegex"),
             "kind": kind,
             "dayObs": dayObs,
+            "exposureIds": exposureIds,
             "fromIso": spec.get("fromIso"),
             "toIso": spec.get("toIso"),
             "fetchedAt": meta.get("fetched_at"),
@@ -912,6 +918,12 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         # most-recently-used one. Mark it before any LRU eviction so
         # it can't get caught up in its own cleanup pass.
         markCacheViewed(job.cacheDir)
+        # Record the dataId that triggered this fetch alongside the
+        # cache (exposure jobs only; night jobs are keyed by dayObs).
+        # Done before eviction so a later eviction pass can't race
+        # with the sidecar write.
+        if job.kind != "night" and job.expId is not None:
+            addExposureToCache(job.cacheDir, job.expId)
         # Run LRU eviction so the on-disk total stays at or under the
         # configured cap. The just-fetched cache is exempted; we
         # accept a brief over-cap state during the fetch itself and

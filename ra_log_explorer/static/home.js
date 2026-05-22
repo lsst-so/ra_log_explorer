@@ -386,12 +386,21 @@ function renderCache(data) {
       ? `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night</span>`
       : `<span class="cache-kind cache-kind-exposure">exposure</span>`;
     // The "key" column shows the most useful identifier for the row's
-    // kind. Night caches have a dayObs (computed by the server from the
-    // noon-UTC start). Exposure caches have no single dataId so we
-    // show "—" (the user has to type a dataId to actually reopen one).
-    const keyCell = isNight
-      ? `<a class="mono cache-key-link" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener">${w.dayObs}</a>`
-      : `<span class="muted">—</span>`;
+    // kind. Night caches have a single dayObs (computed by the server
+    // from the noon-UTC start). Exposure caches carry one *or more*
+    // dataIds — superset reuse means consecutive fetches often land
+    // on the same cache, so we render every dataId that's known to
+    // have triggered this cache as a clickable link.
+    let keyCell;
+    if (isNight) {
+      keyCell = `<a class="mono cache-key-link" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener">${w.dayObs}</a>`;
+    } else if (w.exposureIds && w.exposureIds.length > 0) {
+      keyCell = w.exposureIds
+        .map((id) => `<a class="mono cache-key-link" href="/?dataId=${encodeURIComponent(id)}" target="_blank" rel="noopener">${id}</a>`)
+        .join(' ');
+    } else {
+      keyCell = `<span class="muted">—</span>`;
+    }
     tr.innerHTML = `
       <td>${w.cluster} / ${w.namespace} ${kindBadge}</td>
       <td>${keyCell}</td>

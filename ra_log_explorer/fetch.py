@@ -53,6 +53,12 @@ PODS_DIR_NAME = "pods"
 # the cache (rather than in a central index) means deleting the
 # directory takes the bookkeeping with it.
 LAST_VIEWED_NAME = "_last_viewed.txt"
+# Per-cache sidecar holding the dataIds (one per line, ascending) that
+# have been the *trigger* for a fetch landing on this cache. One cache
+# can serve multiple dataIds via superset reuse — the user-facing cache
+# table surfaces all of them as clickable shortcuts back to each
+# exposure's per-visit view. See ``addExposureToCache`` for the writer.
+EXPOSURE_IDS_NAME = "_exposure_ids.txt"
 
 
 class FetchError(RuntimeError):
@@ -380,6 +386,50 @@ def markCacheViewed(cacheDir: Path, when: dt.datetime | None = None) -> None:
         (cacheDir / LAST_VIEWED_NAME).write_text(ts)
     except OSError:
         pass
+
+
+def addExposureToCache(cacheDir: Path, expId: int) -> None:
+    """Record that ``expId`` was a trigger for the contents of this
+    cache window.
+
+    A given window can be reused by multiple dataIds (the default
+    fetch window is ~5 minutes wide, so consecutive exposures often
+    land on the same superset cache). We append rather than overwrite,
+    de-duplicate, and keep the file sorted so the UI can render a
+    stable list. Best-effort: a write failure does not interrupt the
+    request — the sidecar just won't carry that id.
+    """
+    if not cacheDir.exists():
+        return
+    existing = set(getCacheExposureIds(cacheDir))
+    existing.add(int(expId))
+    body = "\n".join(str(i) for i in sorted(existing)) + "\n"
+    try:
+        (cacheDir / EXPOSURE_IDS_NAME).write_text(body)
+    except OSError:
+        pass
+
+
+def getCacheExposureIds(cacheDir: Path) -> list[int]:
+    """Return the dataIds previously recorded as triggers for this
+    cache, sorted ascending. ``[]`` if the sidecar is missing or
+    unparseable — same best-effort contract as the writer."""
+    p = cacheDir / EXPOSURE_IDS_NAME
+    if not p.exists():
+        return []
+    out: list[int] = []
+    try:
+        for line in p.read_text().splitlines():
+            s = line.strip()
+            if not s:
+                continue
+            try:
+                out.append(int(s))
+            except ValueError:
+                continue
+    except OSError:
+        return []
+    return sorted(set(out))
 
 
 def getCacheLastViewed(cacheDir: Path) -> dt.datetime | None:
