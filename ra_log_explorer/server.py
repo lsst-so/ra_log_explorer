@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
-from . import exposureTimes, night
+from . import appSettings, exposureTimes, night
 from . import parse as parser
 from .config import (
     NIGHT_AOS_POD_REGEX,
@@ -46,7 +46,13 @@ from .config import (
     dayObsEndUtc,
     dayObsStartUtc,
 )
-from .fetch import cacheDuSizeBytes, loadPodLogPath
+from .fetch import (
+    cacheDuSizeBytes,
+    evictToFit,
+    getCacheLastViewed,
+    loadPodLogPath,
+    markCacheViewed,
+)
 from .jobs import FetchJob, JobManager
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -760,6 +766,23 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
     except (OSError, json.JSONDecodeError):
         return
     spec = meta.get("spec") or {}
+    kind = "night" if spec.get("podRegex") else "exposure"
+    lastViewed = getCacheLastViewed(window)
+    # For night caches the dayObs is recoverable from the window start
+    # (noon UTC of dayObs). For exposure caches there's no single
+    # dataId in the meta — the UI looks it up against the loaded state
+    # if/when one is attached, but the cache list itself just leaves
+    # it null.
+    dayObs: int | None = None
+    if kind == "night":
+        fromIso = spec.get("fromIso")
+        if isinstance(fromIso, str):
+            try:
+                # Strip ms / Z to land on a normal isoformat.
+                d = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
+                dayObs = int(d.strftime("%Y%m%d"))
+            except (TypeError, ValueError):
+                dayObs = None
     rows.append(
         {
             "cluster": cluster,
@@ -767,10 +790,12 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             "windowDir": window.name,
             "relPath": relPath,
             "podFilter": spec.get("podRegex"),
-            "kind": "night" if spec.get("podRegex") else "exposure",
+            "kind": kind,
+            "dayObs": dayObs,
             "fromIso": spec.get("fromIso"),
             "toIso": spec.get("toIso"),
             "fetchedAt": meta.get("fetched_at"),
+            "lastViewedAt": lastViewed.isoformat() if lastViewed else None,
             "podCount": meta.get("pod_count", 0),
             "totalBytes": meta.get("total_bytes", 0),
             "sizeOnDisk": cacheDuSizeBytes(window),
@@ -883,6 +908,16 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
     def cb(job: FetchJob) -> None:
         if job.cacheDir is None:
             return  # fetchAll raised; caller will see an error event
+        # The fetch finished successfully — this cache is now the
+        # most-recently-used one. Mark it before any LRU eviction so
+        # it can't get caught up in its own cleanup pass.
+        markCacheViewed(job.cacheDir)
+        # Run LRU eviction so the on-disk total stays at or under the
+        # configured cap. The just-fetched cache is exempted; we
+        # accept a brief over-cap state during the fetch itself and
+        # only sweep at the end.
+        settings = appSettings.loadAppSettings()
+        evictToFit(settings.maxCacheBytes, exempt=[job.cacheDir])
         summaries = parser.summarizeAll(job.cacheDir)
         if job.kind == "night":
             assert job.dayObs is not None
@@ -1031,6 +1066,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     with ctx.jobs.stateLock:
                         state = ctx.getExposureState(dataId)
                     if state is not None:
+                        # Touch the LRU sidecar so eviction sees this
+                        # window as freshly used. Done here (rather
+                        # than only on fetch) so re-opening a tab
+                        # bumps the cache up the LRU even if no fetch
+                        # happens.
+                        markCacheViewed(state.cacheDir)
                         self._send_json(_buildSummaryPayload(state))
                         return
                     self._send_json({"loaded": False, "cache": _cacheRootInfo()})
@@ -1044,6 +1085,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     with ctx.jobs.stateLock:
                         nightState = ctx.getNightState(dayObs)
                     if nightState is not None:
+                        markCacheViewed(nightState.cacheDir)
                         self._send_json(_buildNightPayload(nightState))
                         return
                     self._send_json({"loaded": False, "cache": _cacheRootInfo()})
@@ -1112,6 +1154,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
+                return
+            if path == "/api/settings":
+                s = appSettings.loadAppSettings()
+                self._send_json({"maxCacheBytes": s.maxCacheBytes})
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
@@ -1257,6 +1303,31 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 job = ctx.jobs.createNightJob(spec, dayObs)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
+                return
+            self.send_error(404)
+
+        def do_PUT(self) -> None:  # noqa: N802
+            url = urlparse(self.path)
+            if url.path == "/api/settings":
+                try:
+                    body = _readJsonBody(self)
+                except json.JSONDecodeError as e:
+                    self._send_error_json(400, f"Bad JSON body: {e}")
+                    return
+                maxCacheBytesRaw = body.get("maxCacheBytes")
+                if maxCacheBytesRaw is None:
+                    self._send_error_json(400, "maxCacheBytes is required")
+                    return
+                try:
+                    maxCacheBytes = int(maxCacheBytesRaw)
+                except (TypeError, ValueError):
+                    self._send_error_json(400, "maxCacheBytes must be an integer")
+                    return
+                if maxCacheBytes < 0:
+                    self._send_error_json(400, "maxCacheBytes must be non-negative")
+                    return
+                appSettings.saveAppSettings(appSettings.AppSettings(maxCacheBytes=maxCacheBytes))
+                self._send_json({"maxCacheBytes": maxCacheBytes})
                 return
             self.send_error(404)
 

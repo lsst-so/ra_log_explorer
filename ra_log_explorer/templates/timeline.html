@@ -17,167 +17,177 @@
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
-      <div class="cache">
-        <span id="home-cache-info"></span>
-      </div>
     </header>
 
-    <main id="home-main">
-      <section class="home-card">
-        <h2>Explore exposure processing</h2>
-        <form id="fetch-form">
-          <div class="row">
-            <label>
-              <span class="lbl">dataId / exposure id</span>
-              <input type="number" name="exposureId" required placeholder="e.g. 2026051900722" />
-              <span id="tzero-status" class="hint">enter a 13-digit dataId to resolve its shutter close time</span>
-            </label>
-          </div>
+    <div id="home-layout">
+      <main id="home-main">
+        <section class="home-card">
+          <h2>Explore exposure processing</h2>
+          <form id="fetch-form">
+            <div class="row">
+              <label>
+                <span class="lbl">dataId / exposure id</span>
+                <input type="number" name="exposureId" required placeholder="e.g. 2026051900722" />
+                <span id="tzero-status" class="hint">enter a 13-digit dataId to resolve its shutter close time</span>
+              </label>
+            </div>
+            <details>
+              <summary>per-exposure tuning</summary>
+              <div class="row">
+                <label>
+                  <span class="lbl">window before t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                </label>
+                <label>
+                  <span class="lbl">window after t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowAfter" value="300" step="1" />
+                </label>
+              </div>
+            </details>
+            <div class="row submit-row">
+              <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
+              <span id="fetch-message" class="hint"></span>
+            </div>
+          </form>
+        </section>
 
-          <details>
-            <summary>Advanced options</summary>
+        <section class="home-card">
+          <h2>Investigate night</h2>
+          <p class="hint">
+            Pulls the full 24-hour log window for the AOS-flavoured pods
+            (<code>*aos*</code>) for the given <code>dayObs</code> and
+            serves a failure breakdown — error counts by type and pod,
+            per-dataId tracebacks, and Δshutter histograms for the first
+            task pickup and the calcZernikes finish.
+          </p>
+          <form id="night-form">
+            <div class="row">
+              <label>
+                <span class="lbl">dayObs (YYYYMMDD)</span>
+                <input type="number" name="dayObs" required placeholder="e.g. 20260521" />
+                <span id="night-status" class="hint">a dayObs covers UTC noon to UTC noon the next day</span>
+              </label>
+            </div>
+            <div class="row submit-row">
+              <button type="submit" id="night-submit" class="primary">Investigate night</button>
+              <span id="night-message" class="hint"></span>
+            </div>
+          </form>
+        </section>
+
+        <section class="home-card">
+          <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
+          <p class="hint">
+            Click a row to open that run in a new tab. The ✕ button removes a
+            window from disk.
+            <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+            <button type="button" id="cache-delete-all" class="ghost mini delete">delete all</button>
+          </p>
+          <table id="cache-table">
+            <thead>
+              <tr>
+                <th>cluster / ns</th>
+                <th>key</th>
+                <th>window</th>
+                <th>fetched</th>
+                <th>last viewed</th>
+                <th>pods</th>
+                <th>size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody id="cache-tbody"></tbody>
+            <tfoot id="cache-tfoot"></tfoot>
+          </table>
+        </section>
+
+        <section class="home-card" id="progress-card" hidden>
+          <h2>Fetching</h2>
+          <div class="progress-wrap">
+            <div class="progress-bar"><div id="progress-fill"></div></div>
+            <div id="progress-text" class="hint"></div>
+          </div>
+          <pre id="progress-log" class="progress-log"></pre>
+        </section>
+      </main>
+
+      <aside id="home-sidebar">
+        <section class="home-card sidebar-card">
+          <h2>App settings</h2>
+          <form id="settings-form">
             <div class="row">
               <label>
                 <span class="lbl">cluster</span>
                 <input type="text" name="cluster" value="yagan" />
               </label>
+            </div>
+            <div class="row">
               <label>
                 <span class="lbl">namespace</span>
                 <input type="text" name="namespace" value="rapid-analysis" />
               </label>
-              <label>
-                <span class="lbl">workers (parallel fetches)</span>
-                <input type="number" name="workers" value="8" min="1" max="64" />
-              </label>
             </div>
             <div class="row">
               <label>
-                <span class="lbl">window before t<sub>0</sub> (s)</span>
-                <input type="number" name="windowBefore" value="5" step="0.1" />
+                <span class="lbl">parallel fetch workers</span>
+                <input type="number" name="workers" value="8" min="1" max="64" />
+                <span class="hint">used by both exposure &amp; night fetches</span>
               </label>
-              <label>
-                <span class="lbl">window after t<sub>0</sub> (s)</span>
-                <input type="number" name="windowAfter" value="300" step="1" />
-              </label>
+            </div>
+            <div class="row">
               <label>
                 <span class="lbl">Loki URL</span>
                 <input type="text" name="lokiAddr" value="https://loki-query.ls.lsst.org" />
               </label>
             </div>
-          </details>
-
-          <div class="row submit-row">
-            <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
-            <span id="fetch-message" class="hint"></span>
-          </div>
-        </form>
-      </section>
-
-      <section class="home-card">
-        <h2>Investigate night</h2>
-        <p class="hint">
-          Pulls the full 24-hour log window for the AOS-flavoured pods
-          (<code>*aos*</code>) for the given <code>dayObs</code> and
-          serves a failure breakdown — error counts by type and pod,
-          per-dataId tracebacks, and Δshutter histograms for the first
-          task pickup and the calcZernikes finish.
-        </p>
-        <form id="night-form">
-          <div class="row">
-            <label>
-              <span class="lbl">dayObs (YYYYMMDD)</span>
-              <input type="number" name="dayObs" required placeholder="e.g. 20260521" />
-              <span id="night-status" class="hint">a dayObs covers UTC noon to UTC noon the next day</span>
-            </label>
-          </div>
-          <details>
-            <summary>Advanced options</summary>
             <div class="row">
               <label>
-                <span class="lbl">cluster</span>
-                <input type="text" name="cluster" value="yagan" />
-              </label>
-              <label>
-                <span class="lbl">namespace</span>
-                <input type="text" name="namespace" value="rapid-analysis" />
-              </label>
-              <label>
-                <span class="lbl">workers</span>
-                <input type="number" name="workers" value="16" min="1" max="64" />
+                <span class="lbl">RSP token file</span>
+                <input type="text" name="rspTokenFile" placeholder="~/.lsst/log-browser-token.txt" autocomplete="off" />
+                <span class="hint">ConsDB shutter-close lookup; falls back to <code>RA_LOG_EXPLORER_RSP_TOKEN_FILE</code></span>
               </label>
             </div>
-          </details>
-          <div class="row submit-row">
-            <button type="submit" id="night-submit" class="primary">Investigate night</button>
-            <span id="night-message" class="hint"></span>
-          </div>
-        </form>
-      </section>
+            <div class="row">
+              <label>
+                <span class="lbl">max cache space (GiB)</span>
+                <input type="number" name="maxCacheGiB" value="5" min="0" step="0.5" />
+                <span class="hint">server LRU-evicts oldest caches above this; updates live</span>
+              </label>
+            </div>
+            <div class="row submit-row">
+              <span id="settings-state" class="hint"></span>
+            </div>
+          </form>
+        </section>
 
-      <section class="home-card">
-        <h2>Credentials <span class="muted" id="creds-state"></span></h2>
-        <form id="creds-form">
-          <div class="row">
-            <label>
-              <span class="lbl">Loki username</span>
-              <input type="text" name="username" value="merlin" />
-            </label>
-            <label>
-              <span class="lbl">Loki password</span>
-              <input type="password" name="password" placeholder="(falls back to LOKI_PASSWORD env)" autocomplete="off" />
-            </label>
-            <label class="cb">
-              <input type="checkbox" name="remember" /> remember in this browser
-              <span class="hint">(stored in localStorage, never sent anywhere but this server)</span>
-            </label>
-          </div>
-          <div class="row">
-            <label>
-              <span class="lbl">RSP token file</span>
-              <input type="text" name="rspTokenFile" placeholder="~/.lsst/log-browser-token.txt" autocomplete="off" />
-              <span class="hint">used for ConsDB shutter-close lookups; falls back to RA_LOG_EXPLORER_RSP_TOKEN_FILE env</span>
-            </label>
-          </div>
-          <div class="row submit-row">
-            <button type="button" id="creds-forget" class="ghost">forget stored credentials</button>
-          </div>
-        </form>
-      </section>
-
-      <section class="home-card">
-        <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
-        <p class="hint">
-          Click a row to copy its cluster / namespace / window settings into the
-          fetch form above; the ✕ button on each row removes just that window
-          from disk.
-          <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
-          <button type="button" id="cache-delete-all" class="ghost mini delete">delete all</button>
-        </p>
-        <table id="cache-table">
-          <thead>
-            <tr>
-              <th>cluster / namespace</th>
-              <th>window</th>
-              <th>fetched</th>
-              <th>pods</th>
-              <th>size</th>
-              <th></th>
-            </tr>
-          </thead>
-          <tbody id="cache-tbody"></tbody>
-          <tfoot id="cache-tfoot"></tfoot>
-        </table>
-      </section>
-
-      <section class="home-card" id="progress-card" hidden>
-        <h2>Fetching</h2>
-        <div class="progress-wrap">
-          <div class="progress-bar"><div id="progress-fill"></div></div>
-          <div id="progress-text" class="hint"></div>
-        </div>
-        <pre id="progress-log" class="progress-log"></pre>
-      </section>
-    </main>
+        <section class="home-card sidebar-card">
+          <h2>Credentials <span class="muted" id="creds-state"></span></h2>
+          <form id="creds-form">
+            <div class="row">
+              <label>
+                <span class="lbl">Loki username</span>
+                <input type="text" name="username" value="merlin" />
+              </label>
+            </div>
+            <div class="row">
+              <label>
+                <span class="lbl">Loki password</span>
+                <input type="password" name="password" placeholder="(falls back to LOKI_PASSWORD env)" autocomplete="off" />
+              </label>
+            </div>
+            <div class="row">
+              <label class="cb">
+                <input type="checkbox" name="remember" /> remember in this browser
+              </label>
+              <span class="hint">localStorage only; never sent anywhere but this server</span>
+            </div>
+            <div class="row submit-row">
+              <button type="button" id="creds-forget" class="ghost mini">forget stored credentials</button>
+            </div>
+          </form>
+        </section>
+      </aside>
+    </div>
   </section>
 
   <!-- ===================== EXPLORE VIEW ===================== -->

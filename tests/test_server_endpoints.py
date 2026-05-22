@@ -857,6 +857,135 @@ def test_two_nights_coexist_via_endpoint(runningServer: RunningServer, tmpCacheR
     assert bB["dayObs"] == 20260522
 
 
+def test_settings_get_returns_defaults_then_put_persists(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """GET /api/settings returns the current settings; PUT persists changes.
+
+    The cache root is per-test (via tmpCacheRoot), so the first GET sees
+    the default value.
+    """
+    from ra_log_explorer.appSettings import DEFAULT_MAX_CACHE_BYTES
+
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/settings")
+    assert status == 200
+    assert body["maxCacheBytes"] == DEFAULT_MAX_CACHE_BYTES
+
+    # PUT a new value.
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=json.dumps({"maxCacheBytes": 2 * 1024 * 1024 * 1024}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 200, text
+    assert json.loads(text)["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
+
+    # GET reflects the persisted value.
+    status, body = _get(host, port, "/api/settings")
+    assert status == 200
+    assert body["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
+
+
+def test_settings_put_rejects_non_integer(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    host, port, _ctx = runningServer
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=json.dumps({"maxCacheBytes": "five gigs"}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 400
+    assert "maxCacheBytes" in text
+
+
+def test_cache_list_includes_lastViewedAt_and_dayObs(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Cache rows surface ``lastViewedAt`` and (for night caches) ``dayObs``."""
+    import datetime as _dt
+
+    from ra_log_explorer.fetch import markCacheViewed
+
+    host, port, _ctx = runningServer
+    # Plant a night cache with the noon-UTC start that maps to dayObs=20260521.
+    night = (
+        tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-21T120000Z__2026-05-22T120000Z" / "pods=__aos__"
+    )
+    (night / "pods").mkdir(parents=True)
+    (night / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-21T12:00:00Z",
+                    "toIso": "2026-05-22T12:00:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": ".*aos.*",
+                },
+                "fetched_at": "2026-05-22T13:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    markCacheViewed(night, when=_dt.datetime(2026, 5, 22, 14, 0, tzinfo=_dt.timezone.utc))
+
+    status, body = _get(host, port, "/api/cache")
+    assert status == 200
+    nightRows = [w for w in body["windows"] if w["kind"] == "night"]
+    assert len(nightRows) == 1
+    w = nightRows[0]
+    assert w["dayObs"] == 20260521
+    assert w["lastViewedAt"] is not None
+    assert w["lastViewedAt"].startswith("2026-05-22T14:00")
+
+
+def test_summary_get_bumps_lastViewedAt(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A successful /api/summary?dataId=X touches the cache's LRU sidecar."""
+    import datetime as _dt
+
+    from ra_log_explorer.fetch import getCacheLastViewed
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "cache-A"
+    (cacheDir / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                expId=2026051900001,
+                tZero=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+            )
+        )
+    assert getCacheLastViewed(cacheDir) is None
+    status, _ = _get(host, port, "/api/summary?dataId=2026051900001")
+    assert status == 200
+    # After the request, the sidecar should exist.
+    assert getCacheLastViewed(cacheDir) is not None
+
+
 def test_pod_endpoint_routes_by_dataId_query(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
     """/api/pod/<pod>?dataId=X reads from exposure X's cache, not the most-recently loaded."""
     import datetime as _dt

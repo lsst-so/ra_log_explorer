@@ -35,6 +35,7 @@ import os
 import subprocess
 import sys
 import time
+from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
@@ -46,6 +47,12 @@ PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
 PODS_LIST_NAME = "pods.txt"
 PODS_DIR_NAME = "pods"
+# Per-cache sidecar holding the ISO timestamp of when this window was
+# last opened by the user. Used to LRU-evict old caches when the
+# total on-disk size exceeds the configured max. Living alongside
+# the cache (rather than in a central index) means deleting the
+# directory takes the bookkeeping with it.
+LAST_VIEWED_NAME = "_last_viewed.txt"
 
 
 class FetchError(RuntimeError):
@@ -354,3 +361,116 @@ def stderrProgress(pod: str, i: int, total: int) -> None:
     sys.stderr.flush()
     if i == total:
         sys.stderr.write("\n")
+
+
+# ----- per-cache last-viewed tracking + LRU eviction -----------------------
+
+
+def markCacheViewed(cacheDir: Path, when: dt.datetime | None = None) -> None:
+    """Write the ISO timestamp the user last opened this cache window.
+
+    Best-effort: a write failure here is not worth interrupting an
+    otherwise-successful request. The sidecar file just becomes
+    out-of-date.
+    """
+    if not cacheDir.exists():
+        return
+    ts = (when or dt.datetime.now(dt.timezone.utc)).isoformat()
+    try:
+        (cacheDir / LAST_VIEWED_NAME).write_text(ts)
+    except OSError:
+        pass
+
+
+def getCacheLastViewed(cacheDir: Path) -> dt.datetime | None:
+    """Return the timestamp from a cache's ``_last_viewed.txt`` sidecar,
+    or ``None`` if the file is missing or unparseable."""
+    p = cacheDir / LAST_VIEWED_NAME
+    if not p.exists():
+        return None
+    try:
+        return _parseIso(p.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _iterCacheDirs(root: Path) -> list[Path]:
+    """Walk the cache root and return every dir that contains a valid
+    ``_meta.json``. Includes both top-level exposure caches and nested
+    night ``pods=…`` subdirs.
+    """
+    out: list[Path] = []
+    if not root.exists():
+        return out
+    for cluster in root.iterdir():
+        if not cluster.is_dir():
+            continue
+        for ns in cluster.iterdir():
+            if not ns.is_dir():
+                continue
+            for window in ns.iterdir():
+                if not window.is_dir():
+                    continue
+                if (window / META_NAME).exists():
+                    out.append(window)
+                # Night-mode nests one level deeper under pods=<slug>/.
+                for inner in window.iterdir():
+                    if inner.is_dir() and inner.name.startswith("pods=") and (inner / META_NAME).exists():
+                        out.append(inner)
+    return out
+
+
+def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+    """Evict the least-recently-viewed cache windows until the on-disk
+    total is at or below ``maxBytes``.
+
+    Caches in ``exempt`` are never removed — used to spare the cache
+    that was just fetched. (It would just be re-fetched on the next
+    request, which defeats the point of having any limit at all.)
+
+    Caches without a ``_last_viewed.txt`` sidecar are treated as
+    oldest — they've never been opened, so they're the safest to drop.
+
+    Returns the list of directories that were removed, for logging
+    / debugging.
+    """
+    import shutil
+
+    root = cache_root()
+    exemptR = {p.resolve() for p in exempt}
+    total = cacheDuSizeBytes(root)
+    if total <= maxBytes:
+        return []
+    # Sort by (last-viewed ASC, dir name) so untouched caches go first
+    # and ties are broken stably. Untouched caches get an epoch-zero
+    # sentinel so they precede everything.
+    epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+    candidates: list[tuple[dt.datetime, Path]] = []
+    for d in _iterCacheDirs(root):
+        if d.resolve() in exemptR:
+            continue
+        lv = getCacheLastViewed(d) or epoch
+        candidates.append((lv, d))
+    candidates.sort(key=lambda x: (x[0], x[1].name))
+    removed: list[Path] = []
+    for _, d in candidates:
+        if total <= maxBytes:
+            break
+        sz = cacheDuSizeBytes(d)
+        try:
+            shutil.rmtree(d)
+        except OSError:
+            continue
+        removed.append(d)
+        total -= sz
+        # Tidy up newly-empty parents (cluster/, namespace/, and the
+        # window dir for night caches whose pods= subdir we just
+        # removed).
+        parent = d.parent
+        while parent != root and parent.exists() and not any(parent.iterdir()):
+            try:
+                parent.rmdir()
+            except OSError:
+                break
+            parent = parent.parent
+    return removed

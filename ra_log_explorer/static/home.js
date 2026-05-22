@@ -10,11 +10,28 @@
 'use strict';
 
 const LS = {
+  // Loki creds (still per-user-browser).
   username: 'ra_log_explorer.username',
   password: 'ra_log_explorer.password',
   remember: 'ra_log_explorer.remember',
-  rspTokenFile: 'ra_log_explorer.rspTokenFile',
-  lastRun: 'ra_log_explorer.lastRun',  // JSON {exposureId, cluster, namespace, ...} — no tZero, that's looked up each time
+  // App settings shared across both fetchers. Lives in localStorage
+  // because they're per-user-browser; maxCacheGiB is also POSTed
+  // server-side so the cache eviction can act on it.
+  settings: 'ra_log_explorer.settings',  // JSON {cluster, namespace, workers, lokiAddr, rspTokenFile, maxCacheGiB}
+  // Last per-exposure tuning (windowBefore/After) keyed off the
+  // exposure form alone.
+  lastExpTuning: 'ra_log_explorer.lastExpTuning',  // {windowBefore, windowAfter}
+};
+
+// Application defaults. Mirror the backend's DEFAULT_MAX_CACHE_BYTES /
+// config.DEFAULT_* — kept in sync by hand since the values are stable.
+const SETTINGS_DEFAULTS = {
+  cluster: 'yagan',
+  namespace: 'rapid-analysis',
+  workers: 8,
+  lokiAddr: 'https://loki-query.ls.lsst.org',
+  rspTokenFile: '',
+  maxCacheGiB: 5,
 };
 
 let homeListenersWired = false;
@@ -25,6 +42,7 @@ let lookupSeq = 0;              // sequence number to ignore stale lookup respon
 
 function startHome() {
   if (!homeListenersWired) wireHomeListeners();
+  prefillSettings();
   prefillForm();
   prefillCreds();
   refreshCache();
@@ -71,15 +89,77 @@ function waitAndAutoFetch(expId) {
   }, 200);
 }
 
+function readSettings() {
+  return { ...SETTINGS_DEFAULTS, ...(readJson(LS.settings) || {}) };
+}
+
+function prefillSettings() {
+  // Settings panel: app-wide knobs that both fetchers (and the cache
+  // eviction layer) read from. Persisted in localStorage; the
+  // maxCacheGiB value is also pushed to the server so its eviction
+  // pass uses the latest limit.
+  const s = readSettings();
+  const form = document.getElementById('settings-form');
+  for (const k of Object.keys(SETTINGS_DEFAULTS)) {
+    const el = form.elements.namedItem(k);
+    if (el) el.value = s[k] != null ? s[k] : SETTINGS_DEFAULTS[k];
+  }
+  // Reflect what the server currently believes the cache limit is,
+  // and only override the form's local copy if the server has
+  // something different (e.g. set via PUT from another tab).
+  fetch('/api/settings').then(async (r) => {
+    if (!r.ok) return;
+    const data = await r.json();
+    const gib = Math.round((data.maxCacheBytes / (1024 ** 3)) * 100) / 100;
+    if (gib !== parseFloat(form.elements.maxCacheGiB.value)) {
+      form.elements.maxCacheGiB.value = gib;
+      saveSettings();  // sync localStorage to the server's value
+    }
+  }).catch(() => { /* offline — leave the form alone */ });
+}
+
+function saveSettings() {
+  const form = document.getElementById('settings-form');
+  const s = {};
+  for (const k of Object.keys(SETTINGS_DEFAULTS)) {
+    const el = form.elements.namedItem(k);
+    if (!el) continue;
+    s[k] = el.type === 'number' ? parseFloat(el.value) : el.value.trim();
+  }
+  localStorage.setItem(LS.settings, JSON.stringify(s));
+  // Push the cache size to the server (other fields are client-side
+  // only). Errors are surfaced via #settings-state but don't block
+  // anything else.
+  const stateEl = document.getElementById('settings-state');
+  const bytes = Math.round((s.maxCacheGiB || 0) * (1024 ** 3));
+  fetch('/api/settings', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ maxCacheBytes: bytes }),
+  }).then(async (r) => {
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({}));
+      stateEl.textContent = `(server: ${body.error || `HTTP ${r.status}`})`;
+      stateEl.classList.add('error');
+      return;
+    }
+    stateEl.textContent = '(saved)';
+    stateEl.classList.remove('error');
+    setTimeout(() => { stateEl.textContent = ''; }, 1500);
+  }).catch((e) => {
+    stateEl.textContent = `(server unreachable: ${e})`;
+  });
+}
+
 function prefillForm() {
-  const last = readJson(LS.lastRun);
+  // Per-exposure tuning (windowBefore/After) only — cluster/namespace/
+  // workers are in the settings panel.
+  const last = readJson(LS.lastExpTuning);
   if (!last) return;
   const form = document.getElementById('fetch-form');
   for (const [k, v] of Object.entries(last)) {
     const el = form.elements.namedItem(k);
-    if (!el) continue;
-    if (el.type === 'checkbox') el.checked = !!v;
-    else el.value = v;
+    if (el) el.value = v;
   }
 }
 
@@ -88,13 +168,8 @@ function prefillCreds() {
   const remember = localStorage.getItem(LS.remember) === '1';
   const u = localStorage.getItem(LS.username);
   const p = localStorage.getItem(LS.password);
-  const tk = localStorage.getItem(LS.rspTokenFile);
   if (u != null) form.elements.username.value = u;
   if (p != null) form.elements.password.value = p;
-  // The RSP token path is non-secret (it's a file path, not the token
-  // itself), so we persist it unconditionally — no "remember" toggle
-  // needed.
-  if (tk != null) form.elements.rspTokenFile.value = tk;
   form.elements.remember.checked = remember;
   updateCredsState();
 }
@@ -112,7 +187,6 @@ function saveCreds() {
   const form = document.getElementById('creds-form');
   const u = form.elements.username.value.trim();
   const p = form.elements.password.value;
-  const tk = form.elements.rspTokenFile.value.trim();
   const remember = form.elements.remember.checked;
   if (remember) {
     if (u) localStorage.setItem(LS.username, u);
@@ -121,8 +195,6 @@ function saveCreds() {
   } else {
     localStorage.removeItem(LS.remember);
   }
-  if (tk) localStorage.setItem(LS.rspTokenFile, tk);
-  else localStorage.removeItem(LS.rspTokenFile);
   updateCredsState();
 }
 
@@ -130,18 +202,24 @@ function forgetCreds() {
   localStorage.removeItem(LS.username);
   localStorage.removeItem(LS.password);
   localStorage.removeItem(LS.remember);
-  localStorage.removeItem(LS.rspTokenFile);
   const form = document.getElementById('creds-form');
   form.elements.username.value = 'merlin';
   form.elements.password.value = '';
-  form.elements.rspTokenFile.value = '';
   form.elements.remember.checked = false;
   updateCredsState();
 }
 
-function saveLastRun(values) {
-  const { username, password, tZero, ...rest } = values;  // tZero is looked up each time
-  localStorage.setItem(LS.lastRun, JSON.stringify(rest));
+function saveExpTuning() {
+  // Just the two per-exposure tuning knobs. cluster/namespace/workers
+  // are global settings and persisted separately.
+  const f = document.getElementById('fetch-form');
+  localStorage.setItem(
+    LS.lastExpTuning,
+    JSON.stringify({
+      windowBefore: f.elements.windowBefore.value,
+      windowAfter: f.elements.windowAfter.value,
+    }),
+  );
 }
 
 function readJson(key) {
@@ -155,8 +233,14 @@ function readFormValues() {
   const fd = new FormData(form);
   const out = {};
   for (const [k, v] of fd.entries()) out[k] = v;
+  // Merge in the app-wide settings (cluster, namespace, workers,
+  // lokiAddr). These no longer live on the per-fetch form.
+  const s = readSettings();
+  out.cluster = s.cluster;
+  out.namespace = s.namespace;
+  out.workers = parseInt(s.workers, 10);
+  out.lokiAddr = s.lokiAddr;
   out.exposureId = parseInt(out.exposureId, 10);
-  out.workers = parseInt(out.workers, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
   const creds = document.getElementById('creds-form');
@@ -229,7 +313,7 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  const tokenFile = document.getElementById('creds-form').elements.rspTokenFile.value.trim();
+  const tokenFile = readSettings().rspTokenFile;
   const qs = tokenFile ? `?tokenFile=${encodeURIComponent(tokenFile)}` : '';
   fetch(`/api/exposure-time/${expId}${qs}`)
     .then(async (r) => {
@@ -277,8 +361,6 @@ async function refreshCache() {
 }
 
 function renderCache(data) {
-  document.getElementById('home-cache-info').textContent =
-    `cache: ${humanBytes(data.root.totalBytes)} @ ${data.root.path}`;
   const sumBytes = data.windows.reduce((acc, w) => acc + (w.sizeOnDisk || 0), 0);
   document.getElementById('cache-summary').textContent =
     `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`
@@ -292,25 +374,42 @@ function renderCache(data) {
   for (const w of data.windows) {
     const tr = document.createElement('tr');
     const isNight = w.kind === 'night';
-    tr.title = isNight
-      ? 'click to copy the dayObs into the Investigate night form'
-      : 'click to copy these settings to the form above';
+    const url = cacheRowUrl(w);
+    tr.title = url
+      ? 'click to open this cached run in a new tab'
+      : 'click to copy this window into the exposure form';
     const fromS = (w.fromIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const toS = (w.toIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const fetchedS = (w.fetchedAt || '').replace('T', ' ').replace(/\..*$/, '');
+    const lastViewedS = (w.lastViewedAt || '').replace('T', ' ').replace(/\..*$/, '');
     const kindBadge = isNight
-      ? `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night ${escapeHtml(w.podFilter || '')}</span>`
-      : '';
+      ? `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night</span>`
+      : `<span class="cache-kind cache-kind-exposure">exposure</span>`;
+    // The "key" column shows the most useful identifier for the row's
+    // kind. Night caches have a dayObs (computed by the server from the
+    // noon-UTC start). Exposure caches have no single dataId so we
+    // show "—" (the user has to type a dataId to actually reopen one).
+    const keyCell = isNight
+      ? `<a class="mono cache-key-link" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener">${w.dayObs}</a>`
+      : `<span class="muted">—</span>`;
     tr.innerHTML = `
       <td>${w.cluster} / ${w.namespace} ${kindBadge}</td>
+      <td>${keyCell}</td>
       <td><span class="mono">${fromS} → ${toS}</span></td>
       <td><span class="mono">${fetchedS}</span></td>
+      <td><span class="mono">${lastViewedS || '<span class="muted">never</span>'}</span></td>
       <td>${w.podCount}</td>
       <td>${humanBytes(w.sizeOnDisk)}</td>
       <td><button type="button" class="ghost mini delete" title="delete this cached window">✕</button></td>`;
-    // Row click: copy settings into the form. The trailing ✕ button has
-    // its own handler that stopPropagation()s so it doesn't trigger this.
-    tr.addEventListener('click', () => useCacheSettings(w));
+    // Row click: for night rows, navigate; for exposure rows, copy
+    // window-before/after. The trailing ✕ button has its own handler
+    // that stopPropagation()s so it doesn't trigger this. The key
+    // cell's own <a> handles its target=_blank navigation; we don't
+    // double-trigger the row click for it.
+    tr.addEventListener('click', (ev) => {
+      if (ev.target instanceof HTMLAnchorElement) return;
+      useCacheSettings(w);
+    });
     const delBtn = tr.querySelector('button.delete');
     delBtn.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -322,7 +421,7 @@ function renderCache(data) {
     const tr = document.createElement('tr');
     tr.className = 'cache-total-row';
     tr.innerHTML =
-      `<td colspan="3" class="total-label">total</td>`
+      `<td colspan="5" class="total-label">total</td>`
       + `<td>${data.windows.length}</td>`
       + `<td>${humanBytes(sumBytes)}</td>`
       + `<td></td>`;
@@ -357,7 +456,7 @@ async function deleteCacheWindow(w) {
 async function deleteAllCache() {
   // Read the current total off the visible summary so the confirm dialog
   // is honest about how much disk we're about to free.
-  const info = document.getElementById('home-cache-info').textContent;
+  const info = document.getElementById('cache-summary').textContent;
   if (!window.confirm(`Delete EVERY cached window?\n\n${info}\n\nThis cannot be undone.`)) return;
   try {
     const r = await fetch('/api/cache', { method: 'DELETE' });
@@ -387,23 +486,30 @@ function dayObsFromIso(fromIso) {
   return parseInt(`${m[1]}${m[2]}${m[3]}`, 10);
 }
 
+function cacheRowUrl(w) {
+  // The deep-link a cache row navigates to. For night caches that's
+  // /?dayObs=Y; for exposure caches we don't have a single dataId in
+  // the cache meta (multiple visits may share a window), so we copy
+  // the windowBefore/After + cluster/ns into the form and the user
+  // submits manually. Returns null for that case.
+  if (w.kind === 'night' && w.dayObs != null) {
+    return `/?dayObs=${encodeURIComponent(w.dayObs)}`;
+  }
+  return null;
+}
+
 function useCacheSettings(w) {
-  if (w.kind === 'night') {
-    const nightForm = document.getElementById('night-form');
-    nightForm.elements.cluster.value = w.cluster;
-    nightForm.elements.namespace.value = w.namespace;
-    const dayObs = dayObsFromIso(w.fromIso);
-    if (dayObs != null) nightForm.elements.dayObs.value = dayObs;
-    document.getElementById('night-message').textContent =
-      `Settings copied from cached night ${dayObs || w.windowDir}. Submit to reopen instantly.`;
-    document.getElementById('night-message').classList.remove('error');
+  // Night caches deep-link to their already-cached view. Open in a
+  // new tab so the current tab is preserved.
+  const url = cacheRowUrl(w);
+  if (url) {
+    window.open(url, '_blank', 'noopener');
     return;
   }
+  // Exposure caches don't carry a single dataId — fall back to the
+  // old behaviour of copying the window into the form so the user
+  // can type a matching dataId and submit.
   const form = document.getElementById('fetch-form');
-  form.elements.cluster.value = w.cluster;
-  form.elements.namespace.value = w.namespace;
-  // Recompute windowBefore/After to land on the same cached slug, *if*
-  // we've already resolved a shutter-close time for the current dataId.
   if (resolvedTZero && w.fromIso && w.toIso) {
     try {
       const taiMs = Date.parse(resolvedTZero.endsWith('Z') ? resolvedTZero : resolvedTZero + 'Z');
@@ -415,10 +521,10 @@ function useCacheSettings(w) {
     } catch (_) { /* leave defaults */ }
   }
   const msg = document.getElementById('fetch-message');
-  msg.textContent = `Settings copied from ${w.windowDir}. ` +
+  msg.textContent = `Window from ${w.windowDir} copied. ` +
     (resolvedTZero
       ? 'Hit Fetch to reopen.'
-      : 'Type a dataId so we can compute the matching window-before/after.');
+      : 'Type a matching dataId, then Fetch.');
 }
 
 // ----- fetch + progress ---------------------------------------------------
@@ -439,7 +545,7 @@ async function startFetch(ev) {
     return;
   }
   saveCreds();
-  saveLastRun(values);
+  saveExpTuning();
 
   const submit = document.getElementById('fetch-submit');
   submit.disabled = true;
@@ -604,11 +710,12 @@ async function startNightFetch(ev) {
     return;
   }
   saveCreds();
+  const s = readSettings();
   const body = {
     dayObs,
-    cluster: form.elements.cluster.value.trim() || undefined,
-    namespace: form.elements.namespace.value.trim() || undefined,
-    workers: parseInt(form.elements.workers.value, 10) || undefined,
+    cluster: s.cluster || undefined,
+    namespace: s.namespace || undefined,
+    workers: parseInt(s.workers, 10) || undefined,
     username: credsForm.elements.username.value.trim() || undefined,
     password: credsForm.elements.password.value || undefined,
   };
@@ -648,15 +755,18 @@ function wireHomeListeners() {
   const expIdInput = document.getElementById('fetch-form').elements.exposureId;
   expIdInput.addEventListener('input', scheduleLookup);
   document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
-  // RSP token path is non-secret — persist it as the user types so
-  // the next lookup uses the right path without an explicit save.
-  document.getElementById('creds-form').elements.rspTokenFile.addEventListener('input', () => {
-    saveCreds();
-    // The user may have just supplied a token after a failed lookup —
-    // retry it.
-    triggerLookupIfReady();
-  });
   document.getElementById('creds-forget').addEventListener('click', forgetCreds);
+  // Save settings on every input — they're tiny, latency-free, and the
+  // user expects "I changed it" to mean "it's saved". The RSP token
+  // input also retriggers the dataId lookup, since changing the token
+  // path may unlock a previously-failed lookup.
+  const settingsForm = document.getElementById('settings-form');
+  for (const el of settingsForm.querySelectorAll('input')) {
+    el.addEventListener('input', () => {
+      saveSettings();
+      if (el.name === 'rspTokenFile') triggerLookupIfReady();
+    });
+  }
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
   document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
   homeListenersWired = true;

@@ -191,3 +191,189 @@ def test_cacheDuSizeBytes_sums_recursively(tmp_path: Path) -> None:
 def test_cacheDuSizeBytes_empty_tree(tmp_path: Path) -> None:
     (tmp_path / "empty").mkdir()
     assert fetch.cacheDuSizeBytes(tmp_path) == 0
+
+
+# ----- markCacheViewed / getCacheLastViewed -------------------------------
+
+
+def test_markCacheViewed_writes_iso_timestamp(tmp_path: Path) -> None:
+    fetch.markCacheViewed(tmp_path)
+    p = tmp_path / fetch.LAST_VIEWED_NAME
+    assert p.exists()
+    # Should round-trip to a datetime via _parseIso (which the
+    # getCacheLastViewed helper uses internally).
+    assert fetch.getCacheLastViewed(tmp_path) is not None
+
+
+def test_markCacheViewed_with_explicit_when(tmp_path: Path) -> None:
+    when = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    fetch.markCacheViewed(tmp_path, when=when)
+    assert fetch.getCacheLastViewed(tmp_path) == when
+
+
+def test_getCacheLastViewed_returns_None_when_missing(tmp_path: Path) -> None:
+    assert fetch.getCacheLastViewed(tmp_path) is None
+
+
+def test_getCacheLastViewed_returns_None_when_unparseable(tmp_path: Path) -> None:
+    (tmp_path / fetch.LAST_VIEWED_NAME).write_text("not a timestamp")
+    assert fetch.getCacheLastViewed(tmp_path) is None
+
+
+def test_markCacheViewed_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
+    # No raise.
+    fetch.markCacheViewed(tmp_path / "does-not-exist")
+
+
+# ----- evictToFit ----------------------------------------------------------
+
+
+def _plantWindowWithBody(
+    root: Path,
+    cluster: str,
+    namespace: str,
+    fromIso: str,
+    toIso: str,
+    bodyBytes: int,
+    *,
+    lastViewed: dt.datetime | None,
+) -> Path:
+    fromSlug = fromIso.replace(":", "").replace(".", "_")
+    toSlug = toIso.replace(":", "").replace(".", "_")
+    d = root / cluster / namespace / f"{fromSlug}__{toSlug}"
+    (d / "pods").mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": cluster,
+                    "namespace": namespace,
+                    "fromIso": fromIso,
+                    "toIso": toIso,
+                    "workers": 8,
+                    "lineLimit": 50000,
+                },
+                "pod_count": 1,
+                "total_bytes": bodyBytes,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    (d / "pods" / "fake.jsonl").write_bytes(b"x" * bodyBytes)
+    if lastViewed is not None:
+        fetch.markCacheViewed(d, when=lastViewed)
+    return d
+
+
+def test_evictToFit_noop_when_under_limit(tmpCacheRoot: Path) -> None:
+    _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        bodyBytes=1000,
+        lastViewed=dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc),
+    )
+    removed = fetch.evictToFit(maxBytes=10 * 1000)
+    assert removed == []
+
+
+def test_evictToFit_removes_oldest_until_under_limit(tmpCacheRoot: Path) -> None:
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    a = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base - dt.timedelta(hours=2),  # oldest
+    )
+    b = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T09:00:00Z",
+        "2026-05-20T09:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base - dt.timedelta(hours=1),
+    )
+    c = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T10:00:00Z",
+        "2026-05-20T10:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base,  # newest
+    )
+    # Limit at 3000 bytes — we have ~6000 bytes total (3 caches × 2KB each
+    # plus some meta), so eviction should drop the two oldest.
+    removed = fetch.evictToFit(maxBytes=3000)
+    assert a in removed
+    assert b in removed
+    assert c not in removed
+    assert not a.exists()
+    assert c.exists()
+
+
+def test_evictToFit_skips_exempt(tmpCacheRoot: Path) -> None:
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    a = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base - dt.timedelta(hours=2),
+    )
+    b = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T09:00:00Z",
+        "2026-05-20T09:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base - dt.timedelta(hours=1),
+    )
+    # Even though A is the LRU, the exempt set spares it. B gets the chop.
+    removed = fetch.evictToFit(maxBytes=3000, exempt=[a])
+    assert a in [c for c in [a] if c.exists()]
+    assert b in removed
+    assert not b.exists()
+    assert a.exists()
+
+
+def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    unviewed = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        bodyBytes=2000,
+        lastViewed=None,  # never opened
+    )
+    viewed = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T09:00:00Z",
+        "2026-05-20T09:05:00Z",
+        bodyBytes=2000,
+        lastViewed=base - dt.timedelta(days=365),  # very old, but recorded
+    )
+    # With limit 3000 we must evict one. The never-opened cache should
+    # go first — it's the "safest to drop" by design.
+    removed = fetch.evictToFit(maxBytes=3000)
+    assert unviewed in removed
+    assert viewed.exists()
