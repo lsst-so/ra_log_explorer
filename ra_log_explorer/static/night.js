@@ -162,11 +162,22 @@ function renderHistogram(svgId, metaId, titleId, binPanelId, titleText, hist) {
     l.setAttribute('class', klass);
     svg.appendChild(l);
   }
-  // Bars.
+  // Bars. Each bin renders TWO rects:
+  //
+  //   1. The visible bar at its real height. Even a single-dataId bar
+  //      gets a 2-pixel minimum height so the eye can pick it out of a
+  //      long tail when the y-scale is dominated by a 500-count peak.
+  //
+  //   2. A transparent full-column overlay sitting on top, the same
+  //      width as the bar but spanning the whole plot height. That's
+  //      the click / hover target — so the user can drill into an
+  //      outlier bin by clicking *anywhere* in its column, not just on
+  //      the few pixels of visible bar.
   const dataIdsByBin = hist.dataIdsByBin || [];
   for (let i = 0; i < hist.counts.length; i++) {
     const c = hist.counts[i];
-    const h = maxCount === 0 ? 0 : (c / maxCount) * plotH;
+    const rawH = maxCount === 0 ? 0 : (c / maxCount) * plotH;
+    const h = c > 0 ? Math.max(2, rawH) : 0;
     const x = padL + i * barW;
     const y = (H - padB) - h;
     const rect = document.createElementNS(ns, 'rect');
@@ -175,29 +186,44 @@ function renderHistogram(svgId, metaId, titleId, binPanelId, titleText, hist) {
     rect.setAttribute('width', Math.max(0.5, barW - 1));
     rect.setAttribute('height', h);
     rect.setAttribute('class', 'night-hist-bar');
-    // Tooltip via <title>: native browser hover. Includes a preview of
-    // up to 8 dataIds so the user can sanity-check the bin contents
-    // without clicking.
+    rect.setAttribute('data-bin-index', String(i));
+    svg.appendChild(rect);
+
     const binLo = hist.xMin + i * hist.binWidth;
     const binHi = binLo + hist.binWidth;
     const ids = dataIdsByBin[i] || [];
+
+    // Full-column overlay: same width as the bar, full plot height,
+    // transparent, captures pointer events. Tooltip + click handlers
+    // live here so the entire column is interactive.
+    const hit = document.createElementNS(ns, 'rect');
+    hit.setAttribute('x', x);
+    hit.setAttribute('y', padT);
+    hit.setAttribute('width', Math.max(0.5, barW - 1));
+    hit.setAttribute('height', plotH);
+    hit.setAttribute('class', 'night-hist-bar-hit');
+    hit.setAttribute('data-bin-index', String(i));
     const previewIds = ids.slice(0, 8).join('\n');
-    const moreSuffix = ids.length > 8 ? `\n+${ids.length - 8} more (click bar)` : '';
+    const moreSuffix = ids.length > 8 ? `\n+${ids.length - 8} more (click anywhere in column)` : '';
     const t = document.createElementNS(ns, 'title');
     let titleText = `${binLo.toFixed(2)}–${binHi.toFixed(2)} s\n${c} dataIds`;
     if (ids.length > 0) {
       titleText += '\n\n' + previewIds + moreSuffix + '\n\nclick to drill down';
     }
     t.textContent = titleText;
-    rect.appendChild(t);
-    if (ids.length > 0 && binPanel) {
-      rect.setAttribute('data-bin-index', String(i));
-      rect.style.cursor = 'pointer';
-      rect.addEventListener('click', () => {
+    hit.appendChild(t);
+    // Hover highlight: forward to the visible bar so the user gets
+    // visual feedback. Only "live" bins (non-zero, has dataIds) get
+    // the highlight + click handler — empty columns stay inert.
+    if (c > 0 && ids.length > 0 && binPanel) {
+      hit.style.cursor = 'pointer';
+      hit.addEventListener('mouseenter', () => rect.classList.add('hover'));
+      hit.addEventListener('mouseleave', () => rect.classList.remove('hover'));
+      hit.addEventListener('click', () => {
         renderBinPanel(binPanel, svg, i, binLo, binHi, ids);
       });
     }
-    svg.appendChild(rect);
+    svg.appendChild(hit);
   }
   // X-axis tick labels: min / mid / max.
   for (const x of [hist.xMin, (hist.xMin + hist.xMax) / 2, hist.xMax]) {

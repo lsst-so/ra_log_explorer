@@ -1228,9 +1228,18 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
   border-radius: var(--radius);
 }
 .night-hist-axis { stroke: var(--border-strong); stroke-width: 1; }
-.night-hist-bar  { fill: var(--accent); opacity: 0.85; }
-.night-hist-bar:hover { fill: var(--accent-2); opacity: 1; }
+.night-hist-bar  { fill: var(--accent); opacity: 0.85; pointer-events: none; }
+.night-hist-bar.hover { fill: var(--accent-2); opacity: 1; }
 .night-hist-bar.selected { fill: var(--accent-2); opacity: 1; stroke: var(--text-2); stroke-width: 1.5; }
+/* Invisible full-column overlay that captures clicks/hovers. fill must
+ * be set (not "transparent" alone) plus pointer-events:all for SVG hit
+ * testing to land on it. The faint hover fill makes it feel "alive"
+ * without obscuring the visible bar underneath. */
+.night-hist-bar-hit {
+  fill: rgba(0, 0, 0, 0);
+  pointer-events: all;
+}
+.night-hist-bar-hit:hover { fill: rgba(0, 0, 0, 0.04); }
 .night-hist-tick { font-size: 10.5px; fill: var(--text-muted); font-family: var(--font-mono); }
 
 /* Drilldown panel below each histogram: lists the dataIds in the
