@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Iterable
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
@@ -96,6 +97,101 @@ def queryIsot(dataId: int, token: str, instrument: str | None = None) -> str | N
         if iso is not None:
             return iso
     return None
+
+
+def queryIsotBatch(
+    dataIds: Iterable[int],
+    token: str,
+    chunkSize: int = 500,
+) -> dict[int, str]:
+    """Resolve many dataIds in one round trip per instrument.
+
+    For each instrument in :data:`INSTRUMENTS_BY_PROBE_ORDER` we send
+    a single SELECT ... WHERE exposure_id IN (...) covering whatever
+    dataIds are still unresolved. Returns ``{dataId: iso}`` for the
+    matches found; dataIds with no row in any instrument's table
+    simply don't appear in the output.
+
+    ``chunkSize`` caps the IN-list size per query so an enormous
+    night doesn't trip ConsDB's SQL-length limits. With the default
+    500 a typical night-fetch (~600 dataIds) is two queries per
+    instrument, and the instrument loop short-circuits as soon as
+    all dataIds have been resolved.
+    """
+    out: dict[int, str] = {}
+    remaining = [int(x) for x in dataIds]
+    for instrument in INSTRUMENTS_BY_PROBE_ORDER:
+        if not remaining:
+            break
+        found = _queryBatch(remaining, token, instrument, chunkSize)
+        out.update(found)
+        remaining = [d for d in remaining if d not in out]
+    return out
+
+
+def _queryBatch(dataIds: list[int], token: str, instrument: str, chunkSize: int) -> dict[int, str]:
+    """Send one or more ``IN (...)`` queries against one instrument's table."""
+    out: dict[int, str] = {}
+    for i in range(0, len(dataIds), chunkSize):
+        chunk = dataIds[i : i + chunkSize]
+        idsSql = ",".join(str(d) for d in chunk)
+        sql = f"SELECT exposure_id, obs_end FROM cdb_{instrument}.exposure WHERE exposure_id IN ({idsSql})"
+        try:
+            payload = _postQuery(sql, token)
+        except _UndefinedTableError:
+            # This instrument has no schema — try the next one.
+            return out
+        cols = payload.get("columns") or []
+        rows = payload.get("data") or []
+        try:
+            iIdCol = cols.index("exposure_id")
+            iIsoCol = cols.index("obs_end")
+        except ValueError:
+            continue
+        for row in rows:
+            try:
+                eid = int(row[iIdCol])
+                iso = row[iIsoCol]
+            except (IndexError, TypeError, ValueError):
+                continue
+            if isinstance(iso, str):
+                out[eid] = iso
+    return out
+
+
+class _UndefinedTableError(Exception):
+    """Internal: ConsDB 500'd with a SQL UndefinedTable body. Caller
+    should try the next instrument rather than surface this."""
+
+
+def _postQuery(sql: str, token: str) -> dict:
+    """POST one SQL query, return the parsed JSON payload."""
+    body = json.dumps({"query": sql}).encode("utf-8")
+    req = Request(
+        CONSDB_URL,
+        data=body,
+        headers={
+            "accept": "application/json",
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {token}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=30.0) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        errBody = ""
+        try:
+            errBody = e.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001
+            pass
+        if e.code == 500 and ("UndefinedTable" in errBody or "does not exist" in errBody):
+            raise _UndefinedTableError() from e
+        if e.code in (400, 404):
+            # Empty result rather than an error.
+            return {"columns": [], "data": []}
+        raise ConsDbError(f"ConsDB HTTP {e.code}: {e.reason}") from e
 
 
 def _queryOne(dataId: int, token: str, instrument: str) -> str | None:

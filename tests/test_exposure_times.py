@@ -257,6 +257,88 @@ def test_lookupCached_tolerates_unexpected_schema(monkeypatch: pytest.MonkeyPatc
     assert exposureTimes.lookupCached(2026051900722) is None
 
 
+def test_queryIsotBatch_returns_resolved_in_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The whole point of the batch helper is one round trip per
+    instrument, not one per dataId."""
+    callCount = 0
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        nonlocal callCount
+        callCount += 1
+        sentSql = json.loads(req.data.decode("utf-8"))["query"]
+        assert "IN (" in sentSql
+        return _stubResponse(
+            {
+                "columns": ["exposure_id", "obs_end"],
+                "data": [
+                    [2026051900722, "2026-05-20T08:46:16.267000"],
+                    [2026051900723, "2026-05-20T08:47:02.724000"],
+                ],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([2026051900722, 2026051900723], "TOKEN")
+    assert out == {
+        2026051900722: "2026-05-20T08:46:16.267000",
+        2026051900723: "2026-05-20T08:47:02.724000",
+    }
+    # One call: lsstcam matched everything, so we don't even try the
+    # other instruments.
+    assert callCount == 1
+
+
+def test_queryIsotBatch_falls_through_to_other_instruments(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If lsstcam returns only some rows, the helper queries the next
+    instrument for the still-missing ids."""
+    seenQueries: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        sql = json.loads(req.data.decode("utf-8"))["query"]
+        seenQueries.append(sql)
+        if "cdb_lsstcam." in sql:
+            return _stubResponse(
+                {
+                    "columns": ["exposure_id", "obs_end"],
+                    "data": [[2026051900722, "2026-05-20T08:46:16.267000"]],
+                }
+            )
+        return _stubResponse(
+            {
+                "columns": ["exposure_id", "obs_end"],
+                "data": [[2026052000100, "2026-05-20T09:00:00.000000"]],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([2026051900722, 2026052000100], "TOKEN")
+    assert out == {
+        2026051900722: "2026-05-20T08:46:16.267000",
+        2026052000100: "2026-05-20T09:00:00.000000",
+    }
+    assert "cdb_lsstcam." in seenQueries[0]
+    assert "cdb_latiss." in seenQueries[1]
+
+
+def test_queryIsotBatch_chunks_oversized_in_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A huge IN-list would blow ConsDB's SQL-length limit. The helper
+    chunks itself so this can't happen."""
+    seenQueries: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        seenQueries.append(json.loads(req.data.decode("utf-8"))["query"])
+        return _stubResponse({"columns": ["exposure_id", "obs_end"], "data": []})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    ids = list(range(2026051900000, 2026051901500))  # 1500 dataIds
+    exposureTimes.queryIsotBatch(ids, "TOKEN", chunkSize=500)
+    # 1500 / 500 = 3 chunks per instrument; loop short-circuits since
+    # we never resolve anything, so all 4 instruments are tried.
+    assert len(seenQueries) == 3 * 4
+
+
 def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatch) -> None:
     """If the response schema unexpectedly omits the obs_end column we
     return None rather than crashing."""

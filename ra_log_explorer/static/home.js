@@ -439,6 +439,25 @@ function openProgressStream(jobId) {
       document.getElementById('progress-text').textContent =
         `parsing (${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse})`;
       logProgress(`parsing ${ev.podCount} pods (${humanBytes(ev.totalBytes)}, cacheReuse=${ev.cacheReuse})`);
+    } else if (ev.type === 'shutter-close') {
+      // Night-mode only: post-parse pass resolving shutter close times for
+      // each dataId. May involve a batched ConsDB call.
+      let msg = '';
+      if (ev.phase === 'starting') {
+        msg = `resolving shutter close for ${ev.total} dataIds…`;
+      } else if (ev.phase === 'cache-checked') {
+        msg = `cache: ${ev.cacheHits} hits, ${ev.remaining} to query`;
+      } else if (ev.phase === 'done') {
+        msg = `ConsDB: ${ev.consdbHits} resolved, ${ev.stillMissing} still missing`;
+      } else if (ev.phase === 'no-token' || ev.phase === 'empty-token') {
+        msg = `no RSP token — ${ev.remaining} dataIds will be missing from Δshutter histograms`;
+      } else if (ev.phase === 'consdb-error') {
+        msg = `ConsDB query failed: ${ev.error}`;
+      }
+      if (msg) {
+        document.getElementById('progress-text').textContent = msg;
+        logProgress(msg);
+      }
     } else if (ev.type === 'done') {
       logProgress(`done in ${ev.elapsedS.toFixed(1)}s — ${ev.podCount} pods (${humanBytes(ev.totalBytes)})`);
       document.getElementById('progress-fill').style.width = '100%';

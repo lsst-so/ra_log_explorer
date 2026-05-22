@@ -414,82 +414,119 @@ def _podDetailForNight(state: NightState, pod: str) -> dict:
 # ----- night payload --------------------------------------------------------
 
 
-def _resolveShutterCloseForDataIds(
-    expIds: Iterable[int], state: NightState
-) -> tuple[dict[int, dt.datetime], int]:
-    """Resolve shutter close (UTC) for each expId via the exposure-time
-    cache. Each id either hits the on-disk cache (instant) or — on a
-    cache miss — gets a lazy ConsDB lookup if we can read a token.
+def _prefetchNightShutterCloses(
+    state: NightState, summaries: Iterable[parser.PodSummary], job: FetchJob
+) -> None:
+    """Populate ``state.shutterCloseByExpId`` for everything the night
+    view will need to render histograms + failure Δshutter offsets.
 
-    Returns ``(resolved, nMissing)`` where ``nMissing`` is the count of
-    expIds we couldn't resolve, e.g. because they aren't in ConsDB or
-    we can't reach it. Caches everything we resolve back into the
-    state so the second /api/summary request is instant.
+    Runs as part of the night-fetch job's parsing phase so the
+    /api/summary request that follows is instant. We:
+
+    * collect every dataId we'll need to plot,
+    * read whatever's already in the on-disk exposure-time cache,
+    * batch-query ConsDB for the rest (one ``SELECT … IN (…)`` per
+      instrument with a hard chunk size so a huge IN-list doesn't
+      blow ConsDB's SQL length limit),
+    * persist everything new back to the on-disk cache so the next
+      night-fetch over the same dataIds starts instant.
+
+    Pushes progress events to ``job.events`` so the SSE consumer can
+    show "resolving shutter close for N of M …" without timing out.
     """
-    out = dict(state.shutterCloseByExpId)
-    nMissing = 0
-    # Try ConsDB only if we have a readable token; otherwise stick to
-    # the cache. Resolving 100+ ids over a flaky link could otherwise
-    # block /api/summary for minutes.
+    firstStarts = night.firstTaskStartByDataId(summaries)
+    czEnds = night.calcZernikesEndByDataId(summaries)
+    needIds: set[int] = set(firstStarts) | set(czEnds)
+    for s in summaries:
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                needIds.add(tb.expId)
+    if not needIds:
+        return
+
+    job.push({"type": "shutter-close", "phase": "starting", "total": len(needIds)})
+
+    # 1) Cache lookups — free, instant.
+    misses: list[int] = []
+    cachedHits = 0
+    for expId in needIds:
+        iso = exposureTimes.lookupCached(expId)
+        if iso is None:
+            misses.append(expId)
+            continue
+        state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+        cachedHits += 1
+    job.push(
+        {
+            "type": "shutter-close",
+            "phase": "cache-checked",
+            "cacheHits": cachedHits,
+            "remaining": len(misses),
+        }
+    )
+    if not misses:
+        return
+
+    # 2) Batch ConsDB queries (one per instrument, chunked) — needs a token.
     tokenPath = exposureTimes.rspTokenFilePath()
-    token: str | None = None
-    if tokenPath.exists():
-        try:
-            token = exposureTimes.readRspToken(tokenPath) or None
-        except OSError:
-            token = None
-    for expId in expIds:
-        if expId in out:
-            continue
-        cached = exposureTimes.lookupCached(expId)
-        if cached is None and token is not None:
-            try:
-                cached = exposureTimes.queryIsot(expId, token)
-            except (exposureTimes.ConsDbError, OSError):
-                cached = None
-            if cached is not None:
-                exposureTimes.storeCached(expId, cached)
-        if cached is None:
-            nMissing += 1
-            continue
-        # `cached` is TAI ISO without a timezone. Convert to a UTC
-        # datetime by attaching UTC then subtracting the TAI→UTC offset,
-        # so that (log-utc-time - shutter-close) is a pure Δshutter in
-        # the same scale as the rest of the UI.
-        try:
-            taiAsUtc = parser._parseTimestamp(cached + "Z")
-        except ValueError:
-            nMissing += 1
-            continue
-        out[expId] = taiAsUtc - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
-    # Cache the resolutions back on the state for cheap re-reads.
-    state.shutterCloseByExpId.update(out)
-    return out, nMissing
+    if not tokenPath.exists():
+        job.push(
+            {
+                "type": "shutter-close",
+                "phase": "no-token",
+                "remaining": len(misses),
+                "tokenPath": str(tokenPath),
+            }
+        )
+        return
+    try:
+        token = exposureTimes.readRspToken(tokenPath)
+    except OSError:
+        token = ""
+    if not token:
+        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": len(misses)})
+        return
+    try:
+        resolved = exposureTimes.queryIsotBatch(misses, token)
+    except (exposureTimes.ConsDbError, OSError) as e:
+        job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
+        return
+    for expId, iso in resolved.items():
+        exposureTimes.storeCached(expId, iso)
+        state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+    job.push(
+        {
+            "type": "shutter-close",
+            "phase": "done",
+            "consdbHits": len(resolved),
+            "stillMissing": len(misses) - len(resolved),
+        }
+    )
+
+
+def _taiIsoToUtc(taiIso: str) -> dt.datetime:
+    """Parse a ConsDB ``obs_end`` (TAI ISO, no tz) into a UTC datetime."""
+    return parser._parseTimestamp(taiIso + "Z") - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
 
 
 def _buildNightPayload(state: NightState) -> dict:
-    """Roll the night up into the per-page payload the JS consumes."""
+    """Roll the night up into the per-page payload the JS consumes.
+
+    Pure read-from-state: all shutter closes were resolved during the
+    fetch job's post-parse phase (:func:`_prefetchNightShutterCloses`)
+    or, if no token was configured then, are absent until the user
+    re-fetches with a token in place.
+    """
     stats = night.computeTopStats(state.summaries)
     errType = night.errorsByType(state.summaries)
     errPod = night.errorsByPod(state.summaries)
     firstStarts = night.firstTaskStartByDataId(state.summaries)
     czEnds = night.calcZernikesEndByDataId(state.summaries)
+    shutterCloseByExpId = state.shutterCloseByExpId
 
-    # Resolve shutter closes for the dataIds we'll need for the
-    # histograms and the failed-dataId Δshutter offsets.
     needIds: set[int] = set(firstStarts) | set(czEnds)
-    for s in state.summaries:
-        for tb in s.tracebacks:
-            if tb.expId is not None:
-                needIds.add(tb.expId)
-    shutterCloseByExpId, nMissingShutter = _resolveShutterCloseForDataIds(needIds, state)
+    nMissingShutter = sum(1 for eid in needIds if eid not in shutterCloseByExpId)
 
-    # Note: shutter close from ConsDB is TAI; the per-pod log
-    # timestamps are UTC. We don't subtract the 37s offset here
-    # because the user already sees TAI-based labels everywhere
-    # else; Δshutter is "log-utc-time minus shutter-close-tai" and is
-    # close enough for histogram bucketing (the 37s offset is
-    # consistent and will not change the shape).
     firstOffsets, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
     czOffsets, czNDropped = night.computeDeltaShutterOffsets(czEnds, shutterCloseByExpId)
     histFirst = night.buildHistogram(
@@ -668,6 +705,13 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 startTime=dayObsStartUtc(job.dayObs),
                 endTime=dayObsEndUtc(job.dayObs),
             )
+            # Resolve shutter closes for every dataId we'll need
+            # before publishing the state, so the /api/summary
+            # response is instant and the histograms are populated
+            # on first paint. This can take a few seconds for a busy
+            # night (hundreds of dataIds), so we report progress to
+            # the SSE stream while we work.
+            _prefetchNightShutterCloses(newNight, summaries, job)
             with ctx.jobs.stateLock:
                 ctx.state = None
                 ctx.nightState = newNight
