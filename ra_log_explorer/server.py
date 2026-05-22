@@ -527,12 +527,22 @@ def _buildNightPayload(state: NightState) -> dict:
     needIds: set[int] = set(firstStarts) | set(czEnds)
     nMissingShutter = sum(1 for eid in needIds if eid not in shutterCloseByExpId)
 
-    firstOffsets, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
-    czOffsets, czNDropped = night.computeDeltaShutterOffsets(czEnds, shutterCloseByExpId)
+    firstOffsets, firstIds, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
+    czOffsets, czIds, czNDropped = night.computeDeltaShutterOffsets(czEnds, shutterCloseByExpId)
     histFirst = night.buildHistogram(
-        "First task pickup (Δshutter)", "s", firstOffsets, nDroppedNoTZero=firstNDropped
+        "First task pickup (Δshutter)",
+        "s",
+        firstOffsets,
+        nDroppedNoTZero=firstNDropped,
+        dataIds=firstIds,
     )
-    histCz = night.buildHistogram("calcZernikes end (Δshutter)", "s", czOffsets, nDroppedNoTZero=czNDropped)
+    histCz = night.buildHistogram(
+        "calcZernikes end (Δshutter)",
+        "s",
+        czOffsets,
+        nDroppedNoTZero=czNDropped,
+        dataIds=czIds,
+    )
     failures = night.failureRows(state.summaries, shutterCloseByExpId)
 
     return {

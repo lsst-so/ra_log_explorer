@@ -9,6 +9,15 @@
 'use strict';
 
 async function bootstrap() {
+  // ?dataId=… is the night-view bar-drilldown deep-link. When present we
+  // always land on the home view (which reads the same param and kicks
+  // an auto-fetch) — otherwise the server's existing state would
+  // hijack the new tab into showing the previously-loaded view.
+  const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('dataId')) {
+    window.showHome();
+    return;
+  }
   let summary;
   try {
     const r = await fetch('/api/summary');

@@ -1230,7 +1230,49 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .night-hist-axis { stroke: var(--border-strong); stroke-width: 1; }
 .night-hist-bar  { fill: var(--accent); opacity: 0.85; }
 .night-hist-bar:hover { fill: var(--accent-2); opacity: 1; }
+.night-hist-bar.selected { fill: var(--accent-2); opacity: 1; stroke: var(--text-2); stroke-width: 1.5; }
 .night-hist-tick { font-size: 10.5px; fill: var(--text-muted); font-family: var(--font-mono); }
+
+/* Drilldown panel below each histogram: lists the dataIds in the
+ * selected bar, each clickable to open its per-visit drilldown. */
+.night-hist-bin {
+  margin-top: 8px;
+}
+.night-hist-bin:empty { display: none; }
+.night-hist-bin-header {
+  font-size: 12.5px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--surface-sub);
+  border: 1px solid var(--border);
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+}
+.night-hist-bin-header button { margin-left: auto; }
+.night-hist-bin-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  padding: 8px;
+  max-height: 220px;
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 0 0 var(--radius) var(--radius);
+}
+.night-hist-bin-id {
+  font-size: 12.5px;
+  color: var(--accent);
+  text-decoration: none;
+  padding: 1px 4px;
+  border-radius: 3px;
+}
+.night-hist-bin-id:hover {
+  text-decoration: underline;
+  background: var(--surface-sub);
+}
 
 /* Failures table — row click toggles inline traceback body. */
 .night-failure-row { cursor: pointer; }

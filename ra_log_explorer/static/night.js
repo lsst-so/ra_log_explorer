@@ -27,6 +27,7 @@ function startNight(summary) {
     'night-hist-first',
     'night-hist-first-meta',
     'night-hist-first-title',
+    'night-hist-first-bin',
     'First task pickup',
     summary.histograms.firstTaskStart,
   );
@@ -34,6 +35,7 @@ function startNight(summary) {
     'night-hist-cz',
     'night-hist-cz-meta',
     'night-hist-cz-title',
+    'night-hist-cz-bin',
     'calcZernikes end',
     summary.histograms.calcZernikesEnd,
   );
@@ -125,12 +127,14 @@ function asTd(text, klass) {
 
 // ----- histograms (SVG, no D3 — just a few <rect>s) ------------------------
 
-function renderHistogram(svgId, metaId, titleId, titleText, hist) {
+function renderHistogram(svgId, metaId, titleId, binPanelId, titleText, hist) {
   const svg = document.getElementById(svgId);
   const meta = document.getElementById(metaId);
   const title = document.getElementById(titleId);
+  const binPanel = document.getElementById(binPanelId);
   title.textContent = titleText;
   svg.innerHTML = '';
+  if (binPanel) binPanel.innerHTML = '';
   if (!hist || !hist.counts || hist.counts.length === 0) {
     meta.textContent = hist && hist.nDropped > 0
       ? `(no values to plot; ${hist.nDropped} dataIds excluded — no shutter close known)`
@@ -159,6 +163,7 @@ function renderHistogram(svgId, metaId, titleId, titleText, hist) {
     svg.appendChild(l);
   }
   // Bars.
+  const dataIdsByBin = hist.dataIdsByBin || [];
   for (let i = 0; i < hist.counts.length; i++) {
     const c = hist.counts[i];
     const h = maxCount === 0 ? 0 : (c / maxCount) * plotH;
@@ -170,12 +175,28 @@ function renderHistogram(svgId, metaId, titleId, titleText, hist) {
     rect.setAttribute('width', Math.max(0.5, barW - 1));
     rect.setAttribute('height', h);
     rect.setAttribute('class', 'night-hist-bar');
-    // Tooltip via <title>: native browser hover.
+    // Tooltip via <title>: native browser hover. Includes a preview of
+    // up to 8 dataIds so the user can sanity-check the bin contents
+    // without clicking.
     const binLo = hist.xMin + i * hist.binWidth;
     const binHi = binLo + hist.binWidth;
+    const ids = dataIdsByBin[i] || [];
+    const previewIds = ids.slice(0, 8).join('\n');
+    const moreSuffix = ids.length > 8 ? `\n+${ids.length - 8} more (click bar)` : '';
     const t = document.createElementNS(ns, 'title');
-    t.textContent = `${binLo.toFixed(2)}–${binHi.toFixed(2)} s\n${c} dataIds`;
+    let titleText = `${binLo.toFixed(2)}–${binHi.toFixed(2)} s\n${c} dataIds`;
+    if (ids.length > 0) {
+      titleText += '\n\n' + previewIds + moreSuffix + '\n\nclick to drill down';
+    }
+    t.textContent = titleText;
     rect.appendChild(t);
+    if (ids.length > 0 && binPanel) {
+      rect.setAttribute('data-bin-index', String(i));
+      rect.style.cursor = 'pointer';
+      rect.addEventListener('click', () => {
+        renderBinPanel(binPanel, svg, i, binLo, binHi, ids);
+      });
+    }
     svg.appendChild(rect);
   }
   // X-axis tick labels: min / mid / max.
@@ -205,6 +226,38 @@ function renderHistogram(svgId, metaId, titleId, titleText, hist) {
     metaText += `; ${hist.nDropped} dataIds excluded (no shutter close known)`;
   }
   meta.textContent = metaText;
+}
+
+function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
+  // Highlight the selected bar so it's clear which bin the panel maps to.
+  svg.querySelectorAll('rect.night-hist-bar').forEach((r) => {
+    r.classList.toggle('selected', r.getAttribute('data-bin-index') === String(binIdx));
+  });
+  panel.innerHTML = '';
+  const header = document.createElement('div');
+  header.className = 'night-hist-bin-header';
+  header.innerHTML =
+    `<strong>${binLo.toFixed(2)}–${binHi.toFixed(2)} s</strong>`
+    + ` · ${dataIds.length} dataId${dataIds.length === 1 ? '' : 's'}`
+    + ` · <span class="muted">click any to open its per-visit drilldown</span>`
+    + ` <button type="button" class="ghost mini" id="night-hist-bin-close">close</button>`;
+  panel.appendChild(header);
+  panel.querySelector('#night-hist-bin-close').addEventListener('click', () => {
+    panel.innerHTML = '';
+    svg.querySelectorAll('rect.night-hist-bar.selected').forEach((r) => r.classList.remove('selected'));
+  });
+  const list = document.createElement('div');
+  list.className = 'night-hist-bin-list';
+  for (const id of dataIds) {
+    const a = document.createElement('a');
+    a.className = 'night-hist-bin-id mono';
+    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = String(id);
+    list.appendChild(a);
+  }
+  panel.appendChild(list);
 }
 
 // ----- failures table + drilldown -------------------------------------------

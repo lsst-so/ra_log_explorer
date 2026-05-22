@@ -71,7 +71,13 @@ class FailureRow:
 
 @dataclass(frozen=True)
 class Histogram:
-    """A simple equi-width histogram, computed from a list of x-values."""
+    """A simple equi-width histogram, computed from a list of x-values.
+
+    ``dataIdsByBin`` is an optional parallel list-of-lists giving the
+    dataIds contributing to each bin (in ascending-x order within the
+    bin). It's used by the UI to let the user drill from a bar straight
+    to the per-visit logs.
+    """
 
     label: str
     unit: str
@@ -81,6 +87,7 @@ class Histogram:
     counts: list[int] = field(default_factory=list)
     nValues: int = 0  # how many x-values went in
     nDropped: int = 0  # how many we couldn't bin (no shutter close known, etc.)
+    dataIdsByBin: list[list[int]] = field(default_factory=list)
 
 
 def computeTopStats(summaries: Iterable[parse.PodSummary]) -> TopStats:
@@ -218,11 +225,18 @@ def buildHistogram(
     offsetsS: list[float],
     nDroppedNoTZero: int = 0,
     nBins: int = 30,
+    dataIds: list[int] | None = None,
 ) -> Histogram:
     """Build a 30-bin equi-width histogram over ``offsetsS``.
 
     If ``offsetsS`` is empty we return an empty histogram (xMin == xMax,
     binWidth == 1) so the consumer can still render a placeholder.
+
+    If ``dataIds`` is supplied it must be parallel to ``offsetsS`` —
+    the result's :attr:`Histogram.dataIdsByBin` will then carry the
+    dataIds bucketed alongside their counts. Within each bin the
+    dataIds are sorted by ascending offset so the eye lands on the
+    outliers immediately.
     """
     if not offsetsS:
         return Histogram(
@@ -234,11 +248,15 @@ def buildHistogram(
             counts=[],
             nValues=0,
             nDropped=nDroppedNoTZero,
+            dataIdsByBin=[],
         )
+    if dataIds is not None and len(dataIds) != len(offsetsS):
+        raise ValueError(f"len(dataIds)={len(dataIds)} doesn't match len(offsetsS)={len(offsetsS)}")
     lo = min(offsetsS)
     hi = max(offsetsS)
     if lo == hi:
         # All values identical — fall back to a single bin centred there.
+        singleBin = [list(dataIds)] if dataIds is not None else []
         return Histogram(
             label=label,
             unit=unit,
@@ -248,14 +266,25 @@ def buildHistogram(
             counts=[len(offsetsS)],
             nValues=len(offsetsS),
             nDropped=nDroppedNoTZero,
+            dataIdsByBin=singleBin,
         )
     width = (hi - lo) / nBins
     counts = [0] * nBins
-    for x in offsetsS:
+    # Build per-bin lists of (offset, dataId) so we can sort within bin
+    # and ship just the dataIds out.
+    binMembers: list[list[tuple[float, int]]] = [[] for _ in range(nBins)]
+    for idx, x in enumerate(offsetsS):
         i = int((x - lo) / width)
         if i == nBins:  # right edge case
             i = nBins - 1
         counts[i] += 1
+        if dataIds is not None:
+            binMembers[i].append((x, dataIds[idx]))
+    dataIdsByBin: list[list[int]] = []
+    if dataIds is not None:
+        for bm in binMembers:
+            bm.sort(key=lambda pair: pair[0])
+            dataIdsByBin.append([did for _, did in bm])
     return Histogram(
         label=label,
         unit=unit,
@@ -265,19 +294,24 @@ def buildHistogram(
         counts=counts,
         nValues=len(offsetsS),
         nDropped=nDroppedNoTZero,
+        dataIdsByBin=dataIdsByBin,
     )
 
 
 def computeDeltaShutterOffsets(
     timesByDataId: dict[int, dt.datetime],
     shutterCloseByExpId: dict[int, dt.datetime],
-) -> tuple[list[float], int]:
-    """Convert ``{dataId: timestamp}`` into a flat list of Δshutter offsets.
+) -> tuple[list[float], list[int], int]:
+    """Convert ``{dataId: timestamp}`` into parallel Δshutter / dataId lists.
 
-    Returns ``(offsetsS, nDropped)`` where ``nDropped`` counts the
-    dataIds we couldn't resolve a shutter close for.
+    Returns ``(offsetsS, dataIds, nDropped)``: ``offsetsS[i]`` is the
+    Δshutter offset for ``dataIds[i]``, and ``nDropped`` counts the
+    dataIds we couldn't resolve a shutter close for. The two lists are
+    parallel and same-length so the histogram builder can attribute each
+    bin back to the contributing dataIds.
     """
     offsets: list[float] = []
+    dataIds: list[int] = []
     nDropped = 0
     for dataId, t in timesByDataId.items():
         close = shutterCloseByExpId.get(dataId)
@@ -285,4 +319,5 @@ def computeDeltaShutterOffsets(
             nDropped += 1
             continue
         offsets.append((t - close).total_seconds())
-    return offsets, nDropped
+        dataIds.append(dataId)
+    return offsets, dataIds, nDropped

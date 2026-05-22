@@ -241,6 +241,8 @@ def test_buildHistogram_bins_values_and_reports_drops() -> None:
     assert h.xMin == 1.0
     assert h.xMax == 9.9
     assert len(h.counts) == 10
+    # Without dataIds, the per-bin dataId list is empty.
+    assert h.dataIdsByBin == []
 
 
 def test_buildHistogram_empty_input_yields_empty_histogram() -> None:
@@ -248,6 +250,57 @@ def test_buildHistogram_empty_input_yields_empty_histogram() -> None:
     assert h.counts == []
     assert h.nValues == 0
     assert h.nDropped == 5
+    assert h.dataIdsByBin == []
+
+
+def test_buildHistogram_attributes_dataIds_to_their_bins() -> None:
+    # Span 0..9 across 10 equal-width bins. Each dataId lands in the
+    # bin matching its integer offset.
+    offsets = [0.0, 0.5, 1.5, 5.5, 9.0]
+    dataIds = [100, 101, 102, 103, 104]
+    h = night.buildHistogram("first", "s", offsets, dataIds=dataIds, nBins=10)
+    assert len(h.dataIdsByBin) == 10
+    assert sum(len(b) for b in h.dataIdsByBin) == 5
+    # 0..1s bin contains the two earliest, sorted by offset.
+    assert h.dataIdsByBin[0] == [100, 101]
+    # 9..10s bin (rightmost) contains the latest dataId — right-edge
+    # rule lands x==xMax in the last bin.
+    assert h.dataIdsByBin[-1] == [104]
+    # All bins collectively cover all 5 dataIds without duplicates.
+    flat = [d for b in h.dataIdsByBin for d in b]
+    assert sorted(flat) == sorted(dataIds)
+
+
+def test_buildHistogram_single_value_yields_single_bin_with_id() -> None:
+    h = night.buildHistogram("only", "s", [3.0], dataIds=[42], nBins=10)
+    assert h.counts == [1]
+    assert h.dataIdsByBin == [[42]]
+
+
+def test_buildHistogram_raises_when_parallel_lists_differ() -> None:
+    with pytest.raises(ValueError):
+        night.buildHistogram("bad", "s", [1.0, 2.0], dataIds=[1])
+
+
+def test_computeDeltaShutterOffsets_returns_parallel_lists() -> None:
+    t = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    times = {100: t + dt.timedelta(seconds=5), 200: t + dt.timedelta(seconds=10)}
+    closes = {100: t, 200: t}
+    offsets, ids, nDropped = night.computeDeltaShutterOffsets(times, closes)
+    assert nDropped == 0
+    # Pair up so the test doesn't depend on dict ordering.
+    pairs = sorted(zip(ids, offsets))
+    assert pairs == [(100, 5.0), (200, 10.0)]
+
+
+def test_computeDeltaShutterOffsets_counts_drops_without_emitting_id() -> None:
+    t = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    times = {100: t + dt.timedelta(seconds=5), 200: t + dt.timedelta(seconds=10)}
+    closes = {100: t}  # 200 missing
+    offsets, ids, nDropped = night.computeDeltaShutterOffsets(times, closes)
+    assert nDropped == 1
+    assert ids == [100]
+    assert offsets == [5.0]
 
 
 def test_failureRows_carry_offsetS_when_shutter_close_known() -> None:

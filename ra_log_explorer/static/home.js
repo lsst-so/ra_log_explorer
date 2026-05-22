@@ -28,11 +28,45 @@ function startHome() {
   prefillForm();
   prefillCreds();
   refreshCache();
+  // URL-driven entry: night-mode bar drilldown produces links of the
+  // form /?dataId=<id>&autoFetch=1 that open in a fresh tab. If those
+  // params are present, override the form's prefilled dataId and (if
+  // autoFetch is set) kick the fetch automatically once the shutter-
+  // close lookup resolves.
+  const params = new URLSearchParams(window.location.search);
+  const urlDataId = params.get('dataId');
+  const urlAutoFetch = params.get('autoFetch') === '1';
+  if (urlDataId) {
+    document.getElementById('fetch-form').elements.exposureId.value = urlDataId;
+  }
   // If the form already has a dataId pre-filled from localStorage, kick
   // a lookup so the submit button is ready to fire immediately.
   triggerLookupIfReady();
+  if (urlAutoFetch && urlDataId) waitAndAutoFetch(parseInt(urlDataId, 10));
 }
 window.startHome = startHome;
+
+function waitAndAutoFetch(expId) {
+  // Wait for the shutter-close lookup to resolve, then submit the
+  // exposure form on the user's behalf. We poll every 200ms with a
+  // 30-second cap so a missing RSP token or an unknown dataId
+  // surfaces normally rather than hanging silently.
+  let elapsed = 0;
+  const maxMs = 30_000;
+  const tick = setInterval(() => {
+    elapsed += 200;
+    if (resolvedForExpId === expId && resolvedTZero) {
+      clearInterval(tick);
+      const form = document.getElementById('fetch-form');
+      if (form && !document.getElementById('fetch-submit').disabled) {
+        showMessage('Auto-fetching from night-view drilldown...');
+        form.requestSubmit();
+      }
+    } else if (elapsed >= maxMs) {
+      clearInterval(tick);
+    }
+  }, 200);
+}
 
 function prefillForm() {
   const last = readJson(LS.lastRun);
