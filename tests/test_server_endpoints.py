@@ -1355,7 +1355,7 @@ def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
     tok.write_text("BEARER")
     monkeypatch.setenv(_et.RSP_TOKEN_FILE_ENV, str(tok))
 
-    def boom(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def boom(*_a: Any, **_kw: Any) -> dict[int, str]:
         raise _et.ConsDbError("synthetic 503")
 
     monkeypatch.setattr(_et, "queryIsotBatch", boom)

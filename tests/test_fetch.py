@@ -5,10 +5,12 @@ from __future__ import annotations
 import datetime as dt
 import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from ra_log_explorer import fetch
+from ra_log_explorer.config import FetchSpec
 
 # ----- humanBytes ---------------------------------------------------------
 
@@ -363,9 +365,7 @@ class _FakeCompleted:
         self.returncode = returncode
 
 
-def _stubSpec() -> "fetch.FetchSpec":  # type: ignore[name-defined]
-    from ra_log_explorer.config import FetchSpec
-
+def _stubSpec() -> FetchSpec:
     return FetchSpec(
         lokiAddr="https://loki",
         username="u",
@@ -382,7 +382,7 @@ def test_run_logcli_includes_user_and_addr_in_cmd(monkeypatch: pytest.MonkeyPatc
     """
     captured: dict[str, list[str]] = {}
 
-    def fakeRun(cmd, **kw):  # type: ignore[no-untyped-def]
+    def fakeRun(cmd: list[str], **kw: Any) -> _FakeCompleted:
         captured["cmd"] = list(cmd)
         return _FakeCompleted(stdout=b"hello")
 
@@ -405,7 +405,7 @@ def test_run_logcli_raises_when_LOKI_PASSWORD_missing(monkeypatch: pytest.Monkey
 def test_run_logcli_raises_FetchError_when_binary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def fakeRun(*_a: Any, **_kw: Any) -> _FakeCompleted:
         raise FileNotFoundError("logcli")
 
     monkeypatch.setenv("LOKI_PASSWORD", "x")
@@ -417,7 +417,7 @@ def test_run_logcli_raises_FetchError_when_binary_missing(
 def test_run_logcli_raises_FetchError_with_stderr_excerpt_on_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def fakeRun(*_a: Any, **_kw: Any) -> _FakeCompleted:
         raise fetch.subprocess.CalledProcessError(
             returncode=1, cmd=["logcli"], output=b"", stderr=b"bad query: parse error\n"
         )
@@ -429,7 +429,7 @@ def test_run_logcli_raises_FetchError_with_stderr_excerpt_on_failure(
 
 
 def test_run_logcli_raises_FetchError_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def fakeRun(*_a: Any, **_kw: Any) -> _FakeCompleted:
         raise fetch.subprocess.TimeoutExpired(cmd=["logcli"], timeout=1.0)
 
     monkeypatch.setenv("LOKI_PASSWORD", "x")
@@ -473,7 +473,7 @@ def test_listPods_parses_series_output(monkeypatch: pytest.MonkeyPatch) -> None:
         b'{cluster="yagan", namespace="rapid-analysis"}\n'
     )
 
-    def fakeRunLogcli(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def fakeRunLogcli(*_a: Any, **_kw: Any) -> bytes:
         return seriesOutput
 
     monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
@@ -489,7 +489,7 @@ def test_listPods_handles_malformed_series_lines(monkeypatch: pytest.MonkeyPatch
         b'{cluster="yagan", pod="\n'  # no closing quote on this line
     )
 
-    def fakeRunLogcli(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def fakeRunLogcli(*_a: Any, **_kw: Any) -> bytes:
         return seriesOutput
 
     monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
@@ -500,9 +500,9 @@ def test_listPods_handles_malformed_series_lines(monkeypatch: pytest.MonkeyPatch
 def test_fetchOnePod_writes_stdout_to_outPath_and_returns_bytes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    captured: dict[str, list[str]] = {}
+    captured: dict[str, Any] = {}
 
-    def fakeRunLogcli(_spec, extraArgs, timeout=None):  # type: ignore[no-untyped-def]
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], timeout: float | None = None) -> bytes:
         captured["extraArgs"] = list(extraArgs)
         captured["timeout"] = timeout
         return b'{"timestamp":"...", "line":"hi\\n"}\n'
@@ -529,12 +529,12 @@ def test_fetchAll_happy_path_invokes_listPods_and_fetchOnePod(
     two pods, ``_fetchOnePod`` writes a tiny payload for each, and
     ``fetchAll`` returns a meta block containing both."""
 
-    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
         return ["aos-0", "sfm-0"]
 
     fetched: list[str] = []
 
-    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
         body = f'{{"pod":"{pod}"}}\n'.encode()
         outPath.write_bytes(body)
         fetched.append(pod)
@@ -564,10 +564,10 @@ def test_fetchAll_collects_per_pod_errors_without_bailing(
     """One pod failing shouldn't fail the whole fetch — errors are
     captured per-pod in the meta block."""
 
-    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
         return ["ok-pod", "bad-pod"]
 
-    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
         if pod == "bad-pod":
             raise fetch.FetchError("simulated")
         outPath.write_bytes(b"{}\n")
@@ -585,10 +585,10 @@ def test_fetchAll_collects_per_pod_errors_without_bailing(
 def test_fetchAll_progress_callback_fires_per_pod(
     monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
 ) -> None:
-    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
         return ["a", "b", "c"]
 
-    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
         outPath.write_bytes(b"x")
         return pod, 1
 
@@ -649,7 +649,7 @@ def test_fetchAll_reuses_superset_when_no_exact_match(
         toIso="2026-05-20T08:35:00Z",
     )
 
-    def shouldNotBeCalled(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def shouldNotBeCalled(*_a: Any, **_kw: Any) -> Any:
         raise AssertionError("listPods/fetchOnePod called despite superset hit")
 
     monkeypatch.setattr(fetch, "listPods", shouldNotBeCalled)
@@ -674,7 +674,7 @@ def test_fetchAll_returns_exact_cache_hit_without_fetching(
         )
     )
 
-    def shouldNotBeCalled(*_a, **_kw):  # type: ignore[no-untyped-def]
+    def shouldNotBeCalled(*_a: Any, **_kw: Any) -> Any:
         raise AssertionError("listPods/fetchOnePod called even though cache exists")
 
     monkeypatch.setattr(fetch, "listPods", shouldNotBeCalled)
@@ -685,7 +685,7 @@ def test_fetchAll_returns_exact_cache_hit_without_fetching(
     assert meta["fromCache"] is True
 
 
-def dt_asdict(spec):  # type: ignore[no-untyped-def]
+def dt_asdict(spec: FetchSpec) -> dict[str, Any]:
     """Small shim so the cache _meta.json round-trips."""
     from dataclasses import asdict
 

@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime as dt
+from pathlib import Path
+from typing import Any, Callable
 
 import pytest
 
 from ra_log_explorer import cli
+from ra_log_explorer.config import FetchSpec
 
 
 def test_parseIsoUtc_z_suffix() -> None:
@@ -99,8 +102,6 @@ def test_cmdRun_rejects_partial_args(capsys: pytest.CaptureFixture[str]) -> None
 
 # ----- cmdCacheInfo + cmdCacheFlush --------------------------------------
 
-from pathlib import Path  # noqa: E402
-
 
 def test_cmdCacheInfo_empty_cache_prints_empty_marker(
     tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
@@ -182,7 +183,7 @@ def test_main_no_args_dispatches_to_cmdRun(
     We stub ``serve`` so we don't actually open a socket."""
     serveCalls: list[tuple] = []
 
-    def fakeServe(host, port, ctx):  # type: ignore[no-untyped-def]
+    def fakeServe(host: str, port: int, ctx: cli.ServerContext) -> None:
         serveCalls.append((host, port))
 
     monkeypatch.setattr(cli, "serve", fakeServe)
@@ -203,7 +204,11 @@ def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
     from ra_log_explorer import parse as _parse
 
     # Stub fetchAll: just create a fake cache dir + return it.
-    def fakeFetchAll(spec, progress=None, forceRefresh=False):  # type: ignore[no-untyped-def]
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict[str, Any]]:
         d = tmpCacheRoot / "fake"
         (d / "pods").mkdir(parents=True)
         return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
@@ -240,7 +245,11 @@ def test_eagerFetch_utc_flag_skips_tai_conversion(
     from ra_log_explorer import cli
     from ra_log_explorer import parse as _parse
 
-    def fakeFetchAll(spec, progress=None, forceRefresh=False):  # type: ignore[no-untyped-def]
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict[str, Any]]:
         d = tmpCacheRoot / "fake-utc"
         (d / "pods").mkdir(parents=True)
         return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
@@ -269,7 +278,7 @@ def test_cmdRun_home_mode_starts_server(monkeypatch: pytest.MonkeyPatch) -> None
     start the server with an empty ServerContext."""
     captured: dict[str, "cli.ServerContext"] = {}
 
-    def fakeServe(host, port, ctx):  # type: ignore[no-untyped-def]
+    def fakeServe(host: str, port: int, ctx: cli.ServerContext) -> None:
         captured["ctx"] = ctx
 
     monkeypatch.setattr(cli, "serve", fakeServe)
