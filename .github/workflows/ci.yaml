@@ -1,0 +1,91 @@
+name: "CI"
+
+# Runs pytest + mypy on every PR and push to main. Unlike rubintv_production
+# (which dogfoods a built Docker image because its imports include the DM
+# stack), ra_log_explorer is a Python 3.13 stdlib-only package, so a plain
+# setup-python + pip-install-dev-deps job is enough.
+
+"on":
+  pull_request:
+    branches:
+      - main
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  pytest:
+    name: "Run pytest with coverage"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: "Set up Python 3.13"
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          # Cache pip downloads keyed off the hash of the dev-deps so a
+          # changed mypy / pytest version invalidates the cache.
+          cache: pip
+
+      - name: "Install dev dependencies"
+        # Runtime deps: none (the package is stdlib-only). Dev tooling:
+        # pytest + pytest-cov for the suite + report; mypy is installed
+        # by the mypy job, not here.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pytest-cov
+
+      - name: "Run pytest with coverage"
+        # ``--cov-fail-under=85`` is a floor: the current value is ~91%,
+        # so anything dropping below 85 means something material was lost.
+        # Bump it if/when we add a substantial well-tested surface.
+        run: |
+          pytest \
+            --cov=ra_log_explorer \
+            --cov-report=xml \
+            --cov-report=term \
+            --cov-fail-under=85 \
+            tests/
+
+      - name: "Coverage summary in PR"
+        if: always()
+        # Render the term report into the run's job summary so reviewers
+        # don't have to dig into the raw log.
+        run: |
+          {
+            echo "### pytest coverage"
+            echo ""
+            echo '```'
+            pytest --cov=ra_log_explorer --cov-report=term-missing tests/ 2>&1 \
+              | tail -25
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  mypy:
+    name: "Run mypy"
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: "Install dev dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install mypy
+      - name: "Run mypy"
+        # mypy.ini at the repo root pins files= ra_log_explorer/, tests/
+        # plus the strict-ish flags, so a bare ``mypy`` is enough.
+        run: mypy
