@@ -95,3 +95,189 @@ def test_cmdRun_rejects_partial_args(capsys: pytest.CaptureFixture[str]) -> None
     assert rc == 2
     captured = capsys.readouterr()
     assert "must be supplied together" in captured.err
+
+
+# ----- cmdCacheInfo + cmdCacheFlush --------------------------------------
+
+from pathlib import Path  # noqa: E402
+
+
+def test_cmdCacheInfo_empty_cache_prints_empty_marker(
+    tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Cache root" in out
+    assert "(empty)" in out
+
+
+def test_cmdCacheInfo_lists_windows(
+    tmpCacheRoot: Path, fakeCachedWindow: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The fixture has a complete _meta.json, so the listing tags it "ok".
+    assert "[ok ]" in out
+    assert fakeCachedWindow.name in out
+    # Cluster / namespace from the fixture should appear in the path tail.
+    assert "yagan" in out and "rapid-analysis" in out
+
+
+def test_cmdCacheInfo_tags_partial_windows(tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A window dir with no ``_meta.json`` (e.g. a half-finished
+    fetch) should show up as ``partial`` rather than being silently
+    hidden or crashing the listing."""
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "abandoned"
+    d.mkdir(parents=True)
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "[partial]" in out
+    assert "abandoned" in out
+
+
+def test_cmdCacheFlush_with_yes_deletes_root(
+    tmpCacheRoot: Path, fakeCachedWindow: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    args = cli.build_parser().parse_args(["cache", "flush", "--yes"])
+    rc = cli.cmdCacheFlush(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Cache flushed" in out
+    assert not tmpCacheRoot.exists()
+
+
+def test_cmdCacheFlush_without_yes_respects_no_input(
+    tmpCacheRoot: Path,
+    fakeCachedWindow: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Answering anything but 'y' to the prompt must leave the cache
+    intact — the prompt is the only safety net for ``--yes`` being
+    omitted."""
+    monkeypatch.setattr("builtins.input", lambda _prompt: "n")
+    args = cli.build_parser().parse_args(["cache", "flush"])
+    rc = cli.cmdCacheFlush(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # No "Cache flushed" message — the prompt was declined.
+    assert "Cache flushed" not in out
+    # Cache contents survived.
+    assert fakeCachedWindow.exists()
+
+
+# ----- main() dispatch + cmdRun home mode --------------------------------
+
+
+def test_main_no_args_dispatches_to_cmdRun(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Passing no subcommand should land in cmdRun (the default).
+    We stub ``serve`` so we don't actually open a socket."""
+    serveCalls: list[tuple] = []
+
+    def fakeServe(host, port, ctx):  # type: ignore[no-untyped-def]
+        serveCalls.append((host, port))
+
+    monkeypatch.setattr(cli, "serve", fakeServe)
+    monkeypatch.setattr(cli, "webbrowser", type("S", (), {"open": lambda _u: None})())
+    rc = cli.main(["--port", "0", "--no-browser"])
+    assert rc == 0
+    assert serveCalls == [("127.0.0.1", 0)]
+
+
+def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLI --t-zero flag defaults to TAI. ``_eagerFetchAndBuildState``
+    must apply the 37-second offset before forming the fetch window —
+    a subtle bug here would skew every fetched window by ~37s and
+    drop the actual shutter close from the window."""
+    from ra_log_explorer import cli
+    from ra_log_explorer import parse as _parse
+
+    # Stub fetchAll: just create a fake cache dir + return it.
+    def fakeFetchAll(spec, progress=None, forceRefresh=False):  # type: ignore[no-untyped-def]
+        d = tmpCacheRoot / "fake"
+        (d / "pods").mkdir(parents=True)
+        return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
+
+    monkeypatch.setattr(cli, "fetchAll", fakeFetchAll)
+    monkeypatch.setattr(_parse, "summarizeAll", lambda _d: [])
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--exposure-id",
+            "2026051900722",
+            "--t-zero",
+            "2026-05-20T08:46:16.267",  # TAI by default
+            "--no-serve",
+            "--no-browser",
+        ]
+    )
+    state = cli._eagerFetchAndBuildState(args)
+    # 08:46:16.267 TAI - 37s = 08:45:39.267 UTC.
+    assert state.tZero.hour == 8 and state.tZero.minute == 45 and state.tZero.second == 39
+    assert state.expId == 2026051900722
+    # Reference points carry a "TAI input" label so the UI can show
+    # which scale the user typed in.
+    assert state.referencePoints[0]["source"] == "shutter close"
+
+
+def test_eagerFetch_utc_flag_skips_tai_conversion(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With --t-zero-utc the input is taken as UTC and no offset is
+    applied. Regressing this would silently shift every UTC-mode
+    fetch by 37s."""
+    from ra_log_explorer import cli
+    from ra_log_explorer import parse as _parse
+
+    def fakeFetchAll(spec, progress=None, forceRefresh=False):  # type: ignore[no-untyped-def]
+        d = tmpCacheRoot / "fake-utc"
+        (d / "pods").mkdir(parents=True)
+        return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
+
+    monkeypatch.setattr(cli, "fetchAll", fakeFetchAll)
+    monkeypatch.setattr(_parse, "summarizeAll", lambda _d: [])
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--exposure-id",
+            "1",
+            "--t-zero",
+            "2026-05-20T08:45:39.267",
+            "--t-zero-utc",
+            "--no-serve",
+            "--no-browser",
+        ]
+    )
+    state = cli._eagerFetchAndBuildState(args)
+    # Same numeric value: no conversion applied.
+    assert state.tZero.second == 39
+
+
+def test_cmdRun_home_mode_starts_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No --exposure-id + no --t-zero ⇒ home mode: cmdRun should just
+    start the server with an empty ServerContext."""
+    captured: dict[str, "cli.ServerContext"] = {}
+
+    def fakeServe(host, port, ctx):  # type: ignore[no-untyped-def]
+        captured["ctx"] = ctx
+
+    monkeypatch.setattr(cli, "serve", fakeServe)
+    monkeypatch.setattr(cli, "webbrowser", type("S", (), {"open": lambda _u: None})())
+    args = cli.build_parser().parse_args(["run", "--no-browser"])
+    rc = cli.cmdRun(args)
+    assert rc == 0
+    # No states loaded — the user lands on the home view.
+    ctx = captured["ctx"]
+    assert len(ctx.exposureStates) == 0
+    assert len(ctx.nightStates) == 0

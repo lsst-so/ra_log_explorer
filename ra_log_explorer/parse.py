@@ -192,7 +192,14 @@ def _parseTimestamp(s: str) -> dt.datetime:
     if tz == "Z":
         tz = "+00:00"
     iso = head + tz if tz else head
-    return dt.datetime.fromisoformat(iso).astimezone(dt.timezone.utc)
+    parsed = dt.datetime.fromisoformat(iso)
+    # If the upstream string had no timezone marker, ``fromisoformat``
+    # returns a naive datetime; ``astimezone`` would then treat it as
+    # *local* time, which is the wrong default for log timestamps that
+    # are always UTC by convention. Pin it to UTC explicitly.
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def parseLogLine(pod: str, jsonObj: dict) -> LogLine | None:

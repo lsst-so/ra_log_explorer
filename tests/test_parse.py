@@ -627,6 +627,300 @@ def test_podsTouchingExp_includes_only_pods_with_match(
     assert noise.stem not in pods
 
 
+# ----- edge cases: timestamp + level normalisation ------------------------
+
+
+def test_normalizeLevel_handles_crit_fatal_as_error() -> None:
+    """The DM stack occasionally emits CRITICAL / FATAL — those should
+    bucket into ``error`` so the per-pod counters and UI colouring
+    behave consistently."""
+    assert parse._normalizeLevel("crit") == "error"
+    assert parse._normalizeLevel("critical") == "error"
+    assert parse._normalizeLevel("fatal") == "error"
+    assert parse._normalizeLevel("CRITICAL") == "error"
+
+
+def test_normalizeLevel_unknown_strings_pass_through_lowercased() -> None:
+    # Anything we don't recognise stays as-is (lowercased) so it shows up
+    # in the UI without being silently swallowed.
+    assert parse._normalizeLevel("trace") == "trace"
+    assert parse._normalizeLevel(None) == "unknown"
+    assert parse._normalizeLevel("") == "unknown"
+
+
+def test_parseTimestamp_handles_string_without_tz_offset() -> None:
+    """Some upstream sources emit a naked ISO with no tz suffix — we
+    should treat it as UTC rather than crashing."""
+    t = parse._parseTimestamp("2026-05-21T13:00:00.123456")
+    assert t == dt.datetime(2026, 5, 21, 13, 0, 0, 123456, tzinfo=dt.timezone.utc)
+
+
+def test_parseTimestamp_handles_Z_suffix() -> None:
+    t = parse._parseTimestamp("2026-05-21T13:00:00Z")
+    assert t == dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+
+
+def test_parseLogLine_returns_None_for_unparseable_timestamp() -> None:
+    """A timestamp the regex would accept but ``fromisoformat`` rejects
+    must not throw — the line is just skipped."""
+    line = parse.parseLogLine("p", {"timestamp": "not-an-iso", "line": "x"})
+    assert line is None
+
+
+def test_parseLogLine_returns_None_for_missing_timestamp() -> None:
+    line = parse.parseLogLine("p", {"line": "x"})
+    assert line is None
+
+
+# ----- edge cases: pod-group classification -------------------------------
+
+
+def test_podGroup_unknown_prefix_lands_in_other() -> None:
+    # No anchored prefix match — the group must be "other" so the UI
+    # still shows the pod rather than silently hiding it.
+    assert parse.podGroup("s-lsstcam-run-something-completely-new-0") == "other"
+    assert parse.podGroup("totally-random-pod-name") == "other"
+
+
+def test_podInstrument_recognises_inst_prefixes() -> None:
+    # podInstrument returns the canonical CamelCase form (matches the
+    # Butler `instrument` field that the rest of the codebase compares
+    # against).
+    assert parse.podInstrument("s-lsstcam-run-aos-worker-0") == "LSSTCam"
+    # Longest-match wins over shorter substring: lsstcomcamsim must NOT
+    # be misclassified as lsstcomcam.
+    assert parse.podInstrument("s-lsstcomcamsim-run-sfm-runner-0") == "LSSTComCamSim"
+
+
+# ----- edge cases: traceback capture --------------------------------------
+
+
+def _writePodLog(path: Path, lines: list[tuple[str, str, str]]) -> None:
+    """Helper to write a per-pod JSONL fixture: (ts, level, raw)."""
+    with open(path, "w") as fh:
+        for ts, level, raw in lines:
+            fh.write(
+                json.dumps(
+                    {
+                        "timestamp": ts,
+                        "labels": {"detected_level": level},
+                        "line": raw + "\n",
+                    }
+                )
+                + "\n"
+            )
+
+
+def test_summarizePod_captures_chained_exception_during_handling(tmp_path: Path) -> None:
+    """A traceback can contain "During handling of the above exception,
+    another exception occurred:" — when the lines arrive contiguously
+    (no blank-line gaps, which is what Loki's ``--forward`` JSONL
+    delivers when the chained block is one Python logging call) we
+    should keep capturing through that marker until we reach the real
+    terminal exception class. The captured class stays at the first
+    one seen so the failure aggregation tables don't gain spurious
+    extra entries from the chained RuntimeError.
+    """
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100050 detector 1",
+            ),
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in inner'),
+            ("2026-05-21T13:00:01.002+00:00", "error", "ValueError: bad donut"),
+            (
+                "2026-05-21T13:00:01.004+00:00",
+                "error",
+                "During handling of the above exception, another exception occurred:",
+            ),
+            ("2026-05-21T13:00:01.006+00:00", "error", '  File "/y.py", line 2, in outer'),
+            ("2026-05-21T13:00:01.007+00:00", "error", "RuntimeError: re-raised"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    tb = s.tracebacks[0]
+    # The first exception class we see is the one recorded.
+    assert tb.excClass == "ValueError"
+    # The chained block landed inside the same body record.
+    assert "During handling" in tb.body
+    assert "RuntimeError: re-raised" in tb.body
+
+
+def test_summarizePod_blank_line_terminates_traceback_capture(tmp_path: Path) -> None:
+    """A blank line inside a traceback currently terminates capture —
+    pin that as the known limitation so a future loosening of
+    ``_isTracebackBodyLine`` shows up as a deliberate test churn,
+    not a silent regression.
+    """
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100051 detector 1",
+            ),
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in inner'),
+            ("2026-05-21T13:00:01.002+00:00", "error", "ValueError: first"),
+            # A literal blank line — currently treated as a terminator.
+            ("2026-05-21T13:00:01.003+00:00", "info", ""),
+            # Anything after the blank is no longer in the captured body.
+            ("2026-05-21T13:00:01.004+00:00", "error", "RuntimeError: should-not-appear"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    assert s.tracebacks[0].excClass == "ValueError"
+    assert "should-not-appear" not in s.tracebacks[0].body
+
+
+def test_summarizePod_back_to_back_tracebacks_both_recorded(tmp_path: Path) -> None:
+    """If a new ``Traceback (most recent call last):`` arrives while we
+    still have an open one, the open one must be finalised before the
+    new one starts — otherwise the second body silently grows onto the
+    first record's tail."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100060 detector 1",
+            ),
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", "ValueError: first"),
+            # Second traceback starts WITHOUT an intervening non-body line.
+            ("2026-05-21T13:00:01.002+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.003+00:00", "error", "RuntimeError: second"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 2
+    classes = [tb.excClass for tb in s.tracebacks]
+    assert classes == ["ValueError", "RuntimeError"]
+    assert "first" in s.tracebacks[0].excMessage
+    assert "second" in s.tracebacks[1].excMessage
+
+
+def test_summarizePod_traceback_with_no_terminal_class_stays_unknown(tmp_path: Path) -> None:
+    """If the lead line appears but the body never carries an
+    exception-shaped class, we still ship the record so the user sees
+    the context — class just stays <unknown>. Exercises the end-of-
+    pod-log flush path."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100070 detector 1",
+            ),
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
+            # End of pod log — no terminal class line. The capture
+            # state machine flushes whatever it has.
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    assert s.tracebacks[0].excClass == "<unknown>"
+    assert "/x.py" in s.tracebacks[0].body
+
+
+# ----- edge cases: WORKER_REPORT_FAILED variant ---------------------------
+
+
+def test_classify_emits_WORKER_REPORT_FAILED_for_failed_status() -> None:
+    """The "failed" form of the report line should land in
+    ``WORKER_REPORT_FAILED`` rather than getting silently dropped or
+    mis-bucketed into the FINISHED kind. ``classify`` only inspects
+    worker-shaped lines, so the logger string must reflect that."""
+    line = parse.LogLine(
+        pod="p",
+        timestamp=dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc),
+        level="info",
+        logger="lsst.rubintv.production.SingleCorePipelineRunner",
+        function="report",
+        message=("Reporting AOSSingleCorePipelineRunner failed for detector 5 of exposure 2026052100050"),
+        raw="Reporting AOSSingleCorePipelineRunner failed for detector 5 of exposure 2026052100050",
+    )
+    ev = parse.classify(line)
+    assert ev is not None
+    assert ev.kind == "WORKER_REPORT_FAILED"
+    assert ev.expId == 2026052100050
+    assert ev.detector == 5
+
+
+# ----- edge cases: malformed JSONL --------------------------------------
+
+
+def test_iterPodLines_skips_malformed_jsonl_records(tmp_path: Path) -> None:
+    """A single mid-stream malformed JSON record should be skipped, not
+    abort the iteration. Real Loki output occasionally has a truncated
+    last record."""
+    p = tmp_path / "broken.jsonl"
+    p.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-21T13:00:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "first ok\n",
+            }
+        )
+        + "\n"
+        + "this is not valid json\n"
+        + json.dumps(
+            {
+                "timestamp": "2026-05-21T13:00:01.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "second ok\n",
+            }
+        )
+        + "\n"
+    )
+    out = list(parse.iterPodLines(p))
+    assert [ln.raw for ln in out] == ["first ok", "second ok"]
+
+
+def test_summarizeAll_skips_non_jsonl_files_in_pods_dir(tmp_path: Path) -> None:
+    """Cache dirs are walked with ``iterdir`` — a stray non-.jsonl file
+    (e.g. an editor swapfile, a partial download) must not be parsed."""
+    cacheDir = tmp_path / "cache"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    _writePodLog(
+        podsDir / "s-lsstcam-run-aos-worker-0.jsonl",
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100050 detector 1",
+            ),
+        ],
+    )
+    (podsDir / "notes.txt").write_text("just some scratch notes\n")
+    summaries = parse.summarizeAll(cacheDir)
+    assert {s.pod for s in summaries} == {"s-lsstcam-run-aos-worker-0"}
+
+
+def test_summarizeAll_returns_empty_when_pods_dir_missing(tmp_path: Path) -> None:
+    """fetchAll always creates pods/, but a hand-crafted cache or a
+    half-deleted dir might not — make sure that's a safe no-op."""
+    cacheDir = tmp_path / "no-pods-here"
+    cacheDir.mkdir()
+    assert parse.summarizeAll(cacheDir) == []
+
+
 # ----- helpers ------------------------------------------------------------
 
 

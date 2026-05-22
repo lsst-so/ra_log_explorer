@@ -1035,3 +1035,472 @@ def test_pod_endpoint_routes_by_dataId_query(runningServer: RunningServer, tmpCa
     assert status == 200, body
     # If the routing worked we got the loaded pod's events back.
     assert body["pod"] == podName
+
+
+# ----- /api/summary error branches ---------------------------------------
+
+
+def test_summary_rejects_non_integer_dataId(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/summary?dataId=not-a-number")
+    assert status == 400
+    assert "dataId" in body["error"]
+
+
+def test_summary_rejects_non_integer_dayObs(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/summary?dayObs=oops")
+    assert status == 400
+    assert "dayObs" in body["error"]
+
+
+# ----- /api/pod/<pod> error branches -------------------------------------
+
+
+def test_pod_endpoint_rejects_invalid_pod_name(runningServer: RunningServer) -> None:
+    """The pod regex on the server is `^[A-Za-z0-9._-]+$` — anything
+    with a slash or shell metachar should be rejected at the path
+    parser, not interpreted as a directory traversal attempt."""
+    host, port, _ctx = runningServer
+    status, _ = _get(host, port, "/api/pod/..%2Fevil?dataId=1")
+    # The traversal is double-encoded; the server should reject the
+    # path component rather than read /api/pod with an escape.
+    assert status in (400, 404)
+
+
+def test_pod_endpoint_404_when_dayObs_not_loaded(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/pod/some-pod?dayObs=20990101")
+    assert status == 404
+    assert "20990101" in body["error"]
+
+
+# ----- /api/night/traceback error branches -------------------------------
+
+
+def test_night_traceback_404_when_no_dayObs_param(runningServer: RunningServer) -> None:
+    """Without a ?dayObs query param the server can't pick a night
+    state to read from; the response must be 404 rather than picking
+    an arbitrary loaded night."""
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/night/traceback/some-key")
+    assert status == 404
+    assert "error" in body
+
+
+def test_night_traceback_400_when_dayObs_not_integer(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/night/traceback/some-key?dayObs=bad")
+    assert status == 400
+
+
+def test_night_traceback_404_when_bodyKey_unknown(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """Loaded night, valid dayObs, but the bodyKey doesn't match any
+    captured traceback → 404."""
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "n"
+    (cacheDir / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260521,
+                startTime=serverModule.dayObsStartUtc(20260521),
+                endTime=serverModule.dayObsEndUtc(20260521),
+            )
+        )
+    status, body = _get(host, port, "/api/night/traceback/no-such-key?dayObs=20260521")
+    assert status == 404
+    assert "no-such-key" in body["error"]
+
+
+def test_night_traceback_falls_back_to_time_window_for_unattributed_tb(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """A traceback whose expId can't be carryover-attributed (e.g. fires
+    before any dataId mention) drops into the ``time-window`` context
+    source rather than the ``dataId-block`` one."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "n2"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-0"
+    # Traceback fires with no preceding dataId mention — carryover stays
+    # at None, so the traceback's expId will be None.
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        "\n".join(
+            [
+                _json.dumps(
+                    {
+                        "timestamp": "2026-05-21T13:00:00.000+00:00",
+                        "labels": {"detected_level": "info"},
+                        "line": "pre-startup chatter\n",
+                    }
+                ),
+                _json.dumps(
+                    {
+                        "timestamp": "2026-05-21T13:00:01.000+00:00",
+                        "labels": {"detected_level": "error"},
+                        "line": "Traceback (most recent call last):\n",
+                    }
+                ),
+                _json.dumps(
+                    {
+                        "timestamp": "2026-05-21T13:00:01.001+00:00",
+                        "labels": {"detected_level": "error"},
+                        "line": "RuntimeError: bang\n",
+                    }
+                ),
+            ]
+        )
+        + "\n"
+    )
+    summaries = _parse.summarizeAll(cacheDir)
+    assert summaries[0].tracebacks
+    tb = summaries[0].tracebacks[0]
+    assert tb.expId is None  # the precondition we're exercising
+    bodyKey = f"{podName}@{tb.t.isoformat()}"
+    with ctx.jobs.stateLock:
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=summaries,
+                dayObs=20260521,
+                startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+                endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+            )
+        )
+    status, payload = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs=20260521")
+    assert status == 200, payload
+    assert payload["contextSource"] == "time-window"
+    # The pre-startup chatter line (~1s before the traceback) should be
+    # visible — that's the whole point of the ±30s fallback window.
+    rawTexts = [ln["raw"] for ln in payload["lines"]]
+    assert any("pre-startup chatter" in r for r in rawTexts)
+
+
+# ----- cache-path security boundary --------------------------------------
+
+
+def test_cache_delete_rejects_path_traversal(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """`_safePathComponent` is the wall between the URL and the cache
+    root's resolved subtree. A ``..`` in any segment must be rejected
+    before we ever touch the filesystem — currently as a 404 ("no
+    such cache directory"), which is the safe answer."""
+    host, port, _ctx = runningServer
+    status, _ = _delete(host, port, "/api/cache/yagan/rapid-analysis/..")
+    assert status in (400, 404)
+    # The cache root must still exist (the rejected request didn't
+    # touch the filesystem).
+    assert tmpCacheRoot.exists()
+
+
+def test_cache_delete_404_for_unknown_window(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """Valid path shape but the dir doesn't exist on disk."""
+    host, port, _ctx = runningServer
+    status, _ = _delete(host, port, "/api/cache/yagan/rapid-analysis/2099-01-01T000000Z__2099-01-01T000100Z")
+    assert status == 404
+
+
+# ----- /api/settings PUT validation ---------------------------------------
+
+
+def test_settings_put_rejects_missing_maxCacheBytes(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=json.dumps({}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 400
+    assert "maxCacheBytes" in text
+
+
+def test_settings_put_rejects_negative_value(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=json.dumps({"maxCacheBytes": -1}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 400
+    assert "non-negative" in text or "negative" in text
+
+
+def test_settings_put_rejects_bad_json_body(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=b"{this is not json",
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 400
+    assert "JSON" in text or "json" in text
+
+
+# ----- _prefetchNightShutterCloses signalling ----------------------------
+
+
+def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """If the RSP token file doesn't exist, the prefetch pass must emit
+    a ``no-token`` event rather than raising into the job thread (which
+    would surface as an opaque "error" event)."""
+    import datetime as _dt
+
+    from ra_log_explorer import exposureTimes as _et
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.config import FetchSpec
+    from ra_log_explorer.jobs import JobManager
+    from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
+
+    monkeypatch.delenv(_et.RSP_TOKEN_FILE_ENV, raising=False)
+    monkeypatch.setattr(_et, "DEFAULT_RSP_TOKEN_FILE", tmpCacheRoot / "no-such-token-file")
+    # A summary with one dataId that needs shutter close — without a
+    # token, the lookup can't proceed.
+    summary = _parse.PodSummary(
+        pod="s-lsstcam-run-aos-worker-0",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        events=[
+            _parse.Event(
+                pod="p",
+                t=_dt.datetime(2026, 5, 21, 13, 0, tzinfo=_dt.timezone.utc),
+                kind="WORKER_PICKUP",
+                level="info",
+                expId=2026052100050,
+            )
+        ],
+    )
+    state = NightState(
+        cacheDir=tmpCacheRoot,
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260521,
+        startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+        endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+    )
+    jobs = JobManager()
+    job = jobs.createNightJob(
+        FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="x",
+            toIso="y",
+            podRegex=".*aos.*",
+        ),
+        20260521,
+    )
+    _prefetchNightShutterCloses(state, [summary], job)
+    phases = [ev["phase"] for ev in job.events if ev.get("type") == "shutter-close"]
+    # The "starting" + "cache-checked" phases always fire; the final
+    # phase must be "no-token" given there's no file.
+    assert "no-token" in phases
+    assert "consdb-error" not in phases
+
+
+def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """An exception from the ConsDB batch query must surface as a
+    ``consdb-error`` event, not propagate out of the worker."""
+    import datetime as _dt
+
+    from ra_log_explorer import exposureTimes as _et
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.config import FetchSpec
+    from ra_log_explorer.jobs import JobManager
+    from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
+
+    # Plant a real token file so the no-token branch doesn't short-circuit.
+    tok = tmpCacheRoot / "tok"
+    tok.write_text("BEARER")
+    monkeypatch.setenv(_et.RSP_TOKEN_FILE_ENV, str(tok))
+
+    def boom(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise _et.ConsDbError("synthetic 503")
+
+    monkeypatch.setattr(_et, "queryIsotBatch", boom)
+    summary = _parse.PodSummary(
+        pod="s-lsstcam-run-aos-worker-0",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        events=[
+            _parse.Event(
+                pod="p",
+                t=_dt.datetime(2026, 5, 21, 13, 0, tzinfo=_dt.timezone.utc),
+                kind="WORKER_PICKUP",
+                level="info",
+                expId=2026052100051,
+            )
+        ],
+    )
+    state = NightState(
+        cacheDir=tmpCacheRoot,
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260521,
+        startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+        endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+    )
+    jobs = JobManager()
+    job = jobs.createNightJob(
+        FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="x",
+            toIso="y",
+            podRegex=".*aos.*",
+        ),
+        20260521,
+    )
+    _prefetchNightShutterCloses(state, [summary], job)
+    phases = [ev["phase"] for ev in job.events if ev.get("type") == "shutter-close"]
+    assert "consdb-error" in phases
+
+
+def test_pod_endpoint_routes_by_dayObs_query(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """/api/pod/<pod>?dayObs=Y reads from night Y's cache, returns the
+    night-shaped per-pod payload (no shutter close, offset-from-night-
+    start instead of from t-zero)."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "n-pod-route"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-0"
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-21T13:30:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "Running pipeline for 2026052100050 on detector 1\n",
+            }
+        )
+        + "\n"
+    )
+    summaries = _parse.summarizeAll(cacheDir)
+    with ctx.jobs.stateLock:
+        ctx.putNightState(
+            NightState(
+                cacheDir=cacheDir,
+                cacheBytes=0,
+                meta={},
+                summaries=summaries,
+                dayObs=20260521,
+                startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+                endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+            )
+        )
+    status, body = _get(host, port, f"/api/pod/{podName}?dayObs=20260521")
+    assert status == 200, body
+    assert body["pod"] == podName
+    # Night-mode payload carries lines (not events) and an offsetS
+    # measured from night start (noon UTC), so 13:30 → 1.5h = 5400s.
+    assert body["lines"][0]["offsetS"] == 5400.0
+    assert body["lines"][0]["expId"] == 2026052100050
+
+
+def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
+    tmpCacheRoot: Path,
+) -> None:
+    """With no events that mention dataIds, there's nothing to look up
+    — the function must exit early without emitting any progress
+    events (would otherwise show up as a no-op "starting"+"done"
+    pair in the UI log)."""
+    import datetime as _dt
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.config import FetchSpec
+    from ra_log_explorer.jobs import JobManager
+    from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
+
+    summary = _parse.PodSummary(
+        pod="s-lsstcam-run-aos-worker-0",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=0,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+    )
+    state = NightState(
+        cacheDir=tmpCacheRoot,
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260521,
+        startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
+        endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+    )
+    jobs = JobManager()
+    job = jobs.createNightJob(
+        FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="x",
+            toIso="y",
+            podRegex=".*aos.*",
+        ),
+        20260521,
+    )
+    _prefetchNightShutterCloses(state, [summary], job)
+    shutterEvents = [ev for ev in job.events if ev.get("type") == "shutter-close"]
+    assert shutterEvents == []

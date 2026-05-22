@@ -352,6 +352,346 @@ def test_evictToFit_skips_exempt(tmpCacheRoot: Path) -> None:
     assert a.exists()
 
 
+# ----- _run_logcli + listPods + _fetchOnePod (subprocess-mocked) ----------
+
+
+class _FakeCompleted:
+    """Stand-in for the ``subprocess.CompletedProcess`` we capture."""
+
+    def __init__(self, stdout: bytes = b"", returncode: int = 0) -> None:
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def _stubSpec() -> "fetch.FetchSpec":  # type: ignore[name-defined]
+    from ra_log_explorer.config import FetchSpec
+
+    return FetchSpec(
+        lokiAddr="https://loki",
+        username="u",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-05-20T08:00:00Z",
+        toIso="2026-05-20T08:10:00Z",
+    )
+
+
+def test_run_logcli_includes_user_and_addr_in_cmd(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``_run_logcli`` must call the logcli binary with the connection flags
+    threaded in, not via env vars that could leak.
+    """
+    captured: dict[str, list[str]] = {}
+
+    def fakeRun(cmd, **kw):  # type: ignore[no-untyped-def]
+        captured["cmd"] = list(cmd)
+        return _FakeCompleted(stdout=b"hello")
+
+    monkeypatch.setenv("LOKI_PASSWORD", "x")
+    monkeypatch.setattr(fetch.subprocess, "run", fakeRun)
+    out = fetch._run_logcli(_stubSpec(), ["series", '{cluster="yagan"}'])
+    assert out == b"hello"
+    assert captured["cmd"][0] == "logcli"
+    assert "--username=u" in captured["cmd"]
+    assert "--addr=https://loki" in captured["cmd"]
+    assert captured["cmd"][-2:] == ["series", '{cluster="yagan"}']
+
+
+def test_run_logcli_raises_when_LOKI_PASSWORD_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("LOKI_PASSWORD", raising=False)
+    with pytest.raises(fetch.FetchError, match="LOKI_PASSWORD"):
+        fetch._run_logcli(_stubSpec(), ["series"])
+
+
+def test_run_logcli_raises_FetchError_when_binary_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise FileNotFoundError("logcli")
+
+    monkeypatch.setenv("LOKI_PASSWORD", "x")
+    monkeypatch.setattr(fetch.subprocess, "run", fakeRun)
+    with pytest.raises(fetch.FetchError, match="not found on PATH"):
+        fetch._run_logcli(_stubSpec(), ["series"])
+
+
+def test_run_logcli_raises_FetchError_with_stderr_excerpt_on_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise fetch.subprocess.CalledProcessError(
+            returncode=1, cmd=["logcli"], output=b"", stderr=b"bad query: parse error\n"
+        )
+
+    monkeypatch.setenv("LOKI_PASSWORD", "x")
+    monkeypatch.setattr(fetch.subprocess, "run", fakeRun)
+    with pytest.raises(fetch.FetchError, match="bad query: parse error"):
+        fetch._run_logcli(_stubSpec(), ["series"])
+
+
+def test_run_logcli_raises_FetchError_on_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fakeRun(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise fetch.subprocess.TimeoutExpired(cmd=["logcli"], timeout=1.0)
+
+    monkeypatch.setenv("LOKI_PASSWORD", "x")
+    monkeypatch.setattr(fetch.subprocess, "run", fakeRun)
+    with pytest.raises(fetch.FetchError, match="timed out"):
+        fetch._run_logcli(_stubSpec(), ["series"])
+
+
+def test_matcher_default_has_cluster_and_namespace_only() -> None:
+    spec = _stubSpec()
+    assert fetch._matcher(spec) == '{cluster="yagan",namespace="rapid-analysis"}'
+
+
+def test_matcher_pins_pod_when_given() -> None:
+    m = fetch._matcher(_stubSpec(), pod="s-lsstcam-run-sfm-runner-0")
+    assert 'pod="s-lsstcam-run-sfm-runner-0"' in m
+
+
+def test_matcher_uses_podRegex_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+    from ra_log_explorer.config import FetchSpec
+
+    spec = FetchSpec(
+        lokiAddr="x",
+        username="u",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="x",
+        toIso="y",
+        podRegex=".*aos.*",
+    )
+    m = fetch._matcher(spec)
+    assert 'pod=~".*aos.*"' in m
+
+
+def test_listPods_parses_series_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    seriesOutput = (
+        b'{cluster="yagan", namespace="rapid-analysis", pod="aos-worker-3"}\n'
+        b'{cluster="yagan", namespace="rapid-analysis", pod="sfm-runner-1"}\n'
+        b'{cluster="yagan", namespace="rapid-analysis", pod="aos-worker-3"}\n'
+        # also a line with no `pod=` label — silently dropped.
+        b'{cluster="yagan", namespace="rapid-analysis"}\n'
+    )
+
+    def fakeRunLogcli(*_a, **_kw):  # type: ignore[no-untyped-def]
+        return seriesOutput
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    pods = fetch.listPods(_stubSpec())
+    assert pods == ["aos-worker-3", "sfm-runner-1"]  # deduped + sorted
+
+
+def test_listPods_handles_malformed_series_lines(monkeypatch: pytest.MonkeyPatch) -> None:
+    # An unterminated `pod="...` should be ignored, not crash.
+    seriesOutput = (
+        b"random garbage\n"
+        b'{cluster="yagan", pod="ok-pod"}\n'
+        b'{cluster="yagan", pod="\n'  # no closing quote on this line
+    )
+
+    def fakeRunLogcli(*_a, **_kw):  # type: ignore[no-untyped-def]
+        return seriesOutput
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    pods = fetch.listPods(_stubSpec())
+    assert pods == ["ok-pod"]
+
+
+def test_fetchOnePod_writes_stdout_to_outPath_and_returns_bytes(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, list[str]] = {}
+
+    def fakeRunLogcli(_spec, extraArgs, timeout=None):  # type: ignore[no-untyped-def]
+        captured["extraArgs"] = list(extraArgs)
+        captured["timeout"] = timeout
+        return b'{"timestamp":"...", "line":"hi\\n"}\n'
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    out = tmp_path / "pod.jsonl"
+    pod, nbytes = fetch._fetchOnePod(_stubSpec(), "s-lsstcam-run-aos-worker-0", out)
+    assert pod == "s-lsstcam-run-aos-worker-0"
+    assert nbytes == len(out.read_bytes())
+    assert out.read_text().startswith('{"timestamp"')
+    # The query must use forward order + JSONL output (the file format the
+    # parser assumes). Regressing either of those silently breaks the
+    # downstream pipeline, so they're worth pinning here.
+    assert "--forward" in captured["extraArgs"]
+    assert "jsonl" in captured["extraArgs"]
+    # Per-pod fetches get a longer timeout than series queries.
+    assert captured["timeout"] == 600.0
+
+
+def test_fetchAll_happy_path_invokes_listPods_and_fetchOnePod(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """End-to-end happy path with subprocess fully mocked: listPods returns
+    two pods, ``_fetchOnePod`` writes a tiny payload for each, and
+    ``fetchAll`` returns a meta block containing both."""
+
+    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+        return ["aos-0", "sfm-0"]
+
+    fetched: list[str] = []
+
+    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+        body = f'{{"pod":"{pod}"}}\n'.encode()
+        outPath.write_bytes(body)
+        fetched.append(pod)
+        return pod, len(body)
+
+    # Force `windowInPast` false-positive to trigger a fresh fetch
+    # (window is well in the past relative to "now").
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    spec = _stubSpec()
+    cacheDir, meta = fetch.fetchAll(spec)
+    assert sorted(fetched) == ["aos-0", "sfm-0"]
+    assert meta["pod_count"] == 2
+    assert set(meta["pod_bytes"]) == {"aos-0", "sfm-0"}
+    assert meta["fromCache"] is False
+    assert meta["cacheReuse"] == "none"
+    # Files actually landed in the cacheDir/pods subdir.
+    assert (cacheDir / "pods" / "aos-0.jsonl").exists()
+    assert (cacheDir / "pods" / "sfm-0.jsonl").exists()
+    # Partial flag was cleared at the end of a successful run.
+    assert not (cacheDir / fetch.PARTIAL_FLAG).exists()
+
+
+def test_fetchAll_collects_per_pod_errors_without_bailing(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """One pod failing shouldn't fail the whole fetch — errors are
+    captured per-pod in the meta block."""
+
+    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+        return ["ok-pod", "bad-pod"]
+
+    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+        if pod == "bad-pod":
+            raise fetch.FetchError("simulated")
+        outPath.write_bytes(b"{}\n")
+        return pod, 3
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    _, meta = fetch.fetchAll(_stubSpec())
+    assert "bad-pod" in meta["errors"]
+    assert "simulated" in meta["errors"]["bad-pod"]
+    assert meta["pod_bytes"]["bad-pod"] == 0
+    assert meta["pod_bytes"]["ok-pod"] == 3
+
+
+def test_fetchAll_progress_callback_fires_per_pod(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    def fakeListPods(_spec):  # type: ignore[no-untyped-def]
+        return ["a", "b", "c"]
+
+    def fakeFetchOne(_spec, pod, outPath):  # type: ignore[no-untyped-def]
+        outPath.write_bytes(b"x")
+        return pod, 1
+
+    seen: list[tuple[str, int, int]] = []
+
+    def progress(pod: str, i: int, total: int) -> None:
+        seen.append((pod, i, total))
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    fetch.fetchAll(_stubSpec(), progress=progress)
+    assert len(seen) == 3
+    # Final tick's index == total.
+    assert seen[-1][1] == 3 and seen[-1][2] == 3
+
+
+def test_fetchAll_reuses_superset_when_no_exact_match(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """If we ask for [B, C] and the cache has [A, D] with A<B<C<D, we
+    should reuse the wider window rather than firing a fresh fetch."""
+    # Plant a superset cache covering an hour-long window.
+    superset = fetch.ensureWindowCacheDir(
+        "yagan", "rapid-analysis", "2026-05-20T08:00:00Z", "2026-05-20T09:00:00Z"
+    )
+    (superset / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:00:00Z",
+                    "toIso": "2026-05-20T09:00:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": None,
+                },
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    from ra_log_explorer.config import FetchSpec
+
+    requestedSpec = FetchSpec(
+        lokiAddr="x",
+        username="u",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-05-20T08:30:00Z",  # narrower window, fully inside superset
+        toIso="2026-05-20T08:35:00Z",
+    )
+
+    def shouldNotBeCalled(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise AssertionError("listPods/fetchOnePod called despite superset hit")
+
+    monkeypatch.setattr(fetch, "listPods", shouldNotBeCalled)
+    monkeypatch.setattr(fetch, "_fetchOnePod", shouldNotBeCalled)
+    out, meta = fetch.fetchAll(requestedSpec)
+    assert out == superset
+    assert meta["cacheReuse"] == "superset"
+    assert meta["fromCache"] is True
+    assert meta["cacheReusePath"].endswith(superset.name)
+
+
+def test_fetchAll_returns_exact_cache_hit_without_fetching(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """When an exact-spec cache already exists for a past window, no new
+    fetch is started."""
+    spec = _stubSpec()
+    cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {"spec": dt_asdict(spec), "pod_count": 1, "total_bytes": 0, "errors": {}},
+        )
+    )
+
+    def shouldNotBeCalled(*_a, **_kw):  # type: ignore[no-untyped-def]
+        raise AssertionError("listPods/fetchOnePod called even though cache exists")
+
+    monkeypatch.setattr(fetch, "listPods", shouldNotBeCalled)
+    monkeypatch.setattr(fetch, "_fetchOnePod", shouldNotBeCalled)
+    out, meta = fetch.fetchAll(spec)
+    assert out == cacheDir
+    assert meta["cacheReuse"] == "exact"
+    assert meta["fromCache"] is True
+
+
+def dt_asdict(spec):  # type: ignore[no-untyped-def]
+    """Small shim so the cache _meta.json round-trips."""
+    from dataclasses import asdict
+
+    return asdict(spec)
+
+
 def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
     unviewed = _plantWindowWithBody(

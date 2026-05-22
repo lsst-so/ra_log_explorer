@@ -339,6 +339,115 @@ def test_queryIsotBatch_chunks_oversized_in_lists(monkeypatch: pytest.MonkeyPatc
     assert len(seenQueries) == 3 * 4
 
 
+def test_queryIsotBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 500 UndefinedTable from one instrument shouldn't fail the
+    whole batch — the helper should silently fall through to the next
+    instrument."""
+    calls: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        sql = json.loads(req.data.decode("utf-8"))["query"]
+        calls.append(sql)
+        if "cdb_lsstcam." in sql:
+            raise HTTPError(
+                "https://x",
+                500,
+                "Server Error",
+                {},  # type: ignore[arg-type]
+                io.BytesIO(b'{"detail":"UndefinedTable: table not found"}'),
+            )
+        # latiss returns one row.
+        return _stubResponse(
+            {
+                "columns": ["exposure_id", "obs_end"],
+                "data": [[2026051900722, "2026-05-20T08:46:16.267000"]],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
+    assert out == {2026051900722: "2026-05-20T08:46:16.267000"}
+    # lsstcam tried first and 500'd → moved on to latiss → resolved.
+    assert "cdb_lsstcam." in calls[0]
+    assert "cdb_latiss." in calls[1]
+
+
+def test_queryIsotBatch_skips_rows_with_missing_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the batch response is missing exposure_id or obs_end columns
+    entirely, the batch silently yields nothing rather than indexing
+    into a malformed row."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        return _stubResponse({"columns": ["something_else"], "data": [["x"]]})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
+    assert out == {}
+
+
+def test_queryIsotBatch_skips_rows_with_unexpected_shape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A row with an unexpected element shape (e.g. ``None`` instead of
+    an int dataId) shouldn't break the batch — that row is just
+    skipped."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        return _stubResponse(
+            {
+                "columns": ["exposure_id", "obs_end"],
+                "data": [
+                    [None, "2026-05-20T08:46:16.267000"],
+                    [2026051900722, "2026-05-20T08:46:16.267000"],
+                ],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
+    # The valid row landed; the None-id row got dropped.
+    assert out == {2026051900722: "2026-05-20T08:46:16.267000"}
+
+
+def test_postQuery_treats_400_as_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 400 from ConsDB (typically "no such row" / "invalid query")
+    should surface as an empty payload, not as a ConsDbError that
+    aborts the whole batch."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        raise HTTPError("https://x", 400, "Bad Request", {}, io.BytesIO(b""))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes._postQuery("SELECT 1", "TOKEN")
+    assert out == {"columns": [], "data": []}
+
+
+def test_postQuery_raises_ConsDbError_for_503(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An HTTP 5xx that isn't an UndefinedTable should bubble out as a
+    typed error so the caller can surface it to the user."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        raise HTTPError("https://x", 503, "Unavailable", {}, io.BytesIO(b""))  # type: ignore[arg-type]
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    with pytest.raises(exposureTimes.ConsDbError, match="503"):
+        exposureTimes._postQuery("SELECT 1", "TOKEN")
+
+
+def test_storeCached_recovers_from_corrupt_existing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the existing cache file is corrupt, ``storeCached`` should
+    silently overwrite it with a fresh single-entry map rather than
+    refusing to record the new value."""
+    cachePath = tmp_path / "exposure-times.json"
+    cachePath.write_text("this is not json")
+    monkeypatch.setattr(exposureTimes, "cachedExposureTimesPath", lambda: cachePath)
+    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
+    data = json.loads(cachePath.read_text())
+    assert data == {"2026051900722": "2026-05-20T08:46:16.267000"}
+
+
 def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatch) -> None:
     """If the response schema unexpectedly omits the obs_end column we
     return None rather than crashing."""
