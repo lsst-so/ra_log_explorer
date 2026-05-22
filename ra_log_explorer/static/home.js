@@ -442,15 +442,23 @@ function openProgressStream(jobId) {
     } else if (ev.type === 'done') {
       logProgress(`done in ${ev.elapsedS.toFixed(1)}s — ${ev.podCount} pods (${humanBytes(ev.totalBytes)})`);
       document.getElementById('progress-fill').style.width = '100%';
-      document.getElementById('progress-text').textContent = `done — opening explore view ...`;
+      const target = ev.kind === 'night' ? 'night view' : 'explore view';
+      document.getElementById('progress-text').textContent = `done — opening ${target} ...`;
       es.close();
       activeEventSource = null;
       activeJobId = null;
       updateSubmitButton();
+      document.getElementById('night-submit').disabled = false;
       transitionToExplore();
     } else if (ev.type === 'error') {
       logProgress(`ERROR: ${ev.error}`);
       showMessage(`Fetch failed: ${ev.error.split('\n')[0]}`, true);
+      const nightMsg = document.getElementById('night-message');
+      if (nightMsg) {
+        nightMsg.textContent = `Fetch failed: ${ev.error.split('\n')[0]}`;
+        nightMsg.classList.add('error');
+      }
+      document.getElementById('night-submit').disabled = false;
       es.close();
       activeEventSource = null;
       activeJobId = null;
@@ -465,19 +473,74 @@ async function transitionToExplore() {
     const r = await fetch('/api/summary');
     const summary = await r.json();
     if (!summary.loaded) {
-      showMessage('Fetch finished but the server reports no loaded exposure?', true);
+      showMessage('Fetch finished but the server reports no loaded data?', true);
       return;
     }
-    if (window.showExplore) window.showExplore(summary);
+    if (summary.mode === 'night' && window.showNight) {
+      window.showNight(summary);
+    } else if (window.showExplore) {
+      window.showExplore(summary);
+    }
   } catch (e) {
     showMessage(`Could not load summary: ${e}`, true);
   }
+}
+
+async function startNightFetch(ev) {
+  ev.preventDefault();
+  if (activeJobId) return;
+  const form = document.getElementById('night-form');
+  const credsForm = document.getElementById('creds-form');
+  const dayObsRaw = form.elements.dayObs.value.trim();
+  const dayObs = parseInt(dayObsRaw, 10);
+  if (!Number.isFinite(dayObs) || dayObs < 19000000 || dayObs > 30000000) {
+    const el = document.getElementById('night-message');
+    el.textContent = 'dayObs must be an 8-digit YYYYMMDD integer.';
+    el.classList.add('error');
+    return;
+  }
+  saveCreds();
+  const body = {
+    dayObs,
+    cluster: form.elements.cluster.value.trim() || undefined,
+    namespace: form.elements.namespace.value.trim() || undefined,
+    workers: parseInt(form.elements.workers.value, 10) || undefined,
+    username: credsForm.elements.username.value.trim() || undefined,
+    password: credsForm.elements.password.value || undefined,
+  };
+  const submit = document.getElementById('night-submit');
+  submit.disabled = true;
+  const msgEl = document.getElementById('night-message');
+  msgEl.textContent = 'Starting night fetch...';
+  msgEl.classList.remove('error');
+  showProgressCard(true);
+  resetProgress();
+
+  let jobId;
+  try {
+    const r = await fetch('/api/fetch-night', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    jobId = data.jobId;
+  } catch (e) {
+    msgEl.textContent = `Failed to start night fetch: ${e.message || e}`;
+    msgEl.classList.add('error');
+    submit.disabled = false;
+    return;
+  }
+  activeJobId = jobId;
+  openProgressStream(jobId);
 }
 
 // ----- wiring -------------------------------------------------------------
 
 function wireHomeListeners() {
   document.getElementById('fetch-form').addEventListener('submit', startFetch);
+  document.getElementById('night-form').addEventListener('submit', startNightFetch);
   const expIdInput = document.getElementById('fetch-form').elements.exposureId;
   expIdInput.addEventListener('input', scheduleLookup);
   document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);

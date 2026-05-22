@@ -24,7 +24,7 @@
 
     <main id="home-main">
       <section class="home-card">
-        <h2>Fetch an exposure</h2>
+        <h2>Explore exposure processing</h2>
         <form id="fetch-form">
           <div class="row">
             <label>
@@ -69,6 +69,47 @@
           <div class="row submit-row">
             <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
             <span id="fetch-message" class="hint"></span>
+          </div>
+        </form>
+      </section>
+
+      <section class="home-card">
+        <h2>Investigate night</h2>
+        <p class="hint">
+          Pulls the full 24-hour log window for the AOS-flavoured pods
+          (<code>*aos*</code>) for the given <code>dayObs</code> and
+          serves a failure breakdown — error counts by type and pod,
+          per-dataId tracebacks, and Δshutter histograms for the first
+          task pickup and the calcZernikes finish.
+        </p>
+        <form id="night-form">
+          <div class="row">
+            <label>
+              <span class="lbl">dayObs (YYYYMMDD)</span>
+              <input type="number" name="dayObs" required placeholder="e.g. 20260521" />
+              <span id="night-status" class="hint">a dayObs covers UTC noon to UTC noon the next day</span>
+            </label>
+          </div>
+          <details>
+            <summary>Advanced options</summary>
+            <div class="row">
+              <label>
+                <span class="lbl">cluster</span>
+                <input type="text" name="cluster" value="yagan" />
+              </label>
+              <label>
+                <span class="lbl">namespace</span>
+                <input type="text" name="namespace" value="rapid-analysis" />
+              </label>
+              <label>
+                <span class="lbl">workers</span>
+                <input type="number" name="workers" value="16" min="1" max="64" />
+              </label>
+            </div>
+          </details>
+          <div class="row submit-row">
+            <button type="submit" id="night-submit" class="primary">Investigate night</button>
+            <span id="night-message" class="hint"></span>
           </div>
         </form>
       </section>
@@ -199,8 +240,90 @@
     </aside>
   </section>
 
+  <!-- ===================== NIGHT VIEW ===================== -->
+  <section id="night-view" hidden>
+    <header id="topbar">
+      <div class="title">
+        <button type="button" id="night-back-home" class="ghost mini">&larr; home</button>
+        <span class="brand-mark" aria-hidden="true"></span>
+        <strong>Rapid Analysis Log Explorer</strong>
+        <span id="night-dayobs-display"></span>
+      </div>
+      <div class="cache">
+        <span id="night-cache-info"></span>
+      </div>
+    </header>
+
+    <main id="night-main">
+      <section class="home-card" id="night-stats-card">
+        <h2>Top stats <span class="muted" id="night-window-display"></span></h2>
+        <div id="night-stats"></div>
+      </section>
+
+      <section class="home-card">
+        <h2>Errors by type</h2>
+        <table id="night-errors-by-type">
+          <thead><tr><th>exception</th><th>count</th><th>sample message</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="home-card">
+        <h2>Errors by pod</h2>
+        <table id="night-errors-by-pod">
+          <thead><tr><th>pod</th><th>role</th><th>count</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="home-card">
+        <h2>Histograms</h2>
+        <p class="hint">
+          Both are over dataIds, expressed as Δshutter. A long tail or a
+          bimodal distribution is what to look for.
+        </p>
+        <div class="night-histograms">
+          <div class="night-hist">
+            <h3 id="night-hist-first-title">First task pickup</h3>
+            <svg id="night-hist-first" class="night-hist-svg"></svg>
+            <div id="night-hist-first-meta" class="hint"></div>
+          </div>
+          <div class="night-hist">
+            <h3 id="night-hist-cz-title">calcZernikes end</h3>
+            <svg id="night-hist-cz" class="night-hist-svg"></svg>
+            <div id="night-hist-cz-meta" class="hint"></div>
+          </div>
+        </div>
+      </section>
+
+      <section class="home-card">
+        <h2>Failed dataIds <span class="muted" id="night-failures-count"></span></h2>
+        <p class="hint">
+          One row per traceback. Click a row to expand the captured
+          traceback body inline. The arrow on the right opens the
+          full per-pod log in the explore view.
+        </p>
+        <table id="night-failures">
+          <thead>
+            <tr>
+              <th>time</th>
+              <th>dataId</th>
+              <th>Δshutter</th>
+              <th>pod</th>
+              <th>exception</th>
+              <th>message</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </main>
+  </section>
+
   <script src="/static/explore.js"></script>
   <script src="/static/home.js"></script>
+  <script src="/static/night.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

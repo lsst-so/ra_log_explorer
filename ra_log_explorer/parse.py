@@ -660,6 +660,59 @@ class PodSummary:
     # Total seconds spent in "Spent N seconds waiting for the …" lines,
     # keyed by inferred dataId. Carryover-aware.
     expIdWaitSeconds: dict[int, float] = field(default_factory=dict)
+    # One :class:`TracebackRecord` per traceback found in this pod's log.
+    # Each captures the carryover-attributed dataId, the exception class
+    # + message, and a capped body for the drilldown view. Populated by
+    # ``summarizePod``.
+    tracebacks: list["TracebackRecord"] = field(default_factory=list)
+
+
+@dataclass
+class TracebackRecord:
+    """One Python traceback found in a pod's log.
+
+    Capturing the structured exception class + a short body up front
+    lets the night-view's "errors by type" tally and the per-dataId
+    drilldown work straight off the cached ``PodSummary`` — no second
+    pass over the raw JSONL.
+    """
+
+    pod: str
+    t: dt.datetime  # time of the "Traceback (most recent…)" leader line
+    expId: int | None  # carryover-attributed dataId, if any
+    excClass: str  # e.g. "RuntimeError" or "<unknown>" if no class line
+    excMessage: str  # the rest of the exception line, capped
+    body: str  # full traceback text, capped
+
+
+# How many lines / characters to capture for each traceback body. Bodies
+# longer than this just get truncated — the drilldown explicitly tells
+# the user when this happens.
+_TRACEBACK_MAX_LINES = 80
+_TRACEBACK_MAX_CHARS = 8_000
+# Exception class line: "ModuleError: details" or just "ModuleError"
+_EXC_CLASS_RE = re.compile(
+    r"^(?P<cls>[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z0-9_]+)*"
+    r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
+    r"(?:\s*:\s*(?P<msg>.*))?$"
+)
+
+
+def _isTracebackBodyLine(raw: str) -> bool:
+    """Return True if ``raw`` looks like a continuation of a Python
+    traceback we're already inside — indented frame lines, blank lines,
+    or the standard ``File "…", line N, in func`` and ``  message``
+    shapes. Used to greedily extend the captured body.
+    """
+    if not raw:
+        return False
+    if raw.startswith((" ", "\t")):
+        return True
+    if raw.startswith("During handling") or raw.startswith("The above exception"):
+        return True
+    if _EXC_CLASS_RE.match(raw):
+        return True
+    return False
 
 
 # Worker payloads are deserialized in a noisy way; detect tracebacks by the
@@ -685,6 +738,8 @@ def summarizePod(podLogPath: Path) -> PodSummary:
     )
     isCarryover = group in _CARRYOVER_GROUPS
     currentExpId: int | None = None
+    activeTb: TracebackRecord | None = None
+    tbLines: list[str] = []
     for ln in iterPodLines(podLogPath):
         summary.nLines += 1
         if summary.firstTs is None:
@@ -694,8 +749,31 @@ def summarizePod(podLogPath: Path) -> PodSummary:
             summary.nWarn += 1
         elif ln.level == "error":
             summary.nError += 1
+        # Traceback capture state machine.
         if _TRACEBACK_LEAD in ln.raw:
+            if activeTb is not None:
+                _finaliseTraceback(activeTb, tbLines, summary)
+            activeTb = TracebackRecord(
+                pod=pod,
+                t=ln.timestamp,
+                expId=currentExpId if isCarryover else extractExpId(ln.raw),
+                excClass="<unknown>",
+                excMessage="",
+                body="",
+            )
+            tbLines = [ln.raw]
             summary.nTraceback += 1
+        elif activeTb is not None:
+            if _isTracebackBodyLine(ln.raw) and len(tbLines) < _TRACEBACK_MAX_LINES:
+                tbLines.append(ln.raw)
+                m = _EXC_CLASS_RE.match(ln.raw)
+                if m and activeTb.excClass == "<unknown>":
+                    activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]
+                    activeTb.excMessage = (m.group("msg") or "").strip()[:200]
+            else:
+                _finaliseTraceback(activeTb, tbLines, summary)
+                activeTb = None
+                tbLines = []
         found = extractExpId(ln.raw)
         if found is not None:
             summary.expIdsSeen.add(found)
@@ -714,7 +792,20 @@ def summarizePod(podLogPath: Path) -> PodSummary:
         ev = classify(ln)
         if ev is not None:
             summary.events.append(ev)
+    # Pod's log ended while still inside a traceback — flush whatever
+    # we've collected so it isn't lost.
+    if activeTb is not None:
+        _finaliseTraceback(activeTb, tbLines, summary)
     return summary
+
+
+def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:
+    """Pack `lines` into `record.body` (capped) and attach to `summary`."""
+    body = "\n".join(lines)
+    if len(body) > _TRACEBACK_MAX_CHARS:
+        body = body[:_TRACEBACK_MAX_CHARS] + "\n…(traceback body truncated)"
+    record.body = body
+    summary.tracebacks.append(record)
 
 
 def summarizeAll(cacheDir: Path) -> list[PodSummary]:

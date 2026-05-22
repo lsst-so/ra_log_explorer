@@ -86,9 +86,25 @@ def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -
     return result.stdout
 
 
+def _matcher(spec: FetchSpec, pod: str | None = None) -> str:
+    """Build the LogQL ``{cluster=…, namespace=…, ...}`` matcher.
+
+    If ``pod`` is given we pin the matcher to that exact pod (used for
+    per-pod queries). Otherwise we honour ``spec.podRegex`` if set, so
+    night-mode fetches can restrict the series listing to just the
+    pod-name patterns we care about (e.g. ``.*aos.*``).
+    """
+    parts = [f'cluster="{spec.cluster}"', f'namespace="{spec.namespace}"']
+    if pod is not None:
+        parts.append(f'pod="{pod}"')
+    elif spec.podRegex:
+        parts.append(f'pod=~"{spec.podRegex}"')
+    return "{" + ",".join(parts) + "}"
+
+
 def listPods(spec: FetchSpec) -> list[str]:
     """List unique pod names that emitted logs in the requested window."""
-    matcher = '{cluster="' + spec.cluster + '",namespace="' + spec.namespace + '"}'
+    matcher = _matcher(spec)
     out = _run_logcli(
         spec,
         ["series", matcher, f"--from={spec.fromIso}", f"--to={spec.toIso}"],
@@ -112,7 +128,7 @@ def _fetchOnePod(
     outPath: Path,
 ) -> tuple[str, int]:
     """Fetch logs for a single pod; return (pod, bytes_written)."""
-    matcher = '{cluster="' + spec.cluster + '",namespace="' + spec.namespace + '",pod="' + pod + '"}'
+    matcher = _matcher(spec, pod=pod)
     # `--forward` => time-ordered ascending output; `-o jsonl` => one Loki API
     # JSON object per line which keeps labels (esp. detected_level) intact.
     out = _run_logcli(
@@ -141,11 +157,22 @@ def _parseIso(s: str) -> dt.datetime:
     return t.astimezone(dt.timezone.utc)
 
 
-def findSupersetCache(cluster: str, namespace: str, fromIso: str, toIso: str) -> Path | None:
+def findSupersetCache(
+    cluster: str,
+    namespace: str,
+    fromIso: str,
+    toIso: str,
+    podRegex: str | None = None,
+) -> Path | None:
     """Return the *smallest* cached window that fully contains [fromIso, toIso].
 
     A cache directory is considered usable only if it has a valid ``_meta.json``
     and no ``.partial`` flag. Returns ``None`` if no superset is on disk.
+
+    Pod-filter compatibility: only cache entries whose stored
+    ``spec.podRegex`` matches the requested one are considered. An
+    exposure-mode (all-pods) cache is NOT a valid superset for a
+    night-mode (AOS-only) request, because the on-disk pod sets differ.
     """
     fromT = _parseIso(fromIso)
     toT = _parseIso(toIso)
@@ -153,9 +180,20 @@ def findSupersetCache(cluster: str, namespace: str, fromIso: str, toIso: str) ->
     if not base.exists():
         return None
     candidates: list[tuple[dt.timedelta, Path]] = []
-    for window in base.iterdir():
-        if not window.is_dir():
-            continue
+    # When night-mode (podRegex set), candidates live under base/<window>/pods=<slug>/.
+    # When exposure-mode (no podRegex), candidates live under base/<window>/.
+    # Walk both depths so each mode finds its own kind.
+    windowDirs: list[Path] = []
+    if podRegex is None:
+        windowDirs = [d for d in base.iterdir() if d.is_dir()]
+    else:
+        for d in base.iterdir():
+            if not d.is_dir():
+                continue
+            for inner in d.iterdir():
+                if inner.is_dir() and inner.name.startswith("pods="):
+                    windowDirs.append(inner)
+    for window in windowDirs:
         metaP = window / META_NAME
         if not metaP.exists() or (window / PARTIAL_FLAG).exists():
             continue
@@ -164,6 +202,8 @@ def findSupersetCache(cluster: str, namespace: str, fromIso: str, toIso: str) ->
         except (OSError, json.JSONDecodeError):
             continue
         specMeta = meta.get("spec") or {}
+        if specMeta.get("podRegex") != podRegex:
+            continue  # different filter scope; on-disk pod set is different
         cFromIso = specMeta.get("fromIso")
         cToIso = specMeta.get("toIso")
         if not cFromIso or not cToIso:
@@ -192,7 +232,7 @@ def fetchAll(
     caller should read pod files from — typically the exact-spec dir, but on
     a superset cache hit it points to whichever wider window we found.
     """
-    requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     metaPath = requestedDir / META_NAME
     partialPath = requestedDir / PARTIAL_FLAG
 
@@ -208,7 +248,11 @@ def fetchAll(
             meta["cacheReuse"] = "exact"
             return requestedDir, meta
         # Otherwise, look for a wider cached window that contains us.
-        superset = findSupersetCache(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+        # Superset reuse is only honoured when the pod-filter matches;
+        # otherwise an exposure-mode (all-pods) window could pretend to
+        # contain a night-mode (AOS-only) window and vice-versa, even
+        # though their on-disk contents differ.
+        superset = findSupersetCache(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
         if superset is not None:
             meta = loadCacheMeta(superset)
             meta["fromCache"] = True
@@ -217,7 +261,7 @@ def fetchAll(
             return superset, meta
 
     # No usable cache — fetch fresh into the requested dir.
-    ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
     podsListPath = requestedDir / PODS_LIST_NAME
     partialPath.write_text("")

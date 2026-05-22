@@ -75,7 +75,7 @@ def test_queryIsot_returns_obs_end_on_first_instrument_match(
 ) -> None:
     seen: list[Any] = []
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seen.append((req.get_full_url(), req.data, dict(req.header_items())))
         return _stubResponse({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]})
 
@@ -109,7 +109,7 @@ def test_queryIsot_falls_through_instruments_until_a_match(
         ]
     )
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seen.append(json.loads(req.data.decode("utf-8"))["query"])
         return _stubResponse(next(payloads))
 
@@ -123,7 +123,7 @@ def test_queryIsot_falls_through_instruments_until_a_match(
 def test_queryIsot_returns_None_when_all_instruments_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         return _stubResponse({"columns": ["obs_end"], "data": []})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
@@ -135,7 +135,7 @@ def test_queryIsot_uses_only_the_given_instrument_when_specified(
 ) -> None:
     seen: list[str] = []
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seen.append(json.loads(req.data.decode("utf-8"))["query"])
         return _stubResponse({"columns": ["obs_end"], "data": [["x"]]})
 
@@ -146,7 +146,7 @@ def test_queryIsot_uses_only_the_given_instrument_when_specified(
 
 
 def test_queryIsot_returns_None_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         raise HTTPError(req.get_full_url(), 404, "not found", {}, None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
@@ -156,7 +156,7 @@ def test_queryIsot_returns_None_for_404(monkeypatch: pytest.MonkeyPatch) -> None
 def test_queryIsot_raises_ConsDbError_for_other_HTTP_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         raise HTTPError(req.get_full_url(), 500, "server error", {}, None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
@@ -179,7 +179,7 @@ def test_queryIsot_treats_500_UndefinedTable_as_no_row(
         ]
     )
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         kind, body = next(payloads)
         seen.append(json.loads(req.data.decode("utf-8"))["query"])
         if kind == "undefined":
@@ -205,7 +205,7 @@ def test_queryIsot_raises_for_500_that_is_not_UndefinedTable(
     up rather than being silently swallowed. Otherwise a real outage
     looks identical to 'dataId not found anywhere'."""
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         raise HTTPError(
             req.get_full_url(),
             500,
@@ -261,7 +261,7 @@ def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatc
     """If the response schema unexpectedly omits the obs_end column we
     return None rather than crashing."""
 
-    def fakeUrlopen(req: Any) -> Any:
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         return _stubResponse({"columns": ["something_else"], "data": [["x"]]})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)

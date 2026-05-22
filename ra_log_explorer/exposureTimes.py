@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 
 from .config import cache_root
 
+TAI_MINUS_UTC_S = 37.0
 RSP_TOKEN_FILE_ENV = "RA_LOG_EXPLORER_RSP_TOKEN_FILE"
 DEFAULT_RSP_TOKEN_FILE = Path.home() / ".lsst" / "log-browser-token.txt"
 CONSDB_URL = "https://usdf-rsp.slac.stanford.edu/consdb/query"

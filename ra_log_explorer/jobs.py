@@ -31,17 +31,28 @@ from .config import FetchSpec
 from .fetch import fetchAll
 
 JobStatus = Literal["pending", "running", "parsing", "done", "error"]
+JobKind = Literal["exposure", "night"]
 ProgressEvent = dict[str, Any]
 
 
 @dataclass
 class FetchJob:
-    """One run of `fetchAll`, with its own append-only event log."""
+    """One run of `fetchAll`, with its own append-only event log.
+
+    Both exposure mode and night mode reuse this single shape:
+
+    * Exposure mode: ``kind == "exposure"``, ``expId`` and ``tZero``
+      set, ``dayObs`` is None.
+    * Night mode: ``kind == "night"``, ``dayObs`` set, ``expId`` and
+      ``tZero`` are None.
+    """
 
     jobId: str
     spec: FetchSpec
-    expId: int
-    tZero: dt.datetime
+    kind: JobKind = "exposure"
+    expId: int | None = None
+    tZero: dt.datetime | None = None
+    dayObs: int | None = None
     status: JobStatus = "pending"
     startedAt: dt.datetime | None = None
     finishedAt: dt.datetime | None = None
@@ -83,7 +94,14 @@ class JobManager:
     def createJob(self, spec: FetchSpec, expId: int, tZero: dt.datetime) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
-            job = FetchJob(jobId=jobId, spec=spec, expId=expId, tZero=tZero)
+            job = FetchJob(jobId=jobId, spec=spec, kind="exposure", expId=expId, tZero=tZero)
+            self._jobs[jobId] = job
+            return job
+
+    def createNightJob(self, spec: FetchSpec, dayObs: int) -> FetchJob:
+        with self._lock:
+            jobId = uuid.uuid4().hex[:12]
+            job = FetchJob(jobId=jobId, spec=spec, kind="night", dayObs=dayObs)
             self._jobs[jobId] = job
             return job
 
@@ -131,8 +149,10 @@ class JobManager:
             job.push(
                 {
                     "type": "done",
+                    "kind": job.kind,
                     "expId": job.expId,
-                    "tZero": job.tZero.isoformat(),
+                    "tZero": job.tZero.isoformat() if job.tZero else None,
+                    "dayObs": job.dayObs,
                     "cacheDir": str(cacheDir),
                     "cacheReuse": meta.get("cacheReuse", "none"),
                     "podCount": meta.get("pod_count", 0),

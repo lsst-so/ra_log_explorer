@@ -18,23 +18,37 @@ async function bootstrap() {
       `<pre style="padding:14px;color:#c1252b">Error loading /api/summary: ${e}</pre>`;
     return;
   }
-  if (summary.loaded) {
+  if (summary.loaded && summary.mode === 'night') {
+    window.showNight(summary);
+  } else if (summary.loaded) {
     window.showExplore(summary);
   } else {
     window.showHome();
   }
 }
 
-window.showHome = function showHome() {
-  document.getElementById('home-view').hidden = false;
+function hideAllViews() {
+  document.getElementById('home-view').hidden = true;
   document.getElementById('explore-view').hidden = true;
+  document.getElementById('night-view').hidden = true;
+}
+
+window.showHome = function showHome() {
+  hideAllViews();
+  document.getElementById('home-view').hidden = false;
   window.startHome();
 };
 
 window.showExplore = function showExplore(summary) {
-  document.getElementById('home-view').hidden = true;
+  hideAllViews();
   document.getElementById('explore-view').hidden = false;
   window.startExplore(summary);
+};
+
+window.showNight = function showNight(summary) {
+  hideAllViews();
+  document.getElementById('night-view').hidden = false;
+  window.startNight(summary);
 };
 
 bootstrap();

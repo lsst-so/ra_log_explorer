@@ -17,6 +17,7 @@ import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -242,6 +243,93 @@ def test_fetch_starts_job_and_completes(
         assert ctx.state.expId == 2026051900722
 
 
+def test_night_fetch_validates_dayObs(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(host, port, "/api/fetch-night", {})
+    assert status == 400
+    assert "dayObs" in body["error"]
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 12345})
+    assert status == 400
+    assert "YYYYMMDD" in body["error"]
+
+
+def test_night_fetch_starts_job_and_populates_NightState(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        # The night-spec must carry the AOS pod-regex.
+        assert spec.podRegex == ".*aos.*"
+        cacheDir = tmpCacheRoot / "fake-night"
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+    assert status == 202, body
+    jobId = body["jobId"]
+
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    assert body["kind"] == "night"
+    assert body["dayObs"] == 20260521
+
+    with ctx.jobs.stateLock:
+        assert ctx.state is None
+        assert ctx.nightState is not None
+        assert ctx.nightState.dayObs == 20260521
+
+
+def test_summary_mode_field_distinguishes_exposure_from_night(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a night is loaded, /api/summary reports mode='night' with the
+    night-shaped payload — not the exposure payload."""
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "fake-night"
+    (cacheDir / "pods").mkdir(parents=True)
+    with ctx.jobs.stateLock:
+        ctx.nightState = NightState(
+            cacheDir=cacheDir,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            dayObs=20260521,
+            startTime=serverModule.dayObsStartUtc(20260521),
+            endTime=serverModule.dayObsEndUtc(20260521),
+        )
+    # Block the token lookup so the histogram code falls back to empty.
+    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
+    status, body = _get(host, port, "/api/summary")
+    assert status == 200
+    assert body["loaded"] is True
+    assert body["mode"] == "night"
+    assert body["dayObs"] == 20260521
+    assert body["stats"]["nTracebacks"] == 0
+
+
 def test_fetch_status_404_for_unknown_job(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/fetch/doesnotexist/status")
@@ -317,7 +405,7 @@ def _plantExposureTime(
 
     import io as _io
 
-    def fakeUrlopen(req: object) -> object:
+    def fakeUrlopen(req: object, **_kw: Any) -> object:
         payload = (
             {"columns": ["obs_end"], "data": [[obsEnd]]}
             if obsEnd is not None
@@ -429,7 +517,7 @@ def test_exposure_time_accepts_tokenFile_query_param_override(
 
     import io as _io
 
-    def fakeUrlopen(req: object) -> object:
+    def fakeUrlopen(req: object, **_kw: Any) -> object:
         return _io.BytesIO(
             json.dumps({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]}).encode("utf-8")
         )

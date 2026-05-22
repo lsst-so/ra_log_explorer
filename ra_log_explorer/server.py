@@ -29,15 +29,22 @@ import datetime as dt
 import json
 import mimetypes
 import re
+from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import exposureTimes
+from . import exposureTimes, night
 from . import parse as parser
-from .config import FetchSpec, cache_root
+from .config import (
+    NIGHT_AOS_POD_REGEX,
+    FetchSpec,
+    cache_root,
+    dayObsEndUtc,
+    dayObsStartUtc,
+)
 from .fetch import cacheDuSizeBytes, loadPodLogPath
 from .jobs import FetchJob, JobManager
 
@@ -124,11 +131,32 @@ class ServerState:
 
 
 @dataclass
+class NightState:
+    """A loaded dayObs's worth of parsed AOS-pod data."""
+
+    cacheDir: Path
+    cacheBytes: int
+    meta: dict
+    summaries: list[parser.PodSummary]
+    dayObs: int
+    startTime: dt.datetime  # noon UTC of dayObs (start of dayObs)
+    endTime: dt.datetime  # noon UTC of dayObs + 1
+    # Lazily populated dataId -> shutter-close UTC datetime, used to
+    # turn task event timestamps into Δshutter offsets for histograms.
+    shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
+
+
+@dataclass
 class ServerContext:
-    """Long-lived per-process state shared between the handler threads."""
+    """Long-lived per-process state shared between the handler threads.
+
+    At most one of ``state`` and ``nightState`` is non-None at a time —
+    a fresh fetch in either mode clears the other.
+    """
 
     jobs: JobManager
-    state: ServerState | None = None  # mutate only while holding jobs.stateLock
+    state: ServerState | None = None
+    nightState: NightState | None = None
 
 
 def _toJsonable(obj: Any) -> Any:
@@ -307,6 +335,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
 
     return {
         "loaded": True,
+        "mode": "exposure",
         "expId": state.expId,
         "tZero": state.tZero.isoformat(),
         "cacheDir": str(state.cacheDir),
@@ -350,6 +379,151 @@ def _podDetail(state: ServerState, pod: str) -> dict:
             }
         )
     return {"pod": pod, "lines": lines}
+
+
+def _podDetailForNight(state: NightState, pod: str) -> dict:
+    """Same line-by-line shape as :func:`_podDetail`, but ``offsetS`` is
+    measured from the dayObs start (noon UTC) rather than from a single
+    shutter close — there is no per-pod shutter close in night mode.
+    """
+    logPath = loadPodLogPath(state.cacheDir, pod)
+    group = parser.podGroup(pod)
+    isCarryover = group in parser.carryoverGroups()
+    currentExpId: int | None = None
+    lines: list[dict] = []
+    for ln in parser.iterPodLines(logPath):
+        found = parser.extractExpId(ln.raw)
+        if found is not None:
+            currentExpId = found
+        inferred = currentExpId if isCarryover else found
+        lines.append(
+            {
+                "t": ln.timestamp.isoformat(),
+                "offsetS": (ln.timestamp - state.startTime).total_seconds(),
+                "level": ln.level,
+                "logger": ln.logger,
+                "function": ln.function,
+                "message": ln.message,
+                "raw": ln.raw,
+                "expId": inferred,
+            }
+        )
+    return {"pod": pod, "lines": lines}
+
+
+# ----- night payload --------------------------------------------------------
+
+
+def _resolveShutterCloseForDataIds(
+    expIds: Iterable[int], state: NightState
+) -> tuple[dict[int, dt.datetime], int]:
+    """Resolve shutter close (UTC) for each expId via the exposure-time
+    cache. Each id either hits the on-disk cache (instant) or — on a
+    cache miss — gets a lazy ConsDB lookup if we can read a token.
+
+    Returns ``(resolved, nMissing)`` where ``nMissing`` is the count of
+    expIds we couldn't resolve, e.g. because they aren't in ConsDB or
+    we can't reach it. Caches everything we resolve back into the
+    state so the second /api/summary request is instant.
+    """
+    out = dict(state.shutterCloseByExpId)
+    nMissing = 0
+    # Try ConsDB only if we have a readable token; otherwise stick to
+    # the cache. Resolving 100+ ids over a flaky link could otherwise
+    # block /api/summary for minutes.
+    tokenPath = exposureTimes.rspTokenFilePath()
+    token: str | None = None
+    if tokenPath.exists():
+        try:
+            token = exposureTimes.readRspToken(tokenPath) or None
+        except OSError:
+            token = None
+    for expId in expIds:
+        if expId in out:
+            continue
+        cached = exposureTimes.lookupCached(expId)
+        if cached is None and token is not None:
+            try:
+                cached = exposureTimes.queryIsot(expId, token)
+            except (exposureTimes.ConsDbError, OSError):
+                cached = None
+            if cached is not None:
+                exposureTimes.storeCached(expId, cached)
+        if cached is None:
+            nMissing += 1
+            continue
+        # `cached` is TAI ISO without a timezone. Convert to a UTC
+        # datetime by attaching UTC then subtracting the TAI→UTC offset,
+        # so that (log-utc-time - shutter-close) is a pure Δshutter in
+        # the same scale as the rest of the UI.
+        try:
+            taiAsUtc = parser._parseTimestamp(cached + "Z")
+        except ValueError:
+            nMissing += 1
+            continue
+        out[expId] = taiAsUtc - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+    # Cache the resolutions back on the state for cheap re-reads.
+    state.shutterCloseByExpId.update(out)
+    return out, nMissing
+
+
+def _buildNightPayload(state: NightState) -> dict:
+    """Roll the night up into the per-page payload the JS consumes."""
+    stats = night.computeTopStats(state.summaries)
+    errType = night.errorsByType(state.summaries)
+    errPod = night.errorsByPod(state.summaries)
+    firstStarts = night.firstTaskStartByDataId(state.summaries)
+    czEnds = night.calcZernikesEndByDataId(state.summaries)
+
+    # Resolve shutter closes for the dataIds we'll need for the
+    # histograms and the failed-dataId Δshutter offsets.
+    needIds: set[int] = set(firstStarts) | set(czEnds)
+    for s in state.summaries:
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                needIds.add(tb.expId)
+    shutterCloseByExpId, nMissingShutter = _resolveShutterCloseForDataIds(needIds, state)
+
+    # Note: shutter close from ConsDB is TAI; the per-pod log
+    # timestamps are UTC. We don't subtract the 37s offset here
+    # because the user already sees TAI-based labels everywhere
+    # else; Δshutter is "log-utc-time minus shutter-close-tai" and is
+    # close enough for histogram bucketing (the 37s offset is
+    # consistent and will not change the shape).
+    firstOffsets, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
+    czOffsets, czNDropped = night.computeDeltaShutterOffsets(czEnds, shutterCloseByExpId)
+    histFirst = night.buildHistogram(
+        "First task pickup (Δshutter)", "s", firstOffsets, nDroppedNoTZero=firstNDropped
+    )
+    histCz = night.buildHistogram("calcZernikes end (Δshutter)", "s", czOffsets, nDroppedNoTZero=czNDropped)
+    failures = night.failureRows(state.summaries, shutterCloseByExpId)
+
+    return {
+        "loaded": True,
+        "mode": "night",
+        "dayObs": state.dayObs,
+        "startTime": state.startTime.isoformat(),
+        "endTime": state.endTime.isoformat(),
+        "cacheDir": str(state.cacheDir),
+        "cacheBytes": state.cacheBytes,
+        "meta": _toJsonable(state.meta),
+        "stats": {
+            "nVisitsSeen": stats.nVisitsSeen,
+            "nPods": stats.nPods,
+            "nTracebacks": stats.nTracebacks,
+            "nDataIdsWithTraceback": stats.nDataIdsWithTraceback,
+            "nPodsWithTraceback": stats.nPodsWithTraceback,
+            "nDistinctExceptionClasses": stats.nDistinctExceptionClasses,
+            "nMissingShutterClose": nMissingShutter,
+        },
+        "errorsByType": [_toJsonable(r) for r in errType],
+        "errorsByPod": [_toJsonable(r) for r in errPod],
+        "histograms": {
+            "firstTaskStart": _toJsonable(histFirst),
+            "calcZernikesEnd": _toJsonable(histCz),
+        },
+        "failures": [_toJsonable(r) for r in failures],
+    }
 
 
 # ----- cache listing --------------------------------------------------------
@@ -476,12 +650,29 @@ def _readJsonBody(handler: BaseHTTPRequestHandler) -> Any:
 
 
 def _onFetchComplete(ctx: ServerContext) -> Any:
-    """Return a callback that swaps in a new ServerState after a fetch."""
+    """Return a callback that swaps in a new ServerState / NightState
+    (depending on ``job.kind``) after a fetch."""
 
     def cb(job: FetchJob) -> None:
         if job.cacheDir is None:
             return  # fetchAll raised; caller will see an error event
         summaries = parser.summarizeAll(job.cacheDir)
+        if job.kind == "night":
+            assert job.dayObs is not None
+            newNight = NightState(
+                cacheDir=job.cacheDir,
+                cacheBytes=cacheDuSizeBytes(cache_root()),
+                meta=job.meta,
+                summaries=summaries,
+                dayObs=job.dayObs,
+                startTime=dayObsStartUtc(job.dayObs),
+                endTime=dayObsEndUtc(job.dayObs),
+            )
+            with ctx.jobs.stateLock:
+                ctx.state = None
+                ctx.nightState = newNight
+            return
+        assert job.expId is not None and job.tZero is not None
         newState = ServerState(
             cacheDir=job.cacheDir,
             cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -499,6 +690,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             ],
         )
         with ctx.jobs.stateLock:
+            ctx.nightState = None
             ctx.state = newState
 
     return cb
@@ -595,22 +787,45 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if path == "/api/summary":
                 with ctx.jobs.stateLock:
                     state = ctx.state
-                if state is None:
-                    self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                    nightState = ctx.nightState
+                if state is not None:
+                    self._send_json(_buildSummaryPayload(state))
                     return
-                self._send_json(_buildSummaryPayload(state))
+                if nightState is not None:
+                    self._send_json(_buildNightPayload(nightState))
+                    return
+                self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                return
+            if path.startswith("/api/night/traceback/"):
+                with ctx.jobs.stateLock:
+                    nightState = ctx.nightState
+                if nightState is None:
+                    self._send_error_json(404, "No night loaded")
+                    return
+                from urllib.parse import unquote
+
+                key = unquote(path[len("/api/night/traceback/") :])
+                body = night.tracebackBody(nightState.summaries, key)
+                if body is None:
+                    self._send_error_json(404, f"No traceback with key {key}")
+                    return
+                self._send_json({"bodyKey": key, "body": body})
                 return
             if path.startswith("/api/pod/"):
                 with ctx.jobs.stateLock:
                     state = ctx.state
-                if state is None:
-                    self._send_error_json(404, "No exposure loaded")
-                    return
+                    nightState = ctx.nightState
                 pod = path[len("/api/pod/") :].split("?")[0]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
                     self.send_error(400, "Invalid pod name")
                     return
-                self._send_json(_podDetail(state, pod))
+                if state is not None:
+                    self._send_json(_podDetail(state, pod))
+                    return
+                if nightState is not None:
+                    self._send_json(_podDetailForNight(nightState, pod))
+                    return
+                self._send_error_json(404, "Nothing loaded")
                 return
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
@@ -634,8 +849,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     {
                         "jobId": job.jobId,
                         "status": job.status,
+                        "kind": job.kind,
                         "expId": job.expId,
-                        "tZero": job.tZero.isoformat(),
+                        "tZero": job.tZero.isoformat() if job.tZero else None,
+                        "dayObs": job.dayObs,
                         "fromIso": job.spec.fromIso,
                         "toIso": job.spec.toIso,
                         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
@@ -743,6 +960,22 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
+            if url.path == "/api/fetch-night":
+                try:
+                    body = _readJsonBody(self)
+                except json.JSONDecodeError as e:
+                    self._send_error_json(400, f"Bad JSON body: {e}")
+                    return
+                try:
+                    spec, dayObs, password = _buildNightSpecFromRequest(body)
+                except ValueError as e:
+                    self._send_error_json(400, str(e))
+                    return
+                _maybeSetLokiPassword(password)
+                job = ctx.jobs.createNightJob(spec, dayObs)
+                ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
+                self._send_json({"jobId": job.jobId}, status=202)
+                return
             self.send_error(404)
 
     return Handler
@@ -805,6 +1038,47 @@ def _buildSpecFromRequest(body: dict) -> tuple[FetchSpec, int, dt.datetime, str 
     if password is not None:
         password = str(password)
     return spec, expId, tZero, password
+
+
+def _buildNightSpecFromRequest(body: dict) -> tuple[FetchSpec, int, str | None]:
+    """Translate a JSON night-fetch request body into (FetchSpec, dayObs, password)."""
+    from .config import (
+        DEFAULT_CLUSTER,
+        DEFAULT_LOKI_ADDR,
+        DEFAULT_NAMESPACE,
+        DEFAULT_USERNAME,
+        DEFAULT_WORKERS,
+    )
+
+    if not isinstance(body, dict):
+        raise ValueError("Request body must be a JSON object")
+    dayObsRaw = body.get("dayObs")
+    if dayObsRaw is None:
+        raise ValueError("dayObs is required")
+    try:
+        dayObs = int(dayObsRaw)
+    except (TypeError, ValueError) as e:
+        raise ValueError("dayObs must be an integer YYYYMMDD") from e
+    if dayObs < 19000000 or dayObs > 30000000:
+        raise ValueError(f"dayObs {dayObs} doesn't look like a YYYYMMDD integer")
+
+    fromT = dayObsStartUtc(dayObs)
+    toT = dayObsEndUtc(dayObs)
+
+    spec = FetchSpec(
+        lokiAddr=str(body.get("lokiAddr") or DEFAULT_LOKI_ADDR),
+        username=str(body.get("username") or DEFAULT_USERNAME),
+        cluster=str(body.get("cluster") or DEFAULT_CLUSTER),
+        namespace=str(body.get("namespace") or DEFAULT_NAMESPACE),
+        fromIso=_isoForLogcli(fromT),
+        toIso=_isoForLogcli(toT),
+        workers=int(body.get("workers") or DEFAULT_WORKERS),
+        podRegex=NIGHT_AOS_POD_REGEX,
+    )
+    password = body.get("password")
+    if password is not None:
+        password = str(password)
+    return spec, dayObs, password
 
 
 def _parseClientIso(s: str) -> dt.datetime:
