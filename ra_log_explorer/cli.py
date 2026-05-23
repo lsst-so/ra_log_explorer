@@ -49,6 +49,7 @@ from .config import (
     FetchSpec,
     cache_root,
 )
+from .exposureTimes import TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
     fetchAll,
@@ -58,11 +59,13 @@ from .fetch import (
 from .jobs import JobManager
 from .server import ServerContext, ServerState, serve
 
-# TAI is ahead of UTC by 37 seconds (since 2017-01-01; no further leap
-# seconds have been added). Butler `DimensionRecord` timestamps are TAI,
-# so by default we subtract this when converting the user's t-zero into
-# UTC. Override with --t-zero-utc.
-TAI_MINUS_UTC_S = 37.0
+# Re-export so existing test imports (`cli.TAI_MINUS_UTC_S`) keep
+# working. The canonical definition lives in `exposureTimes` — TAI is
+# ahead of UTC by 37 seconds (since 2017-01-01; no further leap seconds
+# have been added). Butler `DimensionRecord` timestamps are TAI, so by
+# default we subtract this when converting the user's t-zero into UTC.
+# Override with --t-zero-utc.
+__all__ = ["TAI_MINUS_UTC_S", "build_parser", "main"]
 
 
 def _parseIsoUtc(s: str) -> dt.datetime:
@@ -144,7 +147,7 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
     reuse = meta.get("cacheReuse", "none")
     if reuse == "exact":
         print(
-            f"Cache hit (exact): {meta['pod_count']} pods, " f"{humanBytes(meta['total_bytes'])}.",
+            f"Cache hit (exact): {meta['pod_count']} pods, {humanBytes(meta['total_bytes'])}.",
             file=sys.stderr,
         )
     elif reuse == "superset":
@@ -171,7 +174,7 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
     summaries = parser.summarizeAll(cacheDir)
     nRelevant = sum(1 for s in summaries if args.exposure_id in s.expIdsSeen)
     print(
-        f"  {len(summaries)} pods parsed, " f"{nRelevant} touched expId={args.exposure_id}",
+        f"  {len(summaries)} pods parsed, {nRelevant} touched expId={args.exposure_id}",
         file=sys.stderr,
     )
 
@@ -184,7 +187,7 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
         tZero=tZero,
         referencePoints=[
             {
-                "label": (f"shutter close (caller-supplied, " f"{tZeroScale} input)"),
+                "label": f"shutter close (caller-supplied, {tZeroScale} input)",
                 "t": tZero.isoformat(),
                 "offsetS": 0.0,
                 "source": "shutter close",
@@ -235,13 +238,43 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
     if not any(root.iterdir()):
         print("  (empty)")
         return 0
+    # Walk both depths: exposure-mode caches live at
+    # ``<cluster>/<ns>/<window>/`` and night-mode caches one level
+    # deeper at ``<cluster>/<ns>/<window>/pods=<slug>/``. Without
+    # walking the inner layer a pure night cache would always show up
+    # as ``[partial]`` because its window dir has no ``_meta.json`` of
+    # its own.
     for cluster in sorted(p for p in root.iterdir() if p.is_dir()):
         for ns in sorted(p for p in cluster.iterdir() if p.is_dir()):
             for window in sorted(p for p in ns.iterdir() if p.is_dir()):
-                size = cacheDuSizeBytes(window)
                 meta = window / "_meta.json"
-                tag = "ok " if meta.exists() else "partial"
-                print(f"  [{tag}] {humanBytes(size):>10}  " f"{cluster.name}/{ns.name}/{window.name}")
+                if meta.exists():
+                    size = cacheDuSizeBytes(window)
+                    tag = "ok "
+                    print(f"  [{tag}] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
+                else:
+                    # Surface every night-mode pods=<slug> subdir
+                    # individually. A window dir with neither a meta
+                    # of its own nor any pods=<slug>/_meta.json is a
+                    # half-finished fetch — still show that as one
+                    # partial row.
+                    nightInners = [
+                        inner
+                        for inner in sorted(window.iterdir())
+                        if inner.is_dir()
+                        and inner.name.startswith("pods=")
+                        and (inner / "_meta.json").exists()
+                    ]
+                    if nightInners:
+                        for inner in nightInners:
+                            size = cacheDuSizeBytes(inner)
+                            print(
+                                f"  [ok ] {humanBytes(size):>10}  "
+                                f"{cluster.name}/{ns.name}/{window.name}/{inner.name}"
+                            )
+                    else:
+                        size = cacheDuSizeBytes(window)
+                        print(f"  [partial] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
     return 0
 
 

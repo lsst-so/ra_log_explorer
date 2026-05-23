@@ -93,7 +93,7 @@ def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -
         raise FetchError("logcli binary not found on PATH") from e
     except subprocess.CalledProcessError as e:
         raise FetchError(
-            f"logcli failed (rc={e.returncode}): " f"{e.stderr.decode('utf-8', 'replace').strip()[:500]}"
+            f"logcli failed (rc={e.returncode}): {e.stderr.decode('utf-8', 'replace').strip()[:500]}"
         ) from e
     except subprocess.TimeoutExpired as e:
         raise FetchError(f"logcli timed out after {timeout}s") from e
@@ -353,13 +353,17 @@ def cacheDuSizeBytes(root: Path) -> int:
 
 
 def humanBytes(n: int) -> str:
+    """Format ``n`` bytes as a short human-readable string (e.g. "1.5 KiB")."""
     units = ["B", "KiB", "MiB", "GiB", "TiB"]
     x = float(n)
+    # The ``or u == units[-1]`` branch guarantees the loop always
+    # returns on its final iteration, so mypy treats the function as
+    # exhaustively returning a str.
     for u in units:
         if x < 1024.0 or u == units[-1]:
             return f"{x:6.1f} {u}"
         x /= 1024.0
-    return f"{n} B"
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def stderrProgress(pod: str, i: int, total: int) -> None:

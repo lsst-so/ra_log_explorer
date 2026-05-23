@@ -150,6 +150,76 @@ def test_cmdCacheInfo_tags_partial_windows(tmpCacheRoot: Path, capsys: pytest.Ca
     assert "abandoned" in out
 
 
+def test_cmdCacheInfo_lists_night_caches_under_pods_subdir(
+    tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Night-mode caches live one level deeper than exposure caches —
+    ``<window>/pods=<slug>/_meta.json`` rather than
+    ``<window>/_meta.json``. The CLI ``cache info`` listing must
+    surface them as proper entries (with the ``[ok]`` tag) and not
+    mislabel them as ``[partial]`` just because the outer window dir
+    has no ``_meta.json`` of its own.
+    """
+    import json as _json
+
+    windowDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-21T120000Z__2026-05-22T120000Z"
+    nightDir = windowDir / "pods=__aos__"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "_meta.json").write_text(
+        _json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-21T12:00:00Z",
+                    "toIso": "2026-05-22T12:00:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": ".*aos.*",
+                },
+                "pod_count": 1,
+                "total_bytes": 0,
+                "errors": {},
+            }
+        )
+    )
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The night cache must be visible — its ``pods=__aos__`` subdir
+    # path should appear on a row tagged ``[ok ]``.
+    assert "pods=__aos__" in out, f"night cache not listed in:\n{out}"
+    nightRow = next(line for line in out.splitlines() if "pods=__aos__" in line)
+    assert "[ok ]" in nightRow, f"night cache mislabeled partial: {nightRow}"
+
+
+def test_cmdCacheInfo_window_with_meta_and_partial_inner_shows_only_outer(
+    tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """If an outer window has its own ``_meta.json`` (an exposure-mode
+    cache), the listing must show that one row and not also try to
+    surface any partial ``pods=*`` subdirs underneath it.
+    """
+    import json as _json
+
+    windowDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "ex"
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "_meta.json").write_text(_json.dumps({"spec": {}}))
+    # Plant a partial sibling night cache under the same window.
+    inner = windowDir / "pods=__aos__"
+    inner.mkdir()
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    # The exposure row appears once, with no extra ``pods=__aos__`` row.
+    assert "[ok ]" in out
+    assert "pods=__aos__" not in out
+
+
 def test_cmdCacheFlush_with_yes_deletes_root(
     tmpCacheRoot: Path, fakeCachedWindow: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:

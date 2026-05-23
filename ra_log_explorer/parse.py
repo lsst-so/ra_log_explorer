@@ -492,11 +492,12 @@ def classify(line: LogLine) -> Event | None:
                 pod, t, "HEAD_VISITIMAGE_MOSAIC", line.level, expId=int(m.group(1)), message=msg, raw=line.raw
             )
         if m := _HEAD_ONEOFF_RE.search(msg):
-            # `<inst>-<dayObs>-<seq>` — reconstruct expId as <dayObs><seq zero-padded>
+            # The log message uses an unpadded `<inst>-<dayObs>-<seq>`
+            # form. Reconstruct the 13-digit YYYYMMDDSSSSS expId by
+            # mixing dayObs (8 digits) and seq into one integer.
             dayObs = int(m.group("dayObs"))
             seq = int(m.group("seq"))
-            expId = dayObs * 100000 + seq  # YYYYMMDDSSSSS - dayObs is YYYYMMDD,
-            # but the log uses inst-YYYYMMDD-N where N is the seqNum (no zero-padding)
+            expId = dayObs * 100000 + seq
             return Event(
                 pod,
                 t,

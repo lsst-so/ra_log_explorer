@@ -473,6 +473,26 @@ def _podDetailForNight(state: NightState, pod: str) -> dict:
 # ----- night payload --------------------------------------------------------
 
 
+def _neededDataIdsForNight(summaries: Iterable[parser.PodSummary]) -> set[int]:
+    """Return the union of dataIds the night view will need a shutter
+    close for. Shared by the prefetch path (so it knows what to look
+    up) and the payload build (so the ``nMissingShutterClose`` stat
+    matches what the prefetch actually attempted).
+
+    The three sources are: first-task-start times per dataId, the
+    calcZernikes end times per dataId, and any dataId carrying a
+    traceback.
+    """
+    summaries = list(summaries)
+    needIds: set[int] = set(night.firstTaskStartByDataId(summaries))
+    needIds |= set(night.calcZernikesEndByDataId(summaries))
+    for s in summaries:
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                needIds.add(tb.expId)
+    return needIds
+
+
 def _prefetchNightShutterCloses(
     state: NightState, summaries: Iterable[parser.PodSummary], job: FetchJob
 ) -> None:
@@ -493,13 +513,7 @@ def _prefetchNightShutterCloses(
     Pushes progress events to ``job.events`` so the SSE consumer can
     show "resolving shutter close for N of M …" without timing out.
     """
-    firstStarts = night.firstTaskStartByDataId(summaries)
-    czEnds = night.calcZernikesEndByDataId(summaries)
-    needIds: set[int] = set(firstStarts) | set(czEnds)
-    for s in summaries:
-        for tb in s.tracebacks:
-            if tb.expId is not None:
-                needIds.add(tb.expId)
+    needIds = _neededDataIdsForNight(summaries)
     if not needIds:
         return
 
@@ -583,15 +597,10 @@ def _buildNightPayload(state: NightState) -> dict:
     czEnds = night.calcZernikesEndByDataId(state.summaries)
     shutterCloseByExpId = state.shutterCloseByExpId
 
-    # ``needIds`` is the same union the prefetch pass uses to decide
-    # which dataIds it tries to resolve; keep them in lockstep so the
+    # Keep this in lockstep with the prefetch path so the
     # ``nMissingShutterClose`` counter the UI surfaces matches what
     # the prefetch actually attempted.
-    needIds: set[int] = set(firstStarts) | set(czEnds)
-    for s in state.summaries:
-        for tb in s.tracebacks:
-            if tb.expId is not None:
-                needIds.add(tb.expId)
+    needIds = _neededDataIdsForNight(state.summaries)
     nMissingShutter = sum(1 for eid in needIds if eid not in shutterCloseByExpId)
 
     firstOffsets, firstIds, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
@@ -1387,7 +1396,7 @@ def _buildSpecFromRequest(body: dict) -> tuple[FetchSpec, int, dt.datetime, str 
     if body.get("tZeroUtc", False):
         tZero = tZeroInput
     else:
-        tZero = tZeroInput - dt.timedelta(seconds=37.0)  # TAI -> UTC
+        tZero = tZeroInput - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
 
     windowBefore = float(body.get("windowBefore", DEFAULT_WINDOW_BEFORE_S))
     windowAfter = float(body.get("windowAfter", DEFAULT_WINDOW_AFTER_S))
