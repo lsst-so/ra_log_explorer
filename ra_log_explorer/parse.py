@@ -391,6 +391,10 @@ _HEAD_ONEOFF_RE = re.compile(
 _HEAD_LOOP_SLOW_RE = re.compile(
     r"Event loop running slow, last loop took (?P<wall>[\d.]+)s with (?P<work>[\d.]+)s of work"
 )
+# The head-node logs `New exposure record for <expId>` the moment the
+# butler watcher hands an expRecord over for processing — i.e. the
+# earliest moment the head node "saw" the exposure. Useful as a
+# timeline marker right before HEAD_DEFINE_VISIT.
 _HEAD_INCOMING_RE = re.compile(r"New exposure record for (\d+)")
 
 # worker messages
@@ -441,7 +445,11 @@ def classify(line: LogLine) -> Event | None:
     pod = line.pod
 
     # ----- head node patterns -----
-    if "HeadProcessController" in line.logger or "processControl" in line.logger:
+    if "processControl" in line.logger:
+        if m := _HEAD_INCOMING_RE.search(msg):
+            return Event(
+                pod, t, "HEAD_INCOMING", line.level, expId=int(m.group(1)), message=msg, raw=line.raw
+            )
         if m := _HEAD_DEFINE_RE.search(msg):
             return Event(
                 pod, t, "HEAD_DEFINE_VISIT", line.level, expId=int(m.group(1)), message=msg, raw=line.raw

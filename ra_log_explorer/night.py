@@ -139,8 +139,13 @@ def errorsByPod(summaries: Iterable[parse.PodSummary]) -> list[PodErrorRow]:
     return rows
 
 
-def _bodyKey(pod: str, t: dt.datetime) -> str:
-    """A stable id the UI can use to ask for one traceback body."""
+def makeBodyKey(pod: str, t: dt.datetime) -> str:
+    """A stable id the UI can use to ask for one traceback body.
+
+    Reached across module boundaries (the server uses it to match a
+    URL parameter back to a captured traceback), so the public name
+    avoids the leading-underscore convention that suggests internal-only.
+    """
     return f"{pod}@{t.isoformat()}"
 
 
@@ -164,7 +169,7 @@ def failureRows(
                     excMessage=tb.excMessage,
                     offsetS=offsetS,
                     tIso=tb.t.isoformat(),
-                    bodyKey=_bodyKey(s.pod, tb.t),
+                    bodyKey=makeBodyKey(s.pod, tb.t),
                 )
             )
     rows.sort(key=lambda r: r.tIso)
@@ -175,7 +180,7 @@ def tracebackBody(summaries: Iterable[parse.PodSummary], bodyKey: str) -> str | 
     """Look up one traceback's full body by its stable id."""
     for s in summaries:
         for tb in s.tracebacks:
-            if _bodyKey(s.pod, tb.t) == bodyKey:
+            if makeBodyKey(s.pod, tb.t) == bodyKey:
                 return tb.body
     return None
 

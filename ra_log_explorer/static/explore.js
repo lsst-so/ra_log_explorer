@@ -72,7 +72,7 @@ function kindClass(kind, level) {
   if (kind === 'QUANTUM_PREP' || kind === 'QUANTUM_DONE') return 'kind-quantum';
   if (kind && kind.startsWith('WORKER_BINNED_')) return 'kind-binned';
   if (kind === 'HEAD_FANOUT_START' || kind === 'HEAD_FANOUT_DONE' || kind === 'HEAD_PIPELINE_DECIDED') return 'kind-fanout';
-  if (kind === 'HEAD_DEFINE_VISIT') return 'kind-fanout';
+  if (kind === 'HEAD_DEFINE_VISIT' || kind === 'HEAD_INCOMING') return 'kind-fanout';
   if (kind === 'HEAD_GATHER_DISPATCH') return 'kind-gather';
   if (kind === 'HEAD_POSTISR_MOSAIC' || kind === 'HEAD_VISITIMAGE_MOSAIC') return 'kind-mosaic';
   if (kind === 'HEAD_LOOP_SLOW') return 'kind-loopslow';

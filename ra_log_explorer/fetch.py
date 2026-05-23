@@ -32,6 +32,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -484,8 +485,6 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
     Returns the list of directories that were removed, for logging
     / debugging.
     """
-    import shutil
-
     root = cache_root()
     exemptR = {p.resolve() for p in exempt}
     total = cacheDuSizeBytes(root)

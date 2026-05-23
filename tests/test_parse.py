@@ -1051,6 +1051,31 @@ def test_extractExpId_split_form_no_separator_doesnt_match(tmp_path: Path) -> No
     assert parse.extractExpId("dayobs20260519seqnum722") is None
 
 
+def test_classify_head_incoming_extracts_expId() -> None:
+    """The head node logs ``New exposure record for <expId>`` the moment
+    the butler watcher hands the record over; that's the earliest
+    head-node-side moment we can place on the timeline. Without this
+    classification, the time between "incoming" and HEAD_DEFINE_VISIT
+    (which includes butler defineVisit cost) is invisible.
+    """
+    line = parse.LogLine(
+        pod="p",
+        timestamp=dt.datetime(2026, 5, 20, 8, 45, 46, 100000, tzinfo=dt.timezone.utc),
+        level="info",
+        logger="lsst.rubintv.production.processControl.HeadProcessController",
+        function="ingestRecord",
+        message="New exposure record for 2026051900722",
+        raw=(
+            "2026-05-20 08:45:46,100 lsst.rubintv.production.processControl ... "
+            "New exposure record for 2026051900722"
+        ),
+    )
+    ev = parse.classify(line)
+    assert ev is not None
+    assert ev.kind == "HEAD_INCOMING"
+    assert ev.expId == 2026051900722
+
+
 # ----- helpers ------------------------------------------------------------
 
 

@@ -28,14 +28,16 @@ from __future__ import annotations
 import datetime as dt
 import json
 import mimetypes
+import os
 import re
+import shutil
 from collections import OrderedDict
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from . import appSettings, exposureTimes, night
 from . import parse as parser
@@ -581,7 +583,15 @@ def _buildNightPayload(state: NightState) -> dict:
     czEnds = night.calcZernikesEndByDataId(state.summaries)
     shutterCloseByExpId = state.shutterCloseByExpId
 
+    # ``needIds`` is the same union the prefetch pass uses to decide
+    # which dataIds it tries to resolve; keep them in lockstep so the
+    # ``nMissingShutterClose`` counter the UI surfaces matches what
+    # the prefetch actually attempted.
     needIds: set[int] = set(firstStarts) | set(czEnds)
+    for s in state.summaries:
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                needIds.add(tb.expId)
     nMissingShutter = sum(1 for eid in needIds if eid not in shutterCloseByExpId)
 
     firstOffsets, firstIds, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)
@@ -658,7 +668,7 @@ def _tracebackContextForNight(state: NightState, bodyKey: str) -> dict | None:
     targetTb: parser.TracebackRecord | None = None
     for s in state.summaries:
         for tb in s.tracebacks:
-            if night._bodyKey(s.pod, tb.t) == bodyKey:
+            if night.makeBodyKey(s.pod, tb.t) == bodyKey:
                 targetSummary, targetTb = s, tb
                 break
         if targetSummary is not None:
@@ -866,8 +876,6 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     also removed when they become empty, so a flush via repeated deletes
     leaves the same clean state as `DELETE /api/cache` followed by ``ls``.
     """
-    import shutil
-
     with ctx.jobs.stateLock:
         ctx.evictByCacheDir(target)
     shutil.rmtree(target)
@@ -881,8 +889,6 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
 def _deleteCacheRoot(ctx: "ServerContext") -> None:
     """Wipe the entire cache and clear every loaded state (all of which
     by definition referenced the now-gone cache)."""
-    import shutil
-
     with ctx.jobs.stateLock:
         ctx.exposureStates.clear()
         ctx.nightStates.clear()
@@ -1119,8 +1125,6 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 if nightState is None:
                     self._send_error_json(404, "No night loaded for the requested dayObs")
                     return
-                from urllib.parse import unquote
-
                 key = unquote(path[len("/api/night/traceback/") :])
                 payload = _tracebackContextForNight(nightState, key)
                 if payload is None:
@@ -1472,8 +1476,6 @@ def _maybeSetLokiPassword(password: str | None) -> None:
     """
     if not password:
         return
-    import os
-
     os.environ["LOKI_PASSWORD"] = password
 
 
