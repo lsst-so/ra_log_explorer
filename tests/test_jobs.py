@@ -51,7 +51,13 @@ def test_getJob_returns_None_for_unknown() -> None:
 
 
 def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """Happy path: 3 pods fetched, parsing, done. Verify event ordering."""
+    """Happy path: 3 pods fetched, parsing, done. Verify event ordering.
+
+    Also pins the contract that ``onComplete`` fires *before* the
+    terminal ``done`` event is pushed — the SSE consumer relies on
+    `/api/summary` already reflecting the new state by the time it
+    sees ``done``.
+    """
     pods = ["pod-a", "pod-b", "pod-c"]
 
     def fakeFetchAll(
@@ -74,10 +80,13 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     mgr = jobs.JobManager()
     job = mgr.createJob(_spec(), 2026051900722, _tZero())
-    completedFor: list[str] = []
+    # Capture the event-log length *when onComplete fires*. If onComplete
+    # ran before the `done` event was pushed, this snapshot will be
+    # strictly less than len(job.events) at the end of runJob.
+    eventCountAtCompleteTime: list[int] = []
 
     def onComplete(j: jobs.FetchJob) -> None:
-        completedFor.append(j.jobId)
+        eventCountAtCompleteTime.append(len(j.events))
 
     mgr.runJob(job, onComplete=onComplete)
 
@@ -86,13 +95,13 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
     # Status path: pending->running->parsing->done. Final is done.
     assert job.status == "done"
     assert job.error is None
-    assert completedFor == [job.jobId]
-    # onComplete must fire BEFORE the terminal 'done' event so the SSE
-    # consumer can rely on /api/summary already having been updated by
-    # the time it sees `done`.
-    completeIdx = job.events.index({**job.events[-1]})  # last event
-    parsingIdx = next(i for i, e in enumerate(job.events) if e["type"] == "parsing")
-    assert parsingIdx < completeIdx
+    # onComplete fired exactly once, with the job ID we created.
+    assert len(eventCountAtCompleteTime) == 1
+    # And it fired before the terminal `done` event landed in the log:
+    # the snapshot at onComplete time must be strictly less than the
+    # final event count.
+    assert eventCountAtCompleteTime[0] < len(job.events)
+    assert job.events[eventCountAtCompleteTime[0]]["type"] == "done"
 
 
 def test_runJob_propagates_fetchAll_error(

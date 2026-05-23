@@ -132,3 +132,34 @@ def test_ensureWindowCacheDir_honours_podRegex(tmp_path: Path, monkeypatch: pyte
     )
     assert p.exists() and p.is_dir()
     assert p.name.startswith("pods=")
+
+
+def test_NIGHT_AOS_POD_REGEX_constant_is_stable() -> None:
+    """The night-mode regex is part of the on-disk cache key (it slugs
+    into ``pods=<slug>/``). Pin it so a refactor doesn't silently
+    invalidate every existing night cache.
+    """
+    assert config.NIGHT_AOS_POD_REGEX == ".*aos.*"
+
+
+def test_dayObsStartUtc_dayObsEndUtc_round_trip_24h() -> None:
+    """The two helpers must produce exactly 24 hours apart for the same
+    dayObs — the night window relies on this.
+    """
+    start = config.dayObsStartUtc(20260521)
+    end = config.dayObsEndUtc(20260521)
+    assert end - start == __import__("datetime").timedelta(hours=24)
+
+
+def test_dayObsStartUtc_alignment_at_year_boundary() -> None:
+    """A dayObs whose midnight-UTC-12 rolls into the next calendar year
+    should still resolve correctly — the helper subtracts no calendar
+    arithmetic of its own, just adds 12h to the local-midnight UTC.
+    """
+    import datetime as _dt
+
+    start = config.dayObsStartUtc(20251231)
+    assert start == _dt.datetime(2025, 12, 31, 12, 0, 0, tzinfo=_dt.timezone.utc)
+    # The end therefore lands on Jan 1.
+    end = config.dayObsEndUtc(20251231)
+    assert end == _dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)

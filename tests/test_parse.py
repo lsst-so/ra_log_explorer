@@ -437,6 +437,60 @@ def test_tagLinesWithExpId_leading_orphan_lines_remain_None() -> None:
     assert tagged == [None, None, 2026051900722, 2026051900722]
 
 
+def test_tagLinesWithExpId_empty_input_is_empty_output() -> None:
+    """A degenerate empty iterable yields nothing, no exceptions."""
+    assert list(parse.tagLinesWithExpId([], "sfm")) == []
+    assert list(parse.tagLinesWithExpId([], "head")) == []
+
+
+def test_groupLabels_returns_a_defensive_copy() -> None:
+    """``groupLabels()`` must hand back a copy — callers mutating the
+    return value (the timeline payload massages it into a per-group
+    label dict) must not be able to corrupt the module-level
+    ``POD_GROUPS`` source of truth.
+    """
+    snapshot = dict(parse.POD_GROUPS)
+    labels = parse.groupLabels()
+    labels["evil"] = "should not leak"
+    assert parse.POD_GROUPS == snapshot
+    # And a fresh call returns the un-mutated original.
+    assert "evil" not in parse.groupLabels()
+
+
+def test_podsTouchingExp_empty_when_no_pod_matches() -> None:
+    """The base case: no pod summary references the dataId in question."""
+    s = parse.PodSummary(
+        pod="x",
+        group="sfm",
+        instrument=None,
+        ordinal=None,
+        nLines=0,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen={2026051900700},
+    )
+    assert parse.podsTouchingExp([s], 2026051900722) == []
+
+
+def test_normalizeLevel_handles_warn_aliases() -> None:
+    """The DM stack emits both ``warn`` and ``warning``; both must
+    bucket to the canonical ``warn`` label so per-pod counters and UI
+    colouring stay coherent."""
+    assert parse._normalizeLevel("warn") == "warn"
+    assert parse._normalizeLevel("warning") == "warn"
+    assert parse._normalizeLevel("WARNING") == "warn"
+
+
+def test_normalizeLevel_handles_error_aliases() -> None:
+    """``err`` / ``error`` / ``ERROR`` all collapse to ``error``."""
+    assert parse._normalizeLevel("err") == "error"
+    assert parse._normalizeLevel("error") == "error"
+    assert parse._normalizeLevel("ERROR") == "error"
+
+
 def test_summarizePod_records_per_expId_first_last_and_wait(tmp_path: Path) -> None:
     """A worker pod accumulates per-expId first/last timestamps (carryover
     aware) and a per-expId wait-seconds total.

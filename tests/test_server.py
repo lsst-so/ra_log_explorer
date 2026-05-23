@@ -704,3 +704,162 @@ def test_tracebackContextForNight_returns_None_for_unknown_key(tmp_path: Path) -
         endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
     )
     assert server._tracebackContextForNight(state, "nope") is None
+
+
+# ----- _resolveCacheWindow -------------------------------------------------
+
+
+def test_resolveCacheWindow_rejects_components_with_path_separators(tmpCacheRoot: Path) -> None:
+    """A URL segment carrying a slash or other unsafe char must fail the
+    safety check at the path-component allowlist, not surface as a
+    "directory not found" further down."""
+    assert server._resolveCacheWindow("a/b", "ns", "slug") is None
+    assert server._resolveCacheWindow("a", "..", "slug") is None
+    assert server._resolveCacheWindow("a", "b", "..") is None
+
+
+def test_resolveCacheWindow_rejects_podsSub_without_pods_prefix(tmpCacheRoot: Path) -> None:
+    """The optional 4th segment must start with ``pods=`` so the URL
+    space stays unambiguous — anything else short-circuits to None
+    before any filesystem lookup."""
+    # Plant a real window so the cluster/ns/slug branch is otherwise valid.
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "window-x" / "wrongprefix=__aos__"
+    d.mkdir(parents=True)
+    assert server._resolveCacheWindow("yagan", "rapid-analysis", "window-x", "wrongprefix=__aos__") is None
+
+
+def test_resolveCacheWindow_returns_existing_dir(tmpCacheRoot: Path) -> None:
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "window-x"
+    d.mkdir(parents=True)
+    out = server._resolveCacheWindow("yagan", "rapid-analysis", "window-x")
+    assert out == d
+
+
+def test_resolveCacheWindow_returns_None_for_missing_dir(tmpCacheRoot: Path) -> None:
+    """Valid component shape but the directory doesn't exist."""
+    assert server._resolveCacheWindow("yagan", "rapid-analysis", "nope") is None
+
+
+# ----- evictByCacheDir no-op path -----------------------------------------
+
+
+def test_evictByCacheDir_no_match_is_noop(tmp_path: Path) -> None:
+    """``evictByCacheDir`` must leave unrelated loaded states alone —
+    we only ever evict the entries whose cacheDir matches the deleted
+    target, not "everything in the dict".
+    """
+    ctx = _emptyCtx()
+    cdA = tmp_path / "cache-A"
+    cdA.mkdir()
+    cdB = tmp_path / "cache-B"
+    cdB.mkdir()
+    cdGhost = tmp_path / "ghost"
+    cdGhost.mkdir()
+    ctx.putExposureState(_makeExposureState(1, cacheDir=cdA))
+    ctx.putExposureState(_makeExposureState(2, cacheDir=cdB))
+    ctx.evictByCacheDir(cdGhost)  # no state matches
+    assert ctx.getExposureState(1) is not None
+    assert ctx.getExposureState(2) is not None
+
+
+# ----- _buildNightSpecFromRequest -----------------------------------------
+
+
+def test_buildNightSpecFromRequest_happy_path() -> None:
+    """A minimal valid body produces a FetchSpec with the AOS pod-regex
+    pinned and the window set to the dayObs's noon-UTC bounds."""
+    spec, dayObs, password = server._buildNightSpecFromRequest({"dayObs": 20260521})
+    assert dayObs == 20260521
+    assert password is None
+    assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
+    # Window: noon UTC dayObs → noon UTC dayObs+1.
+    assert spec.fromIso.startswith("2026-05-21T12:00:00")
+    assert spec.toIso.startswith("2026-05-22T12:00:00")
+
+
+def test_buildNightSpecFromRequest_rejects_missing_dayObs() -> None:
+    with pytest.raises(ValueError, match="dayObs"):
+        server._buildNightSpecFromRequest({})
+
+
+def test_buildNightSpecFromRequest_rejects_non_integer_dayObs() -> None:
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        server._buildNightSpecFromRequest({"dayObs": "tomorrow"})
+
+
+def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs() -> None:
+    """A YYYYMMDD outside the [1900, 3000] year band almost certainly
+    means the caller passed something that isn't a dayObs — surface
+    that as a 400 rather than letting a nonsense window go to Loki."""
+    with pytest.raises(ValueError, match="YYYYMMDD"):
+        server._buildNightSpecFromRequest({"dayObs": 12345})
+
+
+def test_buildNightSpecFromRequest_password_passthrough() -> None:
+    _, _, password = server._buildNightSpecFromRequest({"dayObs": 20260521, "password": "hunter2"})
+    assert password == "hunter2"
+
+
+# ----- _maybeSetLokiPassword ----------------------------------------------
+
+
+def test_maybeSetLokiPassword_sets_env_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A non-empty password lands in ``LOKI_PASSWORD`` so the next
+    subprocess.run inherits it."""
+    monkeypatch.delenv("LOKI_PASSWORD", raising=False)
+    server._maybeSetLokiPassword("hunter2")
+    import os as _os
+
+    assert _os.environ["LOKI_PASSWORD"] == "hunter2"
+
+
+def test_maybeSetLokiPassword_noop_when_empty_or_None(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty/None password must NOT clobber an existing ``LOKI_PASSWORD``
+    — otherwise the home page's optional credentials card would silently
+    blow away a working env var on every fetch.
+    """
+    import os as _os
+
+    monkeypatch.setenv("LOKI_PASSWORD", "preserve-me")
+    server._maybeSetLokiPassword(None)
+    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
+    server._maybeSetLokiPassword("")
+    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
+
+
+# ----- _parseClientIso ----------------------------------------------------
+
+
+def test_parseClientIso_accepts_Z_suffix() -> None:
+    out = server._parseClientIso("2026-05-20T08:45:39Z")
+    assert out == dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+
+
+def test_parseClientIso_assumes_utc_when_no_offset() -> None:
+    out = server._parseClientIso("2026-05-20T08:45:39")
+    assert out == dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+
+
+def test_parseClientIso_honours_explicit_negative_offset() -> None:
+    """Negative offset path — important because the regex check uses
+    ``"-" in s[10:]`` to detect tz offsets after the YYYY-MM-DD head."""
+    out = server._parseClientIso("2026-05-20T05:45:39-03:00")
+    # 05:45 UTC-3 == 08:45 UTC
+    assert out == dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+
+
+def test_parseClientIso_raises_ValueError_on_garbage() -> None:
+    with pytest.raises(ValueError):
+        server._parseClientIso("not a date")
+
+
+# ----- _isoForLogcli (server.py copy) -------------------------------------
+
+
+def test_isoForLogcli_emits_Z_suffix_and_utc() -> None:
+    """logcli wants RFC3339Nano UTC; the helper must (a) end with Z
+    (not ``+00:00``) and (b) convert any non-UTC input to UTC."""
+    t = dt.datetime(2026, 5, 20, 9, 45, 39, tzinfo=dt.timezone(dt.timedelta(hours=1)))
+    s = server._isoForLogcli(t)
+    assert s.endswith("Z")
+    assert "08:45:39" in s  # the +01:00 input projected to UTC

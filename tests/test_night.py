@@ -396,3 +396,53 @@ def test_calcZernikesEndByDataId_ignores_non_QUANTUM_DONE_events() -> None:
         events=[_ev(t, 100, "QUANTUM_PREP", "calcZernikesTask")],
     )
     assert night.calcZernikesEndByDataId([s]) == {}
+
+
+# ----- empty-input rollups ------------------------------------------------
+
+
+def test_computeTopStats_empty_summaries_are_all_zero() -> None:
+    """A fetch that returned no pods at all must produce a coherent
+    all-zero TopStats payload — the UI renders the numbers literally,
+    so anything else (e.g. raising on empty) would crash the night
+    page."""
+    stats = night.computeTopStats([])
+    assert stats.nVisitsSeen == 0
+    assert stats.nPods == 0
+    assert stats.nTracebacks == 0
+    assert stats.nDataIdsWithTraceback == 0
+    assert stats.nPodsWithTraceback == 0
+    assert stats.nDistinctExceptionClasses == 0
+
+
+def test_errorsByType_empty_summaries_yield_empty_list() -> None:
+    assert night.errorsByType([]) == []
+
+
+def test_errorsByPod_empty_summaries_yield_empty_list() -> None:
+    assert night.errorsByPod([]) == []
+
+
+def test_firstTaskStartByDataId_ignores_events_with_None_expId() -> None:
+    """An event with ``expId=None`` (e.g. an untagged WARN) must not
+    fabricate a synthetic ``None`` dataId entry in the histogram input."""
+    t = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "podA",
+        "aos",
+        events=[_ev(t, None, "QUANTUM_PREP", "isr")],
+    )
+    assert night.firstTaskStartByDataId([s]) == {}
+
+
+def test_failureRows_empty_when_no_tracebacks() -> None:
+    s = _stubSummary("podA", "aos")  # no tracebacks
+    assert night.failureRows([s]) == []
+
+
+def test_buildHistogram_single_value_no_dataIds_yields_empty_dataIdsByBin() -> None:
+    """The lo==hi single-bin fallback should still produce an empty
+    (not ``[[]]``) dataIdsByBin when no dataIds were supplied."""
+    h = night.buildHistogram("only", "s", [5.0], dataIds=None)
+    assert h.counts == [1]
+    assert h.dataIdsByBin == []

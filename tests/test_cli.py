@@ -32,6 +32,14 @@ def test_parseIsoUtc_microseconds() -> None:
     assert t == dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
 
 
+def test_parseIsoUtc_explicit_negative_offset() -> None:
+    """The "tz detection" check looks at ``s[10:]`` for ``-``; a
+    negative offset must be honoured, not get a UTC default appended."""
+    t = cli._parseIsoUtc("2026-05-20T05:45:39-03:00")
+    # 05:45 UTC-3 == 08:45 UTC
+    assert t == dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+
+
 def test_isoForLogcli_ends_with_Z() -> None:
     t = dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
     s = cli._isoForLogcli(t)

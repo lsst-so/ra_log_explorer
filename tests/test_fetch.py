@@ -901,6 +901,75 @@ def test_evictToFit_handles_nested_night_caches(tmpCacheRoot: Path) -> None:
     assert not nightInner.exists()
 
 
+def test_evictToFit_prunes_empty_parent_dirs(tmpCacheRoot: Path) -> None:
+    """When the only cache under a (cluster, ns) tree is evicted, the
+    empty parent directories should be pruned too — otherwise the
+    cache root accumulates empty cluster/ns scaffolding forever.
+    """
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    d = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        bodyBytes=5000,
+        lastViewed=base - dt.timedelta(days=1),
+    )
+    removed = fetch.evictToFit(maxBytes=0)  # evict everything
+    assert d in removed
+    # The cluster/ namespace/ scaffolding should also be gone.
+    assert not (tmpCacheRoot / "yagan" / "rapid-analysis").exists()
+    assert not (tmpCacheRoot / "yagan").exists()
+    # The root itself stays so subsequent fetches still work.
+    assert tmpCacheRoot.exists()
+
+
+def test_evictToFit_prunes_empty_window_parent_for_night_cache(tmpCacheRoot: Path) -> None:
+    """A night cache lives at ``<root>/<cluster>/<ns>/<window>/pods=<slug>/``.
+    When evicted, the now-empty ``<window>/`` and the ``<cluster>/<ns>/``
+    scaffolding should also be pruned.
+    """
+    import json as _json
+
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    windowOuter = tmpCacheRoot / "yagan" / "rapid-analysis" / "win-x"
+    nightInner = windowOuter / "pods=__aos__"
+    (nightInner / "pods").mkdir(parents=True)
+    (nightInner / "_meta.json").write_text(
+        _json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:00:00Z",
+                    "toIso": "2026-05-20T08:05:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": ".*aos.*",
+                },
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    (nightInner / "pods" / "fake.jsonl").write_bytes(b"x" * 5000)
+    fetch.markCacheViewed(nightInner, when=base - dt.timedelta(days=1))
+    fetch.evictToFit(maxBytes=0)
+    # The pods=<slug> inner dir gets removed first; then the outer
+    # window dir is empty, so it goes too; then the namespace dir;
+    # then the cluster dir.
+    assert not nightInner.exists()
+    assert not windowOuter.exists()
+
+
 def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
     unviewed = _plantWindowWithBody(
