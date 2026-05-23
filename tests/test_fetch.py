@@ -733,6 +733,174 @@ def dt_asdict(spec: FetchSpec) -> dict[str, Any]:
     return asdict(spec)
 
 
+def test_findSupersetCache_does_not_match_across_podRegex(tmpCacheRoot: Path) -> None:
+    """An exposure-mode cache (podRegex=None) must NOT be a valid superset
+    for a night-mode (podRegex set) fetch, and vice versa. The on-disk pod
+    sets are different — pretending they aren't would silently serve up
+    incomplete or unrelated data.
+    """
+    # Plant an unfiltered (exposure-mode) cache covering an hour.
+    _writeCache(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T09:00:00Z",
+    )
+    # Ask for a night-mode fetch (.*aos.*) within that hour — must miss.
+    assert (
+        fetch.findSupersetCache(
+            "yagan",
+            "rapid-analysis",
+            "2026-05-20T08:30:00Z",
+            "2026-05-20T08:35:00Z",
+            podRegex=".*aos.*",
+        )
+        is None
+    )
+
+
+def test_findSupersetCache_matches_filtered_to_filtered(tmpCacheRoot: Path) -> None:
+    """A night-mode cache (podRegex=X) is a valid superset for another
+    night-mode request with the same regex, but only nests one level
+    deeper than the exposure-mode layout — make sure the discovery
+    walker actually reaches it.
+    """
+    fromIso, toIso = "2026-05-20T07:00:00Z", "2026-05-20T10:00:00Z"
+    fromSlug = fromIso.replace(":", "").replace(".", "_")
+    toSlug = toIso.replace(":", "").replace(".", "_")
+    # Mirror the on-disk layout: <root>/<cluster>/<ns>/<window>/pods=<slug>/
+    nightDir = tmpCacheRoot / "yagan" / "rapid-analysis" / f"{fromSlug}__{toSlug}" / "pods=_aos_"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": fromIso,
+                    "toIso": toIso,
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": ".*aos.*",
+                },
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    found = fetch.findSupersetCache(
+        "yagan", "rapid-analysis", "2026-05-20T08:30:00Z", "2026-05-20T08:35:00Z", podRegex=".*aos.*"
+    )
+    assert found == nightDir
+
+
+def test_fetchAll_refetches_when_window_extends_into_future(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """If the requested window's end is in the future, we must NOT serve
+    the cache — a snapshot from earlier would miss every line that lands
+    between cache time and "now". This is the safety net for night-mode
+    runs against the current dayObs."""
+    spec = FetchSpec(
+        lokiAddr="x",
+        username="u",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        # toIso 100 years in the future ⇒ window_in_past=False ⇒ refetch.
+        fromIso="2026-05-20T08:00:00Z",
+        toIso="2126-05-20T09:00:00Z",
+    )
+    # Plant a complete-looking cache at the same location.
+    cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps({"spec": dt_asdict(spec), "pod_count": 5, "total_bytes": 0, "errors": {}})
+    )
+
+    listPodsCalled: list[bool] = []
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        listPodsCalled.append(True)
+        return []
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    fetch.fetchAll(spec)
+    assert listPodsCalled == [True], "fetchAll must refetch when the window ends in the future"
+
+
+def test_fetchAll_writes_partial_flag_while_running(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """The `.partial` flag is the only signal that a cache dir was
+    interrupted mid-fetch. listPods runs first, fetchAll writes
+    `.partial` before then; we observe it from inside listPods to pin
+    the ordering."""
+    spec = _stubSpec()
+    partialSeen: list[bool] = []
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        # By now, fetchAll has already written `.partial`.
+        cacheDir = fetch.windowCachePath(_spec.cluster, _spec.namespace, _spec.fromIso, _spec.toIso)
+        partialSeen.append((cacheDir / fetch.PARTIAL_FLAG).exists())
+        return []
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    fetch.fetchAll(spec)
+    assert partialSeen == [True]
+    # And the flag is gone after a successful run.
+    cacheDir = fetch.windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    assert not (cacheDir / fetch.PARTIAL_FLAG).exists()
+
+
+def test_evictToFit_handles_nested_night_caches(tmpCacheRoot: Path) -> None:
+    """Night-mode caches live at <root>/<cluster>/<ns>/<window>/pods=<slug>/.
+    The LRU walker must find and evict them — otherwise the cache grows
+    forever in night-mode use, which defeats the size cap entirely.
+    """
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    windowOuter = tmpCacheRoot / "yagan" / "rapid-analysis" / "win-x"
+    nightInner = windowOuter / "pods=_aos_"
+    (nightInner / "pods").mkdir(parents=True)
+    (nightInner / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:00:00Z",
+                    "toIso": "2026-05-20T08:05:00Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                    "podRegex": ".*aos.*",
+                },
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    (nightInner / "pods" / "fake.jsonl").write_bytes(b"x" * 5000)
+    fetch.markCacheViewed(nightInner, when=base - dt.timedelta(days=1))
+    removed = fetch.evictToFit(maxBytes=1000)
+    # The night cache was the only thing on disk; it must be the one
+    # that got evicted.
+    assert nightInner in removed
+    assert not nightInner.exists()
+
+
 def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
     unviewed = _plantWindowWithBody(

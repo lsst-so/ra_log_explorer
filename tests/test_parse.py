@@ -921,6 +921,136 @@ def test_summarizeAll_returns_empty_when_pods_dir_missing(tmp_path: Path) -> Non
     assert parse.summarizeAll(cacheDir) == []
 
 
+def test_summarizeAll_sorts_pods_deterministically(tmp_path: Path) -> None:
+    """night.errorsByType picks the *first* sample message it sees per
+    exception class, which only makes sense if the summary order is
+    stable across runs. Pin that here."""
+    cacheDir = tmp_path / "cache"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    for name in ("zzz-pod", "aaa-pod", "mmm-pod"):
+        _writePodLog(
+            podsDir / f"{name}.jsonl",
+            [
+                (
+                    "2026-05-21T13:00:00.000+00:00",
+                    "info",
+                    "Running pipeline for 2026052100050 detector 1",
+                )
+            ],
+        )
+    summaries = parse.summarizeAll(cacheDir)
+    assert [s.pod for s in summaries] == ["aaa-pod", "mmm-pod", "zzz-pod"]
+
+
+def test_podsForTimeline_includes_other_group_even_without_match(tmp_path: Path) -> None:
+    """``"other"``-group pods are deliberately surfaced regardless of
+    whether they touched the dataId — the UI safety net for unknown /
+    new roles. Pin the contract."""
+    p = tmp_path / "weird-pod.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Unrelated chatter, no dataIds anywhere",
+            )
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert s.group == "other"
+    assert 2026051900722 not in s.expIdsSeen
+    out = parse.podsForTimeline([s], 2026051900722)
+    assert s in out
+
+
+def test_podsForTimeline_excludes_classified_pods_that_dont_touch_expId(tmp_path: Path) -> None:
+    """A known-role pod (sfm, aos, head, …) that didn't process the
+    target dataId is dropped from the timeline — we don't surface every
+    pod for every exposure, only the ones we actually need."""
+    p = tmp_path / "s-lsstcam-run-sfm-runner-workerset-99.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100099 detector 1",
+            )
+        ],
+    )
+    s = parse.summarizePod(p)
+    out = parse.podsForTimeline([s], 2026051900722)  # different dataId
+    assert s not in out
+
+
+def test_summarizePod_tracks_back_to_back_dataIds_with_carryover(tmp_path: Path) -> None:
+    """A worker pod processing two dataIds in succession must record
+    distinct first/last spans for each. Without this the timeline would
+    show a single conflated span across both visits.
+    """
+    p = tmp_path / "s-lsstcam-run-sfm-runner-workerset-1.jsonl"
+    _writePodLog(
+        p,
+        [
+            (
+                "2026-05-21T13:00:00.000+00:00",
+                "info",
+                "Running pipeline for 2026052100100 detector 0",
+            ),
+            ("2026-05-21T13:00:05.000+00:00", "info", "still working on the first one"),
+            (
+                "2026-05-21T13:00:10.000+00:00",
+                "info",
+                "Running pipeline for 2026052100101 detector 0",
+            ),
+            ("2026-05-21T13:00:15.000+00:00", "info", "second one chugging along"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    f1 = s.expIdFirstLast[2026052100100]
+    f2 = s.expIdFirstLast[2026052100101]
+    assert f1[0] < f1[1] < f2[0] < f2[1]
+    # The first visit's span doesn't extend over the second visit's pickup.
+    assert f1[1] < dt.datetime(2026, 5, 21, 13, 0, 10, tzinfo=dt.timezone.utc)
+
+
+def test_summarizePod_traceback_body_capped_at_max_lines(tmp_path: Path) -> None:
+    """A pathological traceback (hundreds of frames) must not blow memory
+    or grow the captured body without bound. The cap is internal but
+    pinning it here documents the contract."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    rows: list[tuple[str, str, str]] = [
+        ("2026-05-21T13:00:00.000+00:00", "info", "Running pipeline for 2026052100200 detector 1"),
+        ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+    ]
+    for i in range(300):  # > _TRACEBACK_MAX_LINES
+        rows.append(
+            (f"2026-05-21T13:00:0{i % 9 + 2}.{i:06d}+00:00", "error", f'  File "/x.py", line {i}, in inner')
+        )
+    rows.append(("2026-05-21T13:01:00.000+00:00", "error", "RuntimeError: at last"))
+    _writePodLog(p, rows)
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    tb = s.tracebacks[0]
+    # The exception class is still captured even though the body has
+    # already filled up — class detection continues past the cap.
+    assert tb.excClass == "RuntimeError"
+    # The body itself is bounded (we don't pin the exact line count; the
+    # contract is "won't grow without bound").
+    assert len(tb.body.splitlines()) <= parse._TRACEBACK_MAX_LINES + 1
+
+
+def test_extractExpId_split_form_no_separator_doesnt_match(tmp_path: Path) -> None:
+    """The split-form regex requires at least one non-digit char between
+    the key and the value. "dayobs20260519" (no separator) MUST NOT
+    match — otherwise stray numeric runs in logs would false-positive
+    as dataIds.
+    """
+    assert parse.extractExpId("dayobs20260519seqnum722") is None
+
+
 # ----- helpers ------------------------------------------------------------
 
 

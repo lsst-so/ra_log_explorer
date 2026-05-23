@@ -457,3 +457,38 @@ def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     assert exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam") is None
+
+
+def test_queryIsotBatch_empty_input_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty input list must short-circuit without any HTTP call —
+    the night-mode prefetch path calls this with the set of unresolved
+    ids, which may legitimately be empty.
+    """
+
+    def fakeUrlopen(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("urlopen called for empty batch")
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryIsotBatch([], "TOKEN")
+    assert out == {}
+
+
+def test_lookupCached_returns_None_for_non_string_value(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A corrupt cache that maps the right key to a non-string (e.g. an
+    int) must surface as a miss, not crash the caller. Recovery path is
+    "fall through to ConsDB and overwrite"."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"2026051900722": 12345}))
+    assert exposureTimes.lookupCached(2026051900722) is None
+
+
+def test_sqlFor_format_is_stable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SQL we send is part of the contract with ConsDB — pin its
+    shape so a refactor of `_sqlFor` doesn't silently change the wire
+    format (which would be invisible until a query failed in prod)."""
+    sql = exposureTimes._sqlFor(2026051900722, "lsstcam")
+    assert sql == "SELECT obs_end FROM cdb_lsstcam.exposure WHERE exposure_id = 2026051900722"

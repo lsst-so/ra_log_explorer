@@ -290,3 +290,55 @@ def test_cmdRun_home_mode_starts_server(monkeypatch: pytest.MonkeyPatch) -> None
     ctx = captured["ctx"]
     assert len(ctx.exposureStates) == 0
     assert len(ctx.nightStates) == 0
+
+
+def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--force-refresh`` must reach `fetchAll` as `forceRefresh=True`.
+    Without it, cached results would silently override the user's
+    explicit refresh request."""
+    from ra_log_explorer import cli
+    from ra_log_explorer import parse as _parse
+
+    captured: dict[str, bool] = {}
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict[str, Any]]:
+        captured["forceRefresh"] = forceRefresh
+        d = tmpCacheRoot / "fake-force"
+        (d / "pods").mkdir(parents=True)
+        return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
+
+    monkeypatch.setattr(cli, "fetchAll", fakeFetchAll)
+    monkeypatch.setattr(_parse, "summarizeAll", lambda _d: [])
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--exposure-id",
+            "2026051900722",
+            "--t-zero",
+            "2026-05-20T08:46:16.267",
+            "--force-refresh",
+            "--no-serve",
+            "--no-browser",
+        ]
+    )
+    cli._eagerFetchAndBuildState(args)
+    assert captured["forceRefresh"] is True
+
+
+def test_cmdCacheFlush_on_empty_cache_root_is_noop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """When the cache root doesn't exist at all, flush has nothing to do
+    and shouldn't prompt the user (or, worse, crash)."""
+    # Point cache_root at a path that doesn't exist, *without* creating it.
+    fakeRoot = tmp_path / "does-not-exist"
+    monkeypatch.setattr(cli, "cache_root", lambda: fakeRoot)
+    args = cli.build_parser().parse_args(["cache", "flush", "--yes"])
+    rc = cli.cmdCacheFlush(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "Nothing to flush" in out

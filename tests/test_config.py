@@ -86,3 +86,49 @@ def test_FetchSpec_is_frozen() -> None:
     )
     with pytest.raises(Exception):  # noqa: PT011 - dataclasses raises FrozenInstanceError
         spec.cluster = "other"  # type: ignore[misc]
+
+
+def test_windowCachePath_podRegex_nests_under_window(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Night-mode (podRegex set) layouts must live one directory deeper
+    than exposure-mode layouts. If they didn't, an unfiltered fetch and a
+    filtered fetch over the same time window would clobber each other.
+    """
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    bare = config.windowCachePath("yagan", "ns", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z")
+    night = config.windowCachePath(
+        "yagan", "ns", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z", podRegex=".*aos.*"
+    )
+    # The night path nests an extra component below the exposure path.
+    assert night.parent == bare
+    assert night.name.startswith("pods=")
+
+
+def test_windowCachePath_podRegex_slug_is_filesystem_safe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regex slug shouldn't contain anything the filesystem dislikes —
+    no slashes, no leading dots that would shadow hidden-file conventions,
+    just alnum + underscore."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = config.windowCachePath(
+        "yagan", "ns", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z", podRegex=".*aos.*"
+    )
+    slug = p.name[len("pods=") :]
+    # Special chars folded to underscores.
+    assert "/" not in slug and "*" not in slug and "." not in slug
+    # But it survives long enough to keep distinct regexes distinct.
+    other = config.windowCachePath(
+        "yagan", "ns", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z", podRegex=".*sfm.*"
+    )
+    assert p != other
+
+
+def test_ensureWindowCacheDir_honours_podRegex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ensureWindowCacheDir must actually create the night-mode nested
+    directory; otherwise the writer in fetchAll would crash on first use."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = config.ensureWindowCacheDir(
+        "yagan", "ns", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z", podRegex=".*aos.*"
+    )
+    assert p.exists() and p.is_dir()
+    assert p.name.startswith("pods=")

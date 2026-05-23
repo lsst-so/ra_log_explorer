@@ -330,3 +330,69 @@ def test_tracebackBody_round_trips_via_bodyKey() -> None:
 def test_tracebackBody_returns_None_for_unknown_key() -> None:
     s = _stubSummary("podA", "aos")
     assert night.tracebackBody([s], "no-such-key") is None
+
+
+def test_buildHistogram_lo_eq_hi_without_dataIds_yields_single_bin() -> None:
+    """If every offset is the same and no dataIds are supplied, the
+    fallback single-bin shape still has to be coherent — counts and
+    nValues populated, dataIdsByBin empty (not None).
+    """
+    h = night.buildHistogram("only", "s", [3.0, 3.0, 3.0], dataIds=None)
+    assert h.counts == [3]
+    assert h.nValues == 3
+    assert h.dataIdsByBin == []
+
+
+def test_computeDeltaShutterOffsets_empty_input_yields_empty_result() -> None:
+    offsets, ids, nDropped = night.computeDeltaShutterOffsets({}, {})
+    assert offsets == []
+    assert ids == []
+    assert nDropped == 0
+
+
+def test_failureRows_sorted_by_tIso_ascending() -> None:
+    """The order is what the UI table renders top-to-bottom. Pin it so a
+    refactor of failureRows doesn't reshuffle the visible order."""
+    t0 = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "podA",
+        "aos",
+        tracebacks=[
+            _tb("podA", t0 + dt.timedelta(seconds=10), 1, "RuntimeError"),
+            _tb("podA", t0, 2, "ValueError"),
+            _tb("podA", t0 + dt.timedelta(seconds=5), 3, "OSError"),
+        ],
+    )
+    rows = night.failureRows([s])
+    assert [r.dataId for r in rows] == [2, 3, 1]
+
+
+def test_failureRows_bodyKey_is_unique_per_traceback() -> None:
+    """The drilldown endpoint looks up traceback bodies by `bodyKey` —
+    distinct tracebacks must hash to distinct keys, even when they
+    share a pod / dataId / class. The (pod, t) compound key buys this
+    so long as no two tracebacks in one pod share the same timestamp.
+    """
+    t0 = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "podA",
+        "aos",
+        tracebacks=[
+            _tb("podA", t0, 1, "RuntimeError", "first"),
+            _tb("podA", t0 + dt.timedelta(milliseconds=1), 1, "RuntimeError", "second"),
+        ],
+    )
+    rows = night.failureRows([s])
+    assert rows[0].bodyKey != rows[1].bodyKey
+
+
+def test_calcZernikesEndByDataId_ignores_non_QUANTUM_DONE_events() -> None:
+    """``calcZernikesEndByDataId`` is for finishes only. A QUANTUM_PREP
+    of the same task must not count as an end."""
+    t = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "podA",
+        "aos",
+        events=[_ev(t, 100, "QUANTUM_PREP", "calcZernikesTask")],
+    )
+    assert night.calcZernikesEndByDataId([s]) == {}

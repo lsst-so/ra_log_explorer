@@ -199,3 +199,57 @@ def test_fetchjob_push_event_notifies_waiters() -> None:
     t.join(timeout=2.0)
     assert not t.is_alive()
     assert received == [{"type": "hello"}]
+
+
+def test_createNightJob_distinct_from_exposure_job() -> None:
+    """Night jobs carry ``dayObs`` and ``kind='night'``, no expId / tZero.
+    Without this distinction the per-tab routing in the server would
+    misclassify night fetches as exposure fetches."""
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20260521)
+    assert job.kind == "night"
+    assert job.dayObs == 20260521
+    assert job.expId is None
+    assert job.tZero is None
+    # Job is registered alongside exposure jobs in the same id space.
+    assert mgr.getJob(job.jobId) is job
+
+
+def test_runJob_populates_cacheDir_and_meta_on_success(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """After a successful run, the FetchJob carries the cacheDir + meta
+    the caller would otherwise have to fish out of fetchAll directly.
+    The SSE consumer + onComplete callback both rely on this."""
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: ProgressCb | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        return tmp_path, {"spec": {}, "cacheReuse": "exact", "pod_count": 7, "total_bytes": 999}
+
+    monkeypatch.setattr(jobs, "fetchAll", fakeFetchAll)
+    mgr = jobs.JobManager()
+    job = mgr.createJob(_spec(), 1, _tZero())
+    mgr.runJob(job, onComplete=lambda j: None)
+    assert job.cacheDir == tmp_path
+    assert job.meta["pod_count"] == 7
+    assert job.meta["cacheReuse"] == "exact"
+    assert job.startedAt is not None and job.finishedAt is not None
+    assert job.finishedAt >= job.startedAt
+
+
+def test_jobManager_stateLock_is_a_real_lock() -> None:
+    """A second acquire on the same lock from the same thread must block
+    (it's a plain Lock, not RLock). The server depends on this so that a
+    deeply nested re-entry would deadlock visibly rather than silently
+    interleave."""
+    mgr = jobs.JobManager()
+    with mgr.stateLock:
+        acquired = mgr.stateLock.acquire(blocking=False)
+        try:
+            assert acquired is False
+        finally:
+            if acquired:
+                mgr.stateLock.release()

@@ -530,3 +530,177 @@ def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
     assert ctx.getExposureState(1) is None  # matched, evicted
     assert ctx.getExposureState(2) is not None  # unrelated, kept
     assert ctx.getNightState(20260521) is None  # matched, evicted
+
+
+# ----- _taiIsoToUtc --------------------------------------------------------
+
+
+def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
+    """ConsDB obs_end is in TAI without a timezone marker; the helper
+    must (1) treat it as TAI and (2) subtract 37s to land at UTC. Both
+    halves matter — getting either wrong silently shifts every
+    histogram bar.
+    """
+    out = server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    expected = dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
+    assert out == expected
+
+
+# ----- _buildNightPayload --------------------------------------------------
+
+
+def test_buildNightPayload_carries_histograms_and_stats() -> None:
+    """A minimal NightState end-to-end through ``_buildNightPayload``:
+    summaries with one task-pickup + one calcZernikes-done land in the
+    two histograms; tracebacks land in the failures table.
+    """
+    tShutter = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    tPickup = tShutter + dt.timedelta(seconds=5)
+    tCzEnd = tShutter + dt.timedelta(seconds=90)
+    pickupEv = parse.Event(pod="p", t=tPickup, kind="QUANTUM_PREP", level="info", expId=100, taskLabel="isr")
+    czDoneEv = parse.Event(
+        pod="p",
+        t=tCzEnd,
+        kind="QUANTUM_DONE",
+        level="info",
+        expId=100,
+        taskLabel="calcZernikesTask",
+        durationS=2.0,
+    )
+    tbRecord = parse.TracebackRecord(
+        pod="p",
+        t=tCzEnd + dt.timedelta(seconds=1),
+        expId=100,
+        excClass="RuntimeError",
+        excMessage="oops",
+        body="",
+    )
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=10,
+        nWarn=0,
+        nError=1,
+        nTraceback=1,
+        firstTs=tPickup,
+        lastTs=tCzEnd,
+        expIdsSeen={100},
+        events=[pickupEv, czDoneEv],
+        tracebacks=[tbRecord],
+    )
+    state = server.NightState(
+        cacheDir=Path("/tmp/dummy"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+        shutterCloseByExpId={100: tShutter},
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["mode"] == "night"
+    assert payload["dayObs"] == 20260521
+    assert payload["stats"]["nTracebacks"] == 1
+    assert payload["stats"]["nDataIdsWithTraceback"] == 1
+    # The first-task histogram has one value (Δshutter ≈ 5s).
+    assert payload["histograms"]["firstTaskStart"]["nValues"] == 1
+    assert payload["histograms"]["calcZernikesEnd"]["nValues"] == 1
+    # Failures table carries our one record.
+    assert len(payload["failures"]) == 1
+    assert payload["failures"][0]["excClass"] == "RuntimeError"
+
+
+def test_buildNightPayload_counts_missing_shutter_closes() -> None:
+    """``stats.nMissingShutterClose`` surfaces how many dataIds need a
+    ConsDB resolve we don't have yet — the UI uses this for a "still
+    resolving …" notice."""
+    tPickup = dt.datetime(2026, 5, 21, 13, 0, 0, tzinfo=dt.timezone.utc)
+    pickupEv = parse.Event(pod="p", t=tPickup, kind="QUANTUM_PREP", level="info", expId=999, taskLabel="isr")
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=tPickup,
+        lastTs=tPickup,
+        expIdsSeen={999},
+        events=[pickupEv],
+    )
+    state = server.NightState(
+        cacheDir=Path("/tmp/dummy"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+        shutterCloseByExpId={},  # nothing resolved
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["stats"]["nMissingShutterClose"] == 1
+
+
+# ----- _podDetailForNight --------------------------------------------------
+
+
+def test_podDetailForNight_offsetS_is_relative_to_night_start(tmp_path: Path) -> None:
+    """In night mode there's no per-pod shutter close, so the per-line
+    `offsetS` is measured from noon UTC of the dayObs. A line at 13:30
+    on the right day should land at 1.5h × 3600 = 5400s.
+    """
+    import json as _json
+
+    cacheDir = tmp_path / "night-cache"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-0"
+    (podsDir / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-21T13:30:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "2026-05-21 13:30:00,000 logger fn INFO   Running pipeline for 2026052100050\n",
+            }
+        )
+        + "\n"
+    )
+    state = server.NightState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    out = server._podDetailForNight(state, podName)
+    assert out["pod"] == podName
+    assert len(out["lines"]) == 1
+    assert out["lines"][0]["offsetS"] == 5400.0
+    # dataId attribution still works in night mode (carryover-aware).
+    assert out["lines"][0]["expId"] == 2026052100050
+
+
+# ----- _tracebackContextForNight error paths -----------------------------
+
+
+def test_tracebackContextForNight_returns_None_for_unknown_key(tmp_path: Path) -> None:
+    """A bogus bodyKey must yield None so the endpoint can return 404
+    rather than crashing or returning a misleading empty body."""
+    state = server.NightState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    assert server._tracebackContextForNight(state, "nope") is None

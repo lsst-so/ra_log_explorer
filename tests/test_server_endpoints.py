@@ -1498,6 +1498,81 @@ def test_pod_endpoint_routes_by_dayObs_query(runningServer: RunningServer, tmpCa
     assert body["lines"][0]["expId"] == 2026052100050
 
 
+# ----- SSE progress stream ---------------------------------------------
+
+
+def test_progress_sse_replays_history_then_terminates(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SSE handler must replay all prior events to any new subscriber
+    and then close cleanly once the job has reached a terminal state.
+    Otherwise a UI tab opened after the fetch finished would hang
+    forever waiting for events that already happened."""
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        cacheDir = tmpCacheRoot / "sse-fake"
+        (cacheDir / "pods").mkdir(parents=True)
+        # Drive a handful of progress callbacks so the event log has body.
+        for i, name in enumerate(["a", "b", "c"], 1):
+            if progress is not None:
+                progress(name, i, 3)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 3,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch",
+        {"exposureId": 2026051900722, "tZero": "2026-05-20T08:46:16.267"},
+    )
+    assert status == 202, body
+    jobId = body["jobId"]
+
+    # Wait until the job has finished, then attach as a fresh SSE
+    # subscriber. The handler must replay everything and close.
+    for _ in range(100):
+        st, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+
+    conn = http.client.HTTPConnection(host, port, timeout=4.0)
+    conn.request("GET", f"/api/fetch/{jobId}/progress")
+    resp = conn.getresponse()
+    try:
+        rawBody = resp.read()
+    finally:
+        conn.close()
+    text = rawBody.decode("utf-8")
+    # We expect one `data:` line per event. The job's terminal `done`
+    # event must show up; otherwise the stream isn't replaying history.
+    assert '"type": "start"' in text
+    assert '"type": "pod-done"' in text
+    assert '"type": "done"' in text
+
+
+def test_progress_sse_404_for_unknown_job(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/fetch/doesnotexist/progress")
+    assert status == 404
+    assert "error" in body
+
+
 def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
     tmpCacheRoot: Path,
 ) -> None:
