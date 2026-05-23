@@ -2,25 +2,28 @@
 
 The server runs against a long-lived :class:`ServerContext` that holds:
 
-  * the currently-loaded ``ServerState`` (or ``None`` — the "home" mode),
+  * two LRU-ordered dicts of loaded states (one per exposure / night),
   * a :class:`~ra_log_explorer.jobs.JobManager` for fetch jobs the user
     kicks off from the home page,
-  * a thread lock guarding ``state`` so an in-progress fetch can swap it
-    in atomically.
+  * the single ``stateLock`` that guards both keyed-state dicts.
 
 HTTP surface (see ``architecture/architecture.md`` for the full schema):
 
-  GET    /                                              timeline.html (home + explore SPA)
-  GET    /static/*                                       static assets
-  GET    /api/summary                                    current loaded exposure, or {state: null}
-  GET    /api/pod/<pod>                                  full parsed log for one pod
-  GET    /api/cache                                      list of cached windows on disk
-  DELETE /api/cache                                      delete the entire cache
-  DELETE /api/cache/<cluster>/<ns>/<slug>                delete one cached window
-  GET    /api/exposure-time/<dataId>                     dataId -> shutter-close (TAI) lookup
-  POST   /api/fetch                                      start a fetch; returns {jobId}
-  GET    /api/fetch/<id>/status                          JSON snapshot of a fetch job
-  GET    /api/fetch/<id>/progress                        SSE stream of fetch progress events
+  GET    /                                       timeline.html (home + explore + night SPA)
+  GET    /static/*                                static assets
+  GET    /api/summary?dataId=<>|?dayObs=<>        view-state lookup by exposure or dayObs
+  GET    /api/pod/<pod>?dataId=<>|?dayObs=<>      full parsed log for one pod
+  GET    /api/night/traceback/<bodyKey>?dayObs=<> per-failure drilldown
+  GET    /api/cache                               list of cached windows on disk
+  DELETE /api/cache                               delete the entire cache
+  DELETE /api/cache/<cluster>/<ns>/<slug>[/<pods=…>]  delete one cached window
+  GET    /api/exposure-time/<dataId>              dataId -> shutter-close (TAI) lookup
+  GET    /api/settings                            current persisted server-side settings
+  PUT    /api/settings                            update server-side settings
+  POST   /api/fetch                               start an exposure fetch; returns {jobId}
+  POST   /api/fetch-night                         start a night fetch; returns {jobId}
+  GET    /api/fetch/<id>/status                   JSON snapshot of a fetch job
+  GET    /api/fetch/<id>/progress                 SSE stream of fetch progress events
 """
 
 from __future__ import annotations

@@ -117,8 +117,10 @@ Sibling docs:
   `0s` line corresponds to. Conventionally the shutter-close time from
   `DimensionRecord.timespan.end`, which is **TAI**. The CLI and the
   POST body subtract 37 s by default; `--t-zero-utc` / `tZeroUtc: true`
-  opt out. `cli.py:TAI_MINUS_UTC_S` and `exposureTimes.TAI_MINUS_UTC_S`
-  hold the constant.
+  opt out. The canonical constant lives in
+  `exposureTimes.TAI_MINUS_UTC_S`; `cli.TAI_MINUS_UTC_S` and the
+  server's `_buildSpecFromRequest` both reference it, so there's
+  exactly one source of truth.
 
 - **Window** — the (UTC) `[from, to]` time range we query Loki for.
   Exposure-mode default: `(t-zero - 5 s, t-zero + 5 min)`. Night-mode:
