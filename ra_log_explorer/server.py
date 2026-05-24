@@ -476,7 +476,11 @@ def _podDetailForNight(state: NightState, pod: str) -> dict:
 # ----- night payload --------------------------------------------------------
 
 
-def _neededDataIdsForNight(summaries: Iterable[parser.PodSummary]) -> set[int]:
+def _neededDataIdsForNight(
+    summaries: Iterable[parser.PodSummary],
+    firstStarts: dict[int, dt.datetime] | None = None,
+    czEnds: dict[int, dt.datetime] | None = None,
+) -> set[int]:
     """Return the union of dataIds the night view will need a shutter
     close for. Shared by the prefetch path (so it knows what to look
     up) and the payload build (so the ``nMissingShutterClose`` stat
@@ -484,11 +488,16 @@ def _neededDataIdsForNight(summaries: Iterable[parser.PodSummary]) -> set[int]:
 
     The three sources are: first-task-start times per dataId, the
     calcZernikes end times per dataId, and any dataId carrying a
-    traceback.
+    traceback. ``firstStarts`` / ``czEnds`` can be passed in by callers
+    that have already computed them (the payload build does, to feed
+    the histograms) — otherwise we compute them locally.
     """
     summaries = list(summaries)
-    needIds: set[int] = set(night.firstTaskStartByDataId(summaries))
-    needIds |= set(night.calcZernikesEndByDataId(summaries))
+    if firstStarts is None:
+        firstStarts = night.firstTaskStartByDataId(summaries)
+    if czEnds is None:
+        czEnds = night.calcZernikesEndByDataId(summaries)
+    needIds: set[int] = set(firstStarts) | set(czEnds)
     for s in summaries:
         for tb in s.tracebacks:
             if tb.expId is not None:
@@ -602,8 +611,9 @@ def _buildNightPayload(state: NightState) -> dict:
 
     # Keep this in lockstep with the prefetch path so the
     # ``nMissingShutterClose`` counter the UI surfaces matches what
-    # the prefetch actually attempted.
-    needIds = _neededDataIdsForNight(state.summaries)
+    # the prefetch actually attempted. Pass the already-computed
+    # starts / ends in so the helper doesn't redo the per-event scan.
+    needIds = _neededDataIdsForNight(state.summaries, firstStarts=firstStarts, czEnds=czEnds)
     nMissingShutter = sum(1 for eid in needIds if eid not in shutterCloseByExpId)
 
     firstOffsets, firstIds, firstNDropped = night.computeDeltaShutterOffsets(firstStarts, shutterCloseByExpId)

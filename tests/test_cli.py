@@ -200,8 +200,8 @@ def test_cmdCacheInfo_window_with_meta_and_partial_inner_shows_only_outer(
     tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """If an outer window has its own ``_meta.json`` (an exposure-mode
-    cache), the listing must show that one row and not also try to
-    surface any partial ``pods=*`` subdirs underneath it.
+    cache) and a sibling night cache subdir exists but is partial
+    (no ``_meta.json``), the listing shows only the exposure row.
     """
     import json as _json
 
@@ -215,9 +215,38 @@ def test_cmdCacheInfo_window_with_meta_and_partial_inner_shows_only_outer(
     rc = cli.cmdCacheInfo(args)
     assert rc == 0
     out = capsys.readouterr().out
-    # The exposure row appears once, with no extra ``pods=__aos__`` row.
+    # The exposure row appears once, and the partial inner is not
+    # surfaced (it has no ``_meta.json``).
     assert "[ok ]" in out
     assert "pods=__aos__" not in out
+
+
+def test_cmdCacheInfo_coexisting_outer_and_inner_caches_both_listed(
+    tmpCacheRoot: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An exposure cache (outer window has ``_meta.json``) and a night
+    cache (inner ``pods=<slug>/_meta.json``) can coexist under the
+    same window dir — the architecture explicitly allows this. The
+    CLI listing must surface BOTH rows, matching what the server's
+    /api/cache endpoint returns.
+    """
+    import json as _json
+
+    windowDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "ex"
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "_meta.json").write_text(_json.dumps({"spec": {}}))
+    inner = windowDir / "pods=__aos__"
+    (inner / "pods").mkdir(parents=True)
+    (inner / "_meta.json").write_text(_json.dumps({"spec": {"podRegex": ".*aos.*"}}))
+    args = cli.build_parser().parse_args(["cache", "info"])
+    rc = cli.cmdCacheInfo(args)
+    assert rc == 0
+    out = capsys.readouterr().out
+    rows = [line for line in out.splitlines() if "[ok ]" in line]
+    # One row for the outer window, one for the inner pods= subdir.
+    assert len(rows) == 2, f"expected 2 ok rows, got {len(rows)} in:\n{out}"
+    assert any("pods=__aos__" in r for r in rows)
+    assert any("/ex" in r and "pods=" not in r for r in rows)
 
 
 def test_cmdCacheFlush_with_yes_deletes_root(

@@ -80,12 +80,16 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     mgr = jobs.JobManager()
     job = mgr.createJob(_spec(), 2026051900722, _tZero())
-    # Capture the event-log length *when onComplete fires*. If onComplete
-    # ran before the `done` event was pushed, this snapshot will be
-    # strictly less than len(job.events) at the end of runJob.
+    # Capture both the job-id and the event-log length *as onComplete
+    # fires*. The length snapshot is how we verify the ordering
+    # contract: if onComplete ran before the `done` event was pushed,
+    # this snapshot will be strictly less than len(job.events) at the
+    # end of runJob, and the event at that index will be the `done`.
+    completedFor: list[str] = []
     eventCountAtCompleteTime: list[int] = []
 
     def onComplete(j: jobs.FetchJob) -> None:
+        completedFor.append(j.jobId)
         eventCountAtCompleteTime.append(len(j.events))
 
     mgr.runJob(job, onComplete=onComplete)
@@ -95,11 +99,11 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
     # Status path: pending->running->parsing->done. Final is done.
     assert job.status == "done"
     assert job.error is None
-    # onComplete fired exactly once, with the job ID we created.
-    assert len(eventCountAtCompleteTime) == 1
+    # onComplete fired exactly once and got handed our job.
+    assert completedFor == [job.jobId]
     # And it fired before the terminal `done` event landed in the log:
-    # the snapshot at onComplete time must be strictly less than the
-    # final event count.
+    # the snapshot at onComplete time is strictly less than the final
+    # event count, and the very next event pushed is the `done`.
     assert eventCountAtCompleteTime[0] < len(job.events)
     assert job.events[eventCountAtCompleteTime[0]]["type"] == "done"
 
