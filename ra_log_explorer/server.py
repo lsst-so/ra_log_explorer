@@ -1365,7 +1365,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/settings":
                 s = appSettings.loadAppSettings()
-                self._send_json({"maxCacheBytes": s.maxCacheBytes})
+                # ``effectiveCacheRoot`` resolves through the same
+                # priority order as a live fetch (env var → persisted
+                # cacheDir → default) so the UI can show the user what
+                # the server will *actually* use, not just what they
+                # typed.
+                self._send_json(
+                    {
+                        "maxCacheBytes": s.maxCacheBytes,
+                        "cacheDir": s.cacheDir,
+                        "effectiveCacheRoot": str(cache_root()),
+                    }
+                )
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
@@ -1522,20 +1533,47 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 except json.JSONDecodeError as e:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
-                maxCacheBytesRaw = body.get("maxCacheBytes")
-                if maxCacheBytesRaw is None:
-                    self._send_error_json(400, "maxCacheBytes is required")
-                    return
-                try:
-                    maxCacheBytes = int(maxCacheBytesRaw)
-                except (TypeError, ValueError):
-                    self._send_error_json(400, "maxCacheBytes must be an integer")
-                    return
-                if maxCacheBytes < 0:
-                    self._send_error_json(400, "maxCacheBytes must be non-negative")
-                    return
-                appSettings.saveAppSettings(appSettings.AppSettings(maxCacheBytes=maxCacheBytes))
-                self._send_json({"maxCacheBytes": maxCacheBytes})
+                # Start from whatever's currently persisted so a PUT
+                # that touches only one field doesn't accidentally
+                # blank out the other.
+                current = appSettings.loadAppSettings()
+                maxCacheBytes = current.maxCacheBytes
+                if "maxCacheBytes" in body:
+                    raw = body["maxCacheBytes"]
+                    try:
+                        maxCacheBytes = int(raw)
+                    except (TypeError, ValueError):
+                        self._send_error_json(400, "maxCacheBytes must be an integer")
+                        return
+                    if maxCacheBytes < 0:
+                        self._send_error_json(400, "maxCacheBytes must be non-negative")
+                        return
+                cacheDir: str | None = current.cacheDir
+                if "cacheDir" in body:
+                    raw = body["cacheDir"]
+                    if raw is None or (isinstance(raw, str) and not raw.strip()):
+                        cacheDir = None
+                    elif isinstance(raw, str):
+                        candidate = Path(raw).expanduser()
+                        try:
+                            candidate.mkdir(parents=True, exist_ok=True)
+                        except OSError as e:
+                            self._send_error_json(400, f"Could not create cacheDir {candidate}: {e}")
+                            return
+                        cacheDir = str(candidate)
+                    else:
+                        self._send_error_json(400, "cacheDir must be a string or null")
+                        return
+                appSettings.saveAppSettings(
+                    appSettings.AppSettings(maxCacheBytes=maxCacheBytes, cacheDir=cacheDir)
+                )
+                self._send_json(
+                    {
+                        "maxCacheBytes": maxCacheBytes,
+                        "cacheDir": cacheDir,
+                        "effectiveCacheRoot": str(cache_root()),
+                    }
+                )
                 return
             self.send_error(404)
 

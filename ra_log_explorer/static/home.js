@@ -32,6 +32,7 @@ const SETTINGS_DEFAULTS = {
   lokiAddr: 'https://loki-query.ls.lsst.org',
   rspTokenFile: '',
   maxCacheGiB: 5,
+  cacheDir: '',
 };
 
 let homeListenersWired = false;
@@ -104,9 +105,12 @@ function prefillSettings() {
     const el = form.elements.namedItem(k);
     if (el) el.value = s[k] != null ? s[k] : SETTINGS_DEFAULTS[k];
   }
-  // Reflect what the server currently believes the cache limit is,
-  // and only override the form's local copy if the server has
-  // something different (e.g. set via PUT from another tab).
+  // Reflect what the server currently believes the cache limit + the
+  // persisted cacheDir override are. ``effectiveCacheRoot`` is the
+  // path the server will *actually* use next time (env-var > setting >
+  // default) — render it as a hint so the user can see where their
+  // typed input resolves to, including the case where it's overridden
+  // by RA_LOG_EXPLORER_CACHE.
   fetch('/api/settings').then(async (r) => {
     if (!r.ok) return;
     const data = await r.json();
@@ -115,7 +119,19 @@ function prefillSettings() {
       form.elements.maxCacheGiB.value = gib;
       saveSettings();  // sync localStorage to the server's value
     }
+    if (data.cacheDir !== form.elements.cacheDir.value) {
+      form.elements.cacheDir.value = data.cacheDir || '';
+      saveSettings();
+    }
+    updateCacheDirHint(data.effectiveCacheRoot);
   }).catch(() => { /* offline — leave the form alone */ });
+}
+
+function updateCacheDirHint(effective) {
+  const el = document.getElementById('cache-dir-effective');
+  if (!el) return;
+  if (!effective) { el.textContent = ''; return; }
+  el.textContent = `currently using: ${effective}`;
 }
 
 function saveSettings() {
@@ -127,15 +143,15 @@ function saveSettings() {
     s[k] = el.type === 'number' ? parseFloat(el.value) : el.value.trim();
   }
   localStorage.setItem(LS.settings, JSON.stringify(s));
-  // Push the cache size to the server (other fields are client-side
-  // only). Errors are surfaced via #settings-state but don't block
-  // anything else.
+  // Push the server-side fields (cache size + cache root override).
+  // Other fields are client-side only. Errors are surfaced via
+  // #settings-state but don't block anything else.
   const stateEl = document.getElementById('settings-state');
   const bytes = Math.round((s.maxCacheGiB || 0) * (1024 ** 3));
   fetch('/api/settings', {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ maxCacheBytes: bytes }),
+    body: JSON.stringify({ maxCacheBytes: bytes, cacheDir: s.cacheDir || null }),
   }).then(async (r) => {
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
@@ -143,6 +159,9 @@ function saveSettings() {
       stateEl.classList.add('error');
       return;
     }
+    const data = await r.json().catch(() => ({}));
+    if (data.effectiveCacheRoot) updateCacheDirHint(data.effectiveCacheRoot);
+    refreshCache();  // the cache listing comes from the new root
     stateEl.textContent = '(saved)';
     stateEl.classList.remove('error');
     setTimeout(() => { stateEl.textContent = ''; }, 1500);

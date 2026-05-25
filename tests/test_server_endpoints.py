@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import http.client
 import json
+import os
 import socket
 import threading
 import time
@@ -892,6 +893,77 @@ def test_settings_get_returns_defaults_then_put_persists(
     assert body["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
 
 
+def test_settings_put_persists_cacheDir_and_resolves_effective_root(
+    runningServer: RunningServer, tmp_path: Path
+) -> None:
+    """``cacheDir`` round-trips through PUT/GET and the server reports
+    the *effective* cache root it'll actually use next — which honours
+    the env-var override over the persisted value.
+    """
+    host, port, _ctx = runningServer
+    target = tmp_path / "my-custom-cache"
+
+    # PUT a custom cacheDir.
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request(
+        "PUT",
+        "/api/settings",
+        body=json.dumps({"cacheDir": str(target)}),
+        headers={"Content-Type": "application/json"},
+    )
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    assert resp.status == 200, text
+    body = json.loads(text)
+    assert body["cacheDir"] == str(target)
+    # The env-var override (RA_LOG_EXPLORER_CACHE, set by the fixture)
+    # still wins over the persisted cacheDir, so effectiveCacheRoot
+    # reports the env-var value rather than `target`.
+    assert body["effectiveCacheRoot"] == os.environ["RA_LOG_EXPLORER_CACHE"]
+    # The directory was created on the server's side.
+    assert target.is_dir()
+
+    # GET still reports the persisted value.
+    status, body2 = _get(host, port, "/api/settings")
+    assert status == 200
+    assert body2["cacheDir"] == str(target)
+
+
+def test_settings_put_clears_cacheDir_when_set_to_empty(runningServer: RunningServer, tmp_path: Path) -> None:
+    """Setting ``cacheDir`` to an empty string or null reverts to the
+    default resolution chain — the user can undo a custom override
+    without hand-editing the settings JSON."""
+    host, port, _ctx = runningServer
+
+    # Plant a value, then clear it.
+    for clearer in ("", None):
+        conn = http.client.HTTPConnection(host, port, timeout=2.0)
+        conn.request(
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"cacheDir": str(tmp_path / "first")}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        resp.read()
+        conn.close()
+        assert resp.status == 200
+
+        conn = http.client.HTTPConnection(host, port, timeout=2.0)
+        conn.request(
+            "PUT",
+            "/api/settings",
+            body=json.dumps({"cacheDir": clearer}),
+            headers={"Content-Type": "application/json"},
+        )
+        resp = conn.getresponse()
+        text = resp.read().decode("utf-8")
+        conn.close()
+        assert resp.status == 200, text
+        assert json.loads(text)["cacheDir"] is None
+
+
 def test_settings_put_rejects_non_integer(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
     host, port, _ctx = runningServer
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
@@ -1262,7 +1334,11 @@ def test_cache_delete_404_for_unknown_window(runningServer: RunningServer, tmpCa
 # ----- /api/settings PUT validation ---------------------------------------
 
 
-def test_settings_put_rejects_missing_maxCacheBytes(runningServer: RunningServer) -> None:
+def test_settings_put_with_empty_body_is_a_no_op(runningServer: RunningServer) -> None:
+    """PUT /api/settings now accepts partial updates — touching maxCacheBytes
+    alone must not clobber a previously-set cacheDir, and vice versa. The
+    degenerate case of an empty body is therefore a successful no-op that
+    returns whatever's currently persisted."""
     host, port, _ctx = runningServer
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request(
@@ -1274,8 +1350,11 @@ def test_settings_put_rejects_missing_maxCacheBytes(runningServer: RunningServer
     resp = conn.getresponse()
     text = resp.read().decode("utf-8")
     conn.close()
-    assert resp.status == 400
-    assert "maxCacheBytes" in text
+    assert resp.status == 200, text
+    body = json.loads(text)
+    assert "maxCacheBytes" in body
+    assert "cacheDir" in body
+    assert "effectiveCacheRoot" in body
 
 
 def test_settings_put_rejects_negative_value(runningServer: RunningServer) -> None:

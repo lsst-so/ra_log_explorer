@@ -23,15 +23,69 @@ DEFAULT_HTTP_PORT = 8765
 DEFAULT_LINE_LIMIT = 50_000  # per-pod safety cap; pods rarely emit this much
 
 
+def settingsFilePath() -> Path:
+    """Return the location of the persisted app-settings JSON.
+
+    Defaults to ``~/.config/ra_log_explorer/settings.json``. Tests and
+    scripted runs can redirect it with ``RA_LOG_EXPLORER_CONFIG_DIR`` so
+    they don't share state with the real user. Kept as a public helper
+    so :mod:`.appSettings` (which writes the file) and :func:`cache_root`
+    (which reads it directly to avoid an import cycle) agree on the
+    one true path.
+    """
+    override = os.environ.get("RA_LOG_EXPLORER_CONFIG_DIR")
+    base = Path(override).expanduser() if override else Path.home() / ".config" / "ra_log_explorer"
+    return base / "settings.json"
+
+
 def cache_root() -> Path:
-    """Return the on-disk cache root, creating it if needed."""
+    """Return the on-disk cache root, creating it if needed.
+
+    Resolution order:
+
+    1. The ``RA_LOG_EXPLORER_CACHE`` env var, if set — useful for tests
+       and for scripted runs where the user wants a one-off override
+       that ignores persisted settings entirely.
+    2. The ``cacheDir`` field of the persisted app settings, if set.
+       This is what the settings panel in the home view writes.
+    3. The XDG-style default at ``~/.cache/ra_log_explorer``.
+
+    The settings JSON is read here by hand (instead of via
+    :mod:`.appSettings`) so this module stays an import leaf — making
+    it safe for the settings module to depend on config rather than
+    the other way around.
+    """
     override = os.environ.get("RA_LOG_EXPLORER_CACHE")
     if override:
         root = Path(override).expanduser()
     else:
-        root = Path.home() / ".cache" / "ra_log_explorer"
+        settingsDir = _readPersistedCacheDir()
+        if settingsDir:
+            root = Path(settingsDir).expanduser()
+        else:
+            root = Path.home() / ".cache" / "ra_log_explorer"
     root.mkdir(parents=True, exist_ok=True)
     return root
+
+
+def _readPersistedCacheDir() -> str | None:
+    """Best-effort read of the ``cacheDir`` setting from the appSettings
+    JSON, returning ``None`` on any failure (file missing, malformed,
+    field absent). Kept private to this module so :func:`cache_root`
+    can call it without needing to import :mod:`.appSettings` and
+    risking an import cycle.
+    """
+    import json
+
+    path = settingsFilePath()
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    val = raw.get("cacheDir") if isinstance(raw, dict) else None
+    return val if isinstance(val, str) and val else None
 
 
 def windowCachePath(

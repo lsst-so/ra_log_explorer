@@ -154,6 +154,14 @@
                 <span class="hint">server LRU-evicts oldest caches above this; updates live</span>
               </label>
             </div>
+            <div class="row">
+              <label>
+                <span class="lbl">cache directory</span>
+                <input type="text" name="cacheDir" placeholder="~/.cache/ra_log_explorer" autocomplete="off" />
+                <span class="hint">blank = default; <code>RA_LOG_EXPLORER_CACHE</code> env var overrides this</span>
+                <span id="cache-dir-effective" class="hint"></span>
+              </label>
+            </div>
             <div class="row submit-row">
               <span id="settings-state" class="hint"></span>
             </div>
