@@ -117,24 +117,36 @@ open by itself, paste the URL by hand. To stop the server, press
 
 In the browser:
 
-1. The home page loads. Fill in your **Loki username + password** in
-   the *Credentials* card if you haven't already — tick "remember in
-   this browser" if you want them kept in `localStorage`. The password
-   field is optional; if you leave it blank the server falls back to
-   `LOKI_PASSWORD` from its environment.
-2. Type a **dataId** (e.g. `2026051900722`). After ~300 ms the tool
-   resolves the shutter close time and shows it inline under the input.
-3. Optionally open *Advanced options* to tweak cluster, namespace,
-   worker count, or the pre-/post-shutter window padding.
+1. The home page loads with a **right-side App settings sidebar**
+   (cluster, namespace, parallel-fetch workers, Loki URL, RSP token
+   file, max cache space) and a **Credentials** card below it. Fill
+   in your **Loki username + password** if you haven't already —
+   tick "remember in this browser" if you want them kept in
+   `localStorage`. The password field is optional; if you leave it
+   blank the server falls back to `LOKI_PASSWORD` from its
+   environment. Settings persist as you type (and `maxCacheBytes` is
+   pushed to the server immediately so its LRU eviction uses the
+   latest cap).
+2. Type a **dataId** (e.g. `2026051900722`) in the *Explore exposure
+   processing* card. After ~300 ms the tool resolves the shutter
+   close time and shows it inline under the input.
+3. Optional *per-exposure tuning* (window before / after t₀) lives
+   in a small details fold on the exposure form. The global
+   knobs — cluster, namespace, worker count, Loki URL — are in the
+   sidebar and shared with night-mode fetches.
 4. Click **Fetch & explore**. A progress bar follows the fetch live
-   (Server-Sent Events). When it's done the page switches to the
-   timeline view.
+   (Server-Sent Events). When it's done the URL updates to
+   `/?dataId=<id>` and the page switches to the timeline view.
 
-The home page also lists every cached window on disk. Clicking a row
-copies its cluster / namespace / window settings into the fetch form so
-a subsequent submit cache-hits exactly. The ✕ button on each row
-deletes that one window; the "delete all" button under the table wipes
-the whole cache.
+The home page also lists every cached window on disk in the *Recent
+runs* table. Each row carries a **key** column showing the dataId(s)
+that triggered fetches landing on that cache (or the `dayObs` for
+night caches); the keys are clickable links that open the cached
+view in a new tab. The ✕ button on each row deletes that one
+window; the "delete all" button under the table wipes the whole
+cache. The server also LRU-evicts the least-recently-viewed windows
+automatically once the on-disk total exceeds the sidebar's *max
+cache space* setting (5 GiB by default).
 
 ## Eager mode (CLI-driven, useful for scripting)
 

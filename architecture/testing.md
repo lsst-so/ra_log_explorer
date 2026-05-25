@@ -14,10 +14,28 @@ The project has two test layers:
 Pre-commit, `mypy`, `mypy-coverage`, and the unit tests together are
 the supported validation loop; see the
 [ra-log-explorer-validation](../.claude/skills/ra-log-explorer-validation/SKILL.md)
-skill for the exact commands. There IS now a GitHub Actions workflow
-that runs `pytest`, `mypy`, and `mypy-coverage` on every PR — so a
-regression in the unit suite or the body-coverage target will fail
-CI rather than slipping through silently.
+skill for the exact commands.
+
+Two GitHub Actions workflows under
+[.github/workflows/](../.github/workflows/) run on every PR and on
+pushes to `main`:
+
+- **`ci.yaml`** — two jobs:
+    - `pytest`: setup-python 3.13 → `pip install -e .` + pytest /
+      pytest-cov → runs the suite with
+      `--cov=ra_log_explorer --cov-fail-under=85`. Current coverage is
+      ~93%, so the floor leaves ~8% of headroom before CI fails.
+      Coverage table piped into the run's `$GITHUB_STEP_SUMMARY`.
+    - `mypy`: same setup → bare `mypy` (picks up `mypy.ini`'s
+      `files = ra_log_explorer/, tests/` automatically). Pytest is
+      installed in this job too — without it mypy can't resolve the
+      `import pytest` in the test files.
+- **`mypy-coverage.yaml`** — runs `mfisherlevine/mypy_coverage` to
+  drop inline body-coverage annotations on the PR diff and post a
+  sticky markdown summary as a PR comment. Informational only
+  today (the package + tests are both at 100% mypy body-coverage so
+  any regression is already a deliberate change worth blocking on,
+  but we haven't wired a threshold gate yet).
 
 ## Unit-test scope
 
