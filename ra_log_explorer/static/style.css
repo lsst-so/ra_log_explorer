@@ -459,8 +459,10 @@ button.ghost.mini.delete:disabled {
   color: var(--text-2);
 }
 
-/* Progress card */
-.progress-wrap { margin-bottom: 10px; }
+/* Inline progress region — rendered inside the form that launched
+   the fetch (#fetch-form / #night-form). The progress bar + the
+   single-line status text live together; no rolling pod log. */
+.inline-progress { margin-top: 10px; }
 .progress-bar {
   height: 8px;
   background: #eef0f4;
@@ -468,26 +470,13 @@ button.ghost.mini.delete:disabled {
   overflow: hidden;
   border: 1px solid var(--border);
 }
-#progress-fill {
+.progress-fill {
   height: 100%;
   background: linear-gradient(to right, var(--accent), #2e9c8c);
   width: 0%;
   transition: width 0.15s linear;
 }
-#progress-text { margin-top: 6px; color: var(--text-2); font-size: 12px; }
-.progress-log {
-  max-height: 280px;
-  overflow: auto;
-  background: var(--surface-sub);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px 12px;
-  font-family: var(--font-mono);
-  font-size: 11.5px;
-  margin: 0;
-  white-space: pre-wrap;
-  color: var(--text-2);
-}
+.progress-text { margin-top: 6px; color: var(--text-2); font-size: 12px; }
 
 /* ============================================================
    Refs / filter bar (#refs)

@@ -48,6 +48,10 @@
               <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
               <span id="fetch-message" class="hint"></span>
             </div>
+            <div id="fetch-progress" class="inline-progress" hidden>
+              <div class="progress-bar"><div class="progress-fill"></div></div>
+              <div class="progress-text hint"></div>
+            </div>
           </form>
         </section>
 
@@ -71,6 +75,10 @@
             <div class="row submit-row">
               <button type="submit" id="night-submit" class="primary">Investigate night</button>
               <span id="night-message" class="hint"></span>
+            </div>
+            <div id="night-progress" class="inline-progress" hidden>
+              <div class="progress-bar"><div class="progress-fill"></div></div>
+              <div class="progress-text hint"></div>
             </div>
           </form>
         </section>
@@ -101,14 +109,6 @@
           </table>
         </section>
 
-        <section class="home-card" id="progress-card" hidden>
-          <h2>Fetching</h2>
-          <div class="progress-wrap">
-            <div class="progress-bar"><div id="progress-fill"></div></div>
-            <div id="progress-text" class="hint"></div>
-          </div>
-          <pre id="progress-log" class="progress-log"></pre>
-        </section>
       </main>
 
       <aside id="home-sidebar">

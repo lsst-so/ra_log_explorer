@@ -559,6 +559,11 @@ function useCacheSettings(w) {
 
 let activeJobId = null;
 let activeEventSource = null;
+// Which card launched the active fetch. The inline progress region for
+// each form is rendered next to its own submit button, so when an SSE
+// update comes in we know which DOM element to update without having
+// to look up the job kind on the server.
+let activeProgressKind = null;  // 'exposure' | 'night' | null
 
 async function startFetch(ev) {
   ev.preventDefault();
@@ -578,8 +583,9 @@ async function startFetch(ev) {
   const submit = document.getElementById('fetch-submit');
   submit.disabled = true;
   showMessage('Starting fetch...');
-  showProgressCard(true);
-  resetProgress();
+  activeProgressKind = 'exposure';
+  showInlineProgress('exposure', true);
+  resetInlineProgress('exposure');
 
   let jobId;
   try {
@@ -593,6 +599,7 @@ async function startFetch(ev) {
     jobId = data.jobId;
   } catch (e) {
     showMessage(`Failed to start fetch: ${e.message || e}`, true);
+    activeProgressKind = null;
     updateSubmitButton();
     return;
   }
@@ -606,20 +613,36 @@ function showMessage(text, isError) {
   el.classList.toggle('error', !!isError);
 }
 
-function showProgressCard(visible) {
-  document.getElementById('progress-card').hidden = !visible;
+function progressEls(kind) {
+  // Both forms host an identically-shaped inline progress region. Look
+  // up the wrapper and its children by kind so the SSE consumer can
+  // route updates to whichever card launched the active job.
+  const wrap = document.getElementById(kind === 'night' ? 'night-progress' : 'fetch-progress');
+  return {
+    wrap,
+    fill: wrap.querySelector('.progress-fill'),
+    text: wrap.querySelector('.progress-text'),
+  };
 }
 
-function resetProgress() {
-  document.getElementById('progress-fill').style.width = '0%';
-  document.getElementById('progress-text').textContent = '';
-  document.getElementById('progress-log').textContent = '';
+function showInlineProgress(kind, visible) {
+  progressEls(kind).wrap.hidden = !visible;
 }
 
-function logProgress(line) {
-  const el = document.getElementById('progress-log');
-  el.textContent = el.textContent + line + '\n';
-  el.scrollTop = el.scrollHeight;
+function resetInlineProgress(kind) {
+  const els = progressEls(kind);
+  els.fill.style.width = '0%';
+  els.text.textContent = '';
+}
+
+function setProgressText(text) {
+  if (!activeProgressKind) return;
+  progressEls(activeProgressKind).text.textContent = text;
+}
+
+function setProgressFill(pct) {
+  if (!activeProgressKind) return;
+  progressEls(activeProgressKind).fill.style.width = pct;
 }
 
 function openProgressStream(jobId) {
@@ -627,49 +650,45 @@ function openProgressStream(jobId) {
   const es = new EventSource(`/api/fetch/${jobId}/progress`);
   activeEventSource = es;
   let total = 0, done = 0;
+  let windowStr = '';  // remembered between events so each pod-count update can re-include the window
   es.onmessage = (msg) => {
     let ev;
     try { ev = JSON.parse(msg.data); } catch (_) { return; }
     if (ev.type === 'start') {
-      logProgress(`window  ${ev.fromIso} → ${ev.toIso}`);
+      const fromS = (ev.fromIso || '').replace('T', ' ').replace(/\..*Z$/, '');
+      const toS = (ev.toIso || '').replace('T', ' ').replace(/\..*Z$/, '');
+      windowStr = `${fromS} → ${toS}`;
+      setProgressText(`window ${windowStr}`);
     } else if (ev.type === 'pod-done') {
       total = ev.total;
       done = ev.i;
       const pct = total ? (done / total) * 100 : 0;
-      document.getElementById('progress-fill').style.width = pct.toFixed(1) + '%';
-      document.getElementById('progress-text').textContent =
-        `${done}/${total} pods fetched`;
-      if (done % 20 === 0 || done === total) {
-        logProgress(`  ${done.toString().padStart(4)}/${total}  ${ev.pod}`);
-      }
+      setProgressFill(pct.toFixed(1) + '%');
+      setProgressText(`${windowStr}  ·  ${done}/${total} pods fetched`);
     } else if (ev.type === 'parsing') {
-      document.getElementById('progress-text').textContent =
-        `parsing (${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse})`;
-      logProgress(`parsing ${ev.podCount} pods (${humanBytes(ev.totalBytes)}, cacheReuse=${ev.cacheReuse})`);
+      setProgressText(
+        `${windowStr}  ·  parsing (${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse})`,
+      );
     } else if (ev.type === 'shutter-close') {
       // Night-mode only: post-parse pass resolving shutter close times for
       // each dataId. May involve a batched ConsDB call.
-      let msg = '';
+      let phaseMsg = '';
       if (ev.phase === 'starting') {
-        msg = `resolving shutter close for ${ev.total} dataIds…`;
+        phaseMsg = `resolving shutter close for ${ev.total} dataIds…`;
       } else if (ev.phase === 'cache-checked') {
-        msg = `cache: ${ev.cacheHits} hits, ${ev.remaining} to query`;
+        phaseMsg = `cache: ${ev.cacheHits} hits, ${ev.remaining} to query`;
       } else if (ev.phase === 'done') {
-        msg = `ConsDB: ${ev.consdbHits} resolved, ${ev.stillMissing} still missing`;
+        phaseMsg = `ConsDB: ${ev.consdbHits} resolved, ${ev.stillMissing} still missing`;
       } else if (ev.phase === 'no-token' || ev.phase === 'empty-token') {
-        msg = `no RSP token — ${ev.remaining} dataIds will be missing from Δshutter histograms`;
+        phaseMsg = `no RSP token — ${ev.remaining} dataIds will be missing from Δshutter histograms`;
       } else if (ev.phase === 'consdb-error') {
-        msg = `ConsDB query failed: ${ev.error}`;
+        phaseMsg = `ConsDB query failed: ${ev.error}`;
       }
-      if (msg) {
-        document.getElementById('progress-text').textContent = msg;
-        logProgress(msg);
-      }
+      if (phaseMsg) setProgressText(`${windowStr}  ·  ${phaseMsg}`);
     } else if (ev.type === 'done') {
-      logProgress(`done in ${ev.elapsedS.toFixed(1)}s — ${ev.podCount} pods (${humanBytes(ev.totalBytes)})`);
-      document.getElementById('progress-fill').style.width = '100%';
+      setProgressFill('100%');
       const target = ev.kind === 'night' ? 'night view' : 'explore view';
-      document.getElementById('progress-text').textContent = `done — opening ${target} ...`;
+      setProgressText(`done in ${ev.elapsedS.toFixed(1)}s — opening ${target} …`);
       es.close();
       activeEventSource = null;
       activeJobId = null;
@@ -677,7 +696,7 @@ function openProgressStream(jobId) {
       document.getElementById('night-submit').disabled = false;
       transitionToExplore({ kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs });
     } else if (ev.type === 'error') {
-      logProgress(`ERROR: ${ev.error}`);
+      setProgressText(`ERROR: ${ev.error.split('\n')[0]}`);
       showMessage(`Fetch failed: ${ev.error.split('\n')[0]}`, true);
       const nightMsg = document.getElementById('night-message');
       if (nightMsg) {
@@ -688,6 +707,7 @@ function openProgressStream(jobId) {
       es.close();
       activeEventSource = null;
       activeJobId = null;
+      activeProgressKind = null;
       updateSubmitButton();
     }
   };
@@ -752,8 +772,9 @@ async function startNightFetch(ev) {
   const msgEl = document.getElementById('night-message');
   msgEl.textContent = 'Starting night fetch...';
   msgEl.classList.remove('error');
-  showProgressCard(true);
-  resetProgress();
+  activeProgressKind = 'night';
+  showInlineProgress('night', true);
+  resetInlineProgress('night');
 
   let jobId;
   try {
