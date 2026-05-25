@@ -175,6 +175,24 @@ return:
   cache}` if not loaded.
 - no params — home view shape (`{loaded: false, cache}`).
 
+If the requested key isn't in the in-memory state dict, the server
+makes one attempt to reconstruct it from disk: it walks the cache root
+for a matching window (an exposure-mode cache whose
+`_exposure_ids.txt` lists the dataId; or a night-mode cache whose
+window starts at noon UTC of the dayObs), reparses it with
+`parser.summarizeAll`, and returns the rebuilt payload. This lets a
+deep-linked tab (e.g. opening the dataId column in the home page's
+cache table) land directly on its explore/night view without an
+intervening home → fetch click — the cache is the source of truth, so
+no re-fetch is needed. For exposure caches the shutter close must
+already be in the local `exposure-times.json` (it always is whenever
+the cache itself exists, because the fetch path stores both); if it
+isn't, the server falls back to `{loaded: false}` and the home view
+takes over. Night-mode rebuilds skip the ConsDB fallback (there's no
+SSE channel to report progress on a sync request) — any dataId not
+already locally cached stays absent in the histograms until a real
+fetch fills it in.
+
 On a hit, the cache's `_last_viewed.txt` sidecar is touched so re-opening
 a tab bumps that window up the LRU even without a fresh fetch.
 

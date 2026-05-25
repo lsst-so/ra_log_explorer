@@ -102,17 +102,20 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
 ## Per-cache sidecars
 
 - **`_last_viewed.txt`** — ISO timestamp of the most-recent time
-  the user opened this cache (either via a fresh fetch or via
+  the user opened this cache (either via a fresh fetch, via
   `/api/summary?dataId=` / `?dayObs=` against an already-loaded
-  state). Written best-effort by `markCacheViewed`; absent caches
-  are treated as "never opened" (epoch zero) for LRU purposes.
+  state, or via the on-demand cache rebuild path). Written
+  best-effort by `markCacheViewed`; absent caches are treated as
+  "never opened" (epoch zero) for LRU purposes.
 
 - **`_exposure_ids.txt`** — exposure caches only. Ascending list of
   the dataIds that have ever triggered a fetch landing on this
   cache. One window can serve many dataIds via superset reuse, and
   the `/api/cache` listing surfaces all of them as clickable
   shortcuts. Written by `addExposureToCache`; deduped and sorted on
-  every write.
+  every write. The on-demand cache rebuild path in `/api/summary`
+  uses this file to map a deep-linked dataId back to its cache
+  window without needing the in-memory state to already exist.
 
 ## LRU eviction (size cap)
 

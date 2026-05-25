@@ -52,11 +52,14 @@ from .config import (
     dayObsStartUtc,
 )
 from .fetch import (
+    META_NAME,
+    PARTIAL_FLAG,
     addExposureToCache,
     cacheDuSizeBytes,
     evictToFit,
     getCacheExposureIds,
     getCacheLastViewed,
+    loadCacheMeta,
     loadPodLogPath,
     markCacheViewed,
 )
@@ -849,6 +852,165 @@ def _cacheRootInfo() -> dict:
     }
 
 
+def _findExposureCacheDir(expId: int) -> Path | None:
+    """Return the most-recently-fetched exposure cache containing ``expId``.
+
+    Walks the cache root, skips partial / night-mode caches, and picks the
+    cache with the latest ``fetched_at`` whose ``_exposure_ids.txt`` lists
+    this dataId. Returns ``None`` if no such cache exists.
+    """
+    root = cache_root()
+    if not root.exists():
+        return None
+    best: tuple[str, Path] | None = None
+    for cluster in root.iterdir():
+        if not cluster.is_dir():
+            continue
+        for ns in cluster.iterdir():
+            if not ns.is_dir():
+                continue
+            for window in ns.iterdir():
+                if not window.is_dir():
+                    continue
+                metaPath = window / META_NAME
+                if not metaPath.exists() or (window / PARTIAL_FLAG).exists():
+                    continue
+                try:
+                    meta = json.loads(metaPath.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                spec = meta.get("spec") or {}
+                if spec.get("podRegex"):
+                    continue  # night-mode cache; lives one level deeper
+                if expId not in getCacheExposureIds(window):
+                    continue
+                fetchedAt = str(meta.get("fetched_at") or "")
+                if best is None or fetchedAt > best[0]:
+                    best = (fetchedAt, window)
+    return best[1] if best else None
+
+
+def _findNightCacheDir(dayObs: int) -> Path | None:
+    """Return the most-recently-fetched night cache for ``dayObs``."""
+    root = cache_root()
+    if not root.exists():
+        return None
+    best: tuple[str, Path] | None = None
+    for cluster in root.iterdir():
+        if not cluster.is_dir():
+            continue
+        for ns in cluster.iterdir():
+            if not ns.is_dir():
+                continue
+            for window in ns.iterdir():
+                if not window.is_dir():
+                    continue
+                for inner in window.iterdir():
+                    if not inner.is_dir() or not inner.name.startswith("pods="):
+                        continue
+                    metaPath = inner / META_NAME
+                    if not metaPath.exists() or (inner / PARTIAL_FLAG).exists():
+                        continue
+                    try:
+                        meta = json.loads(metaPath.read_text())
+                    except (OSError, json.JSONDecodeError):
+                        continue
+                    spec = meta.get("spec") or {}
+                    if not spec.get("podRegex"):
+                        continue
+                    fromIso = spec.get("fromIso")
+                    if not isinstance(fromIso, str):
+                        continue
+                    try:
+                        f = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
+                    except (TypeError, ValueError):
+                        continue
+                    if int(f.strftime("%Y%m%d")) != dayObs:
+                        continue
+                    fetchedAt = str(meta.get("fetched_at") or "")
+                    if best is None or fetchedAt > best[0]:
+                        best = (fetchedAt, inner)
+    return best[1] if best else None
+
+
+def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None:
+    """Reconstruct a :class:`ServerState` from disk for ``expId``, if possible.
+
+    Lets the user open a deep-linked exposure URL (e.g. from the cache
+    table in another tab) without forcing a re-fetch — the cache + the
+    on-disk exposure-time record together carry everything we need to
+    rebuild the in-memory state. Returns ``None`` if either is missing.
+    """
+    cacheDir = _findExposureCacheDir(expId)
+    if cacheDir is None:
+        return None
+    tZeroIso = exposureTimes.lookupCached(expId)
+    if tZeroIso is None:
+        return None
+    try:
+        meta = loadCacheMeta(cacheDir)
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        return None
+    tZero = _taiIsoToUtc(tZeroIso)
+    summaries = parser.summarizeAll(cacheDir)
+    state = ServerState(
+        cacheDir=cacheDir,
+        cacheBytes=cacheDuSizeBytes(cache_root()),
+        meta=meta,
+        summaries=summaries,
+        expId=expId,
+        tZero=tZero,
+        referencePoints=[
+            {
+                "label": "shutter close (caller-supplied)",
+                "t": tZero.isoformat(),
+                "offsetS": 0.0,
+                "source": "shutter close",
+            }
+        ],
+    )
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(state)
+    markCacheViewed(cacheDir)
+    return state
+
+
+def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
+    """Reconstruct a :class:`NightState` from disk for ``dayObs``, if possible.
+
+    Mirrors :func:`_loadExposureFromCache` for the night-mode view. Shutter
+    closes are populated from the on-disk exposure-time cache only — no
+    ConsDB call is made (it's synchronous and we have no progress stream
+    here). Any dataId not already in the local cache stays absent until a
+    real fetch fills it in.
+    """
+    cacheDir = _findNightCacheDir(dayObs)
+    if cacheDir is None:
+        return None
+    try:
+        meta = loadCacheMeta(cacheDir)
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        return None
+    summaries = parser.summarizeAll(cacheDir)
+    state = NightState(
+        cacheDir=cacheDir,
+        cacheBytes=cacheDuSizeBytes(cache_root()),
+        meta=meta,
+        summaries=summaries,
+        dayObs=dayObs,
+        startTime=dayObsStartUtc(dayObs),
+        endTime=dayObsEndUtc(dayObs),
+    )
+    for needId in _neededDataIdsForNight(summaries):
+        iso = exposureTimes.lookupCached(needId)
+        if iso is not None:
+            state.shutterCloseByExpId[needId] = _taiIsoToUtc(iso)
+    with ctx.jobs.stateLock:
+        ctx.putNightState(state)
+    markCacheViewed(cacheDir)
+    return state
+
+
 # A cache path component must be a "safe" basename — no path separators,
 # no leading dot, no `..` traversal. The same pattern is also used to
 # validate pod names elsewhere so the choice is consistent.
@@ -1105,6 +1267,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     with ctx.jobs.stateLock:
                         state = ctx.getExposureState(dataId)
+                    if state is None:
+                        # Not loaded in memory — try rebuilding from the
+                        # on-disk cache so a deep-linked tab (e.g. the
+                        # dataId column in the cache table) doesn't
+                        # silently fall back to home view.
+                        state = _loadExposureFromCache(ctx, dataId)
                     if state is not None:
                         # Touch the LRU sidecar so eviction sees this
                         # window as freshly used. Done here (rather
@@ -1124,6 +1292,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     with ctx.jobs.stateLock:
                         nightState = ctx.getNightState(dayObs)
+                    if nightState is None:
+                        nightState = _loadNightFromCache(ctx, dayObs)
                     if nightState is not None:
                         markCacheViewed(nightState.cacheDir)
                         self._send_json(_buildNightPayload(nightState))
