@@ -55,9 +55,126 @@ jobs:
 
       - run: pytest -q
 
+
+  # The unit suite runs the Python; it does not run the *image*, under a
+  # path prefix, with a read-only root filesystem, configured only from the
+  # environment. That is the only shape anybody actually runs, so check it
+  # before pushing something people will deploy.
+  smoke:
+    name: "Smoke-test the image"
+    needs: "checks"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: "read"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: "Build the image"
+        uses: docker/build-push-action@v6
+        with:
+          context: "."
+          push: false
+          load: true
+          tags: "ra-log-explorer:ci"
+          cache-from: "type=gha"
+          cache-to: "type=gha,mode=max"
+
+      - name: "Run it the way the deployment does"
+        run: |
+          set -euo pipefail
+          mkdir -p sites
+          cat > sites/sites.toml <<'TOML'
+          default_site = "bts"
+
+          [[site]]
+          name = "bts"
+          cluster = "manke"
+          namespace = "rapid-analysis"
+          lokiAddr = "https://loki-query.ls.lsst.org"
+          consdbUrl = "http://consdb-pq.consdb.svc.cluster.local:8080/consdb/query"
+          TOML
+          docker run -d --name ra-le-ci \
+            --read-only --tmpfs /tmp --tmpfs /var/cache/ra-log-explorer \
+            -v "$PWD/sites:/etc/ra-log-explorer:ro" -p 8080:8080 \
+            -e RA_LOG_EXPLORER_BASE_PATH=/log-explorer \
+            -e RA_LOG_EXPLORER_CACHE=/var/cache/ra-log-explorer \
+            -e RA_LOG_EXPLORER_SITES_FILE=/etc/ra-log-explorer/sites.toml \
+            -e RA_LOG_EXPLORER_WINDOW_BEFORE_S=7 \
+            -e LOKI_USERNAME=omega -e LOKI_PASSWORD=dummy \
+            ra-log-explorer:ci
+          # `cmd && break` under `set -e` exits the step when cmd fails,
+          # which here is the ordinary not-up-yet case. Use an if.
+          for _ in $(seq 30); do
+            if curl -fsS localhost:8080/log-explorer/healthz >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+      - name: "Check the contract the chart depends on"
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; docker logs ra-le-ci || true; exit 1; }
+
+          # The readiness probe path. If this 404s the pod never joins the
+          # Service and the deployment wedges with no obvious cause.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/log-explorer/healthz)" = "200" ] \
+            || fail "healthz did not answer under the base path"
+
+          # Paths outside the prefix belong to other apps on the same host.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/)" = "404" ] \
+            || fail "served a path outside its base path"
+
+          # Assets must load, or the page renders blank in a way that looks
+          # like an application bug rather than a routing one.
+          [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8080/log-explorer/static/app.js)" = "200" ] \
+            || fail "static assets are not served under the base path"
+
+          html=$(curl -fsS localhost:8080/log-explorer/)
+          if grep -q '__BASE_PATH__\|__WINDOW_' <<<"$html"; then
+            fail "an unsubstituted placeholder reached the browser"
+          fi
+          grep -q 'src="/log-explorer/static/app.js"' <<<"$html" \
+            || fail "asset URLs are missing the base path"
+          # Configuration is the deployment's, never the visitor's.
+          if grep -qE 'name="username"|name="password"|name="workers"|creds-form|settings-form' <<<"$html"; then
+            fail "a configuration field reached the browser"
+          fi
+          # The environment reaches the form it is supposed to seed.
+          grep -q 'name="windowBefore" value="7"' <<<"$html" \
+            || fail "window default did not come from the environment"
+
+          # Writable despite the read-only root filesystem.
+          curl -fsS localhost:8080/log-explorer/api/cache >/dev/null \
+            || fail "cache root is not usable"
+
+          # logcli is present and is the pinned version the fetch path needs.
+          docker exec ra-le-ci logcli --version 2>&1 | head -1
+          [ "$(docker exec ra-le-ci id -u)" = "1000" ] \
+            || fail "image does not run as the UID the chart declares"
+          echo "container contract OK"
+
+      - name: "Refuse to start on a malformed setting"
+        run: |
+          set -euo pipefail
+          # A typo'd Helm value must stop the container rather than
+          # silently reverting to the built-in default.
+          if docker run --rm -e RA_LOG_EXPLORER_WORKERS=eight ra-log-explorer:ci >/dev/null 2>&1; then
+            echo "::error::started despite a malformed RA_LOG_EXPLORER_WORKERS"
+            exit 1
+          fi
+          echo "malformed configuration is rejected"
+
+      - name: "Container logs"
+        if: always()
+        run: docker logs ra-le-ci || true
+
   build:
     name: "Build and push the image"
-    needs: "checks"
+    needs: ["checks", "smoke"]
     runs-on: ubuntu-latest
     timeout-minutes: 20
 

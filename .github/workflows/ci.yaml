@@ -70,6 +70,48 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
+  chart-contract:
+    name: "Check against the Phalanx chart"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # The Helm chart that deploys this application lives in another
+      # repository, so the two halves can drift apart with nothing to
+      # notice. Check the real chart out and render it. While the chart is
+      # still on a ticket branch, set the PHALANX_REF repository variable to
+      # that branch; the tests skip cleanly if the chart is not in whatever
+      # ref is checked out, so this job stays honest either way.
+      - uses: actions/checkout@v4
+        with:
+          repository: "lsst-sqre/phalanx"
+          ref: ${{ vars.PHALANX_REF || 'main' }}
+          path: "phalanx"
+
+      - uses: azure/setup-helm@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: "Install dev dependencies"
+        # PyYAML parses the rendered manifests. The test module
+        # importorskip's it, so its absence would skip rather than fail —
+        # which is exactly the silent pass we do not want here.
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install pytest pyyaml
+
+      - name: "Render the chart and check it against this code"
+        env:
+          PHALANX_REPO: ${{ github.workspace }}/phalanx
+        # -rs reports skips with their reason, so a job that skipped
+        # everything is visibly different from one that verified anything.
+        run: pytest -rs -v tests/test_phalanx_chart.py
+
   mypy:
     name: "Run mypy"
     runs-on: ubuntu-latest

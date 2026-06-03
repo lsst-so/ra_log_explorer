@@ -284,15 +284,19 @@ def test_the_set_of_environment_variables_is_pinned() -> None:
     `values.yaml`, `templates/deployment.yaml`, and the Configuration
     tables in `README.md` and `architecture/architecture.md`.
     """
-    source = Path(config.__file__).read_text()
-    found = set(re.findall(r'"(RA_LOG_EXPLORER_[A-Z_]+|LOKI_[A-Z_]+)"', source))
+    package = Path(config.__file__).parent
+    found: set[str] = set()
+    for module in sorted(package.glob("*.py")):
+        found |= set(re.findall(r'"(RA_LOG_EXPLORER_[A-Z_]+|LOKI_[A-Z_]+)"', module.read_text()))
     assert found == {
         "RA_LOG_EXPLORER_BASE_PATH",
         "RA_LOG_EXPLORER_CACHE",
         "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
+        "RA_LOG_EXPLORER_SITES_FILE",
         "RA_LOG_EXPLORER_WINDOW_AFTER_S",
         "RA_LOG_EXPLORER_WINDOW_BEFORE_S",
         "RA_LOG_EXPLORER_WORKERS",
+        "LOKI_PASSWORD",
         "LOKI_USERNAME",
     }
 
