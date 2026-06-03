@@ -1,0 +1,328 @@
+"""Night-mode analysis: roll a set of per-pod summaries up into a
+dayObs-wide health view.
+
+The exposure-mode :class:`~.parse.PodSummary` already carries everything
+we need (events, tracebacks, per-dataId first/last times), so the
+analysis here is pure list-and-dict massaging. Nothing in this module
+touches Loki, ConsDB, or disk.
+
+What we surface:
+
+* **Top stats** — counts of distinct dataIds, tracebacks, pods,
+  exception classes seen.
+* **Errors by exception class** — what failed, and how often.
+* **Errors by pod** — which workers are throwing them.
+* **First-task-start histogram** — Δshutter of the earliest task
+  pickup per dataId. A bimodal or long-tailed distribution is the
+  thing to look for.
+* **calcZernikes-end histogram** — Δshutter of the latest
+  ``*calcZernikes*`` task completion per dataId.
+* **Failed dataIds** — one row per (dataId × pod × traceback) so the
+  user can click straight into the traceback body.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+from collections import Counter
+from dataclasses import dataclass, field
+from typing import Iterable
+
+from . import parse
+
+
+@dataclass(frozen=True)
+class TopStats:
+    nVisitsSeen: int
+    nPods: int
+    nTracebacks: int
+    nDataIdsWithTraceback: int
+    nPodsWithTraceback: int
+    nDistinctExceptionClasses: int
+
+
+@dataclass(frozen=True)
+class ErrorTypeRow:
+    excClass: str
+    count: int
+    sampleMessage: str  # one representative message for this class
+
+
+@dataclass(frozen=True)
+class PodErrorRow:
+    pod: str
+    group: str
+    count: int
+
+
+@dataclass(frozen=True)
+class FailureRow:
+    """One traceback's worth of drilldown metadata."""
+
+    dataId: int | None
+    pod: str
+    group: str
+    excClass: str
+    excMessage: str
+    offsetS: float | None  # Δshutter (TAI) for this traceback, if known
+    tIso: str  # absolute timestamp (UTC)
+    bodyKey: str  # stable id so the UI can ask for the body on demand
+
+
+@dataclass(frozen=True)
+class Histogram:
+    """A simple equi-width histogram, computed from a list of x-values.
+
+    ``dataIdsByBin`` is an optional parallel list-of-lists giving the
+    dataIds contributing to each bin (in ascending-x order within the
+    bin). It's used by the UI to let the user drill from a bar straight
+    to the per-visit logs.
+    """
+
+    label: str
+    unit: str
+    xMin: float
+    xMax: float
+    binWidth: float
+    counts: list[int] = field(default_factory=list)
+    nValues: int = 0  # how many x-values went in
+    nDropped: int = 0  # how many we couldn't bin (no shutter close known, etc.)
+    dataIdsByBin: list[list[int]] = field(default_factory=list)
+
+
+def computeTopStats(summaries: Iterable[parse.PodSummary]) -> TopStats:
+    summaries = list(summaries)
+    visits: set[int] = set()
+    tbCount = 0
+    podsWithTb: set[str] = set()
+    dataIdsWithTb: set[int] = set()
+    excClasses: set[str] = set()
+    for s in summaries:
+        visits |= s.expIdsSeen
+        tbCount += len(s.tracebacks)
+        if s.tracebacks:
+            podsWithTb.add(s.pod)
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                dataIdsWithTb.add(tb.expId)
+            excClasses.add(tb.excClass)
+    return TopStats(
+        nVisitsSeen=len(visits),
+        nPods=len(summaries),
+        nTracebacks=tbCount,
+        nDataIdsWithTraceback=len(dataIdsWithTb),
+        nPodsWithTraceback=len(podsWithTb),
+        nDistinctExceptionClasses=len(excClasses),
+    )
+
+
+def errorsByType(summaries: Iterable[parse.PodSummary]) -> list[ErrorTypeRow]:
+    counts: Counter[str] = Counter()
+    samples: dict[str, str] = {}
+    for s in summaries:
+        for tb in s.tracebacks:
+            counts[tb.excClass] += 1
+            samples.setdefault(tb.excClass, tb.excMessage)
+    return [
+        ErrorTypeRow(excClass=cls, count=n, sampleMessage=samples.get(cls, ""))
+        for cls, n in counts.most_common()
+    ]
+
+
+def errorsByPod(summaries: Iterable[parse.PodSummary]) -> list[PodErrorRow]:
+    rows: list[PodErrorRow] = []
+    for s in summaries:
+        if not s.tracebacks:
+            continue
+        rows.append(PodErrorRow(pod=s.pod, group=s.group, count=len(s.tracebacks)))
+    rows.sort(key=lambda r: (-r.count, r.pod))
+    return rows
+
+
+def makeBodyKey(pod: str, t: dt.datetime) -> str:
+    """A stable id the UI can use to ask for one traceback body.
+
+    Reached across module boundaries (the server uses it to match a
+    URL parameter back to a captured traceback), so the public name
+    avoids the leading-underscore convention that suggests internal-only.
+    """
+    return f"{pod}@{t.isoformat()}"
+
+
+def failureRows(
+    summaries: Iterable[parse.PodSummary],
+    shutterCloseByExpId: dict[int, dt.datetime] | None = None,
+) -> list[FailureRow]:
+    rows: list[FailureRow] = []
+    shutterCloseByExpId = shutterCloseByExpId or {}
+    for s in summaries:
+        for tb in s.tracebacks:
+            offsetS: float | None = None
+            if tb.expId is not None and tb.expId in shutterCloseByExpId:
+                offsetS = (tb.t - shutterCloseByExpId[tb.expId]).total_seconds()
+            rows.append(
+                FailureRow(
+                    dataId=tb.expId,
+                    pod=s.pod,
+                    group=s.group,
+                    excClass=tb.excClass,
+                    excMessage=tb.excMessage,
+                    offsetS=offsetS,
+                    tIso=tb.t.isoformat(),
+                    bodyKey=makeBodyKey(s.pod, tb.t),
+                )
+            )
+    rows.sort(key=lambda r: r.tIso)
+    return rows
+
+
+def tracebackBody(summaries: Iterable[parse.PodSummary], bodyKey: str) -> str | None:
+    """Look up one traceback's full body by its stable id."""
+    for s in summaries:
+        for tb in s.tracebacks:
+            if makeBodyKey(s.pod, tb.t) == bodyKey:
+                return tb.body
+    return None
+
+
+def firstTaskStartByDataId(
+    summaries: Iterable[parse.PodSummary],
+) -> dict[int, dt.datetime]:
+    """Earliest task pickup time per dataId, across all summaries.
+
+    Uses :class:`~.parse.Event` records of kind ``QUANTUM_PREP``,
+    ``WORKER_PICKUP`` or ``WORKER_QG_START`` — whichever fires first
+    for each dataId.
+    """
+    starts: dict[int, dt.datetime] = {}
+    startKinds = {"QUANTUM_PREP", "WORKER_PICKUP", "WORKER_QG_START"}
+    for s in summaries:
+        for ev in s.events:
+            if ev.expId is None or ev.kind not in startKinds:
+                continue
+            existing = starts.get(ev.expId)
+            if existing is None or ev.t < existing:
+                starts[ev.expId] = ev.t
+    return starts
+
+
+def calcZernikesEndByDataId(
+    summaries: Iterable[parse.PodSummary],
+) -> dict[int, dt.datetime]:
+    """Latest ``QUANTUM_DONE`` time per dataId where the task label
+    contains "calczernikes" (case-insensitive)."""
+    ends: dict[int, dt.datetime] = {}
+    for s in summaries:
+        for ev in s.events:
+            if ev.expId is None or ev.kind != "QUANTUM_DONE":
+                continue
+            if not (ev.taskLabel and "calczernikes" in ev.taskLabel.lower()):
+                continue
+            existing = ends.get(ev.expId)
+            if existing is None or ev.t > existing:
+                ends[ev.expId] = ev.t
+    return ends
+
+
+def buildHistogram(
+    label: str,
+    unit: str,
+    offsetsS: list[float],
+    nDroppedNoTZero: int = 0,
+    nBins: int = 30,
+    dataIds: list[int] | None = None,
+) -> Histogram:
+    """Build a 30-bin equi-width histogram over ``offsetsS``.
+
+    If ``offsetsS`` is empty we return an empty histogram (xMin == xMax,
+    binWidth == 1) so the consumer can still render a placeholder.
+
+    If ``dataIds`` is supplied it must be parallel to ``offsetsS`` —
+    the result's :attr:`Histogram.dataIdsByBin` will then carry the
+    dataIds bucketed alongside their counts. Within each bin the
+    dataIds are sorted by ascending offset so the eye lands on the
+    outliers immediately.
+    """
+    if not offsetsS:
+        return Histogram(
+            label=label,
+            unit=unit,
+            xMin=0.0,
+            xMax=0.0,
+            binWidth=1.0,
+            counts=[],
+            nValues=0,
+            nDropped=nDroppedNoTZero,
+            dataIdsByBin=[],
+        )
+    if dataIds is not None and len(dataIds) != len(offsetsS):
+        raise ValueError(f"len(dataIds)={len(dataIds)} doesn't match len(offsetsS)={len(offsetsS)}")
+    lo = min(offsetsS)
+    hi = max(offsetsS)
+    if lo == hi:
+        # All values identical — fall back to a single bin centred there.
+        singleBin = [list(dataIds)] if dataIds is not None else []
+        return Histogram(
+            label=label,
+            unit=unit,
+            xMin=lo,
+            xMax=hi,
+            binWidth=1.0,
+            counts=[len(offsetsS)],
+            nValues=len(offsetsS),
+            nDropped=nDroppedNoTZero,
+            dataIdsByBin=singleBin,
+        )
+    width = (hi - lo) / nBins
+    counts = [0] * nBins
+    # Build per-bin lists of (offset, dataId) so we can sort within bin
+    # and ship just the dataIds out.
+    binMembers: list[list[tuple[float, int]]] = [[] for _ in range(nBins)]
+    for idx, x in enumerate(offsetsS):
+        i = int((x - lo) / width)
+        if i == nBins:  # right edge case
+            i = nBins - 1
+        counts[i] += 1
+        if dataIds is not None:
+            binMembers[i].append((x, dataIds[idx]))
+    dataIdsByBin: list[list[int]] = []
+    if dataIds is not None:
+        for bm in binMembers:
+            bm.sort(key=lambda pair: pair[0])
+            dataIdsByBin.append([did for _, did in bm])
+    return Histogram(
+        label=label,
+        unit=unit,
+        xMin=lo,
+        xMax=hi,
+        binWidth=width,
+        counts=counts,
+        nValues=len(offsetsS),
+        nDropped=nDroppedNoTZero,
+        dataIdsByBin=dataIdsByBin,
+    )
+
+
+def computeDeltaShutterOffsets(
+    timesByDataId: dict[int, dt.datetime],
+    shutterCloseByExpId: dict[int, dt.datetime],
+) -> tuple[list[float], list[int], int]:
+    """Convert ``{dataId: timestamp}`` into parallel Δshutter / dataId lists.
+
+    Returns ``(offsetsS, dataIds, nDropped)``: ``offsetsS[i]`` is the
+    Δshutter offset for ``dataIds[i]``, and ``nDropped`` counts the
+    dataIds we couldn't resolve a shutter close for. The two lists are
+    parallel and same-length so the histogram builder can attribute each
+    bin back to the contributing dataIds.
+    """
+    offsets: list[float] = []
+    dataIds: list[int] = []
+    nDropped = 0
+    for dataId, t in timesByDataId.items():
+        close = shutterCloseByExpId.get(dataId)
+        if close is None:
+            nDropped += 1
+            continue
+        offsets.append((t - close).total_seconds())
+        dataIds.append(dataId)
+    return offsets, dataIds, nDropped

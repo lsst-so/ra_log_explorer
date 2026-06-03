@@ -1,0 +1,37 @@
+[build-system]
+# Pin a setuptools floor that accepts the SPDX-string form of
+# ``project.license`` (the older table form was deprecated in 77.0)
+# and honours ``[tool.setuptools.packages.find]``.
+requires = ["setuptools>=77.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ra_log_explorer"
+version = "0.1.0"
+description = "Interactive log exploration for the rapid analysis backend"
+readme = "README.md"
+requires-python = ">=3.13"
+authors = [
+    { name = "Merlin Fisher-Levine", email = "merlin.fisherlevine@gmail.com" },
+]
+license = "GPL-3.0-or-later"
+
+[tool.setuptools.packages.find]
+# Without this, setuptools' flat-layout auto-discovery sees both
+# ``ra_log_explorer/`` and ``architecture/`` as top-level packages and
+# refuses to build. Limit it to the actual Python package.
+include = ["ra_log_explorer*"]
+
+[tool.setuptools.package-data]
+# Ship the static assets + HTML templates with the wheel so an editable
+# install can find them via ``Path(__file__).parent / "static"``.
+ra_log_explorer = ["static/*", "templates/*"]
+
+[tool.isort]
+profile = "black"
+line_length = 110
+known_first_party = ["ra_log_explorer"]
+
+[tool.black]
+line-length = 110
+target-version = ["py313"]
