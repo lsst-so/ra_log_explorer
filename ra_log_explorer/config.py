@@ -7,10 +7,7 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_LOKI_ADDR = "https://loki-query.ls.lsst.org"
 DEFAULT_USERNAME = "merlin"
-DEFAULT_CLUSTER = "yagan"
-DEFAULT_NAMESPACE = "rapid-analysis"
 DEFAULT_WORKERS = 8
 # Window padding around the user's t-zero. The CLI applies the TAI→UTC
 # conversion internally so t-zero is the actual shutter-close UTC moment;

@@ -17,6 +17,11 @@
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
+      <div class="site-switcher" id="site-switcher" hidden>
+        <label for="site-select">site</label>
+        <select id="site-select"></select>
+        <span class="muted" id="site-info"></span>
+      </div>
     </header>
 
     <div id="home-layout">
@@ -117,34 +122,9 @@
           <form id="settings-form">
             <div class="row">
               <label>
-                <span class="lbl">cluster</span>
-                <input type="text" name="cluster" value="yagan" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">namespace</span>
-                <input type="text" name="namespace" value="rapid-analysis" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
                 <span class="lbl">parallel fetch workers</span>
                 <input type="number" name="workers" value="8" min="1" max="64" />
                 <span class="hint">used by both exposure &amp; night fetches</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">Loki URL</span>
-                <input type="text" name="lokiAddr" value="https://loki-query.ls.lsst.org" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">RSP token file</span>
-                <input type="text" name="rspTokenFile" placeholder="~/.lsst/log-browser-token.txt" autocomplete="off" />
-                <span class="hint">ConsDB shutter-close lookup; falls back to <code>RA_LOG_EXPLORER_RSP_TOKEN_FILE</code></span>
               </label>
             </div>
             <div class="row">

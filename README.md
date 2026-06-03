@@ -43,40 +43,75 @@ drive it from the CLI, troubleshooting — read on.
 
 ## Required environment + credentials
 
-The tool needs **one env var** and **one token file** to fetch logs
-and resolve dataIds. Put the env var in your shell rc (`~/.zshrc`,
-`~/.bashrc`, …) so it survives across terminals:
+The tool needs **one env var** and **one ConsDB token file per site
+you want to talk to** (see [Sites](#sites) below — today there are
+two: the summit and the Base Test Stand). Put the env var in
+`~/.zshenv` (or your bash equivalent) so it survives across both
+interactive shells and non-interactive ones:
 
 ```sh
 # 1. Loki credentials — used by `logcli` to authenticate against the
-#    summit Loki cluster.
+#    Loki cluster behind every site. Same value works for all sites.
 export LOKI_PASSWORD='<the password>'
 ```
 
 ```sh
-# 2. RSP bearer token — used to query the ConsDB shutter-close
-#    timestamp for each dataId. Get a token at
-#    https://usdf-rsp.slac.stanford.edu/auth/tokens/ and save it as:
+# 2a. Summit RSP bearer token — used to query the ConsDB shutter-close
+#     timestamp when the active site is "summit" (cluster yagan). Get
+#     one at https://usdf-rsp.slac.stanford.edu/auth/tokens/.
 mkdir -p ~/.lsst
-echo '<paste-token-here>' > ~/.lsst/log-browser-token.txt
+echo '<paste-summit-token>' > ~/.lsst/log-browser-token.txt
 chmod 600 ~/.lsst/log-browser-token.txt
+
+# 2b. BTS RSP bearer token — used when the active site is "bts"
+#     (cluster manke). Get one from base-lsp.lsst.codes.
+echo '<paste-bts-token>'    > ~/.lsst/manke-token.txt
+chmod 600 ~/.lsst/manke-token.txt
 ```
 
-Once a dataId has been resolved on this machine it is cached on
-disk (under `~/.cache/ra_log_explorer/exposure-times.json`), so
-subsequent lookups for the same id work without the token. Exposure
-end-times are immutable once recorded, so the cache never goes
-stale.
+Once a dataId has been resolved on this machine it is cached on disk
+per-site (under `~/.cache/ra_log_explorer/exposure-times/<site>.json`),
+so subsequent lookups for the same id work without the token. Exposure
+end-times are immutable once recorded, so the cache never goes stale.
+Sites have separate cache files so a colliding bare dataId between
+scopes (BTS simulated vs. summit real) can't return the wrong obs_end.
 
 | Setting                                   | Required for                                  | What if it's missing                                 |
 |--------------------------------------------|------------------------------------------------|------------------------------------------------------|
 | `LOKI_PASSWORD` (env var)                  | Every Loki fetch                              | `logcli` refuses to run; fetches fail at submit time. |
-| `~/.lsst/log-browser-token.txt` (file)     | dataId → shutter-close auto-resolution        | The home form shows "RSP token file not found"; cached dataIds still resolve. The CLI's `--t-zero` flag is also a manual override. |
-| `RA_LOG_EXPLORER_RSP_TOKEN_FILE` (env var) | *Optional* — overrides the token file path    | Defaults to `~/.lsst/log-browser-token.txt`. Also overridable per-session in the home page Credentials card. |
+| `~/.lsst/log-browser-token.txt` (file)     | dataId → shutter-close auto-resolution for the **summit** site | The home form shows "ConsDB token file for site 'summit' not found"; cached dataIds still resolve. The CLI's `--t-zero` flag is also a manual override. |
+| `~/.lsst/manke-token.txt` (file)           | dataId → shutter-close auto-resolution for the **bts** site    | Same shape of error, scoped to the BTS site. |
+| `RA_LOG_EXPLORER_SITES_FILE` (env var)     | *Optional* — point at a custom site catalog   | Defaults to the checked-in [`ra_log_explorer/sites.toml`](ra_log_explorer/sites.toml). |
 | `RA_LOG_EXPLORER_CACHE` (env var)          | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
 
 The username for `logcli` defaults to `merlin` and is overridable in the
 browser's Credentials card (or via the CLI's `--username` flag).
+
+## Sites
+
+A *site* pairs a Loki cluster (where the logs live) with the ConsDB
+endpoint that owns its shutter-close truth. The site catalog is
+checked in at [`ra_log_explorer/sites.toml`](ra_log_explorer/sites.toml)
+and currently has two entries:
+
+| Site name | Cluster (Loki) | ConsDB endpoint                                    | Token file                       |
+|-----------|----------------|----------------------------------------------------|----------------------------------|
+| `summit`  | `yagan`        | `https://usdf-rsp.slac.stanford.edu/consdb/query` | `~/.lsst/log-browser-token.txt`  |
+| `bts`     | `manke`        | `https://base-lsp.lsst.codes/consdb/query`        | `~/.lsst/manke-token.txt`        |
+
+The summit site sees the real Vera C. Rubin camera; BTS is the Base
+Test Stand replica that runs simulated data through the same pipeline.
+The two ConsDBs are independent databases, so the same 13-digit dataId
+can refer to a real exposure on the summit and a simulated one on BTS
+with completely different `obs_end` values — the catalog keeps them
+from crosstalking.
+
+Pick a site in the browser's top-bar switcher; the selection is
+remembered per browser. From the CLI, pass `--site=summit|bts`
+(default: the catalog's `default_site` — currently `summit`).
+
+(USDF will get its own site once we plumb that path; it'll share the
+summit ConsDB.)
 
 ## Other prerequisites
 
@@ -117,23 +152,26 @@ open by itself, paste the URL by hand. To stop the server, press
 
 In the browser:
 
-1. The home page loads with a **right-side App settings sidebar**
-   (cluster, namespace, parallel-fetch workers, Loki URL, RSP token
-   file, max cache space) and a **Credentials** card below it. Fill
-   in your **Loki username + password** if you haven't already —
-   tick "remember in this browser" if you want them kept in
-   `localStorage`. The password field is optional; if you leave it
-   blank the server falls back to `LOKI_PASSWORD` from its
-   environment. Settings persist as you type (and `maxCacheBytes` is
-   pushed to the server immediately so its LRU eviction uses the
+1. The home page loads with a **top-bar site switcher** (summit vs.
+   bts) and a **right-side App settings sidebar** (parallel-fetch
+   workers, max cache space, cache directory) plus a **Credentials**
+   card below it. Pick the site that matches the cluster you want to
+   investigate — `summit` for real-camera data on yagan, `bts` for
+   simulated data on manke. Fill in your **Loki username + password**
+   if you haven't already — tick "remember in this browser" if you
+   want them kept in `localStorage`. The password field is optional;
+   if you leave it blank the server falls back to `LOKI_PASSWORD` from
+   its environment. Settings persist as you type (and `maxCacheBytes`
+   is pushed to the server immediately so its LRU eviction uses the
    latest cap).
 2. Type a **dataId** (e.g. `2026051900722`) in the *Explore exposure
    processing* card. After ~300 ms the tool resolves the shutter
    close time and shows it inline under the input.
 3. Optional *per-exposure tuning* (window before / after t₀) lives
-   in a small details fold on the exposure form. The global
-   knobs — cluster, namespace, worker count, Loki URL — are in the
-   sidebar and shared with night-mode fetches.
+   in a small details fold on the exposure form. Cluster, namespace,
+   Loki URL and ConsDB token file all come from the active site, so
+   you don't enter them anywhere — switch sites in the top-bar
+   instead.
 4. Click **Fetch & explore**. A progress bar follows the fetch live
    (Server-Sent Events). When it's done the URL updates to
    `/?dataId=<id>` and the page switches to the timeline view.
@@ -311,9 +349,7 @@ performance accelerator; flushing it costs you nothing but a re-fetch.
 --window-before SECONDS  pre-shutter pad (default 5)
 --window-after  SECONDS  post-shutter pad (default 300)
 --workers N              parallel log fetch threads (default 8)
---cluster NAME           Loki cluster label (default yagan)
---namespace NAME         Loki namespace label (default rapid-analysis)
---loki-addr URL          Loki API base URL
+--site NAME              site from sites.toml (default: catalog default_site)
 --username USER          Loki HTTP basic-auth user (default merlin)
 --force-refresh          ignore the cache and re-fetch
 --host HOST              bind address (default 127.0.0.1)
@@ -343,8 +379,25 @@ The cache layout, reuse rules, and `.partial` flag are described in
 (`brew install grafana/grafana/logcli`) and reopen your shell. The tool
 will not auto-install or fall back to a different client.
 
-**"LOKI_PASSWORD is not set in the environment"** — export it. Don't
-pass passwords on the command line.
+**"LOKI_PASSWORD is not set in the environment"** — export it from
+`~/.zshenv` (or your bash equivalent). Don't pass passwords on the
+command line, and don't drop the export in `~/.zshrc` — that's only
+sourced for interactive shells, so non-interactive child processes
+won't see it.
+
+**"ConsDB token file for site '<name>' not found at <path>"** — you
+picked a site whose token file isn't on this machine. Either drop the
+right token at the named path (see [Sites](#sites) for the matrix), or
+switch the top-bar site picker back to one you do have a token for.
+Cached dataIds still resolve without a token.
+
+**Shutter close looks off after switching sites** — sanity check that
+you're on the right site. The summit cluster's dataIds resolve against
+the summit ConsDB; BTS dataIds resolve against the BTS ConsDB; same
+13-digit id can mean different exposures in each. The per-site cache
+files at `~/.cache/ra_log_explorer/exposure-times/` keep them
+separate, but the top-bar switcher is what tells the server which to
+use for *new* lookups.
 
 **A few pods show 0 events but the exposure obviously touched them** —
 look at the pod's `.jsonl` directly under the cache directory. If the

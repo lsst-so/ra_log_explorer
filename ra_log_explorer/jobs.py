@@ -49,6 +49,11 @@ class FetchJob:
 
     jobId: str
     spec: FetchSpec
+    # The named site this fetch belongs to (see ``sites.py``); drives
+    # which ConsDB endpoint resolves shutter-close times for the
+    # resulting ServerState / NightState and which per-site exposure-
+    # time cache file the resolved values land in.
+    siteName: str = ""
     kind: JobKind = "exposure"
     expId: int | None = None
     tZero: dt.datetime | None = None
@@ -91,17 +96,19 @@ class JobManager:
         self._lock = threading.Lock()
         self.stateLock = threading.Lock()
 
-    def createJob(self, spec: FetchSpec, expId: int, tZero: dt.datetime) -> FetchJob:
+    def createJob(self, spec: FetchSpec, expId: int, tZero: dt.datetime, siteName: str = "") -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
-            job = FetchJob(jobId=jobId, spec=spec, kind="exposure", expId=expId, tZero=tZero)
+            job = FetchJob(
+                jobId=jobId, spec=spec, siteName=siteName, kind="exposure", expId=expId, tZero=tZero
+            )
             self._jobs[jobId] = job
             return job
 
-    def createNightJob(self, spec: FetchSpec, dayObs: int) -> FetchJob:
+    def createNightJob(self, spec: FetchSpec, dayObs: int, siteName: str = "") -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
-            job = FetchJob(jobId=jobId, spec=spec, kind="night", dayObs=dayObs)
+            job = FetchJob(jobId=jobId, spec=spec, siteName=siteName, kind="night", dayObs=dayObs)
             self._jobs[jobId] = job
             return job
 

@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import shutil
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
+
+from ra_log_explorer import sites
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -67,6 +70,73 @@ def tmpCacheRoot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     # test under examination clobbers our env var.
     if str(root) == os.environ.get("RA_LOG_EXPLORER_CACHE", ""):
         shutil.rmtree(root, ignore_errors=True)
+
+
+@dataclass(frozen=True)
+class FakeSiteCatalog:
+    """Handle returned by :func:`siteCatalog` for tests that need to plant
+    tokens at the right path. ``writeSummitToken`` and ``writeBtsToken``
+    drop a string at the site's token file so a ConsDB lookup can proceed
+    without flaky path-handling.
+    """
+
+    catalog: list[sites.Site]
+    defaultName: str
+    summitTokenFile: Path
+    btsTokenFile: Path
+    sitesFile: Path
+
+    def writeSummitToken(self, token: str = "fake-summit-token") -> None:
+        self.summitTokenFile.parent.mkdir(parents=True, exist_ok=True)
+        self.summitTokenFile.write_text(token)
+
+    def writeBtsToken(self, token: str = "fake-bts-token") -> None:
+        self.btsTokenFile.parent.mkdir(parents=True, exist_ok=True)
+        self.btsTokenFile.write_text(token)
+
+
+@pytest.fixture
+def siteCatalog(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[FakeSiteCatalog]:
+    """Write a per-test ``sites.toml`` and point the loader at it.
+
+    The packaged ``sites.toml`` references token files in the developer's
+    home dir, which neither CI nor a hermetic test should depend on.
+    This fixture builds an equivalent two-site catalog (summit + bts)
+    whose token-file paths land inside ``tmp_path`` and sets
+    ``RA_LOG_EXPLORER_SITES_FILE`` so :func:`sites.loadSites` picks it
+    up. Token files start absent; tests that need a working ConsDB call
+    invoke ``writeSummitToken`` / ``writeBtsToken``.
+    """
+    summitTok = tmp_path / "tokens" / "summit.txt"
+    btsTok = tmp_path / "tokens" / "bts.txt"
+    sitesFile = tmp_path / "sites.toml"
+    sitesFile.write_text(f"""default_site = "summit"
+
+[[site]]
+name = "summit"
+cluster = "yagan"
+namespace = "rapid-analysis"
+lokiAddr = "https://loki-query.ls.lsst.org"
+consdbUrl = "https://summit-consdb.example/consdb/query"
+consdbTokenFile = "{summitTok}"
+
+[[site]]
+name = "bts"
+cluster = "manke"
+namespace = "rapid-analysis"
+lokiAddr = "https://loki-query.ls.lsst.org"
+consdbUrl = "https://bts-consdb.example/consdb/query"
+consdbTokenFile = "{btsTok}"
+""")
+    monkeypatch.setenv(sites.SITES_FILE_ENV, str(sitesFile))
+    catalog, default = sites.loadSites()
+    yield FakeSiteCatalog(
+        catalog=catalog,
+        defaultName=default,
+        summitTokenFile=summitTok,
+        btsTokenFile=btsTok,
+        sitesFile=sitesFile,
+    )
 
 
 @pytest.fixture

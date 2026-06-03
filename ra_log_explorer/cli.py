@@ -38,10 +38,7 @@ import webbrowser
 
 from . import parse as parser
 from .config import (
-    DEFAULT_CLUSTER,
     DEFAULT_HTTP_PORT,
-    DEFAULT_LOKI_ADDR,
-    DEFAULT_NAMESPACE,
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
@@ -65,6 +62,7 @@ from .fetch import (
 )
 from .jobs import JobManager
 from .server import ServerContext, ServerState, serve
+from .sites import Site, loadSites, siteByName
 
 
 def _parseIsoUtc(s: str) -> dt.datetime:
@@ -90,10 +88,14 @@ def _isoForLogcli(t: dt.datetime) -> str:
 
 
 def _addCommonArgs(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--loki-addr", default=DEFAULT_LOKI_ADDR)
+    p.add_argument(
+        "--site",
+        default=None,
+        help="Named site to fetch from (see ra_log_explorer/sites.toml). "
+        "Defaults to the catalog's `default_site`. Each site bundles a "
+        "Loki cluster/namespace/URL and the matching ConsDB endpoint.",
+    )
     p.add_argument("--username", default=DEFAULT_USERNAME)
-    p.add_argument("--cluster", default=DEFAULT_CLUSTER)
-    p.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     p.add_argument(
         "--workers",
         type=int,
@@ -115,7 +117,14 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
     p.add_argument("--force-refresh", action="store_true", help="Re-fetch even if cached results exist")
 
 
-def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
+def _resolveSite(args: argparse.Namespace) -> Site:
+    """Look up the site named by --site (or the catalog default)."""
+    sites, defaultName = loadSites()
+    name = args.site or defaultName
+    return siteByName(sites, name)
+
+
+def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerState:
     """Do the CLI-side fetch + parse and return a populated `ServerState`."""
     tZeroInput = _parseIsoUtc(args.t_zero)
     if args.t_zero_utc:
@@ -125,6 +134,7 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
         tZero = tZeroInput - dt.timedelta(seconds=TAI_MINUS_UTC_S)
         tZeroScale = "TAI"
     print(
+        f"site:                   {site.name} (cluster={site.cluster})\n"
         f"t-zero (input, {tZeroScale}): {tZeroInput.isoformat()}\n"
         f"t-zero (used, UTC):     {tZero.isoformat()}",
         file=sys.stderr,
@@ -132,10 +142,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
     fromT = tZero - dt.timedelta(seconds=args.window_before)
     toT = tZero + dt.timedelta(seconds=args.window_after)
     spec = FetchSpec(
-        lokiAddr=args.loki_addr,
+        lokiAddr=site.lokiAddr,
         username=args.username,
-        cluster=args.cluster,
-        namespace=args.namespace,
+        cluster=site.cluster,
+        namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
         workers=args.workers,
@@ -206,15 +216,23 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
         return 2
 
+    site = _resolveSite(args)
+    sites, defaultName = loadSites()
     state: ServerState | None = None
     if eager:
-        state = _eagerFetchAndBuildState(args)
+        state = _eagerFetchAndBuildState(args, site)
+        # Eager state belongs to the site we just fetched against.
+        state.siteName = site.name
         if args.no_serve:
             return 0
     else:
-        print("Starting in home mode — pick an exposure in the browser.", file=sys.stderr)
+        print(
+            f"Starting in home mode (site={site.name}, cluster={site.cluster}) — "
+            "pick an exposure in the browser.",
+            file=sys.stderr,
+        )
 
-    ctx = ServerContext(jobs=JobManager())
+    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName)
     if state is not None:
         ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}/"

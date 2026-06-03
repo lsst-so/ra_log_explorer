@@ -76,12 +76,24 @@ Sibling docs:
                       the server starts; populates an exposure ServerState
                       ahead of time. Home mode hands over an empty context.
 
-       exposureTimes.py   dataId → shutter-close (TAI) via the ConsDB SQL
-                          endpoint at https://usdf-rsp.slac.stanford.edu/consdb/query.
-                          Needs a bearer token from ~/.lsst/log-browser-token.txt
-                          (overridable). Persistent on-disk cache at
-                          <cache_root>/exposure-times.json so once-resolved
-                          dataIds work offline.
+       exposureTimes.py   dataId → shutter-close (TAI) via a ConsDB SQL
+                          endpoint. The endpoint and bearer-token file
+                          are looked up per-site from sites.toml (see
+                          below), so the same dataId can resolve to
+                          different obs_end values depending on the
+                          active site. Persistent per-site on-disk cache
+                          at <cache_root>/exposure-times/<site>.json so
+                          once-resolved dataIds work offline.
+
+       sites.py           Per-deployment site catalog. A *site* pairs a
+                          Loki cluster with the ConsDB endpoint that
+                          owns its shutter-close truth. yagan→summit
+                          (USDF/summit RSP) and manke→bts (base-lsp);
+                          the table lives in the checked-in
+                          ra_log_explorer/sites.toml. The home page
+                          shows a top-bar switcher; every fetch and
+                          shutter-close lookup carries a `site` field
+                          that the server resolves via the catalog.
 
        appSettings.py     Server-side settings persisted at
                           <cache_root>/settings.json. Currently just
@@ -96,7 +108,8 @@ Sibling docs:
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache (exact / superset reuse), the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table. No I/O. |
-| `exposureTimes.py` | dataId → shutter-close ISO (TAI) lookup against the RSP ConsDB. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Reads its bearer token from `~/.lsst/log-browser-token.txt` (overridable via `RA_LOG_EXPLORER_RSP_TOKEN_FILE`). Persists results to `<cache_root>/exposure-times.json` — exposure end-times are immutable so the cache never goes stale. Provides `queryIsotBatch` for night-mode prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → shutter-close ISO (TAI) lookup against a ConsDB endpoint. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists results per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure end-times are immutable so the cache never goes stale. Provides `queryIsotBatch` for night-mode prefetches (one `IN (…)` query per instrument, chunked). |
+| `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards both keyed-state dicts. `createJob` (exposure) and `createNightJob` (dayObs) put a `kind` discriminator on each job. |
 | `appSettings.py`   | Reads / writes `<cache_root>/settings.json`. Schema is open-ended; today the only field is `maxCacheBytes`. Used by the LRU cache eviction in `fetch.evictToFit`. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing the `JobManager` and two LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`). Multiple tabs / dataIds / dayObses coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
@@ -104,6 +117,26 @@ Sibling docs:
 | `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page form, credentials, cache list, progress), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown). One HTML template (`templates/timeline.html`) holds all three sections; the bootstrap shows whichever matches the URL. No build step. |
 
 ## Key Concepts
+
+- **Site** — a (Loki cluster, ConsDB endpoint, bearer-token file)
+  bundle that pairs the *log source* with the *truth source* for
+  shutter-close times. Catalogued in the checked-in
+  [`ra_log_explorer/sites.toml`](../ra_log_explorer/sites.toml);
+  loaded once at startup into `ServerContext.sites`. Today there are
+  two: **summit** (cluster `yagan`, ConsDB at
+  `usdf-rsp.slac.stanford.edu`, token `~/.lsst/log-browser-token.txt`)
+  and **bts** (cluster `manke`, ConsDB at `base-lsp.lsst.codes`, token
+  `~/.lsst/manke-token.txt`).
+
+  Sites matter because the same bare dataId can refer to a real-camera
+  exposure on the summit and a *different*, simulated exposure on BTS
+  — different `obs_end` values, separate sources of truth. Every
+  shutter-close lookup and every exposure-time cache file is scoped by
+  site to keep them from crosstalking. The home page exposes the
+  current site as a top-bar switcher; every fetch + exposure-time
+  request body carries a `site` field that the server resolves via the
+  catalog (falls back to `default_site` if omitted). USDF will get its
+  own site once we plumb that path; it'll share the summit ConsDB.
 
 - **dataId / expId** — 13-digit `YYYYMMDDSSSSS` integer (e.g. `2026051900722`).
   Exposure mode targets a single one of these at a time.
@@ -320,26 +353,47 @@ Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
 `truncated: true`.
 
-### `GET /api/exposure-time/<dataId>`
+### `GET /api/exposure-time/<dataId>?site=<name>`
 
 dataId → shutter-close ISOT (TAI) lookup, used by the home form to
-resolve a user-typed dataId before kicking off the fetch.
+resolve a user-typed dataId before kicking off the fetch. The optional
+`site` query param picks which entry from the sites catalog to use;
+omitted = the catalog's `default_site`.
 
-- 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool}`.
+- 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool, "site"}`.
+- 400 `"No site named '<x>'; known: [...]"` — unknown site.
 - 404 `"No exposure-time record for dataId=N"` — every instrument
   table searched, no row anywhere.
 - 502 `"ConsDB query failed: ..."` — typed ConsDB error (5xx, etc.).
-- 503 `"RSP token file not found at <path>. Set the path in the home
-  page Credentials card or via the RA_LOG_EXPLORER_RSP_TOKEN_FILE env
-  var."` — token missing.
-- 503 `"RSP token file is empty: <path>"` — token file present but
+- 503 `"ConsDB token file for site '<name>' not found at <path>. Get a
+  token from the relevant RSP and drop it there."` — token missing.
+- 503 `"ConsDB token file is empty: <path>"` — token file present but
   blank.
 
-The on-disk cache at `<cache_root>/exposure-times.json` is checked
-first; a cache hit returns immediately with `fromCache: true` and no
-network call. The home page also accepts a `?tokenFile=` query param
-that overrides the env-var/default lookup for one request — used by
-the Credentials card so users can pick a token without restarting.
+The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
+is checked first; a cache hit returns immediately with `fromCache:
+true` and no network call. Sites have separate cache files so a
+colliding bare dataId between scopes (BTS simulated vs. summit real)
+can't return the wrong obs_end.
+
+### `GET /api/sites`
+
+Return the per-deployment site catalog plus the default site name.
+The token-file paths are *not* echoed — they're a server-side detail.
+
+```jsonc
+{
+  "default_site": "summit",
+  "sites": [
+    { "name": "summit", "cluster": "yagan", "namespace": "rapid-analysis",
+      "lokiAddr": "https://loki-query.ls.lsst.org",
+      "consdbUrl": "https://usdf-rsp.slac.stanford.edu/consdb/query" },
+    { "name": "bts",    "cluster": "manke", "namespace": "rapid-analysis",
+      "lokiAddr": "https://loki-query.ls.lsst.org",
+      "consdbUrl": "https://base-lsp.lsst.codes/consdb/query" }
+  ]
+}
+```
 
 ### `GET /api/cache`
 
@@ -404,23 +458,26 @@ bad JSON, missing field, non-int, or negative values with 400.
 
 ### `POST /api/fetch`  (exposure)
 
-Request body (every field except `exposureId`/`tZero` falls back to
-the CLI defaults; the password is consumed by the fetch worker thread
-to set `LOKI_PASSWORD` in its process env, and is never echoed back
-or persisted):
+Request body (`site` falls through to the catalog's `default_site`;
+the password is consumed by the fetch worker thread to set
+`LOKI_PASSWORD` in its process env, and is never echoed back or
+persisted):
 
 ```jsonc
 {
   "exposureId": 2026051900722,         // required, integer
   "tZero":      "2026-05-20T08:46:16.267",  // required, ISO-8601
   "tZeroUtc":   false,                 // optional; default false (treat as TAI)
+  "site":       "summit",              // optional; falls back to default_site
   "username":   "merlin", "password": "...",
-  "cluster":    "yagan", "namespace": "rapid-analysis",
-  "lokiAddr":   "https://loki-query.ls.lsst.org",
   "workers":    8,
   "windowBefore": 5.0, "windowAfter": 300.0
 }
 ```
+
+`cluster` / `namespace` / `lokiAddr` are *derived* server-side from
+the named site — clients no longer send them. An unknown site returns
+`400 Bad Request`.
 
 Response: `202 Accepted`, `{"jobId": "<12-char hex>"}`. Validation
 errors return `400` with `{"error": "..."}`.
@@ -430,9 +487,8 @@ errors return `400` with `{"error": "..."}`.
 ```jsonc
 {
   "dayObs":   20260521,                // required, YYYYMMDD integer
+  "site":     "summit",                // optional; falls back to default_site
   "username": "merlin", "password": "...",
-  "cluster":  "yagan", "namespace": "rapid-analysis",
-  "lokiAddr": "https://loki-query.ls.lsst.org",
   "workers":  8
 }
 ```

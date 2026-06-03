@@ -16,24 +16,32 @@ const LS = {
   remember: 'ra_log_explorer.remember',
   // App settings shared across both fetchers. Lives in localStorage
   // because they're per-user-browser; maxCacheGiB is also POSTed
-  // server-side so the cache eviction can act on it.
-  settings: 'ra_log_explorer.settings',  // JSON {cluster, namespace, workers, lokiAddr, rspTokenFile, maxCacheGiB}
+  // server-side so the cache eviction can act on it. Cluster /
+  // namespace / Loki URL / ConsDB token file all moved into the
+  // server-side site catalog (sites.toml) and are picked via the
+  // top-bar site switcher.
+  settings: 'ra_log_explorer.settings',  // JSON {workers, maxCacheGiB, cacheDir}
+  // Which site the user last picked in the top-bar switcher.
+  site: 'ra_log_explorer.site',  // bare site name string
   // Last per-exposure tuning (windowBefore/After) keyed off the
   // exposure form alone.
   lastExpTuning: 'ra_log_explorer.lastExpTuning',  // {windowBefore, windowAfter}
 };
 
-// Application defaults. Mirror the backend's DEFAULT_MAX_CACHE_BYTES /
-// config.DEFAULT_* — kept in sync by hand since the values are stable.
+// Application defaults for the user-tunable knobs (everything left
+// after cluster/namespace/Loki URL/ConsDB token moved into the site
+// catalog). Kept in sync with config.DEFAULT_* and DEFAULT_MAX_CACHE_BYTES.
 const SETTINGS_DEFAULTS = {
-  cluster: 'yagan',
-  namespace: 'rapid-analysis',
   workers: 8,
-  lokiAddr: 'https://loki-query.ls.lsst.org',
-  rspTokenFile: '',
   maxCacheGiB: 5,
   cacheDir: '',
 };
+
+// Site catalog as returned by /api/sites: {default_site, sites: [...]}.
+// Loaded once at startup; the switcher renders from it and the rest of
+// the home view reads ``activeSite`` for `site` request fields.
+let siteCatalog = null;
+let activeSite = null;
 
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
@@ -46,6 +54,7 @@ function startHome() {
   prefillSettings();
   prefillForm();
   prefillCreds();
+  loadSiteCatalog();
   refreshCache();
   // URL-driven entry. We land here either via a deep-link
   // (/?dataId=…&autoFetch=1) or because the URL points at a key the
@@ -67,6 +76,54 @@ function startHome() {
   if (urlAutoFetch && urlDataId) waitAndAutoFetch(parseInt(urlDataId, 10));
 }
 window.startHome = startHome;
+
+async function loadSiteCatalog() {
+  // The site catalog is the same for every user of this deployment
+  // (it's checked into sites.toml on the server). Pull it once at
+  // startup, populate the switcher, restore the user's last pick.
+  try {
+    const r = await fetch('/api/sites');
+    if (!r.ok) return;
+    siteCatalog = await r.json();
+  } catch (_) {
+    return;
+  }
+  if (!siteCatalog || !Array.isArray(siteCatalog.sites) || !siteCatalog.sites.length) return;
+  const sel = document.getElementById('site-select');
+  sel.innerHTML = '';
+  for (const s of siteCatalog.sites) {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = `${s.name} (${s.cluster})`;
+    sel.appendChild(opt);
+  }
+  const stored = localStorage.getItem(LS.site);
+  const startName = siteCatalog.sites.find(s => s.name === stored)
+    ? stored
+    : siteCatalog.default_site;
+  sel.value = startName;
+  setActiveSite(startName);
+  document.getElementById('site-switcher').hidden = false;
+  sel.addEventListener('change', () => {
+    setActiveSite(sel.value);
+    localStorage.setItem(LS.site, sel.value);
+    // A site switch changes which ConsDB the lookup hits AND which
+    // per-site exposure-time cache we read, so any pending dataId
+    // resolution must re-run.
+    clearResolvedTZero();
+    triggerLookupIfReady();
+    refreshCache();
+  });
+}
+
+function setActiveSite(name) {
+  if (!siteCatalog) return;
+  activeSite = siteCatalog.sites.find(s => s.name === name) || null;
+  const info = document.getElementById('site-info');
+  if (info && activeSite) {
+    info.textContent = `consdb=${activeSite.consdbUrl.replace(/^https?:\/\//, '')}`;
+  }
+}
 
 function waitAndAutoFetch(expId) {
   // Wait for the shutter-close lookup to resolve, then submit the
@@ -252,13 +309,12 @@ function readFormValues() {
   const fd = new FormData(form);
   const out = {};
   for (const [k, v] of fd.entries()) out[k] = v;
-  // Merge in the app-wide settings (cluster, namespace, workers,
-  // lokiAddr). These no longer live on the per-fetch form.
+  // Merge in the app-wide knobs that no longer live on the per-fetch
+  // form. cluster / namespace / Loki URL are derived from the
+  // currently-selected site on the server side (we just pass `site`).
   const s = readSettings();
-  out.cluster = s.cluster;
-  out.namespace = s.namespace;
+  out.site = activeSite ? activeSite.name : undefined;
   out.workers = parseInt(s.workers, 10);
-  out.lokiAddr = s.lokiAddr;
   out.exposureId = parseInt(out.exposureId, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
@@ -332,8 +388,12 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  const tokenFile = readSettings().rspTokenFile;
-  const qs = tokenFile ? `?tokenFile=${encodeURIComponent(tokenFile)}` : '';
+  // The site picks which ConsDB to ask AND which per-site cache file
+  // the resolved obs_end lands in. Falls through to the server's
+  // default_site if we haven't loaded the catalog yet (rare race on
+  // first paint).
+  const siteName = activeSite ? activeSite.name : '';
+  const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
   fetch(`/api/exposure-time/${expId}${qs}`)
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
@@ -761,8 +821,7 @@ async function startNightFetch(ev) {
   const s = readSettings();
   const body = {
     dayObs,
-    cluster: s.cluster || undefined,
-    namespace: s.namespace || undefined,
+    site: activeSite ? activeSite.name : undefined,
     workers: parseInt(s.workers, 10) || undefined,
     username: credsForm.elements.username.value.trim() || undefined,
     password: credsForm.elements.password.value || undefined,
@@ -806,15 +865,10 @@ function wireHomeListeners() {
   document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
   document.getElementById('creds-forget').addEventListener('click', forgetCreds);
   // Save settings on every input — they're tiny, latency-free, and the
-  // user expects "I changed it" to mean "it's saved". The RSP token
-  // input also retriggers the dataId lookup, since changing the token
-  // path may unlock a previously-failed lookup.
+  // user expects "I changed it" to mean "it's saved".
   const settingsForm = document.getElementById('settings-form');
   for (const el of settingsForm.querySelectorAll('input')) {
-    el.addEventListener('input', () => {
-      saveSettings();
-      if (el.name === 'rspTokenFile') triggerLookupIfReady();
-    });
+    el.addEventListener('input', saveSettings);
   }
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
   document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);

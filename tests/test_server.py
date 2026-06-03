@@ -9,6 +9,22 @@ from pathlib import Path
 import pytest
 
 from ra_log_explorer import parse, server
+from ra_log_explorer.jobs import JobManager
+
+from .conftest import FakeSiteCatalog
+
+
+def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> server.ServerContext:
+    """Build a ServerContext seeded with the test catalog. Match what
+    `cli.cmdRun` does at startup so the unit-level tests of the request
+    builders exercise the same plumbing.
+    """
+    return server.ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        defaultSiteName=siteCatalog.defaultName,
+    )
+
 
 # ----- task palette -------------------------------------------------------
 
@@ -765,38 +781,54 @@ def test_evictByCacheDir_no_match_is_noop(tmp_path: Path) -> None:
 # ----- _buildNightSpecFromRequest -----------------------------------------
 
 
-def test_buildNightSpecFromRequest_happy_path() -> None:
+def test_buildNightSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> None:
     """A minimal valid body produces a FetchSpec with the AOS pod-regex
     pinned and the window set to the dayObs's noon-UTC bounds."""
-    spec, dayObs, password = server._buildNightSpecFromRequest({"dayObs": 20260521})
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, dayObs, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
     assert dayObs == 20260521
     assert password is None
+    assert site.name == "summit"  # falls back to default
     assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
     # Window: noon UTC dayObs → noon UTC dayObs+1.
     assert spec.fromIso.startswith("2026-05-21T12:00:00")
     assert spec.toIso.startswith("2026-05-22T12:00:00")
 
 
-def test_buildNightSpecFromRequest_rejects_missing_dayObs() -> None:
+def test_buildNightSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+    """The night-fetch endpoint accepts the same ``site`` field as the
+    exposure-fetch endpoint — picking BTS swaps both the Loki target
+    and the ConsDB endpoint used for the prefetch pass."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, _, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
+    assert site.name == "bts"
+    assert spec.cluster == "manke"
+
+
+def test_buildNightSpecFromRequest_rejects_missing_dayObs(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="dayObs"):
-        server._buildNightSpecFromRequest({})
+        server._buildNightSpecFromRequest(ctx, {})
 
 
-def test_buildNightSpecFromRequest_rejects_non_integer_dayObs() -> None:
+def test_buildNightSpecFromRequest_rejects_non_integer_dayObs(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="YYYYMMDD"):
-        server._buildNightSpecFromRequest({"dayObs": "tomorrow"})
+        server._buildNightSpecFromRequest(ctx, {"dayObs": "tomorrow"})
 
 
-def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs() -> None:
+def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs(siteCatalog: FakeSiteCatalog) -> None:
     """A YYYYMMDD outside the [1900, 3000] year band almost certainly
     means the caller passed something that isn't a dayObs — surface
     that as a 400 rather than letting a nonsense window go to Loki."""
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="YYYYMMDD"):
-        server._buildNightSpecFromRequest({"dayObs": 12345})
+        server._buildNightSpecFromRequest(ctx, {"dayObs": 12345})
 
 
-def test_buildNightSpecFromRequest_password_passthrough() -> None:
-    _, _, password = server._buildNightSpecFromRequest({"dayObs": 20260521, "password": "hunter2"})
+def test_buildNightSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "password": "hunter2"})
     assert password == "hunter2"
 
 

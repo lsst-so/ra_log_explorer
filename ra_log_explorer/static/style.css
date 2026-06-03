@@ -147,6 +147,34 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   gap: 6px;
 }
 #topbar button.ghost:hover { background: var(--nav-bg-2); }
+#topbar .site-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--nav-muted);
+}
+#topbar .site-switcher label {
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  font-size: 10.5px;
+  color: var(--nav-muted);
+}
+#topbar .site-switcher select {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--nav-text);
+  background: var(--nav-bg-2);
+  border: 1px solid var(--nav-border);
+  border-radius: 999px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+#topbar .site-switcher #site-info {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
 
 /* ============================================================
    Home view

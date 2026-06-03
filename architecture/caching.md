@@ -10,7 +10,9 @@ repeat runs into instant loads.
 ```
 ~/.cache/ra_log_explorer/                          ← override with $RA_LOG_EXPLORER_CACHE
 ├── settings.json                                  ← server-side settings (maxCacheBytes)
-├── exposure-times.json                            ← persistent dataId → shutter-close (TAI) cache
+├── exposure-times/                                ← persistent dataId → shutter-close (TAI) cache,
+│   ├── summit.json                                  split per site so a colliding dataId between
+│   └── bts.json                                     scopes can't return the wrong obs_end
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
         ├── _meta.json                             ← FetchSpec + per-pod byte counts
@@ -37,7 +39,7 @@ Night-mode caches nest one extra level (`pods=<regex-slug>`) below the
 window dir, so a same-window exposure-mode (all pods) and night-mode
 (AOS-only) cache can coexist on disk without clobbering each other.
 
-`exposure-times.json` and `settings.json` live at the root, not under
+`exposure-times/` and `settings.json` live at the root, not under
 the cluster/namespace tree, so they survive `rm -rf
 ~/.cache/ra_log_explorer/<cluster>` but disappear with a full root
 wipe.
@@ -170,9 +172,9 @@ button).
 
 ## The exposure-time cache
 
-`<cache_root>/exposure-times.json` maps `dataId → obs_end ISO (TAI)`
-across runs. It's the only thing in the cache root that lives outside
-the cluster/namespace tree, because:
+`<cache_root>/exposure-times/<siteName>.json` maps `dataId → obs_end
+ISO (TAI)` across runs, split per site. It lives outside the
+cluster/namespace tree because:
 
 - exposure end-times are immutable once `cdb_<instrument>.exposure`
   has a row, so the cache has zero staleness concerns;
@@ -182,11 +184,19 @@ the cluster/namespace tree, because:
   what makes the home page work for users who don't have an RSP
   token configured.
 
+The cache is split per site (`exposure-times/summit.json`,
+`exposure-times/bts.json`) because a 13-digit dataId is meaningful
+*within* a site, not globally: BTS simulated exposures can carry an
+id that also exists on the summit, with a completely different
+`obs_end`. `lookupCached(..., siteName=...)` and `storeCached(...,
+siteName=...)` enforce the split at every call site, so the wrong-site
+value can never leak in.
+
 The lookup is best-effort: a corrupt JSON file, an unexpected schema,
 or a non-string value all return `None` from `lookupCached` and fall
 through to a fresh ConsDB query (which then overwrites the bad
 record). The store path is the same on every cache hit, miss, and
-batch-resolve, so `rm <cache_root>/exposure-times.json` is the
+batch-resolve, so `rm -r <cache_root>/exposure-times/` is the
 nuclear reset.
 
 ## Future: cleaner subset semantics
