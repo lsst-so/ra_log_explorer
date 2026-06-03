@@ -529,6 +529,13 @@ async function deleteCacheWindow(w) {
   const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`;
   try {
     const r = await fetch(url, { method: 'DELETE' });
+    if (r.status === 404) {
+      // Dir is already gone (deleted out of band, or from another tab).
+      // Re-fetch the listing so the stale row disappears instead of
+      // leaving the user clicking ✕ on a phantom.
+      await refreshCache();
+      return;
+    }
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       alert(`Delete failed: ${body.error || r.status}`);
