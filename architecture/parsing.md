@@ -114,7 +114,7 @@ Each captured traceback becomes a `TracebackRecord`:
 | `pod`        | pod name                                                          |
 | `t`          | timestamp of the leader line                                       |
 | `expId`      | carryover-attributed dataId for worker pods; bare-id-on-the-line for control-plane pods; `None` if neither |
-| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. Stays `<unknown>` if no class line is found before the body ends. |
+| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. Set to `<truncated>` if no class line was found before the body ended — this surfaces tracebacks whose tail was dropped by the log forwarder (e.g. another logger interleaved an INFO line mid-traceback) rather than guessing a class. |
 | `excMessage` | the rest of the exception line, capped at 200 chars                |
 | `body`       | the full traceback text, capped at `_TRACEBACK_MAX_LINES = 250` lines and `_TRACEBACK_MAX_CHARS = 32_000` chars |
 

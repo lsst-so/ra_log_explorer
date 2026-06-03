@@ -34,6 +34,22 @@ def tracebackJsonl() -> Path:
 
 
 @pytest.fixture
+def truncatedTracebackJsonl() -> Path:
+    """Real-world slice from an AOS worker on 20260602 where the log
+    forwarder dropped the tail of one chained traceback.
+
+    The slice is a single `self.consdbClient.insert(...)` retry burst:
+    four chained tracebacks (`ConnectionRefusedError` →
+    `NewConnectionError` → `MaxRetryError` → final `requests.exceptions
+    .ConnectionError`). The first three complete normally; the fourth's
+    body stops mid-frame, then a `Starting to process …` INFO line from
+    another logger interrupts. Pins the `<truncated>` sentinel behaviour
+    end-to-end on real upstream data.
+    """
+    return DATA_DIR / "s-lsstcam-run-aos-worker-aosworkerset-8-truncated.jsonl"
+
+
+@pytest.fixture
 def tmpCacheRoot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     """Redirect `cache_root()` to a per-test scratch directory.
 

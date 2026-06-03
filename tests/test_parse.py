@@ -865,11 +865,12 @@ def test_summarizePod_back_to_back_tracebacks_both_recorded(tmp_path: Path) -> N
     assert "second" in s.tracebacks[1].excMessage
 
 
-def test_summarizePod_traceback_with_no_terminal_class_stays_unknown(tmp_path: Path) -> None:
+def test_summarizePod_traceback_with_no_terminal_class_marks_truncated(tmp_path: Path) -> None:
     """If the lead line appears but the body never carries an
     exception-shaped class, we still ship the record so the user sees
-    the context — class just stays <unknown>. Exercises the end-of-
-    pod-log flush path."""
+    the context — but the class flips to ``"<truncated>"`` so the UI
+    can distinguish "log was cut short" from a real complete traceback.
+    Exercises the end-of-pod-log flush path."""
     p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
     _writePodLog(
         p,
@@ -887,8 +888,76 @@ def test_summarizePod_traceback_with_no_terminal_class_stays_unknown(tmp_path: P
     )
     s = parse.summarizePod(p)
     assert len(s.tracebacks) == 1
-    assert s.tracebacks[0].excClass == "<unknown>"
+    assert s.tracebacks[0].excClass == "<truncated>"
     assert "/x.py" in s.tracebacks[0].body
+
+
+def test_summarizePod_traceback_interleaved_log_line_marks_truncated(tmp_path: Path) -> None:
+    """The on-cluster failure mode that motivated the ``<truncated>``
+    sentinel: a multi-line traceback being streamed line-by-line gets
+    interrupted by an INFO line from another logger before its
+    exception class is reached. The active record is finalised at the
+    interruption point and flipped to ``"<truncated>"`` — we don't
+    guess a class, and we don't silently drop the record either.
+
+    Also pins the contrast: the *preceding* normal traceback in the
+    same fixture must keep its real class. This makes the difference
+    visible in the snapshot diff so a future loosening of the body
+    terminator can't quietly relabel real classes."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            ("2026-05-21T13:00:00.000+00:00", "info", "Running pipeline for 2026052100071 detector 1"),
+            # First traceback: completes cleanly.
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/a.py", line 1, in foo'),
+            ("2026-05-21T13:00:01.002+00:00", "error", "ValueError: real class"),
+            # Second traceback: cut short by an interleaved INFO line
+            # before reaching its exception class.
+            ("2026-05-21T13:00:02.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:02.001+00:00", "error", '  File "/b.py", line 1, in bar'),
+            ("2026-05-21T13:00:02.002+00:00", "error", "    self.something()"),
+            ("2026-05-21T13:00:02.020+00:00", "info", "Starting to process nextThing"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    classes = [tb.excClass for tb in s.tracebacks]
+    assert classes == ["ValueError", "<truncated>"]
+    # The truncated record still ships its captured body so the user
+    # gets context even though the class is unknowable.
+    assert "/b.py" in s.tracebacks[1].body
+    assert "self.something()" in s.tracebacks[1].body
+
+
+def test_summarizePod_truncated_traceback_fixture(truncatedTracebackJsonl: Path) -> None:
+    """End-to-end pin against a real Loki slice (a 20260602 AOS-worker
+    `consdbClient.insert(...)` retry burst). The slice contains a
+    four-chain that completes through the first three links and then
+    has its fourth chained traceback's tail dropped by the log
+    forwarder — interrupted mid-frame by a ``Starting to process …``
+    INFO line from a different logger. The first three links must keep
+    their real exception classes; the fourth gets the ``<truncated>``
+    sentinel rather than ``<unknown>`` so the UI can show the user
+    that the data — not the parser — was incomplete here."""
+    s = parse.summarizePod(truncatedTracebackJsonl)
+    assert s.group == "aos"
+    classes = [tb.excClass for tb in s.tracebacks]
+    assert classes == [
+        "ConnectionRefusedError",
+        "NewConnectionError",
+        "MaxRetryError",
+        "<truncated>",
+    ]
+    truncated = s.tracebacks[-1]
+    # The truncated record still ships the captured fragment.
+    assert "postProcessIsr" in truncated.body
+    assert truncated.body.startswith("Traceback (most recent call last):")
+    # …but the body genuinely doesn't contain a terminal exception
+    # class line — that's what makes it `<truncated>` and not a real
+    # `<unknown>` parser miss.
+    assert "ConnectionError:" not in truncated.body
+    assert truncated.excMessage == ""
 
 
 # ----- edge cases: WORKER_REPORT_FAILED variant ---------------------------

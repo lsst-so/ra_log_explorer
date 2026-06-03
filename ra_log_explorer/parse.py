@@ -696,7 +696,15 @@ class TracebackRecord:
     pod: str
     t: dt.datetime  # time of the "Traceback (most recent…)" leader line
     expId: int | None  # carryover-attributed dataId, if any
-    excClass: str  # e.g. "RuntimeError" or "<unknown>" if no class line
+    # e.g. "RuntimeError". Two sentinel values surface incomplete data:
+    #   "<truncated>" — traceback ended before any exception class line
+    #     appeared in the captured body (typically because the log
+    #     forwarder split the traceback across batches and lost the tail,
+    #     or another logger interleaved an INFO line mid-traceback).
+    #   "<unknown>"   — only used as a transient default while the body
+    #     is being collected; flipped to "<truncated>" at finalisation
+    #     if no class match was found.
+    excClass: str
     excMessage: str  # the rest of the exception line, capped
     body: str  # full traceback text, capped
 
@@ -842,11 +850,20 @@ def summarizePod(podLogPath: Path) -> PodSummary:
 
 
 def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:
-    """Pack `lines` into `record.body` (capped) and attach to `summary`."""
+    """Pack `lines` into `record.body` (capped) and attach to `summary`.
+
+    If we never matched an exception class line inside the body, flip
+    the in-progress ``"<unknown>"`` sentinel to ``"<truncated>"`` so the
+    UI can tell "log was cut short before the class line" apart from a
+    real, complete traceback. See the ``excClass`` field doc on
+    :class:`TracebackRecord` for why.
+    """
     body = "\n".join(lines)
     if len(body) > _TRACEBACK_MAX_CHARS:
         body = body[:_TRACEBACK_MAX_CHARS] + "\n…(traceback body truncated)"
     record.body = body
+    if record.excClass == "<unknown>":
+        record.excClass = "<truncated>"
     summary.tracebacks.append(record)
 
 
