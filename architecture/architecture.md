@@ -238,6 +238,7 @@ shapes:
 {
   "loaded": true,
   "mode": "exposure",
+  "site": "summit",
   "expId": 2026051900722,
   "tZero": "2026-05-20T08:45:39.267000+00:00",
   "cacheDir": ".../yagan/rapid-analysis/<window-slug>",
@@ -273,6 +274,7 @@ fetch window ended before the pod did.
 {
   "loaded": true,
   "mode": "night",
+  "site": "summit",
   "dayObs": 20260521,
   "startTime": "2026-05-21T12:00:00+00:00",
   "endTime":   "2026-05-22T12:00:00+00:00",

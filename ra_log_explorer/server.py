@@ -424,6 +424,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
     return {
         "loaded": True,
         "mode": "exposure",
+        "site": state.siteName,
         "expId": state.expId,
         "tZero": state.tZero.isoformat(),
         "cacheDir": str(state.cacheDir),
@@ -665,6 +666,7 @@ def _buildNightPayload(state: NightState) -> dict:
     return {
         "loaded": True,
         "mode": "night",
+        "site": state.siteName,
         "dayObs": state.dayObs,
         "startTime": state.startTime.isoformat(),
         "endTime": state.endTime.isoformat(),

@@ -72,14 +72,26 @@ window.showHome = function showHome() {
   window.startHome();
 };
 
+function _applyActiveSite(summary) {
+  // Set the per-site accent (border-top strip + switcher chip colour)
+  // as soon as we know which site this view belongs to. Without this
+  // the strip wouldn't appear on a deep-linked /?dataId=… or /?dayObs=…
+  // load because the home view's switcher never runs.
+  if (summary && summary.site) {
+    document.body.dataset.site = summary.site;
+  }
+}
+
 window.showExplore = function showExplore(summary) {
   hideAllViews();
+  _applyActiveSite(summary);
   document.getElementById('explore-view').hidden = false;
   window.startExplore(summary);
 };
 
 window.showNight = function showNight(summary) {
   hideAllViews();
+  _applyActiveSite(summary);
   document.getElementById('night-view').hidden = false;
   window.startNight(summary);
 };

@@ -119,6 +119,14 @@ async function loadSiteCatalog() {
 function setActiveSite(name) {
   if (!siteCatalog) return;
   activeSite = siteCatalog.sites.find(s => s.name === name) || null;
+  // Drive the per-site CSS accent (border-top strip, switcher chip).
+  // Persists across home/explore/night views — the strip is visible
+  // even when the switcher itself isn't on screen.
+  if (activeSite) {
+    document.body.dataset.site = activeSite.name;
+  } else {
+    delete document.body.dataset.site;
+  }
   const info = document.getElementById('site-info');
   if (info && activeSite) {
     info.textContent = `consdb=${activeSite.consdbUrl.replace(/^https?:\/\//, '')}`;

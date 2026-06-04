@@ -603,6 +603,9 @@ function wireExploreListeners() {
   document.getElementById('groups-collapse-all').addEventListener('click', collapseAllGroups);
   document.getElementById('groups-expand-all').addEventListener('click', expandAllGroups);
   document.getElementById('back-home').addEventListener('click', () => {
+    // Drop the exposure key out of the URL bar so a subsequent refresh
+    // lands on home — not back on whatever exposure we just left.
+    history.replaceState({}, '', window.location.pathname);
     if (window.showHome) window.showHome();
   });
   window.addEventListener('keydown', (e) => {

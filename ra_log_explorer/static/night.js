@@ -42,6 +42,9 @@ function startNight(summary) {
   renderFailures(summary.failures);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
+      // Drop the dayObs key out of the URL bar so a subsequent refresh
+      // lands on home — not back on whatever night we just left.
+      history.replaceState({}, '', window.location.pathname);
       if (window.showHome) window.showHome();
     });
     nightListenersWired = true;

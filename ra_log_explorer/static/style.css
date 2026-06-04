@@ -147,34 +147,60 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   gap: 6px;
 }
 #topbar button.ghost:hover { background: var(--nav-bg-2); }
+/* Site switcher: deliberately loud — which site you're talking to is
+   the most important thing on the page; everything else is secondary.
+   The accent colour comes from `body[data-site=…]` below so it shifts
+   with the selection and is impossible to lose track of. */
 #topbar .site-switcher {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12.5px;
-  color: var(--nav-muted);
+  gap: 10px;
+  padding: 5px 14px 5px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--site-accent, #4a8cdf) 18%, transparent);
+  border: 1px solid var(--site-accent, #4a8cdf);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--site-accent, #4a8cdf) 20%, transparent);
 }
 #topbar .site-switcher label {
   text-transform: uppercase;
-  letter-spacing: 0.06em;
-  font-size: 10.5px;
-  color: var(--nav-muted);
+  letter-spacing: 0.1em;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--site-accent, #4a8cdf);
 }
 #topbar .site-switcher select {
   font: inherit;
   font-family: var(--font-mono);
-  font-size: 12px;
-  color: var(--nav-text);
-  background: var(--nav-bg-2);
-  border: 1px solid var(--nav-border);
-  border-radius: 999px;
-  padding: 2px 8px;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #fff;
+  background: transparent;
+  border: none;
+  padding: 0;
   cursor: pointer;
+  /* Custom caret in the accent colour so the native one doesn't clash. */
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 18px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--site-accent, #4a8cdf) 50%),
+                    linear-gradient(-45deg, transparent 50%, var(--site-accent, #4a8cdf) 50%);
+  background-position: calc(100% - 8px) 50%, calc(100% - 3px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
 }
+#topbar .site-switcher select:focus { outline: none; }
 #topbar .site-switcher #site-info {
   font-family: var(--font-mono);
   font-size: 11px;
+  color: color-mix(in srgb, var(--site-accent, #4a8cdf) 80%, #fff 20%);
 }
+
+/* Page-wide accent strip + per-site colour mapping. The strip is the
+   "you can't miss which cluster you're on" signal that survives
+   across views. */
+body[data-site] { border-top: 3px solid var(--site-accent); }
+body[data-site="summit"] { --site-accent: #4a8cdf; }
+body[data-site="bts"]    { --site-accent: #ff8a3a; }
 
 /* ============================================================
    Home view
