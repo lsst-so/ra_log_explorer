@@ -1404,6 +1404,15 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
   background: #ede4fb;
   color: #6b3df0;
 }
+.cache-kind-range {
+  background: #d7f0e6;
+  color: #137a55;
+}
+/* Range cache key: full start/stop dataIds stacked on two lines. */
+.cache-key-range {
+  display: inline-block;
+  line-height: 1.35;
+}
 
 .night-tb-context { padding: 0; }
 .night-tb-header {
@@ -1438,3 +1447,62 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 }
 .night-tb-body .tb-lvl.tb-warn  { color: var(--warn); }
 .night-tb-body .tb-lvl.tb-error { color: var(--err); }
+
+/* ============================================================
+   Range navigator (#range-nav) — shown above the explore
+   timeline in range mode. Chip per resolved dataId + prev/next.
+   ============================================================ */
+#range-nav {
+  padding: 8px 18px 10px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.range-nav-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.range-nav-head .spacer { flex: 1; }
+#range-nav-label { font-size: 12.5px; }
+.range-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 84px;
+  overflow-y: auto;
+}
+.range-chip {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  line-height: 1.5;
+}
+.range-chip:hover { border-color: var(--accent); color: var(--accent); }
+/* An exposure with no logs in the fetched window — still navigable but
+   visually de-emphasised so the eye lands on the ones that did run. */
+.range-chip.no-logs { opacity: 0.5; }
+/* An exposure that raised at least one traceback — the thing you most
+   often opened the range to find. */
+.range-chip.has-traceback {
+  border-color: var(--err);
+  background: var(--err-soft);
+  color: var(--err);
+}
+.range-chip.selected {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.range-chip.selected.has-traceback {
+  border-color: var(--err);
+  background: var(--err);
+  color: #fff;
+}
+.range-empty { padding: 40px 18px; font-size: 13px; }

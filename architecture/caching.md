@@ -20,6 +20,7 @@ repeat runs into instant loads.
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
         │                                            that triggered fetches landing here
+        ├── _range.txt                             ← (range caches only) two lines: startId, stopId
         ├── pods/<pod>.jsonl                       ← raw Loki JSONL, --forward order
         ├── .partial                               ← present only while a fetch is in progress
         └── pods=<regex-slug>/                     ← (night caches only) one subdir per Loki
@@ -38,6 +39,13 @@ function of the window.
 Night-mode caches nest one extra level (`pods=<regex-slug>`) below the
 window dir, so a same-window exposure-mode (all pods) and night-mode
 (AOS-only) cache can coexist on disk without clobbering each other.
+
+Range-mode caches are structurally identical to exposure caches — one
+wide all-pods window, no `pods=` subdir — and are distinguished only by
+the presence of a `_range.txt` sidecar recording their `[startId,
+stopId]` bounds. Because they're plain all-pods windows, they also
+participate in superset reuse: a later single-exposure fetch whose
+window falls inside the range gets served from the range cache for free.
 
 `exposure-times/` and `settings.json` live at the root, not under
 the cluster/namespace tree, so they survive `rm -rf
@@ -118,6 +126,13 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
   every write. The on-demand cache rebuild path in `/api/summary`
   uses this file to map a deep-linked dataId back to its cache
   window without needing the in-memory state to already exist.
+
+- **`_range.txt`** — range caches only. Two lines, `startId` then
+  `stopId`. Written by `markCacheRange` when a range fetch completes.
+  This is the sole marker that tells the `/api/cache` listing to label
+  the window `kind: "range"` (rather than `"exposure"`) and deep-link
+  it back to `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it
+  to rehydrate a `RangeState` from disk on a reload / deep link.
 
 ## LRU eviction (size cap)
 

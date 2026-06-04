@@ -1,10 +1,19 @@
 # ra_log_explorer — Architecture & Data Flow
 
 A standalone tool for reconstructing what happened in the rapid analysis
-distributed pipeline. Given **either** a dataId + t-zero (single
-exposure) **or** a dayObs (night-wide AOS survey), it pulls every pod's
-logs from Loki for the relevant window, parses them into structured
-events, and serves an interactive browser timeline.
+distributed pipeline. Given **a dataId + t-zero** (single exposure),
+**a dayObs** (night-wide AOS survey), or **a start/stop dataId pair**
+(a contiguous range of exposures), it pulls every pod's logs from Loki
+for the relevant window, parses them into structured events, and serves
+an interactive browser timeline.
+
+The three modes differ only in how the Loki window is chosen and how the
+results are presented. Range mode fetches one wide all-pods window
+spanning `shutterClose(start) - before → shutterClose(stop) + after` as a
+**single cache block** (so the heavily-overlapping per-exposure windows
+aren't downloaded N times), resolves each in-range dataId's shutter close
+from ConsDB, and reuses the per-exposure timeline view with a navigator
+to step between exposures — each anchored at its own shutter close.
 
 Sibling docs:
 
@@ -44,13 +53,15 @@ Sibling docs:
     │                            │  event log + threading.Condition; the
     │                            │  shared stateLock.
     └─────────────┬──────────────┘
-                  │ ServerState / NightState (via stateLock)
+                  │ ServerState / NightState / RangeState (via stateLock)
                   ▼
     ┌────────────────────────────┐         GET    /                          (home/explore/night SPA)
     │   server.py                │ ◄────── GET    /static/*
     │   (stdlib HTTP + SSE)      │ ◄────── GET    /api/summary?dataId=…
     │                            │ ◄────── GET    /api/summary?dayObs=…
+    │                            │ ◄────── GET    /api/summary?rangeStart=&rangeStop=[&dataId=]
     │                            │ ◄────── GET    /api/pod/<pod>?dataId|dayObs=…
+    │                            │ ◄────── GET    /api/pod/<pod>?rangeStart=&rangeStop=&dataId=
     │                            │ ◄────── GET    /api/night/traceback/<key>?dayObs=…
     │                            │ ◄────── GET    /api/cache                  (lists windows)
     │                            │ ◄────── DELETE /api/cache                  (wipe all)
@@ -60,6 +71,7 @@ Sibling docs:
     │                            │ ◄────── PUT    /api/settings
     │                            │ ◄────── POST   /api/fetch                  (exposure)
     │                            │ ◄────── POST   /api/fetch-night            (dayObs)
+    │                            │ ◄────── POST   /api/fetch-range            (start/stop)
     │                            │ ◄────── GET    /api/fetch/<id>/status
     │                            │ ◄────── GET    /api/fetch/<id>/progress    (SSE)
     └────────────────────────────┘
@@ -70,7 +82,9 @@ Sibling docs:
        ├─ app.js (bootstrap)   └─ timeline.html (home + explore + night SPA)
        ├─ home.js
        ├─ explore.js  (per-exposure timeline + detail drawer)
-       └─ night.js    (dayObs-wide histograms + failure drilldown)
+       ├─ night.js    (dayObs-wide histograms + failure drilldown)
+       └─ range.js    (range navigator strip; drives the explore view
+                       for the selected dataId in the range)
 
        cli.py         optional "eager mode" — fetch + parse on the CLI before
                       the server starts; populates an exposure ServerState
@@ -110,11 +124,11 @@ Sibling docs:
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table. No I/O. |
 | `exposureTimes.py` | dataId → shutter-close ISO (TAI) lookup against a ConsDB endpoint. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists results per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure end-times are immutable so the cache never goes stale. Provides `queryIsotBatch` for night-mode prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
-| `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards both keyed-state dicts. `createJob` (exposure) and `createNightJob` (dayObs) put a `kind` discriminator on each job. |
+| `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `appSettings.py`   | Reads / writes `<cache_root>/settings.json`. Schema is open-ended; today the only field is `maxCacheBytes`. Used by the LRU cache eviction in `fetch.evictToFit`. |
-| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing the `JobManager` and two LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`). Multiple tabs / dataIds / dayObses coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
+| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
-| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page form, credentials, cache list, progress), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown). One HTML template (`templates/timeline.html`) holds all three sections; the bootstrap shows whichever matches the URL. No build step. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, credentials, cache list, progress), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
 
 ## Key Concepts
 
@@ -145,6 +159,17 @@ Sibling docs:
   calendar over at UTC-12, so dayObs 20260521 covers
   `2026-05-21T12:00Z → 2026-05-22T12:00Z` (`config.dayObsStartUtc` /
   `dayObsEndUtc`). Night mode targets a dayObs.
+
+- **Range** — a contiguous `[startId, stopId]` span of dataIds, keyed
+  in memory and in the URL by `"<startId>-<stopId>"`
+  (`/?rangeStart=…&rangeStop=…`). Range mode fetches **one** wide
+  all-pods window for the whole span and resolves every in-range
+  dataId's shutter close from ConsDB. The integer span is the candidate
+  set; ConsDB is the source of truth for which are real exposures (the
+  rest are "skipped" integers, expected and simply omitted). Capped at
+  `config.MAX_RANGE_SPAN` (500) as a fat-finger backstop. The per-dataId
+  timeline is the ordinary exposure view, computed on demand from the
+  shared parsed summaries with that dataId's own shutter close as t-zero.
 
 - **t-zero** — exposure mode only. The reference time the timeline's
   `0s` line corresponds to. Conventionally the shutter-close time from
@@ -206,13 +231,20 @@ return:
   false, cache}` if not loaded.
 - `?dayObs=<int>` — return that night's payload, or `{loaded: false,
   cache}` if not loaded.
+- `?rangeStart=<int>&rangeStop=<int>` — return that range's **index**
+  payload (`mode: "range"`), or `{loaded: false, cache}` if not loaded.
+- `?rangeStart=<int>&rangeStop=<int>&dataId=<int>` — return one
+  in-range exposure's timeline (`mode: "range-exposure"`, the same shape
+  as the exposure payload plus a `podDetailQuery`). 404 if the dataId
+  has no resolved shutter close (a skipped integer).
 - no params — home view shape (`{loaded: false, cache}`).
 
 If the requested key isn't in the in-memory state dict, the server
 makes one attempt to reconstruct it from disk: it walks the cache root
 for a matching window (an exposure-mode cache whose
-`_exposure_ids.txt` lists the dataId; or a night-mode cache whose
-window starts at noon UTC of the dayObs), reparses it with
+`_exposure_ids.txt` lists the dataId; a night-mode cache whose
+window starts at noon UTC of the dayObs; or a range cache whose
+`_range.txt` records the `[startId, stopId]` bounds), reparses it with
 `parser.summarizeAll`, and returns the rebuilt payload. This lets a
 deep-linked tab (e.g. opening the dataId column in the home page's
 cache table) land directly on its explore/night view without an
@@ -303,11 +335,59 @@ fetch window ended before the pod did.
 }
 ```
 
-### `GET /api/pod/<podName>?dataId=<int>` or `?dayObs=<int>`
+#### Range index payload  (`mode: "range"`)
+
+The lightweight navigator index — one entry per resolved dataId, no
+pod/event arrays. The per-dataId timelines are fetched on demand (see
+below).
+
+```jsonc
+{
+  "loaded": true,
+  "mode": "range",
+  "site": "summit",
+  "startId": 2026051900722,
+  "stopId":  2026051900750,
+  "fromTime": "2026-05-20T08:45:34+00:00",   // fetch window (UTC)
+  "toTime":   "2026-05-20T08:51:39+00:00",
+  "cacheDir": ".../yagan/rapid-analysis/<window>",
+  "cacheBytes": 84115620,
+  "meta":     { ...fetch metadata },
+  "nMissing": 3,                              // ids in [start,stop] ConsDB had no row for
+  "dataIds": [
+    { "expId": 2026051900722, "tZero": "<utc iso>",
+      "nPods": 12, "nTraceback": 0, "hasLogs": true }, ...
+  ]
+}
+```
+
+#### Range per-exposure payload  (`mode: "range-exposure"`)
+
+Returned by `?rangeStart=&rangeStop=&dataId=`. Byte-for-byte the
+exposure payload shape (built by reusing `_buildSummaryPayload` against
+the range's shared summaries with the dataId's own shutter close as
+`tZero`), plus:
+
+```jsonc
+{
+  "mode": "range-exposure",
+  "startId": 2026051900722, "stopId": 2026051900750,
+  "podDetailQuery": "rangeStart=2026051900722&rangeStop=2026051900750&dataId=2026051900725",
+  // ...all the exposure-payload fields (pods, podsAll, taskColors, ...)
+}
+```
+
+`podDetailQuery` is what the explore renderer appends to `/api/pod/<pod>`
+so pod-detail lookups route back through the range state (and anchor
+their offsets at this dataId's shutter close).
+
+### `GET /api/pod/<podName>?dataId=<int>` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=`
 
 Returns every parsed `LogLine` from that pod's JSONL file. The query
 string routes to the right loaded state (`dataId` → exposure, `dayObs`
-→ night). 400 if no key, 404 if the targeted state isn't loaded.
+→ night, `rangeStart`+`rangeStop`+`dataId` → that dataId within a loaded
+range, with offsets anchored at its shutter close). 400 if no key, 404
+if the targeted state isn't loaded.
 
 ```jsonc
 {
@@ -409,11 +489,13 @@ The token-file paths are *not* echoed — they're a server-side detail.
       "relPath":   "2026-05-20T...__2026-05-20T..."  // or "<window>/pods=__aos__"
                                                      // for night caches
       "podFilter": null,                             // or ".*aos.*" for night
-      "kind":      "exposure",                       // or "night"
+      "kind":      "exposure",                       // or "night" / "range"
       "dayObs":    null,                             // night caches recover dayObs
                                                      // from the window start
-      "exposureIds": [2026051900722, 2026051900723], // dataIds that triggered
-                                                     // fetches landing here
+      "rangeStart": null, "rangeStop": null,         // range caches: the [start, stop]
+                                                     // bounds from _range.txt
+      "exposureIds": [2026051900722, 2026051900723], // (exposure caches) dataIds that
+                                                     // triggered fetches landing here
       "fromIso":      "...", "toIso":       "...",
       "fetchedAt":    "...", "lastViewedAt": "...",
       "podCount": 432, "totalBytes": 42289444, "sizeOnDisk": 42330276
@@ -499,6 +581,31 @@ The window is the full 24-hour dayObs (noon UTC → noon UTC) with the
 `pod=~".*aos.*"` filter applied at the Loki layer. Same response
 shape as `/api/fetch`.
 
+### `POST /api/fetch-range`  (start/stop)
+
+```jsonc
+{
+  "rangeStart": 2026051900722,         // required, integer
+  "rangeStop":  2026051900750,         // required, integer; > rangeStart
+  "tZeroStart": "2026-05-20T08:46:16.267",  // required, ISO-8601 (start shutter close)
+  "tZeroStop":  "2026-05-20T08:51:09.512",  // required, ISO-8601 (stop shutter close)
+  "tZeroUtc":   false,                 // optional; default false (treat both as TAI)
+  "site":       "summit",              // optional; falls back to default_site
+  "username":   "merlin", "password": "...",
+  "workers":    8,
+  "windowBefore": 5.0, "windowAfter": 300.0
+}
+```
+
+The client resolves `tZeroStart` / `tZeroStop` up front via
+`/api/exposure-time`. The window is one wide all-pods span,
+`[tZeroStart - windowBefore, tZeroStop + windowAfter]`. The span
+`rangeStop - rangeStart` is capped at `config.MAX_RANGE_SPAN` (400 if
+exceeded, or if `rangeStop <= rangeStart`). Per-dataId shutter closes
+for the whole span are resolved server-side post-parse (ConsDB batch,
+reporting on the `shutter-close` SSE event). Same response shape as
+`/api/fetch`.
+
 ### `GET /api/fetch/<jobId>/status`
 
 JSON snapshot of one job:
@@ -507,10 +614,11 @@ JSON snapshot of one job:
 {
   "jobId": "8970db79c0a6",
   "status": "running" | "parsing" | "done" | "error",
-  "kind":   "exposure" | "night",
-  "expId":  2026051900722,             // null for night jobs
-  "tZero":  "...",                     // null for night jobs
+  "kind":   "exposure" | "night" | "range",
+  "expId":  2026051900722,             // null for night / range jobs
+  "tZero":  "...",                     // null for night / range jobs
   "dayObs": null,                      // 20260521 for night jobs
+  "startId": null, "stopId": null,     // set for range jobs
   "fromIso": "...", "toIso": "...",
   "startedAt": "...", "finishedAt": "...",
   "cacheDir":  "...",
@@ -530,7 +638,9 @@ is one JSON event (`{"type": ...}`):
   from 1; reaches `total` on the last).
 - `parsing`: `{ cacheReuse, podCount, totalBytes }` — after the
   fetch finishes, before `summarizeAll` runs.
-- `shutter-close`: `{ phase, ... }` — night-mode only. Phases:
+- `shutter-close`: `{ phase, ... }` — night **and range** modes (both
+  resolve per-dataId shutter closes post-parse via the shared
+  `_resolveShutterClosesInto`). Phases:
     - `starting`: `{ total }` (number of dataIds we'll try to
        resolve)
     - `cache-checked`: `{ cacheHits, remaining }` — after the
@@ -540,11 +650,12 @@ is one JSON event (`{"type": ...}`):
     - `empty-token`: `{ remaining }` — token file blank.
     - `consdb-error`: `{ error }` — typed ConsDB error.
     - `done`: `{ consdbHits, stillMissing }` — happy path.
-- `done`: `{ kind, expId, tZero, dayObs, cacheDir, cacheReuse,
-  podCount, totalBytes, elapsedS }` — after the server's keyed
-  `ServerState`/`NightState` slot has been populated. **Always**
-  fired after `onComplete` so SSE consumers can rely on the
-  summary being ready when they see `done`.
+- `done`: `{ kind, expId, tZero, dayObs, startId, stopId, cacheDir,
+  cacheReuse, podCount, totalBytes, elapsedS }` — after the server's
+  keyed `ServerState` / `NightState` / `RangeState` slot has been
+  populated (`startId`/`stopId` set for range jobs). **Always** fired
+  after `onComplete` so SSE consumers can rely on the summary being
+  ready when they see `done`.
 - `error`: `{ error }` — terminal; the job failed.
 
 History is replayable: the SSE handler emits every event already in
@@ -562,9 +673,9 @@ intermediate proxies don't time the stream out.
 The shared `ServerContext` is mutated only while holding
 `ctx.jobs.stateLock`, which guards:
 
-- inserting / evicting entries in `ctx.exposureStates` and
-  `ctx.nightStates` (worker thread → ✓ insert; DELETE handlers →
-  ✓ evict);
+- inserting / evicting entries in `ctx.exposureStates`,
+  `ctx.nightStates`, and `ctx.rangeStates` (worker thread → ✓ insert;
+  DELETE handlers → ✓ evict);
 - reading those dicts to render `/api/summary` or `/api/pod/<>`
   (request threads → snapshot read).
 
@@ -574,13 +685,13 @@ Each fetch runs on its own daemon thread spawned by
 
 ### Multi-tab support
 
-Both keyed-state dicts are LRU-ordered (`OrderedDict.move_to_end`
-on every read) and capped at `_MAX_LOADED_STATES = 8`. A user with
-several open tabs (different dataIds / dayObses) sees each one keep
-its state until 9+ tabs are in play; the least-recently-opened gets
-evicted then. The browser's URL carries the routing key so reload /
-back-button on an evicted tab triggers a fresh `/api/summary` fetch
-against the cache.
+All three keyed-state dicts are LRU-ordered (`OrderedDict.move_to_end`
+on every read) and each capped at `_MAX_LOADED_STATES = 8`. A user with
+several open tabs (different dataIds / dayObses / ranges) sees each one
+keep its state until 9+ tabs of that kind are in play; the
+least-recently-opened gets evicted then. The browser's URL carries the
+routing key so reload / back-button on an evicted tab triggers a fresh
+`/api/summary` fetch against the cache.
 
 Pod detail and traceback drilldown responses re-read the JSONL
 files from disk on each request rather than buffering them in
@@ -592,9 +703,10 @@ stays cheap.
 1. **Home mode** — `python3 -m ra_log_explorer.cli` with no
    `--exposure-id`/`--t-zero`. CLI just spins up a fresh `JobManager`
    and an empty `ServerContext`, hands it to `server.serve()`, and
-   the user picks an exposure (or a dayObs for night mode) in the
-   browser. Every fetch from then on goes through `POST /api/fetch`
-   or `POST /api/fetch-night` and the SSE progress endpoint.
+   the user picks an exposure (or a dayObs for night mode, or a
+   start/stop pair for range mode) in the browser. Every fetch from
+   then on goes through `POST /api/fetch`, `POST /api/fetch-night`, or
+   `POST /api/fetch-range` and the SSE progress endpoint.
 
 2. **Eager fetch mode** — `--exposure-id` + `--t-zero` supplied. CLI
    runs the same TAI-adjustment + `fetch.fetchAll` + `parse.summarizeAll`

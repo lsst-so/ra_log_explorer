@@ -61,6 +61,54 @@
         </section>
 
         <section class="home-card">
+          <h2>Explore a range of exposures</h2>
+          <p class="hint">
+            Give a start and stop dataId. One Loki fetch covers the whole
+            span (shutter close of the start, through shutter close of the
+            stop plus the after-buffer) as a single cache block — far
+            cheaper than fetching each exposure's overlapping window
+            separately. Step through each exposure's timeline in the
+            explore view, anchored at its own shutter close. Skipped
+            integers in the range are expected and simply omitted.
+          </p>
+          <form id="range-form">
+            <div class="row">
+              <label>
+                <span class="lbl">start dataId</span>
+                <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
+                <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
+              </label>
+              <label>
+                <span class="lbl">stop dataId</span>
+                <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
+                <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
+              </label>
+            </div>
+            <details>
+              <summary>per-exposure tuning</summary>
+              <div class="row">
+                <label>
+                  <span class="lbl">window before start t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                </label>
+                <label>
+                  <span class="lbl">window after stop t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowAfter" value="300" step="1" />
+                </label>
+              </div>
+            </details>
+            <div class="row submit-row">
+              <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
+              <span id="range-message" class="hint"></span>
+            </div>
+            <div id="range-progress" class="inline-progress" hidden>
+              <div class="progress-bar"><div class="progress-fill"></div></div>
+              <div class="progress-text hint"></div>
+            </div>
+          </form>
+        </section>
+
+        <section class="home-card">
           <h2>Investigate night</h2>
           <p class="hint">
             Pulls the full 24-hour log window for the AOS-flavoured pods
@@ -188,6 +236,19 @@
         <span id="expId-display"></span>
       </div>
     </header>
+
+    <!-- Range navigator: only shown in range mode (range.js populates it
+         and app.js toggles its visibility). Lets you step between the
+         exposures in the fetched range; each loads its own timeline. -->
+    <section id="range-nav" hidden>
+      <div class="range-nav-head">
+        <span id="range-nav-label" class="muted"></span>
+        <span class="spacer"></span>
+        <button type="button" id="range-prev" class="mini" title="previous exposure (←)">◀ prev</button>
+        <button type="button" id="range-next" class="mini" title="next exposure (→)">next ▶</button>
+      </div>
+      <div id="range-chips" class="range-chips"></div>
+    </section>
 
     <section id="refs">
       <label for="ref-select">t<sub>0</sub>:</label>
@@ -328,6 +389,7 @@
   <script src="/static/explore.js"></script>
   <script src="/static/home.js"></script>
   <script src="/static/night.js"></script>
+  <script src="/static/range.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

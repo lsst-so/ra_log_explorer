@@ -178,9 +178,9 @@ In the browser:
 
 The home page also lists every cached window on disk in the *Recent
 runs* table. Each row carries a **key** column showing the dataId(s)
-that triggered fetches landing on that cache (or the `dayObs` for
-night caches); the keys are clickable links that open the cached
-view in a new tab. The ✕ button on each row deletes that one
+that triggered fetches landing on that cache (the `dayObs` for night
+caches, or the seq-number span for range caches); the keys are
+clickable links that open the cached view in a new tab. The ✕ button on each row deletes that one
 window; the "delete all" button under the table wipes the whole
 cache. The server also LRU-evicts the least-recently-viewed windows
 automatically once the on-disk total exceeds the sidebar's *max
@@ -216,15 +216,23 @@ port. Ctrl-C in the terminal stops the server.
 
 ## What the UI shows
 
-The browser app has two views:
+The browser app has three views:
 
-- **Home view** — the landing page when no exposure is loaded.
-  Hosts the fetch form, the credentials panel, the cached-runs table,
+- **Home view** — the landing page when nothing is loaded. Hosts the
+  three fetch forms (single exposure, a range of exposures, an
+  investigate-night), the credentials panel, the cached-runs table,
   and the live progress bar for an in-flight fetch.
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is
-  a navigation, not a reset).
+  a navigation, not a reset). In **range mode** the explore view gains
+  a navigator strip on top: one chip per exposure in the range (red if
+  it raised a traceback), plus ◀/▶ buttons and the ←/→ arrow keys to
+  step between them. Each exposure's timeline is anchored at its own
+  shutter close, so the `Δt₀ = 0` line always sits on the exposure
+  you're looking at.
+- **Night view** — the dayObs-wide failure breakdown and Δshutter
+  histograms.
 
 Inside the explore view:
 
@@ -315,6 +323,21 @@ python3 -m ra_log_explorer.cli \
 The `Δt₀ = 0` reference stays on the same exposure; you just see more
 of the surrounding cluster activity. If a cached run already covers
 the wider window the subset is reused immediately — no re-fetch.
+
+### Explore a contiguous range of exposures
+
+In the home page, use the **Explore a range of exposures** card: type a
+start and a stop dataId. The browser resolves both shutter-close times,
+then a **single** Loki fetch covers the whole span
+(`shutterClose(start) − before → shutterClose(stop) + after`) as one
+cache block — far cheaper than fetching each exposure's overlapping
+window on its own. The server resolves every in-range dataId's shutter
+close from ConsDB (skipped integers in the range are expected and just
+omitted), and you land in the explore view with a navigator strip on
+top. Step through each exposure with the chips, the ◀/▶ buttons, or the
+←/→ arrow keys; every exposure is anchored at its own shutter close.
+This mode is browser-only (there's no CLI flag) and is meant for tens
+of consecutive exposures.
 
 ### Inspect what's cached
 

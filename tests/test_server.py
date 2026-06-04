@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from ra_log_explorer import parse, server
+from ra_log_explorer import config, parse, server
 from ra_log_explorer.jobs import JobManager
 
 from .conftest import FakeSiteCatalog
@@ -185,16 +185,22 @@ def test_summaryToDict_keeps_untagged_warn_only_in_work_window() -> None:
     assert kinds == ["WORKER_PICKUP", "WARN", "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE"]
 
 
-def test_summaryToDict_keeps_all_untagged_when_no_targeted_events() -> None:
-    # A pod with no explicitly-tagged events still gets its untagged
-    # warnings shown (e.g. head-node lines that don't mention an expId).
+def test_summaryToDict_anchors_untagged_window_on_tZero_when_no_targeted_events() -> None:
+    # A pod with no explicitly-tagged events for this dataId still surfaces
+    # its untagged warnings, but scoped to a t₀-anchored window rather than
+    # the whole (possibly very wide) fetch. This matters for range mode and
+    # superset-reuse exposure views, where "keep all untagged" would pull
+    # the entire span's warnings into a single dataId's timeline. The
+    # fallback window is (t₀ - DEFAULT_WINDOW_BEFORE_S, t₀ +
+    # DEFAULT_WINDOW_AFTER_S) = (t₀ - 5 s, t₀ + 300 s).
     tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
     events = [
-        _ev(tZero - dt.timedelta(seconds=60), "WARN", level="warn"),
-        _ev(tZero + dt.timedelta(seconds=60), "WARN", level="warn"),
+        _ev(tZero - dt.timedelta(seconds=60), "WARN", level="warn"),  # before window -> dropped
+        _ev(tZero + dt.timedelta(seconds=60), "WARN", level="warn"),  # inside window -> kept
+        _ev(tZero + dt.timedelta(seconds=3600), "WARN", level="warn"),  # far after -> dropped
     ]
     out = server._summaryToDict(_stubSummary(events), tZero, 2026051900722)
-    assert len(out["events"]) == 2
+    assert len(out["events"]) == 1
 
 
 # ----- _buildSummaryPayload reference points ------------------------------
@@ -481,6 +487,19 @@ def _makeNightState(dayObs: int, *, cacheDir: Path | None = None) -> server.Nigh
     )
 
 
+def _makeRangeState(startId: int, stopId: int, *, cacheDir: Path | None = None) -> server.RangeState:
+    return server.RangeState(
+        cacheDir=cacheDir or Path(f"/tmp/range-{startId}-{stopId}"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=startId,
+        stopId=stopId,
+        fromTime=dt.datetime(2026, 5, 20, 8, 45, tzinfo=dt.timezone.utc),
+        toTime=dt.datetime(2026, 5, 20, 8, 51, tzinfo=dt.timezone.utc),
+    )
+
+
 def _emptyCtx() -> server.ServerContext:
     from ra_log_explorer.jobs import JobManager
 
@@ -504,6 +523,26 @@ def test_put_then_get_night_state_roundtrips() -> None:
     n = _makeNightState(20260521)
     ctx.putNightState(n)
     assert ctx.getNightState(20260521) is n
+
+
+def test_put_then_get_range_state_roundtrips() -> None:
+    ctx = _emptyCtx()
+    r = _makeRangeState(2026051900722, 2026051900750)
+    ctx.putRangeState(r)
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is r
+
+
+def test_get_range_state_returns_None_when_unknown() -> None:
+    ctx = _emptyCtx()
+    assert ctx.getRangeState(server.rangeKey(1, 2)) is None
+
+
+def test_evictByCacheDir_drops_matching_range_state(tmp_path: Path) -> None:
+    ctx = _emptyCtx()
+    r = _makeRangeState(2026051900722, 2026051900750, cacheDir=tmp_path)
+    ctx.putRangeState(r)
+    ctx.evictByCacheDir(tmp_path)
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is None
 
 
 def test_two_exposures_coexist_independently() -> None:
@@ -830,6 +869,193 @@ def test_buildNightSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCat
     ctx = _ctxWithSites(siteCatalog)
     _, _, _, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "password": "hunter2"})
     assert password == "hunter2"
+
+
+# ----- _buildRangeSpecFromRequest -----------------------------------------
+
+
+def _rangeBody(**overrides: object) -> dict:
+    body: dict = {
+        "rangeStart": 2026051900722,
+        "rangeStop": 2026051900750,
+        "tZeroStart": "2026-05-20T08:46:16.267",
+        "tZeroStop": "2026-05-20T08:51:09.512",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> None:
+    """A valid body produces an all-pods spec whose window spans from the
+    start anchor (minus the before-buffer) to the stop anchor (plus the
+    after-buffer), with the TAI→UTC conversion applied to both anchors."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, startId, stopId, tZeroStart, tZeroStop, password = server._buildRangeSpecFromRequest(
+        ctx, _rangeBody()
+    )
+    assert (startId, stopId) == (2026051900722, 2026051900750)
+    assert password is None
+    assert site.name == "summit"  # default
+    assert spec.podRegex is None  # range is an all-pods fetch
+    # TAI inputs minus 37 s; default windowBefore=5, windowAfter=300.
+    # start 08:46:16.267 TAI -> 08:45:39.267 UTC -> minus 5 s = 08:45:34.267.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+    # stop 08:51:09.512 TAI -> 08:50:32.512 UTC -> plus 300 s = 08:55:32.512.
+    assert spec.toIso.startswith("2026-05-20T08:55:32.512")
+    # The returned anchors are the UTC shutter closes (window-defining).
+    assert tZeroStart == dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
+    assert tZeroStop == dt.datetime(2026, 5, 20, 8, 50, 32, 512000, tzinfo=dt.timezone.utc)
+
+
+def test_buildRangeSpecFromRequest_tZeroUtc_skips_conversion(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, _, tZeroStart, _, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
+    assert tZeroStart == dt.datetime(2026, 5, 20, 8, 46, 16, 267000, tzinfo=dt.timezone.utc)
+
+
+def test_buildRangeSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, site, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
+    assert site.name == "bts"
+
+
+def test_buildRangeSpecFromRequest_rejects_reversed_range(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    with pytest.raises(ValueError, match="greater than"):
+        server._buildRangeSpecFromRequest(ctx, _rangeBody(rangeStart=2026051900750, rangeStop=2026051900722))
+
+
+def test_buildRangeSpecFromRequest_rejects_oversize_span(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    start = 2026051900722
+    with pytest.raises(ValueError, match="exceeds"):
+        server._buildRangeSpecFromRequest(
+            ctx, _rangeBody(rangeStart=start, rangeStop=start + config.MAX_RANGE_SPAN + 1)
+        )
+
+
+def test_buildRangeSpecFromRequest_rejects_missing_anchor(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    body = _rangeBody()
+    del body["tZeroStart"]
+    with pytest.raises(ValueError, match="tZeroStart"):
+        server._buildRangeSpecFromRequest(ctx, body)
+
+
+def test_buildRangeSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    *_, password = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2"))
+    assert password == "hunter2"
+
+
+def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
+    """An empty browser number input serializes to JSON null; it must fall
+    back to the default window, not crash on ``float(None)`` (which the
+    handler doesn't catch — it would drop the connection with no
+    response)."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
+    # Defaults: start 08:45:39.267 − 5 s, stop 08:50:32.512 + 300 s.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+    assert spec.toIso.startswith("2026-05-20T08:55:32.512")
+
+
+def test_buildRangeSpecFromRequest_zero_window_is_preserved(siteCatalog: FakeSiteCatalog) -> None:
+    """``0`` is a legitimate window (start exactly at the shutter close)
+    and must not be coerced to the default."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
+    assert spec.fromIso.startswith("2026-05-20T08:45:39.267")
+
+
+def test_buildSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
+    """Same null-window robustness for the single-exposure endpoint, which
+    shares the window-parsing helper."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "windowBefore": None}
+    )
+    # 08:46:16.267 TAI − 37 s − default 5 s = 08:45:34.267.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+
+
+# ----- range payloads -----------------------------------------------------
+
+
+def _rangeStateForPayload() -> server.RangeState:
+    """A RangeState over [722, 725] where 724 is a skipped integer, 725
+    resolved a shutter close but produced no logs, and 723 has a traceback."""
+    tb = parse.TracebackRecord(
+        pod="p",
+        t=dt.datetime(2026, 5, 20, 8, 46, tzinfo=dt.timezone.utc),
+        expId=2026051900723,
+        excClass="RuntimeError",
+        excMessage="boom",
+        body="Traceback ...",
+    )
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=1,
+        nTraceback=1,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen={2026051900722, 2026051900723},
+        events=[],
+        tracebacks=[tb],
+    )
+    state = server.RangeState(
+        cacheDir=Path("/tmp/range"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        startId=2026051900722,
+        stopId=2026051900725,
+        fromTime=dt.datetime(2026, 5, 20, 8, 45, tzinfo=dt.timezone.utc),
+        toTime=dt.datetime(2026, 5, 20, 8, 51, tzinfo=dt.timezone.utc),
+    )
+    base = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    state.shutterCloseByExpId = {
+        2026051900722: base,
+        2026051900723: base + dt.timedelta(seconds=30),
+        2026051900725: base + dt.timedelta(seconds=90),  # resolved but no logs
+    }
+    return state
+
+
+def test_buildRangePayload_lists_resolved_dataIds_with_overview() -> None:
+    payload = server._buildRangePayload(_rangeStateForPayload())
+    assert payload["mode"] == "range"
+    assert payload["startId"] == 2026051900722 and payload["stopId"] == 2026051900725
+    # 4 candidate ids (722..725); 724 has no resolved shutter close.
+    assert payload["nMissing"] == 1
+    ids = payload["dataIds"]
+    assert [d["expId"] for d in ids] == [2026051900722, 2026051900723, 2026051900725]
+    byId = {d["expId"]: d for d in ids}
+    assert byId[2026051900723]["nTraceback"] == 1
+    assert byId[2026051900722]["hasLogs"] is True
+    assert byId[2026051900725]["hasLogs"] is False  # resolved but produced no logs
+
+
+def test_buildRangeExposurePayload_reuses_exposure_shape_with_query() -> None:
+    state = _rangeStateForPayload()
+    payload = server._buildRangeExposurePayload(state, 2026051900722)
+    assert payload is not None
+    assert payload["mode"] == "range-exposure"
+    assert payload["expId"] == 2026051900722
+    assert payload["podDetailQuery"] == (
+        "rangeStart=2026051900722&rangeStop=2026051900725&dataId=2026051900722"
+    )
+    assert "pods" in payload  # the reused exposure-payload body
+
+
+def test_buildRangeExposurePayload_returns_None_for_skipped_id() -> None:
+    state = _rangeStateForPayload()
+    assert server._buildRangeExposurePayload(state, 2026051900724) is None
 
 
 # ----- _maybeSetLokiPassword ----------------------------------------------

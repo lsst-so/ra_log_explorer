@@ -343,6 +343,241 @@ def test_summary_mode_field_distinguishes_exposure_from_night(
     assert body["stats"]["nTracebacks"] == 0
 
 
+# ----- /api/fetch-range + range summary -----------------------------------
+
+
+def test_range_fetch_validates_reversed_range(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900750,
+            "rangeStop": 2026051900722,  # < start
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:51:09.512",
+        },
+    )
+    assert status == 400
+    assert "greater than" in body["error"]
+
+
+def test_range_fetch_starts_job_and_populates_RangeState(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        # A range fetch is an all-pods window (no AOS pod-regex).
+        assert spec.podRegex is None
+        cacheDir = tmpCacheRoot / "fake-range"
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900722,
+            "rangeStop": 2026051900724,
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:46:36.267",
+        },
+    )
+    assert status == 202, body
+    jobId = body["jobId"]
+
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    assert body["kind"] == "range"
+    assert body["startId"] == 2026051900722
+    assert body["stopId"] == 2026051900724
+
+    with ctx.jobs.stateLock:
+        loaded = ctx.getRangeState(serverModule.rangeKey(2026051900722, 2026051900724))
+    assert loaded is not None
+    # No ConsDB token was configured, so only the client-resolved start
+    # and stop anchors got seeded (the middle id stays unresolved).
+    assert set(loaded.shutterCloseByExpId) == {2026051900722, 2026051900724}
+    # _range.txt was written so the cache lists as a range + rehydrates.
+    from ra_log_explorer.fetch import getCacheRange
+
+    assert getCacheRange(loaded.cacheDir) == (2026051900722, 2026051900724)
+
+
+def test_range_summary_index_and_per_dataId(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A loaded range serves a lightweight index payload, and the
+    per-dataId timeline when ``dataId`` is added."""
+    import datetime as _dt
+
+    from ra_log_explorer.server import RangeState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "range-1"
+    (cacheDir / "pods").mkdir(parents=True)
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026051900722,
+        stopId=2026051900724,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+    )
+    state.shutterCloseByExpId = {
+        2026051900722: base,
+        2026051900724: base + _dt.timedelta(seconds=20),  # 723 is a skipped integer
+    }
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+
+    # Index payload.
+    status, body = _get(host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["mode"] == "range"
+    assert body["nMissing"] == 1
+    assert [d["expId"] for d in body["dataIds"]] == [2026051900722, 2026051900724]
+
+    # Per-dataId timeline.
+    status, body = _get(
+        host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724&dataId=2026051900722"
+    )
+    assert status == 200, body
+    assert body["mode"] == "range-exposure"
+    assert body["expId"] == 2026051900722
+    assert "dataId=2026051900722" in body["podDetailQuery"]
+
+    # A skipped integer 404s.
+    status, body = _get(
+        host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724&dataId=2026051900723"
+    )
+    assert status == 404
+
+
+def test_range_summary_unloaded_when_unknown(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/summary?rangeStart=1&rangeStop=2")
+    assert status == 200
+    assert body["loaded"] is False
+
+
+def test_range_pod_endpoint_routes_through_range_state(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """/api/pod/<pod>?rangeStart=&rangeStop=&dataId= reads from the range's
+    shared cache, anchored at that dataId's shutter close."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.server import RangeState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "range-pod"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-sfm-runner-sfmworkerset-0"
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "some range log line\n",
+            }
+        )
+        + "\n"
+    )
+    summaries = _parse.summarizeAll(cacheDir)
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=summaries,
+        startId=2026051900722,
+        stopId=2026051900722,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+    )
+    state.shutterCloseByExpId = {2026051900722: base}
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+    status, body = _get(
+        host,
+        port,
+        f"/api/pod/{podName}?rangeStart=2026051900722&rangeStop=2026051900722&dataId=2026051900722",
+    )
+    assert status == 200, body
+    assert body["pod"] == podName
+    assert len(body["lines"]) == 1
+
+
+def test_cache_list_includes_range_kind(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A cache dir carrying a `_range.txt` sidecar lists as kind 'range'
+    with its [start, stop] bounds, so the UI can deep-link it back to the
+    range view."""
+    from ra_log_explorer.fetch import markCacheRange
+
+    host, port, _ctx = runningServer
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085532_512000Z"
+    (d / "pods").mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:45:34.267000Z",
+                    "toIso": "2026-05-20T08:55:32.512000Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 5,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    markCacheRange(d, 2026051900722, 2026051900750)
+    status, body = _get(host, port, "/api/cache")
+    assert status == 200
+    rows = [w for w in body["windows"] if w["kind"] == "range"]
+    assert len(rows) == 1
+    assert rows[0]["rangeStart"] == 2026051900722
+    assert rows[0]["rangeStop"] == 2026051900750
+
+
 def test_fetch_status_404_for_unknown_job(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/fetch/doesnotexist/status")

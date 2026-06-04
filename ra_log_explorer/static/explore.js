@@ -532,7 +532,12 @@ async function selectPod(pod) {
   document.getElementById('detail-title').textContent = pod;
   document.getElementById('detail-body').textContent = 'loading...';
   if (!podDetailCache[pod]) {
-    const r = await fetch(`/api/pod/${pod}?dataId=${encodeURIComponent(summary.expId)}`);
+    // In range mode the timeline payload carries a podDetailQuery that
+    // routes the lookup back through the range state (so offsets anchor
+    // at this dataId's shutter close); single-exposure mode just keys
+    // off the loaded dataId.
+    const q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
+    const r = await fetch(`/api/pod/${pod}?${q}`);
     podDetailCache[pod] = await r.json();
   }
   renderDetail();

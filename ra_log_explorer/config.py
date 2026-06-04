@@ -18,6 +18,11 @@ DEFAULT_WINDOW_BEFORE_S = 5.0
 DEFAULT_WINDOW_AFTER_S = 5 * 60.0
 DEFAULT_HTTP_PORT = 8765
 DEFAULT_LINE_LIMIT = 50_000  # per-pod safety cap; pods rarely emit this much
+# Range mode fetches one wide window covering [startId, stopId]. The tool is
+# meant for tens of consecutive exposures; this is a fat-finger backstop so a
+# transposed/typo'd pair can't generate a multi-thousand-id ConsDB sweep or a
+# pathologically wide Loki window.
+MAX_RANGE_SPAN = 500
 
 
 def settingsFilePath() -> Path:

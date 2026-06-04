@@ -31,7 +31,7 @@ from .config import FetchSpec
 from .fetch import fetchAll
 
 JobStatus = Literal["pending", "running", "parsing", "done", "error"]
-JobKind = Literal["exposure", "night"]
+JobKind = Literal["exposure", "night", "range"]
 ProgressEvent = dict[str, Any]
 
 
@@ -39,12 +39,15 @@ ProgressEvent = dict[str, Any]
 class FetchJob:
     """One run of `fetchAll`, with its own append-only event log.
 
-    Both exposure mode and night mode reuse this single shape:
+    All three modes reuse this single shape:
 
     * Exposure mode: ``kind == "exposure"``, ``expId`` and ``tZero``
       set, ``dayObs`` is None.
     * Night mode: ``kind == "night"``, ``dayObs`` set, ``expId`` and
       ``tZero`` are None.
+    * Range mode: ``kind == "range"``, ``startId`` / ``stopId`` and the
+      two UTC window anchors ``tZeroStart`` / ``tZeroStop`` set; ``expId``
+      / ``tZero`` / ``dayObs`` are None.
     """
 
     jobId: str
@@ -58,6 +61,12 @@ class FetchJob:
     expId: int | None = None
     tZero: dt.datetime | None = None
     dayObs: int | None = None
+    # Range mode: the [startId, stopId] dataId span plus the two UTC
+    # shutter-close anchors that define the fetch window.
+    startId: int | None = None
+    stopId: int | None = None
+    tZeroStart: dt.datetime | None = None
+    tZeroStop: dt.datetime | None = None
     status: JobStatus = "pending"
     startedAt: dt.datetime | None = None
     finishedAt: dt.datetime | None = None
@@ -112,6 +121,30 @@ class JobManager:
             self._jobs[jobId] = job
             return job
 
+    def createRangeJob(
+        self,
+        spec: FetchSpec,
+        startId: int,
+        stopId: int,
+        tZeroStart: dt.datetime,
+        tZeroStop: dt.datetime,
+        siteName: str = "",
+    ) -> FetchJob:
+        with self._lock:
+            jobId = uuid.uuid4().hex[:12]
+            job = FetchJob(
+                jobId=jobId,
+                spec=spec,
+                siteName=siteName,
+                kind="range",
+                startId=startId,
+                stopId=stopId,
+                tZeroStart=tZeroStart,
+                tZeroStop=tZeroStop,
+            )
+            self._jobs[jobId] = job
+            return job
+
     def getJob(self, jobId: str) -> FetchJob | None:
         with self._lock:
             return self._jobs.get(jobId)
@@ -160,6 +193,8 @@ class JobManager:
                     "expId": job.expId,
                     "tZero": job.tZero.isoformat() if job.tZero else None,
                     "dayObs": job.dayObs,
+                    "startId": job.startId,
+                    "stopId": job.stopId,
                     "cacheDir": str(cacheDir),
                     "cacheReuse": meta.get("cacheReuse", "none"),
                     "podCount": meta.get("pod_count", 0),
