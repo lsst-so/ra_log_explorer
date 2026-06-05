@@ -126,7 +126,7 @@ Sibling docs:
 | `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
-| `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table. No I/O. |
+| `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
@@ -357,6 +357,10 @@ fetch window ended before the pod did.
       "excClass": "RuntimeError", "excMessage": "...", "offsetS": 87.2,
       "tIso": "...", "bodyKey": "<pod>@<iso>" }, ...
   ],
+  "gatherOnly": [ 2026052100200, ... ],          // dataIds with gather (step1b)
+                                                 // activity but no step1a — physically
+                                                 // impossible, so a tell the fetch dropped
+                                                 // step1a logs (surfaced as a warning banner)
   "exposureInfo": {                              // dataId (string) -> curated ConsDB record
     "2026052100050": { "img_type": "science", "physical_filter": "z_20",
                        "observation_reason": "...", ... }, ...

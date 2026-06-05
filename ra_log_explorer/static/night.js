@@ -18,6 +18,7 @@ function startNight(summary) {
   if (window.renderFetchBanner) {
     window.renderFetchBanner(document.getElementById('night-fetch-banner'), summary);
   }
+  renderGatherOnly(summary.gatherOnly || []);
   document.getElementById('night-dayobs-display').textContent = `dayObs=${summary.dayObs}`;
   document.getElementById('night-window-display').textContent =
     `(${summary.startTime} → ${summary.endTime})`;
@@ -140,6 +141,62 @@ function nightExposureTooltip(dataId) {
   const info = (nightSummary && nightSummary.exposureInfo) || {};
   const fn = window.exposureInfoTooltip;
   return fn ? fn(info[String(dataId)]) : '';
+}
+
+// ----- gather-only warning --------------------------------------------------
+//
+// A gather (step1b) step aggregates step1a's per-detector output, so it
+// cannot run for a dataId unless step1a ran first. Seeing gather activity
+// with no step1a for the same dataId is physically impossible — it means the
+// fetch dropped the step1a lines (the grafana/loki#17270 symptom). We flag it
+// loudly because it also explains a biased "first task pickup" histogram:
+// with step1a gone, the earliest event left for that dataId is the gather.
+function renderGatherOnly(dataIds) {
+  const el = document.getElementById('night-gather-banner');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!dataIds || dataIds.length === 0) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  const title = document.createElement('div');
+  title.className = 'fetch-banner-title';
+  title.textContent =
+    `⚠ ${dataIds.length} dataId${dataIds.length === 1 ? '' : 's'} show gather (step1b) `
+    + 'activity with no step1a — impossible unless the fetch dropped step1a logs';
+  el.appendChild(title);
+
+  const sub = document.createElement('div');
+  sub.className = 'fetch-banner-sub';
+  sub.textContent =
+    'Gather aggregates step1a output, so it cannot run without it. These are '
+    + 'almost certainly missing data (and bias the first-task-pickup histogram). '
+    + 'Re-fetch with force-refresh.';
+  el.appendChild(sub);
+
+  const list = document.createElement('div');
+  list.className = 'night-hist-bin-list';
+  const shown = dataIds.slice(0, 40);
+  for (const id of shown) {
+    const a = document.createElement('a');
+    a.className = 'night-hist-bin-id mono';
+    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = String(id);
+    const tip = nightExposureTooltip(id);
+    if (tip) a.title = tip;
+    list.appendChild(a);
+  }
+  el.appendChild(list);
+  if (dataIds.length > shown.length) {
+    const more = document.createElement('div');
+    more.className = 'fetch-banner-sub muted';
+    more.textContent = `+${dataIds.length - shown.length} more (see the night cache _meta.json / re-fetch)`;
+    el.appendChild(more);
+  }
 }
 
 // ----- histograms (SVG, no D3 — just a few <rect>s) ------------------------

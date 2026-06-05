@@ -206,6 +206,41 @@ def firstTaskStartByDataId(
     return starts
 
 
+# A gather (step1b) step aggregates the per-detector outputs of its step1a
+# precursor, so it physically *cannot* run for a dataId unless step1a ran
+# first. Seeing gather activity with no step1a for the same dataId is
+# therefore impossible in reality — it means the fetch dropped the step1a
+# lines (exactly the grafana/loki#17270 symptom). The pairing is by
+# pipeline: AOS gather (step1b-aos) consumes aos-worker output; science
+# gather (step1b) consumes sfm output. Both halves of each pair are in the
+# same fetch scope (the night fetch is AOS-only, so only the first pair can
+# ever fire there), so a missing precursor is a true data-loss tell, not an
+# out-of-scope artefact.
+GATHER_PRECURSOR_GROUPS: dict[str, str] = {
+    "step1b-aos": "aos",
+    "step1b": "sfm",
+}
+
+
+def gatherOnlyDataIds(summaries: Iterable[parse.PodSummary]) -> list[int]:
+    """Return dataIds with gather (step1b) activity but no step1a precursor.
+
+    Such a dataId is physically impossible — gather can't run without the
+    step1a output it aggregates — so it's a reliable signal that the fetch
+    silently dropped the precursor's logs. See
+    :data:`GATHER_PRECURSOR_GROUPS`. Returned ascending.
+    """
+    seenByGroup: dict[str, set[int]] = {}
+    for s in summaries:
+        seenByGroup.setdefault(s.group, set()).update(s.expIdsSeen)
+    flagged: set[int] = set()
+    for gatherGroup, precursorGroup in GATHER_PRECURSOR_GROUPS.items():
+        gathered = seenByGroup.get(gatherGroup, set())
+        precursed = seenByGroup.get(precursorGroup, set())
+        flagged |= gathered - precursed
+    return sorted(flagged)
+
+
 def calcZernikesEndByDataId(
     summaries: Iterable[parse.PodSummary],
 ) -> dict[int, dt.datetime]:

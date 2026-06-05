@@ -755,6 +755,7 @@ def _buildNightPayload(state: NightState) -> dict:
     errPod = night.errorsByPod(state.summaries)
     firstStarts = night.firstTaskStartByDataId(state.summaries)
     czEnds = night.calcZernikesEndByDataId(state.summaries)
+    gatherOnly = night.gatherOnlyDataIds(state.summaries)
     shutterCloseByExpId = state.shutterCloseByExpId
 
     # Keep this in lockstep with the prefetch path so the
@@ -808,6 +809,10 @@ def _buildNightPayload(state: NightState) -> dict:
             "calcZernikesEnd": _toJsonable(histCz),
         },
         "failures": [_toJsonable(r) for r in failures],
+        # dataIds with gather (step1b) activity but no step1a precursor —
+        # physically impossible, so a tell that the fetch dropped step1a
+        # lines. The UI surfaces these as a data-completeness warning.
+        "gatherOnly": gatherOnly,
         # dataId (as string) -> curated ConsDB record, for the tooltips on
         # the histogram-bin and failure-table dataId links.
         "exposureInfo": {str(eid): rec for eid, rec in state.exposureInfoByExpId.items()},

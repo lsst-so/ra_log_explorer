@@ -446,3 +446,34 @@ def test_buildHistogram_single_value_no_dataIds_yields_empty_dataIdsByBin() -> N
     h = night.buildHistogram("only", "s", [5.0], dataIds=None)
     assert h.counts == [1]
     assert h.dataIdsByBin == []
+
+
+# ----- gatherOnlyDataIds (impossible gather-with-no-step1a) -----------------
+
+
+def test_gatherOnlyDataIds_flags_step1b_without_step1a() -> None:
+    # dataId 100: aos (step1a) AND step1b-aos (gather) — fine.
+    # dataId 200: step1b-aos only — impossible, gather can't precede step1a.
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100})
+    gather = _stubSummary("step1b-aos-0", "step1b-aos", expIdsSeen={100, 200})
+    assert night.gatherOnlyDataIds([aos, gather]) == [200]
+
+
+def test_gatherOnlyDataIds_empty_when_every_gather_has_step1a() -> None:
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100, 200})
+    gather = _stubSummary("step1b-aos-0", "step1b-aos", expIdsSeen={100, 200})
+    assert night.gatherOnlyDataIds([aos, gather]) == []
+
+
+def test_gatherOnlyDataIds_pairs_by_pipeline() -> None:
+    # Science gather (step1b) needs sfm; AOS gather (step1b-aos) needs aos.
+    # An aos for 300 does NOT satisfy a science step1b for 300.
+    sfmGather = _stubSummary("step1b-0", "step1b", expIdsSeen={300})
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={300})
+    assert night.gatherOnlyDataIds([sfmGather, aos]) == [300]
+
+
+def test_gatherOnlyDataIds_ignores_dataids_with_no_gather() -> None:
+    # A step1a-only dataId is normal (gather may simply not have run yet).
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100})
+    assert night.gatherOnlyDataIds([aos]) == []
