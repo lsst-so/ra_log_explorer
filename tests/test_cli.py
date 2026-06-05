@@ -98,7 +98,7 @@ def test_build_parser_cache_flush_with_yes() -> None:
 
 
 def test_warnIfIncompleteFetch_silent_when_complete(capsys: pytest.CaptureFixture[str]) -> None:
-    cli._warnIfIncompleteFetch({"errors": {}}, "/tmp/cache")
+    cli._warnIfIncompleteFetch({"errors": {}, "incomplete_pods": {}}, "/tmp/cache")
     assert capsys.readouterr().err == ""
 
 
@@ -109,16 +109,29 @@ def test_warnIfIncompleteFetch_shouts_and_lists_failed_pods(
     cli._warnIfIncompleteFetch(meta, "/tmp/cache")
     err = capsys.readouterr().err
     assert "INCOMPLETE FETCH" in err
-    assert "2 pod(s) failed" in err
+    assert "2 pod(s) are missing data" in err
     assert "aos-worker-7" in err and "sfm-runner-1" in err
     assert "--force-refresh" in err
+
+
+def test_warnIfIncompleteFetch_surfaces_soft_incomplete_pods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pod flagged incomplete by the chunker (no hard error) must still
+    trigger the warning — that's the silent-data-loss case."""
+    meta = {"errors": {}, "incomplete_pods": {"aos-worker-0": "burst too dense to split"}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "INCOMPLETE FETCH" in err
+    assert "1 pod(s) are missing data" in err
+    assert "aos-worker-0" in err and "burst too dense" in err
 
 
 def test_warnIfIncompleteFetch_caps_the_pod_list(capsys: pytest.CaptureFixture[str]) -> None:
     meta = {"errors": {f"pod-{i}": "boom" for i in range(20)}}
     cli._warnIfIncompleteFetch(meta, "/tmp/cache")
     err = capsys.readouterr().err
-    assert "20 pod(s) failed" in err
+    assert "20 pod(s) are missing data" in err
     assert "and 8 more" in err  # 20 - 12 shown
 
 
@@ -308,10 +321,12 @@ def test_cmdCacheFlush_without_yes_respects_no_input(
 
 
 def test_main_no_args_dispatches_to_cmdRun(
+    tmpCacheRoot: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Passing no subcommand should land in cmdRun (the default).
-    We stub ``serve`` so we don't actually open a socket."""
+    We stub ``serve`` so we don't actually open a socket. ``tmpCacheRoot``
+    keeps main()'s startup schema-flush off the real user cache."""
     serveCalls: list[tuple] = []
 
     def fakeServe(host: str, port: int, ctx: cli.ServerContext) -> None:

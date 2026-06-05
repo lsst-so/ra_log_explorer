@@ -128,19 +128,24 @@ window.showRange = function showRange(indexSummary) {
 
 // ----- incomplete-fetch banner (shared by explore + night views) -----------
 //
-// A fetch is "complete" only when every pod's logs came back in full. With
-// logcli --limit=0 the one way to fall short is a per-pod failure (timeout /
-// transient 5xx), recorded in meta.errors. When that happens the window is
+// A fetch is "complete" only when every pod's logs came back in full. There
+// are two ways to fall short, both flagged here: a hard per-pod failure
+// (timeout / transient 5xx) in meta.errors, or a pod whose chunks couldn't be
+// reconciled to a lossless single-batch fetch in meta.incomplete_pods (data
+// the Loki #17270 bug may have dropped). When that happens the window is
 // missing data — and for the night view that silently biases the Δshutter
 // histograms — so we shout rather than letting a partial window pass for the
 // whole night. `summary.meta.fetchComplete` is the explicit signal; we also
-// treat any non-empty meta.errors as incomplete for older payloads.
+// treat either non-empty map as incomplete for robustness.
 function renderFetchBanner(bannerEl, summary) {
   if (!bannerEl) return;
   bannerEl.innerHTML = '';
   const meta = summary && summary.meta;
   const errors = (meta && meta.errors) || {};
-  const pods = Object.keys(errors);
+  const incomplete = (meta && meta.incomplete_pods) || {};
+  // Merge both failure modes; a hard error wins over a soft shortfall.
+  const problems = Object.assign({}, incomplete, errors);
+  const pods = Object.keys(problems);
   const complete = meta ? (meta.fetchComplete !== false && pods.length === 0) : true;
   if (complete) {
     bannerEl.hidden = true;
@@ -151,7 +156,7 @@ function renderFetchBanner(bannerEl, summary) {
 
   const title = document.createElement('div');
   title.className = 'fetch-banner-title';
-  title.textContent = `⚠ Incomplete fetch — ${pods.length} of ${total} pods failed to download`;
+  title.textContent = `⚠ Incomplete fetch — ${pods.length} of ${total} pods missing data`;
   bannerEl.appendChild(title);
 
   const sub = document.createElement('div');
@@ -171,7 +176,7 @@ function renderFetchBanner(bannerEl, summary) {
     name.className = 'mono';
     name.textContent = pod;
     li.appendChild(name);
-    li.appendChild(document.createTextNode(` — ${errors[pod]}`));
+    li.appendChild(document.createTextNode(` — ${problems[pod]}`));
     list.appendChild(li);
   }
   if (pods.length > shown.length) {

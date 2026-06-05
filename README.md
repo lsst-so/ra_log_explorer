@@ -373,6 +373,12 @@ python3 -m ra_log_explorer.cli cache flush
 Or just `rm -rf ~/.cache/ra_log_explorer`. The cache is purely a
 performance accelerator; flushing it costs you nothing but a re-fetch.
 
+You rarely need to do this by hand: when an upgrade changes *how* logs
+are fetched, the tool bumps an internal cache-schema version and flushes
+the whole cache automatically on the next start (printing a one-line
+notice), so a stale snapshot from an older version is never re-served.
+The first loads after such an upgrade re-fetch and so are slower.
+
 ## All CLI options
 
 ```
@@ -438,13 +444,16 @@ file is empty, that's Loki returning nothing for the window — usually a
 transient series-index gap. Re-run with `--force-refresh` to pull again.
 
 **Red "Incomplete fetch" banner (or an `INCOMPLETE FETCH` line on the
-CLI)** — one or more pods failed to download in full (a `logcli`
-timeout, or a transient 5xx from Loki), so the window you're looking at
-is missing data. This matters most in night mode, where missing pods
+CLI)** — one or more pods are missing data, so the window you're looking
+at is incomplete. This matters most in night mode, where missing pods
 silently bias the Δshutter histograms. The banner lists the affected
-pods; re-run with `--force-refresh` to retry. (The tool never caps a
-pod's log count — it fetches every line with `logcli --limit=0` — so an
-incomplete fetch is always a fetch *failure*, never a silent truncation.)
+pods; re-run with `--force-refresh` to retry. There are two causes, both
+flagged the same way: a hard `logcli` failure (timeout / transient 5xx),
+or a pod whose logs couldn't be verified complete. (The tool fetches
+every line — it works around a Loki bug that silently drops lines on wide
+busy windows by fetching in verified single-batch time-chunks — so it
+either gets the whole window or tells you which pods it couldn't, never a
+silent truncation.)
 
 **Cache hit when you didn't expect one** — the tool reuses any
 *superset* of the requested window. If you specifically want to refetch,

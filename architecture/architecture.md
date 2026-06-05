@@ -124,7 +124,7 @@ Sibling docs:
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
 | `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant. |
-| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache (exact / superset reuse), the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
+| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table. No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
@@ -307,13 +307,18 @@ shapes:
 every pod that emitted in the window.
 
 `meta` is the fetch's `_meta.json` verbatim. Beyond `cacheReuse`, the
-fields the UI cares about are `fetchComplete` (bool — `false` iff any pod
-failed to download in full) and `errors` (`{pod: message}` for the
-failures). When `fetchComplete` is `false` the explore and night views
-render a loud banner (`renderFetchBanner`); an incomplete night fetch
-otherwise silently biases the Δshutter histograms. `fetchSchemaVersion`
-gates cache reuse (see [caching.md](caching.md)). This same `meta` block
-appears in the night and range payloads below.
+fields the UI cares about are `fetchComplete` (bool) and the two
+fall-short maps it summarises: `errors` (`{pod: message}` — a hard
+logcli failure) and `incomplete_pods` (`{pod: reason}` — a pod whose
+chunks couldn't be verified lossless, i.e. data grafana/loki#17270 may
+have dropped). `fetchComplete` is `false` iff either map is non-empty;
+the explore and night views then render a loud banner (`renderFetchBanner`,
+which merges both maps), since an incomplete night fetch otherwise
+silently biases the Δshutter histograms. `meta` also carries `pod_bytes`,
+`pod_lines`, and `pod_expected` (the `count_over_time` oracle per pod) for
+sanity-checking. `fetchSchemaVersion` gates cache reuse (see
+[caching.md](caching.md)). This same `meta` block appears in the night
+and range payloads below.
 
 `looksTruncatedEnd` is `true` for sfm/aos/step1b/step1b-aos/backlog
 pods that touched this expId but did NOT emit a canonical finish event

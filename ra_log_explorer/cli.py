@@ -56,6 +56,7 @@ from .config import (
 from .exposureTimes import TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    ensureCacheSchemaCurrent,
     fetchAll,
     humanBytes,
     stderrProgress,
@@ -127,21 +128,27 @@ def _resolveSite(args: argparse.Namespace) -> Site:
 def _warnIfIncompleteFetch(meta: dict, cacheDir: object) -> None:
     """Print a loud stderr warning if the fetch missed any pod's logs.
 
-    ``--limit=0`` means the only way a window comes back short is a per-pod
-    logcli failure (recorded in ``meta['errors']``). Such a window is
-    missing data and easy to mistake for complete, so we make it obvious.
+    A window comes back short in two ways, both flagged here: a hard
+    per-pod logcli failure (``meta['errors']``) or a pod whose chunks
+    couldn't be reconciled to a lossless single-batch fetch
+    (``meta['incomplete_pods']`` — i.e. data the Loki #17270 bug may have
+    eaten). Either way the logs are missing data and easy to mistake for
+    complete, so we make it obvious.
     """
     errors = meta.get("errors") or {}
-    if not errors:
+    incomplete = meta.get("incomplete_pods") or {}
+    # Merge both failure modes for a single, ordered report. A pod that hard-
+    # failed takes precedence over a soft reconciliation shortfall.
+    problems = {**incomplete, **errors}
+    if not problems:
         return
-    nFailed = len(errors)
+    nFailed = len(problems)
     print(
-        f"\n  *** INCOMPLETE FETCH: {nFailed} pod(s) failed to download — "
-        "the logs are MISSING DATA and may be misleading. ***",
+        f"\n  *** INCOMPLETE FETCH: {nFailed} pod(s) are missing data — " "the logs may be misleading. ***",
         file=sys.stderr,
     )
-    for pod, err in list(errors.items())[:12]:
-        print(f"      - {pod}: {err}", file=sys.stderr)
+    for pod, why in list(problems.items())[:12]:
+        print(f"      - {pod}: {why}", file=sys.stderr)
     if nFailed > 12:
         print(f"      ... and {nFailed - 12} more (see {cacheDir}/_meta.json)", file=sys.stderr)
     print("  Re-run with --force-refresh to retry.\n", file=sys.stderr)
@@ -381,6 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     p = build_parser()
     args = p.parse_args(argv)
+    # Reconcile the on-disk cache to the current schema before doing anything.
+    # If CACHE_SCHEMA_VERSION was bumped, this flushes the whole tree once, up
+    # front, so no stale (possibly line-dropping) data is read and the user
+    # sees the re-fetch cost explicitly rather than one slow load at a time.
+    ensureCacheSchemaCurrent()
     if getattr(args, "fn", None) is None:
         # No subcommand: default to run (home mode if exposure args missing).
         args.fn = cmdRun

@@ -22,16 +22,37 @@ A cache hit re-uses the existing files iff:
 If the window extends into the future, we always re-fetch — otherwise we
 would silently return a snapshot from before the window finished.
 
+Schema-version flush
+--------------------
+On top of the per-cache ``fetchSchemaVersion`` guard, bumping
+``CACHE_SCHEMA_VERSION`` triggers a one-shot flush of the *entire* cache
+tree (see :func:`ensureCacheSchemaCurrent`, called once at process
+start). The per-cache guard alone would re-fetch stale windows lazily,
+one surprise-slow load at a time; the flush makes the cost explicit and
+up front, and guarantees no data written by an older (possibly
+line-dropping) fetch path can survive anywhere on disk. A sentinel file
+at the cache root records the version the cache was built with.
+
 Completeness
 ------------
-Each per-pod query uses logcli's ``--limit=0`` ("fetch all entries"),
-which paginates internally until the stream is exhausted — there is no
-line cap to silently tail-drop the busiest pods. The *only* way a fetch
-can come up short is a per-pod logcli failure (timeout, transient 5xx),
-which is recorded in ``_meta.json``'s ``errors`` map; ``fetchComplete``
-is ``True`` iff that map is empty. Callers surface an incomplete fetch
-loudly rather than letting the user mistake a partial window for the
-whole night.
+``logcli`` silently drops log lines on wide, busy windows (Loki bug
+grafana/loki#17270: across a multi-stream response it advances the next
+batch's cursor by the *global* max timestamp, so a busier stream's tail
+falls into a 1 ns dedup gap and vanishes). The loss only happens when a
+query *paginates* — i.e. when some batch comes back full and logcli asks
+for another. So each per-pod fetch is built entirely out of single-batch
+queries: we size each time-chunk (presized by ``count_over_time``, the
+exact server-side oracle) so it returns fewer than one ``--batch`` worth
+of lines, and trust a chunk only when ``got < BATCH`` proves it completed
+in a single, un-paginated request. Chunks that still fill a batch are
+discarded and re-fetched as time-split halves until every piece fits, or
+— at the :data:`MIN_SPLIT_S` floor — flagged. See :func:`_fetchOnePod`.
+
+A fetch is therefore incomplete in two distinct ways, both recorded in
+``_meta.json`` and surfaced loudly downstream: a hard per-pod ``logcli``
+failure (``errors``), or a pod whose chunks could not be reconciled to a
+single-batch guarantee (``incomplete_pods``). ``fetchComplete`` is
+``True`` iff both maps are empty.
 
 Superset reuse: when the requested window has no exact match but is fully
 contained within some other cached window for the same (cluster, namespace),
@@ -45,30 +66,74 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import math
 import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Callable
 
 from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
 
 # Bumped whenever a change to how we fetch makes older caches untrustworthy.
 # v1 (implicit, no field) capped each pod at 50_000 lines and so silently
-# tail-dropped the busiest pods on a full night; v2 fetches every line
-# (logcli --limit=0). A cache without this exact value is re-fetched rather
-# than re-served, so no truncated v1 snapshot can leak into the UI.
-CACHE_SCHEMA_VERSION = 2
+# tail-dropped the busiest pods on a full night; v2 fetched with logcli
+# --limit=0 but still silently dropped lines on wide busy windows (Loki bug
+# grafana/loki#17270); v3 fetches in count-presized single-batch chunks and
+# verifies completeness structurally. Bumping this value flushes the whole
+# cache (see ``ensureCacheSchemaCurrent``) and, as a second line of defence,
+# any individual cache lacking this exact value is re-fetched, not re-served.
+CACHE_SCHEMA_VERSION = 3
 
-# Per-pod query timeout. logcli --limit=0 paginates the whole window, so a
-# very chatty pod over a full night can take a while; this is generous on
-# purpose. The series listing keeps the shorter default in _run_logcli.
+# Sentinel at the cache root recording the schema version its contents were
+# built with. A mismatch (or its absence) means a version bump happened, so
+# the whole tree is flushed before anything is read. Lives at the root (not
+# per-cache) precisely so the flush can be a single cheap check.
+CACHE_SCHEMA_SENTINEL = "_cache_schema_version.txt"
+
+# logcli's per-request batch size, set equal to the cluster's Loki
+# ``max_entries_limit_per_query`` (≈5000 on yagan/manke). Two things hinge
+# on this number, and both break if it *exceeds* the true server cap:
+#   * logcli paginates in batches of this size. A batch that comes back
+#     *full* (== this many entries) is the only thing that makes logcli ask
+#     for another batch — and it's that next-batch cursor advance where
+#     grafana/loki#17270 drops lines. So a fetch whose total ``got`` is
+#     *fewer* than this completed in one un-paginated request and cannot
+#     have lost anything.
+#   * if we asked for a batch larger than the server cap, a full server
+#     response (cap entries < our batch) would look non-full and logcli
+#     would stop early — silently truncating. So never raise this above the
+#     real cap; lowering it only costs extra (still-correct) chunking.
+SERVER_QUERY_CAP = 5000
+
+# Target lines per presized chunk. Comfortably below SERVER_QUERY_CAP so the
+# single-batch fetch has headroom for log-rate non-uniformity within the
+# chunk and still comes back ``got < SERVER_QUERY_CAP`` (i.e. trusted).
+CHUNK_TARGET_LINES = 4000
+
+# Floor on how finely we split a window in time. >SERVER_QUERY_CAP lines from
+# one pod inside this span is an implausible burst we cannot fetch in a
+# single batch; rather than recurse forever we keep what we got and flag the
+# pod incomplete. Generous: real pods average single-digit lines/second.
+MIN_SPLIT_S = 1.0
+
+# Cap on how many sub-windows one split produces, so a pathological count
+# can't fan out into hundreds of children at once; deeper recursion handles
+# the rest.
+MAX_SPLIT_PARTS = 60
+
+# Per-pod query timeout. A presized chunk is bounded (≤ SERVER_QUERY_CAP
+# lines) so it returns quickly, but a very chatty pod over a full night
+# fans out into many chunks; this budget covers the whole per-pod tree. The
+# series listing and the count_over_time oracle keep shorter timeouts.
 PER_POD_TIMEOUT_S = 1800.0
+COUNT_TIMEOUT_S = 180.0
 
 PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
@@ -96,6 +161,58 @@ RANGE_NAME = "_range.txt"
 
 class FetchError(RuntimeError):
     pass
+
+
+def ensureCacheSchemaCurrent() -> int:
+    """Flush the entire cache tree iff it was built by a different schema.
+
+    Call this once at process start. A sentinel file at the cache root
+    records the ``CACHE_SCHEMA_VERSION`` its contents were written with;
+    when that doesn't match (including the first run after an upgrade,
+    where the sentinel is absent), every cached window is removed and the
+    sentinel rewritten. Returns the number of top-level entries deleted
+    (0 when already current or empty), so the caller can tell the user why
+    the next load is slow.
+
+    This is deliberately heavier-handed than the per-cache
+    ``fetchSchemaVersion`` guard: that guard re-fetches stale windows
+    lazily, one surprise-slow load at a time, and leaves untrusted bytes
+    on disk in the meantime. The flush makes the cost explicit and up
+    front and guarantees nothing written by an older (possibly
+    line-dropping) fetch path survives anywhere.
+    """
+    root = cache_root()
+    sentinel = root / CACHE_SCHEMA_SENTINEL
+    current = str(CACHE_SCHEMA_VERSION)
+    try:
+        recorded = sentinel.read_text().strip() if sentinel.exists() else None
+    except OSError:
+        recorded = None
+    if recorded == current:
+        return 0
+    removed = 0
+    for child in root.iterdir():
+        if child.name == CACHE_SCHEMA_SENTINEL:
+            continue
+        try:
+            if child.is_dir():
+                shutil.rmtree(child)
+            else:
+                child.unlink()
+            removed += 1
+        except OSError:
+            pass  # best-effort; the per-cache guard still refuses stale meta
+    try:
+        sentinel.write_text(current + "\n")
+    except OSError:
+        pass
+    if removed:
+        print(
+            f"Cache schema changed (was {recorded or 'unversioned'}, now {current}); "
+            f"flushed {removed} cached window(s). They will re-fetch on demand.",
+            file=sys.stderr,
+        )
+    return removed
 
 
 def _run_logcli(
@@ -181,31 +298,97 @@ def listPods(spec: FetchSpec) -> list[str]:
     return sorted(pods)
 
 
-def _fetchOnePod(
-    spec: FetchSpec,
-    pod: str,
-    outPath: Path,
-) -> tuple[str, int]:
-    """Fetch *all* logs for a single pod; return (pod, bytes_written).
+def _fmtLogcliTime(t: dt.datetime) -> str:
+    """Format a datetime for logcli ``--from``/``--to``/``--now``.
 
-    ``--limit=0`` tells logcli to fetch every entry in the window,
-    paginating internally (correct boundary handling, no dedup gaps)
-    until the stream is exhausted. There is intentionally no line cap:
-    a cap would silently tail-drop the busiest pods, which is precisely
-    the bug this avoids. Output is streamed to ``outPath`` so a pod that
-    emits millions of lines can't blow up memory.
+    RFC3339 with a ``Z`` suffix (microsecond precision). logcli honours the
+    explicit ``Z`` as UTC — matching how ``spec.fromIso``/``toIso`` are
+    produced upstream, so split-window boundaries stay consistent with the
+    requested window.
+    """
+    return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
+
+
+def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime) -> int | None:
+    """Return how many lines this pod emitted in ``[fromT, toT)``, or None.
+
+    Uses ``sum(count_over_time(...))`` evaluated at ``--now=toT`` over a
+    range selector spanning the window. count_over_time is a *server-side*
+    aggregation — it never paginates entries, so unlike a log query it is
+    exact and immune to grafana/loki#17270. It is the oracle we presize
+    chunks by (and record for transparency).
+
+    Best-effort: any failure (logcli error, unparseable output) returns
+    ``None``. Correctness never depends on this — the single-batch
+    ``got < SERVER_QUERY_CAP`` check in :func:`_fetchWindowInto` is what
+    actually guarantees no lines were dropped; the count only makes the
+    chunking efficient and gives humans a number to sanity-check against.
+    """
+    rangeNs = int((toT - fromT).total_seconds() * 1e9)
+    if rangeNs <= 0:
+        return 0
+    matcher = _matcher(spec, pod=pod)
+    query = f"sum(count_over_time({matcher}[{rangeNs}ns]))"
+    try:
+        out = _run_logcli(
+            spec,
+            ["instant-query", query, f"--now={_fmtLogcliTime(toT)}", "-o", "jsonl"],
+            timeout=COUNT_TIMEOUT_S,
+        )
+    except FetchError:
+        return None
+    return _parseCountOutput(out)
+
+
+def _parseCountOutput(out: bytes) -> int | None:
+    """Pull the integer sample value out of an instant-query ``-o jsonl``
+    result, tolerant of the exact shape logcli emits.
+
+    A ``sum(...)`` instant query yields a single vector sample whose value
+    is ``[<ts>, "<count>"]``. We sum any such samples we can find (a bare
+    ``count_over_time`` without ``sum`` would emit one per stream). Returns
+    ``None`` if nothing parses — see :func:`_countOverTime` on why that is
+    safe.
+    """
+    total = 0
+    found = False
+    for line in out.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        value = obj.get("value") if isinstance(obj, dict) else None
+        # Loki vector sample: value == [<unixSeconds>, "<count>"].
+        if isinstance(value, list) and len(value) == 2:
+            try:
+                total += int(float(value[1]))
+                found = True
+            except (TypeError, ValueError):
+                continue
+    return total if found else None
+
+
+def _queryWindowToFile(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, outPath: Path) -> int:
+    """Fetch ``[fromT, toT)`` for one pod into ``outPath``; return line count.
+
+    A single ``query`` with ``--batch=SERVER_QUERY_CAP``. ``--forward`` =>
+    ascending output; ``-o jsonl`` => one Loki API JSON object per line
+    (keeps labels, esp. detected_level, intact). The caller decides whether
+    to trust the result based on the returned count vs the batch size.
     """
     matcher = _matcher(spec, pod=pod)
-    # `--forward` => time-ordered ascending output; `-o jsonl` => one Loki API
-    # JSON object per line which keeps labels (esp. detected_level) intact.
     _run_logcli(
         spec,
         [
             "query",
             matcher,
-            f"--from={spec.fromIso}",
-            f"--to={spec.toIso}",
+            f"--from={_fmtLogcliTime(fromT)}",
+            f"--to={_fmtLogcliTime(toT)}",
             "--limit=0",
+            f"--batch={SERVER_QUERY_CAP}",
             "-o",
             "jsonl",
             "--forward",
@@ -213,7 +396,149 @@ def _fetchOnePod(
         timeout=PER_POD_TIMEOUT_S,
         stdoutPath=outPath,
     )
-    return pod, outPath.stat().st_size
+    return _countLines(outPath)
+
+
+def _countLines(path: Path) -> int:
+    """Count newline-terminated lines in a file without loading it whole."""
+    n = 0
+    with open(path, "rb") as fh:
+        while True:
+            chunk = fh.read(1 << 20)
+            if not chunk:
+                break
+            n += chunk.count(b"\n")
+    return n
+
+
+def _appendFileInto(src: Path, dst: BinaryIO) -> None:
+    """Append ``src``'s bytes to the already-open binary file ``dst``."""
+    with open(src, "rb") as fh:
+        shutil.copyfileobj(fh, dst)
+
+
+@dataclass
+class _PodFetch:
+    """Outcome of fetching one pod's logs across all its chunks."""
+
+    pod: str
+    nbytes: int
+    lines: int
+    expected: int | None  # count_over_time oracle for the whole pod window
+    complete: bool
+    reason: str  # "" when complete; else why a chunk could not be reconciled
+
+
+def _fetchOnePod(spec: FetchSpec, pod: str, outPath: Path) -> _PodFetch:
+    """Fetch *all* of one pod's logs into ``outPath`` without dropping lines.
+
+    logcli silently loses entries on wide, busy windows (grafana/loki#17270,
+    a cross-stream cursor-advance bug that only bites when a query
+    paginates). We sidestep it by building the output entirely from
+    *single-batch* queries: presize each time-chunk by the count_over_time
+    oracle, fetch it in one ``--batch`` request, and trust it only when
+    ``got < SERVER_QUERY_CAP`` proves it didn't paginate. Anything bigger is
+    split in time and retried; see :func:`_fetchWindowInto`.
+
+    Output stays globally time-ascending (chunks are processed left→right,
+    each ``--forward``) so the parser's ordering assumption still holds.
+    """
+    fromT = _parseIso(spec.fromIso)
+    toT = _parseIso(spec.toIso)
+    expected = _countOverTime(spec, pod, fromT, toT)
+    with open(outPath, "wb") as fh:
+        lines, complete, reason = _fetchWindowInto(spec, pod, fromT, toT, fh, expected)
+    return _PodFetch(
+        pod=pod,
+        nbytes=outPath.stat().st_size,
+        lines=lines,
+        expected=expected,
+        complete=complete,
+        reason=reason,
+    )
+
+
+def _fetchWindowInto(
+    spec: FetchSpec,
+    pod: str,
+    fromT: dt.datetime,
+    toT: dt.datetime,
+    fh: BinaryIO,
+    expected: int | None,
+) -> tuple[int, bool, str]:
+    """Fetch ``[fromT, toT)`` for one pod, appending to open file ``fh``.
+
+    Returns ``(linesWritten, complete, reason)``. ``expected`` is the
+    count_over_time oracle for *this* window (``None`` => look it up). The
+    invariant that makes this lossless: a window is only trusted when its
+    single fetch returns fewer than one full batch of lines, which means
+    logcli never advanced a batch cursor and so #17270 never fired.
+    """
+    if expected is None:
+        expected = _countOverTime(spec, pod, fromT, toT)
+    if expected == 0:
+        return 0, True, ""  # oracle says empty — no query needed
+    span = (toT - fromT).total_seconds()
+    # Oracle already proves this won't fit one batch: split up front rather
+    # than waste a fetch we know will paginate (and be discarded).
+    if expected is not None and expected >= SERVER_QUERY_CAP and span > MIN_SPLIT_S:
+        return _splitWindowInto(spec, pod, fromT, toT, fh, expected)
+
+    # Chunk temps go in the system temp dir, NOT the pods dir: a crash mid-
+    # fetch must never strand a ".chunk-*.jsonl" beside the real pod files,
+    # where the parser (which globs pods/*.jsonl) would mistake it for a pod.
+    # We append via copyfileobj, so the temp needn't share a filesystem.
+    fd, tmpName = tempfile.mkstemp(prefix="ra-log-chunk-", suffix=".jsonl")
+    os.close(fd)  # mkstemp opens it; _queryWindowToFile reopens to write
+    tmpPath = Path(tmpName)
+    try:
+        got = _queryWindowToFile(spec, pod, fromT, toT, tmpPath)
+        if got < SERVER_QUERY_CAP:
+            _appendFileInto(tmpPath, fh)  # one un-paginated batch — trusted
+            return got, True, ""
+        if span <= MIN_SPLIT_S:
+            # >SERVER_QUERY_CAP lines from one pod in ≤MIN_SPLIT_S: an
+            # implausible burst we can't fetch losslessly in one batch. Keep
+            # what we got but flag it — never silently pretend it's whole.
+            _appendFileInto(tmpPath, fh)
+            return got, False, f"{got}+ lines in {span:.3f}s exceeds one batch and can't be split finer"
+    finally:
+        tmpPath.unlink(missing_ok=True)
+    # got >= cap and we have room to split: the count under-counted (or was
+    # unavailable). Discard the untrusted fetch and recurse on halves.
+    return _splitWindowInto(spec, pod, fromT, toT, fh, max(expected or 0, got))
+
+
+def _splitWindowInto(
+    spec: FetchSpec,
+    pod: str,
+    fromT: dt.datetime,
+    toT: dt.datetime,
+    fh: BinaryIO,
+    expected: int,
+) -> tuple[int, bool, str]:
+    """Split ``[fromT, toT)`` into equal-time sub-windows and fetch each.
+
+    The half-open split tiles the window exactly (``[a, mid) ∪ [mid, b)``),
+    so no entry is dropped or duplicated at a boundary. The number of parts
+    is sized from the oracle to aim for ~``CHUNK_TARGET_LINES`` each; any
+    sub-window that still overflows gets split again by :func:`_fetchWindowInto`.
+    """
+    span = (toT - fromT).total_seconds()
+    nParts = 2
+    if expected > 0:
+        nParts = min(MAX_SPLIT_PARTS, max(2, math.ceil(expected / CHUNK_TARGET_LINES)))
+    edges = [fromT + dt.timedelta(seconds=span * i / nParts) for i in range(nParts + 1)]
+    total = 0
+    complete = True
+    reason = ""
+    for a, b in zip(edges[:-1], edges[1:]):
+        ln, ok, why = _fetchWindowInto(spec, pod, a, b, fh, expected=None)
+        total += ln
+        if not ok:
+            complete = False
+            reason = reason or why
+    return total, complete, reason
 
 
 def _parseIso(s: str) -> dt.datetime:
@@ -352,22 +677,32 @@ def fetchAll(
     podsListPath.write_text("\n".join(pods) + "\n")
 
     perPodBytes: dict[str, int] = {}
+    perPodLines: dict[str, int] = {}
+    perPodExpected: dict[str, int] = {}
     totalBytes = 0
+    # Two distinct ways a fetch falls short, both surfaced loudly downstream:
+    #   errors          — a hard logcli failure (timeout, transient 5xx)
+    #   incompletePods  — chunks that couldn't be reconciled to a single-batch
+    #                     guarantee, i.e. data #17270 may have eaten
     errors: dict[str, str] = {}
+    incompletePods: dict[str, str] = {}
 
     with ThreadPoolExecutor(max_workers=spec.workers) as ex:
         futures = {ex.submit(_fetchOnePod, spec, pod, podsDir / f"{pod}.jsonl"): pod for pod in pods}
         for i, fut in enumerate(as_completed(futures), 1):
             pod = futures[fut]
             try:
-                _, nbytes = fut.result()
-                perPodBytes[pod] = nbytes
-                totalBytes += nbytes
+                res = fut.result()
+                perPodBytes[pod] = res.nbytes
+                perPodLines[pod] = res.lines
+                if res.expected is not None:
+                    perPodExpected[pod] = res.expected
+                totalBytes += res.nbytes
+                if not res.complete:
+                    incompletePods[pod] = res.reason or "chunks could not be reconciled"
             except Exception as e:  # noqa: BLE001 - collect, don't bail
-                # A pod that errored is the only way this fetch can be
-                # incomplete (--limit=0 otherwise gets every line). Record
-                # it so the UI/CLI can shout. A streamed query may have left
-                # a partial file behind; count whatever bytes landed.
+                # Hard per-pod failure. A streamed query may have left a
+                # partial file behind; count whatever bytes landed.
                 errors[pod] = str(e)
                 partialFile = podsDir / f"{pod}.jsonl"
                 partialBytes = partialFile.stat().st_size if partialFile.exists() else 0
@@ -385,10 +720,15 @@ def fetchAll(
         "pod_count": len(pods),
         "total_bytes": totalBytes,
         "pod_bytes": perPodBytes,
+        "pod_lines": perPodLines,
+        # count_over_time oracle per pod (when available) — lets a human (or
+        # test) sanity-check lines-written against what Loki says was there.
+        "pod_expected": perPodExpected,
         "errors": errors,
-        # True iff every pod's logs were fetched in full. Any per-pod error
-        # means the window is missing data — surfaced loudly downstream.
-        "fetchComplete": not errors,
+        "incomplete_pods": incompletePods,
+        # True iff every pod's logs were fetched in full: no hard failure and
+        # every chunk proved lossless. Either map non-empty => missing data.
+        "fetchComplete": not errors and not incompletePods,
         "window_in_past": windowInPast,
         "fromCache": False,
         "cacheReuse": "none",

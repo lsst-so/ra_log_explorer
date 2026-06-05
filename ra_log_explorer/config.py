@@ -167,11 +167,12 @@ class FetchSpec:
     ``.*aos.*``). ``None`` means no filter, i.e. fetch every pod that
     logged anything in the window.
 
-    There is deliberately no per-pod line cap: the per-pod query uses
-    logcli's ``--limit=0`` ("fetch all entries") so a window — especially
-    a full night — is always retrieved in its entirety. A cap would
-    silently tail-drop the busiest pods, which is exactly the failure
-    this tool exists to avoid. See :func:`fetch._fetchOnePod`.
+    There is deliberately no per-pod line cap. A naïve ``--limit=0`` does
+    *not* suffice — logcli silently drops lines on wide, busy windows
+    (grafana/loki#17270). Instead each pod is fetched in count-presized,
+    single-batch time-chunks whose completeness is verified structurally,
+    so a window — especially a full night — is retrieved in its entirety
+    or flagged where it can't be. See :func:`fetch._fetchOnePod`.
     """
 
     lokiAddr: str

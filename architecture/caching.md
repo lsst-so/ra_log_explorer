@@ -9,6 +9,8 @@ repeat runs into instant loads.
 
 ```
 ~/.cache/ra_log_explorer/                          ← override with $RA_LOG_EXPLORER_CACHE
+├── _cache_schema_version.txt                      ← schema the cache was built with; a
+│                                                    mismatch flushes the whole tree at startup
 ├── settings.json                                  ← server-side settings (maxCacheBytes)
 ├── exposure-times/                                ← persistent dataId → ConsDB exposure record
 │   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
@@ -16,8 +18,9 @@ repeat runs into instant loads.
 │                                                    can't return the wrong record
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
-        ├── _meta.json                             ← FetchSpec + fetchSchemaVersion +
-        │                                            per-pod byte counts + fetchComplete
+        ├── _meta.json                             ← FetchSpec + fetchSchemaVersion + per-pod
+        │                                            byte/line counts + count_over_time oracle +
+        │                                            fetchComplete + errors + incomplete_pods
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
@@ -54,6 +57,32 @@ the cluster/namespace tree, so they survive `rm -rf
 ~/.cache/ra_log_explorer/<cluster>` but disappear with a full root
 wipe.
 
+## Schema-version flush
+
+`CACHE_SCHEMA_VERSION` (in `fetch.py`) is bumped whenever a change to
+*how* we fetch makes older caches untrustworthy. On top of the per-cache
+`fetchSchemaVersion` guard (below), bumping it triggers a one-shot flush
+of the **entire** cache tree:
+
+- `_cache_schema_version.txt` at the cache root records the version the
+  contents were written with.
+- `ensureCacheSchemaCurrent()` runs once at process start (from
+  `cli.main()`). If the sentinel is missing or doesn't match the current
+  version, it deletes every top-level entry under the root (the
+  cluster trees, plus `exposure-times/`) and rewrites the sentinel,
+  printing a one-line notice so the user understands why the next loads
+  re-fetch.
+
+This is deliberately heavier than the per-cache guard, which only
+re-fetches stale windows lazily — one surprise-slow load at a time —
+and leaves untrusted bytes on disk in between. The flush makes the cost
+explicit and up front and guarantees nothing written by an older
+(possibly line-dropping) fetch path survives anywhere. The version
+history: v1 (implicit) capped each pod at 50 000 lines; v2 used
+`--limit=0` but still silently dropped lines on wide busy windows
+(grafana/loki#17270); v3 fetches in count-presized single-batch chunks
+(see *Completeness* below).
+
 ## Cache hit policy
 
 `fetchAll(spec, ...)` decides in order:
@@ -84,8 +113,8 @@ wipe.
 
 4. Otherwise **fetch fresh**: create the requested directory, write
    `.partial`, list pods via `logcli series` (honouring `podRegex`
-   if set), fetch each pod in parallel with `--limit=0 --forward`
-   (every line, no cap — see *Completeness* below), write
+   if set), fetch each pod in parallel in count-presized single-batch
+   chunks (every line, verified — see *Completeness* below), write
    `_meta.json`, remove `.partial`. Returns the requested directory
    with `cacheReuse = "none"`.
 
@@ -113,31 +142,68 @@ nothing is mis-attributed.
 ## Completeness (never silently truncate)
 
 A fetch must return the **whole** window — for a full night, every line
-of every pod. There is deliberately no per-pod line cap: each per-pod
-query uses logcli's `--limit=0` ("fetch all entries"), which paginates
-internally until the stream is exhausted. (The old behaviour capped each
-pod at 50 000 lines with `--forward`, which silently *tail-dropped* the
-busiest pods — so a busy night's late exposures lost their early
-processing and the night histograms were biased late. That bug is what
-`--limit=0` fixes.) Output is streamed straight to the pod's `.jsonl`
-file so a pathologically chatty pod can't exhaust memory.
+of every pod. A naïve `logcli query --limit=0` does **not** achieve this:
+it silently drops lines on wide, busy windows (grafana/loki#17270 — when
+a response spans multiple Loki streams, logcli advances the next batch's
+cursor by the *global* max timestamp, so a busier stream's tail falls
+into a 1 ns dedup gap and vanishes). A single `{pod=…}` is already ≥2
+streams by `detected_level`, so a 24 h AOS night came back ~9 % short
+while still reporting itself complete. (The even-older behaviour capped
+each pod at 50 000 lines, tail-dropping the busiest pods outright.)
 
-The only way a fetch can now come up short is a per-pod logcli failure
-(timeout, transient 5xx). Each such failure is recorded in
-`_meta.json`'s `errors` map (`{pod: message}`), and `fetchComplete` is
-`True` iff that map is empty. A partial download left behind by a
-streamed query that died mid-flight is kept (its bytes counted) but the
-pod is still flagged errored. Consumers surface an incomplete fetch
-loudly rather than letting a partial window pass for the whole night:
+The fix turns on one structural fact: **the loss only happens when a
+query paginates** — i.e. when some batch comes back *full* and logcli
+asks for another. So `_fetchOnePod` builds each pod's output entirely out
+of *single-batch* queries:
+
+- **Presize by the oracle.** `count_over_time` is a server-side
+  aggregation — it never paginates entries, so it is exact and immune to
+  the bug. `_countOverTime` uses it to learn how many lines a window
+  holds and split the time range into chunks targeting
+  `CHUNK_TARGET_LINES` (< the batch size) each.
+- **Fetch one batch and verify structurally.** Each chunk is fetched with
+  `--batch=SERVER_QUERY_CAP` (set equal to the cluster's
+  `max_entries_limit_per_query`). A chunk is trusted **only** when
+  `got < SERVER_QUERY_CAP`: that proves it completed in a single
+  un-paginated request, so the cursor-advance bug never fired. The
+  oracle is just an accelerator — correctness rests on this check, not on
+  the count being right (if the count is unavailable the chunker falls
+  back to blind time-bisection and is still correct).
+- **Split and retry.** A chunk that comes back *full* (`got ≥` the cap)
+  is discarded untrusted and re-fetched as two half-open time halves
+  (`[a, mid) ∪ [mid, b)` tiles exactly — no gap, no dup). This recurses
+  until every piece fits one batch, keeping the output globally
+  time-ascending so the parser's ordering assumption holds.
+- **Floor.** If a window is already `≤ MIN_SPLIT_S` wide and *still*
+  overflows a batch (an implausible >5000-line burst in ≤1 s), it can't
+  be fetched losslessly; we keep what we got and flag the pod rather than
+  lie.
+
+A fetch can therefore come up short in two distinct ways, both recorded
+in `_meta.json` and both setting `fetchComplete=False`:
+
+- `errors` (`{pod: message}`) — a hard logcli failure (timeout,
+  transient 5xx). A partial file left by a query that died mid-flight is
+  kept (bytes counted) but the pod is flagged.
+- `incomplete_pods` (`{pod: reason}`) — a pod whose chunks couldn't be
+  reconciled to the single-batch guarantee (the floor case above).
+
+`fetchComplete` is `True` iff **both** maps are empty. `_meta.json` also
+carries `pod_lines` (lines written per pod) and `pod_expected` (the
+`count_over_time` oracle per pod, when available) so a human or test can
+sanity-check lines-written against what Loki says was there. Consumers
+surface an incomplete fetch loudly rather than letting a partial window
+pass for the whole night:
 
 - **Browser** — a red banner at the top of the explore and night views
-  (`renderFetchBanner` in `app.js`) lists the failed pods.
+  (`renderFetchBanner` in `app.js`) merges both maps and lists the pods.
 - **CLI** — `_warnIfIncompleteFetch` prints an unmissable stderr warning
   after any fetch (cache hit included).
 
-When the *shape* of what makes a cache trustworthy changes (as the line
-cap → `--limit=0` switch did), bump `CACHE_SCHEMA_VERSION` so older
-caches re-fetch instead of being re-served (see the cache hit policy).
+When the *shape* of what makes a cache trustworthy changes (as the
+`--limit=0` → chunked-fetch switch did), bump `CACHE_SCHEMA_VERSION`:
+older caches re-fetch instead of being re-served (per-cache guard), and
+the whole tree is flushed once at startup (see *Schema-version flush*).
 
 ## The `.partial` flag
 
@@ -206,6 +272,10 @@ one, typically).
   re-parsing always produces the same events.
 
 ## When to flush
+
+- **Automatic** — bumping `CACHE_SCHEMA_VERSION` flushes the whole
+  tree at the next startup (see *Schema-version flush*). You don't
+  flush by hand for a fetch-method change; you bump the version.
 
 - After a regex change in `parse.py` whose effect you can't
   reproduce with `--force-refresh` alone (rare — `parse.py` reads
