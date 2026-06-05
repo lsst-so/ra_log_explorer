@@ -138,6 +138,22 @@ def test_loadSites_raises_for_duplicate_site_name(tmp_path: Path) -> None:
         sites.loadSites(p)
 
 
+def test_loadSites_raises_for_duplicate_cluster(tmp_path: Path) -> None:
+    """Two sites on one cluster make ``siteByCluster`` ambiguous, which
+    would silently misroute a rehydrated cache (keyed by cluster path
+    component) to the wrong ConsDB; reject the catalog up front."""
+    p = _writeCatalog(
+        tmp_path / "dupeCluster.toml",
+        'default_site = "a"\n'
+        '[[site]]\nname = "a"\ncluster = "shared"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\nconsdbTokenFile = "~/t1"\n'
+        '[[site]]\nname = "b"\ncluster = "shared"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x2"\nconsdbTokenFile = "~/t2"\n',
+    )
+    with pytest.raises(sites.SitesConfigError, match="duplicate cluster"):
+        sites.loadSites(p)
+
+
 def test_siteByName_and_siteByCluster_roundtrip(tmp_path: Path) -> None:
     p = _writeCatalog(
         tmp_path / "roundtrip.toml",

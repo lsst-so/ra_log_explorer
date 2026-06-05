@@ -600,8 +600,9 @@ shape as `/api/fetch`.
 The client resolves `tZeroStart` / `tZeroStop` up front via
 `/api/exposure-time`. The window is one wide all-pods span,
 `[tZeroStart - windowBefore, tZeroStop + windowAfter]`. The span
-`rangeStop - rangeStart` is capped at `config.MAX_RANGE_SPAN` (400 if
-exceeded, or if `rangeStop <= rangeStart`). Per-dataId shutter closes
+`rangeStop - rangeStart` is capped at `config.MAX_RANGE_SPAN` (currently
+500); a larger span — or `rangeStop <= rangeStart` — returns `400`.
+Per-dataId shutter closes
 for the whole span are resolved server-side post-parse (ConsDB batch,
 reporting on the `shutter-close` SSE event). Same response shape as
 `/api/fetch`.
@@ -615,6 +616,7 @@ JSON snapshot of one job:
   "jobId": "8970db79c0a6",
   "status": "running" | "parsing" | "done" | "error",
   "kind":   "exposure" | "night" | "range",
+  "site":   "summit",                  // the named site this job fetched against
   "expId":  2026051900722,             // null for night / range jobs
   "tZero":  "...",                     // null for night / range jobs
   "dayObs": null,                      // 20260521 for night jobs

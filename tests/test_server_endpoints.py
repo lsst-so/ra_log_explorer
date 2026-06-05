@@ -578,6 +578,80 @@ def test_cache_list_includes_range_kind(runningServer: RunningServer, tmpCacheRo
     assert rows[0]["rangeStop"] == 2026051900750
 
 
+def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A range that isn't in memory is rebuilt from its on-disk cache.
+
+    Exercises the deep-link / post-eviction path end to end:
+    ``_findRangeCacheDir`` (matches the ``_range.txt`` bounds),
+    ``_siteForCacheDir`` (derives the site from the ``yagan`` cluster
+    path component), and ``_loadRangeFromCache`` (reads each in-range
+    shutter close from the per-site exposure-time cache only — no
+    ConsDB call on a sync request). None of this is touched by the
+    in-memory range tests above.
+    """
+    from ra_log_explorer.fetch import markCacheRange
+
+    host, port, ctx = runningServer
+    startId, stopId = 2026051900722, 2026051900724  # 723 is a skipped integer
+    window = (
+        tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z"
+    )
+    (window / "pods").mkdir(parents=True)
+    (window / "pods" / "s-lsstcam-run-sfm-runner-sfmworkerset-0.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "a line in the range window\n",
+            }
+        )
+        + "\n"
+    )
+    (window / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:45:34.267000Z",
+                    "toIso": "2026-05-20T08:50:39.267000Z",
+                    "workers": 8,
+                    "lineLimit": 50000,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    markCacheRange(window, startId, stopId)
+    # Only start + stop were ever resolved into the per-site cache (the
+    # original fetch had no token for the middle id, say).
+    exposureTimes.storeCached(startId, "2026-05-20T08:46:16.267000", siteName="summit")
+    exposureTimes.storeCached(stopId, "2026-05-20T08:46:36.267000", siteName="summit")
+
+    # Fresh server: nothing loaded in memory, so this must rebuild from disk.
+    assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is None
+    status, body = _get(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["mode"] == "range"
+    assert body["site"] == "summit"  # derived from the yagan cluster path component
+    assert body["nMissing"] == 1  # 723 had no cached shutter close
+    assert [d["expId"] for d in body["dataIds"]] == [startId, stopId]
+
+    # The rebuilt state is now resident for follow-up pod-detail requests.
+    with ctx.jobs.stateLock:
+        assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is not None
+
+
 def test_fetch_status_404_for_unknown_job(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/fetch/doesnotexist/status")

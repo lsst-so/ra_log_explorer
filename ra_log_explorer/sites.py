@@ -65,7 +65,8 @@ def loadSites(path: Path | None = None) -> tuple[list[Site], str]:
     """Read the site catalog. Returns ``(sites, defaultSiteName)``.
 
     Raises :exc:`SitesConfigError` if the file is missing, malformed,
-    has no sites, or names a ``default_site`` that no entry defines.
+    has no sites, has a duplicate site name or cluster, or names a
+    ``default_site`` that no entry defines.
     """
     p = sitesFilePath(path)
     try:
@@ -80,6 +81,7 @@ def loadSites(path: Path | None = None) -> tuple[list[Site], str]:
         raise SitesConfigError(f"Sites catalog at {p} has no [[site]] entries.")
     sites: list[Site] = []
     names: set[str] = set()
+    clusters: set[str] = set()
     for i, entry in enumerate(rawSites):
         if not isinstance(entry, dict):
             raise SitesConfigError(f"Sites catalog entry #{i} is not a table.")
@@ -87,6 +89,17 @@ def loadSites(path: Path | None = None) -> tuple[list[Site], str]:
         if sites[-1].name in names:
             raise SitesConfigError(f"Sites catalog has duplicate site name {sites[-1].name!r} in {p}.")
         names.add(sites[-1].name)
+        # `siteByCluster` (used to map a cache dir's cluster path
+        # component back to its site when rehydrating from disk) assumes
+        # each cluster belongs to exactly one site. Enforce it here so a
+        # mis-edited catalog fails loudly at load instead of silently
+        # routing a rehydrated cache to the wrong ConsDB.
+        if sites[-1].cluster in clusters:
+            raise SitesConfigError(
+                f"Sites catalog has duplicate cluster {sites[-1].cluster!r} in {p}; "
+                "each Loki cluster must map to exactly one site."
+            )
+        clusters.add(sites[-1].cluster)
     default = raw.get("default_site")
     if not isinstance(default, str) or default not in names:
         raise SitesConfigError(

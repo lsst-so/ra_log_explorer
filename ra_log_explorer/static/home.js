@@ -42,6 +42,7 @@ const SETTINGS_DEFAULTS = {
 // the home view reads ``activeSite`` for `site` request fields.
 let siteCatalog = null;
 let activeSite = null;
+let siteSwitcherWired = false;  // guard: startHome() re-runs on every back-home
 
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
@@ -88,8 +89,11 @@ window.startHome = startHome;
 
 async function loadSiteCatalog() {
   // The site catalog is the same for every user of this deployment
-  // (it's checked into sites.toml on the server). Pull it once at
-  // startup, populate the switcher, restore the user's last pick.
+  // (it's checked into sites.toml on the server). Pull it once: the
+  // switcher's <option>s, the active-site state, and the change listener
+  // all live in the persistent DOM / module scope, so re-running on a
+  // later back-home would only leak a duplicate listener — guard it.
+  if (siteSwitcherWired) return;
   try {
     const r = await fetch('/api/sites');
     if (!r.ok) return;
@@ -126,6 +130,7 @@ async function loadSiteCatalog() {
     triggerRangeLookupsIfReady();
     refreshCache();
   });
+  siteSwitcherWired = true;
 }
 
 function setActiveSite(name) {
