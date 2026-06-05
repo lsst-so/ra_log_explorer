@@ -233,7 +233,11 @@ The browser app has three views:
   shutter close, so the `Δt₀ = 0` line always sits on the exposure
   you're looking at.
 - **Night view** — the dayObs-wide failure breakdown and Δshutter
-  histograms.
+  histograms, plus data-completeness banners: an incomplete-fetch
+  warning, and a "gather-only" warning listing any dataIds whose
+  step1b (gather) ran with no step1a — physically impossible, so a tell
+  that step1a logs were dropped (and a cause of a biased first-task
+  histogram).
 
 Inside the explore view:
 

@@ -4,6 +4,8 @@
  * a one-page failure dashboard:
  *
  *   - Top stats (visits seen, tracebacks, distinct exception classes …)
+ *   - An incomplete-fetch banner and a gather-only banner (dataIds whose
+ *     step1b ran with no step1a — a dropped-step1a-logs tell)
  *   - Errors-by-type and errors-by-pod tables
  *   - Δshutter histograms for the first task pickup and calcZernikes end
  *   - Per-traceback failure list with click-to-expand drilldown

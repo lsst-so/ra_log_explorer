@@ -5,8 +5,10 @@ Caching strategy
 Logs are keyed by the (cluster, namespace, fromIso, toIso) tuple. The cache
 directory contains:
 
-  _meta.json          mandatory; records the spec, fetched_at, byte totals,
-                      and per-pod file sizes
+  _meta.json          mandatory; records the spec, fetchSchemaVersion,
+                      fetched_at, byte/line totals, the count_over_time
+                      oracle per pod, and the two fall-short maps
+                      (errors, incomplete_pods) behind fetchComplete
   pods/<pod>.jsonl    one Loki JSONL file per pod that had any output
   pods.txt            cached list of pod names
 

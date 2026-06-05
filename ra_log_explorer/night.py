@@ -19,6 +19,9 @@ What we surface:
   ``*calcZernikes*`` task completion per dataId.
 * **Failed dataIds** — one row per (dataId × pod × traceback) so the
   user can click straight into the traceback body.
+* **Gather-only dataIds** — dataIds with gather (step1b) activity but no
+  step1a precursor. Physically impossible, so a tell that the fetch
+  dropped the step1a logs (which also biases the first-task histogram).
 """
 
 from __future__ import annotations
