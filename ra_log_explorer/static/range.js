@@ -71,6 +71,11 @@ function chipTitle(d) {
   const parts = [`dataId ${d.expId}`, `t₀ ${d.tZero}`, `${d.nPods} pod${d.nPods === 1 ? '' : 's'}`];
   if (d.nTraceback) parts.push(`${d.nTraceback} traceback${d.nTraceback === 1 ? '' : 's'}`);
   if (!d.hasLogs) parts.push('no logs in window');
+  // ConsDB properties (filter / image type / reason / …) so the user can
+  // tell what kind of image each step in the range is without opening it.
+  const fn = window.exposureInfoTooltip;
+  const info = fn ? fn(d.exposure) : '';
+  if (info) parts.push('', info);
   return parts.join('\n');
 }
 

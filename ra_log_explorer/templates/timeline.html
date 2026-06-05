@@ -242,6 +242,12 @@
          a complete fetch. Populated by window.renderFetchBanner. -->
     <div id="explore-fetch-banner" class="fetch-banner" hidden></div>
 
+    <!-- ConsDB exposure properties (filter, exp time, image type,
+         program, reason, …) for the loaded dataId. Populated by
+         explore.renderExposureInfoBox from summary.exposure; hidden when
+         ConsDB never resolved the record. -->
+    <div id="exposure-info" class="exposure-info" hidden></div>
+
     <!-- Range navigator: only shown in range mode (range.js populates it
          and app.js toggles its visibility). Lets you step between the
          exposures in the fetched range; each loads its own timeline. -->

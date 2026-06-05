@@ -631,8 +631,12 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     markCacheRange(window, startId, stopId)
     # Only start + stop were ever resolved into the per-site cache (the
     # original fetch had no token for the middle id, say).
-    exposureTimes.storeCached(startId, "2026-05-20T08:46:16.267000", siteName="summit")
-    exposureTimes.storeCached(stopId, "2026-05-20T08:46:36.267000", siteName="summit")
+    exposureTimes.storeCachedRecord(
+        startId, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+    )
+    exposureTimes.storeCachedRecord(
+        stopId, {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science"}, siteName="summit"
+    )
 
     # Fresh server: nothing loaded in memory, so this must rebuild from disk.
     assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is None
@@ -643,6 +647,12 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     assert body["site"] == "summit"  # derived from the yagan cluster path component
     assert body["nMissing"] == 1  # 723 had no cached shutter close
     assert [d["expId"] for d in body["dataIds"]] == [startId, stopId]
+    # The curated record stored in the per-site cache rode through the
+    # rehydration into the navigator-chip payload (cache → record → JSON).
+    assert {d["expId"]: d["exposure"]["img_type"] for d in body["dataIds"]} == {
+        startId: "science",
+        stopId: "science",
+    }
 
     # The rebuilt state is now resident for follow-up pod-detail requests.
     with ctx.jobs.stateLock:
@@ -757,21 +767,31 @@ def test_buildSpecFromRequest_rejects_bad_tZero(siteCatalog: FakeSiteCatalog) ->
 
 
 def _stubConsdb(monkeypatch: pytest.MonkeyPatch, obsEnd: str | None) -> None:
-    """Stub `urlopen` so queryIsot returns ``obsEnd`` (or ``None`` if no row)."""
+    """Stub `urlopen` so a query returns a full-ish exposure row carrying
+    ``obs_end`` (or no row at all when ``obsEnd`` is None). The columns
+    mirror the curated record so tests can assert the richer fields the
+    endpoint now echoes back, not just the t-zero."""
     import io as _io
 
+    cols = ["exposure_id", "obs_end", "physical_filter", "img_type", "observation_reason", "exp_time"]
+
     def fakeUrlopen(req: object, **_kw: Any) -> object:
+        sql = json.loads(req.data.decode("utf-8"))["query"]  # type: ignore[attr-defined]
+        # Pull the queried id straight out of the SQL so single + IN()
+        # forms both echo a matching exposure_id.
+        digits = "".join(ch for ch in sql.split("exposure_id")[-1] if ch.isdigit())
+        eid = int(digits) if digits else 0
         payload = (
-            {"columns": ["obs_end"], "data": [[obsEnd]]}
+            {"columns": cols, "data": [[eid, obsEnd, "z_20", "science", "template_blob", 30.0]]}
             if obsEnd is not None
-            else {"columns": ["obs_end"], "data": []}
+            else {"columns": cols, "data": []}
         )
         return _io.BytesIO(json.dumps(payload).encode("utf-8"))
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
 
 
-def test_exposure_time_returns_isot(
+def test_exposure_time_returns_record(
     runningServer: RunningServer,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -783,13 +803,16 @@ def test_exposure_time_returns_isot(
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 200
-    assert body == {
-        "dataId": 2026051900722,
-        "tZero": "2026-05-20T08:46:16.267000",
-        "scale": "TAI",
-        "fromCache": False,
-        "site": "summit",
-    }
+    assert body["dataId"] == 2026051900722
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"
+    assert body["scale"] == "TAI"
+    assert body["fromCache"] is False
+    assert body["site"] == "summit"
+    # The curated exposure record rides along so the home form can show
+    # the image properties before the fetch even starts.
+    assert body["exposure"]["physical_filter"] == "z_20"
+    assert body["exposure"]["img_type"] == "science"
+    assert body["exposure"]["obs_end"] == "2026-05-20T08:46:16.267000"
 
 
 def test_exposure_time_404_when_no_row_anywhere(
@@ -838,7 +861,9 @@ def test_exposure_time_returns_cached_without_calling_consdb(
     short-circuit: no token needed, no ConsDB call. The cache is
     immutable (exposure end-times never change once recorded)."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000", siteName="summit")
+    exposureTimes.storeCachedRecord(
+        2026051900722, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+    )
 
     def blowUp(*_args: object, **_kw: object) -> object:
         raise AssertionError("urlopen should not be reached on a cache hit")
@@ -850,6 +875,7 @@ def test_exposure_time_returns_cached_without_calling_consdb(
     assert status == 200
     assert body["tZero"] == "2026-05-20T08:46:16.267000"
     assert body["fromCache"] is True
+    assert body["exposure"]["img_type"] == "science"
 
 
 def test_exposure_time_writes_to_cache_on_consdb_hit(
@@ -868,8 +894,11 @@ def test_exposure_time_writes_to_cache_on_consdb_hit(
     status1, body1 = _get(host, port, "/api/exposure-time/2026051900722")
     assert status1 == 200
     assert body1["fromCache"] is False
-    # Cache file now exists with the entry persisted under the summit site.
-    assert exposureTimes.lookupCached(2026051900722, siteName="summit") == "2026-05-20T08:46:16.267000"
+    # Cache file now exists with the record persisted under the summit site.
+    cached = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert cached is not None
+    assert exposureTimes.obsEnd(cached) == "2026-05-20T08:46:16.267000"
+    assert cached["img_type"] == "science"  # the richer columns landed too
 
 
 def test_exposure_time_picks_site_from_query_param(
@@ -890,10 +919,13 @@ def test_exposure_time_picks_site_from_query_param(
     assert status == 200
     assert body["site"] == "bts"
     assert body["tZero"] == "2026-06-03T00:42:43.632000"
-    assert exposureTimes.lookupCached(2026060200001, siteName="bts") == "2026-06-03T00:42:43.632000"
+    assert (
+        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="bts"))
+        == "2026-06-03T00:42:43.632000"
+    )
     # And NOT under the summit cache — the per-site isolation is the
     # whole point of this scoping.
-    assert exposureTimes.lookupCached(2026060200001, siteName="summit") is None
+    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="summit") is None
 
 
 def test_exposure_time_400_for_unknown_site(runningServer: RunningServer) -> None:
@@ -1877,10 +1909,10 @@ def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
 
     siteCatalog.writeSummitToken("BEARER")
 
-    def boom(*_a: Any, **_kw: Any) -> dict[int, str]:
+    def boom(*_a: Any, **_kw: Any) -> dict[int, dict]:
         raise _et.ConsDbError("synthetic 503")
 
-    monkeypatch.setattr(_et, "queryIsotBatch", boom)
+    monkeypatch.setattr(_et, "queryExposureRecordBatch", boom)
     summary = _aosPodSummary(2026052100051)
     state = NightState(
         cacheDir=tmpCacheRoot,

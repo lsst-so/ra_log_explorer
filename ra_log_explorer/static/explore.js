@@ -101,6 +101,74 @@ function groupOrder() {
   ];
 }
 
+// ----- ConsDB exposure properties (info box + shared tooltip) ---------------
+
+// Curated ConsDB exposure record → ordered [label, value] display items.
+// `compact` keeps only the "what kind of image is this" essentials (used
+// for the dataId-link tooltips in the night + range views); the full set
+// adds observing context for the explore-view info box. Null / blank
+// columns are skipped so a sparse record doesn't render empty rows.
+function exposureInfoItems(rec, compact) {
+  if (!rec) return [];
+  const items = [];
+  const push = (label, val) => {
+    if (val !== null && val !== undefined && val !== '') items.push([label, String(val)]);
+  };
+  const num = (v, dp) => (v === null || v === undefined ? null : Number(v).toFixed(dp));
+  push('image type', rec.img_type);
+  push('reason', rec.observation_reason);
+  push('program', rec.science_program);
+  push('filter', rec.physical_filter);
+  if (rec.exp_time !== null && rec.exp_time !== undefined) push('exp time', `${num(rec.exp_time, 1)} s`);
+  push('target', rec.target_name);
+  // cur/max index is the tell-tale for a multi-exposure group (e.g. a
+  // CWFS intra/extra-focal pair shows "1 of 2").
+  if (rec.max_index !== null && rec.max_index !== undefined && Number(rec.max_index) > 1) {
+    push('in group', `${rec.cur_index} of ${rec.max_index}`);
+  }
+  if (compact) return items;
+  push('group', rec.group_id);
+  push('airmass', num(rec.airmass, 2));
+  if (rec.dimm_seeing !== null && rec.dimm_seeing !== undefined) push('seeing', `${num(rec.dimm_seeing, 2)}″`);
+  if (rec.s_ra !== null && rec.s_ra !== undefined && rec.s_dec !== null && rec.s_dec !== undefined) {
+    push('RA, Dec', `${num(rec.s_ra, 3)}°, ${num(rec.s_dec, 3)}°`);
+  }
+  if (rec.sky_rotation !== null && rec.sky_rotation !== undefined) push('rot', `${num(rec.sky_rotation, 1)}°`);
+  push('name', rec.exposure_name);
+  return items;
+}
+
+// Multi-line "label: value" string for a title= tooltip. '' when there's
+// no record (so callers can assign it unconditionally). Shared with the
+// night + range views via window.
+function exposureInfoTooltip(rec) {
+  const items = exposureInfoItems(rec, true);
+  return items.map(([l, v]) => `${l}: ${v}`).join('\n');
+}
+window.exposureInfoTooltip = exposureInfoTooltip;
+
+function renderExposureInfoBox(rec) {
+  const box = document.getElementById('exposure-info');
+  if (!box) return;
+  box.innerHTML = '';
+  const items = exposureInfoItems(rec, false);
+  if (!items.length) {
+    box.hidden = true;
+    return;
+  }
+  for (const [label, value] of items) {
+    const span = document.createElement('span');
+    span.className = 'exp-item';
+    const lab = document.createElement('span');
+    lab.className = 'exp-label';
+    lab.textContent = label;
+    span.appendChild(lab);
+    span.appendChild(document.createTextNode(value));
+    box.appendChild(span);
+  }
+  box.hidden = false;
+}
+
 // ----- entry point ----------------------------------------------------------
 
 async function startExplore(loadedSummary) {
@@ -115,6 +183,7 @@ async function startExplore(loadedSummary) {
   }
   document.getElementById('expId-display').textContent =
     `expId=${summary.expId}  ·  t₀=${summary.tZero}`;
+  renderExposureInfoBox(summary.exposure);
   shutterUtcMs = new Date(summary.tZero).getTime();
   populateRefSelect();
   populateTaskLegend();

@@ -131,6 +131,17 @@ function asTd(text, klass) {
   return td;
 }
 
+// Tooltip (filter / exp time / image type / reason / …) for a dataId,
+// built from the night payload's exposureInfo map. '' when the record
+// wasn't resolved (no token, or a skipped id), so a hover just shows
+// nothing extra. Lets a user tell *what kind of image* a flagged dataId
+// is — e.g. spot a CWFS pair — without leaving the night view.
+function nightExposureTooltip(dataId) {
+  const info = (nightSummary && nightSummary.exposureInfo) || {};
+  const fn = window.exposureInfoTooltip;
+  return fn ? fn(info[String(dataId)]) : '';
+}
+
 // ----- histograms (SVG, no D3 — just a few <rect>s) ------------------------
 
 function renderHistogram(svgId, metaId, titleId, binPanelId, titleText, hist) {
@@ -287,6 +298,8 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
+    const tip = nightExposureTooltip(id);
+    if (tip) a.title = tip;
     list.appendChild(a);
   }
   panel.appendChild(list);
@@ -307,7 +320,12 @@ function renderFailures(rows) {
     const tr = document.createElement('tr');
     tr.className = 'night-failure-row';
     tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));
-    tr.appendChild(asTd(r.dataId == null ? '?' : String(r.dataId), 'mono'));
+    const idTd = asTd(r.dataId == null ? '?' : String(r.dataId), 'mono');
+    if (r.dataId != null) {
+      const tip = nightExposureTooltip(r.dataId);
+      if (tip) idTd.title = tip;
+    }
+    tr.appendChild(idTd);
     tr.appendChild(asTd(r.offsetS == null ? '—' : fmtOffset(r.offsetS), 'mono'));
     tr.appendChild(asTd(r.pod, 'mono night-pod-cell'));
     tr.appendChild(asTd(r.excClass, 'mono'));

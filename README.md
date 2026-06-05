@@ -25,7 +25,8 @@ window. One exposure at a time.
 # Loki password — ask Merlin for the value.
 export LOKI_PASSWORD='...'
 
-# RSP bearer token for the ConsDB shutter-close lookup. Get one at
+# RSP bearer token for the ConsDB exposure lookup (shutter close +
+# the image properties shown in the explore-view info box). Get one at
 # https://usdf-rsp.slac.stanford.edu/auth/tokens/ and drop it in:
 mkdir -p ~/.lsst && cat > ~/.lsst/log-browser-token.txt   # paste, then Ctrl-D
 
@@ -238,6 +239,15 @@ Inside the explore view:
 
 - **Top bar** — the dataId, the UTC t-zero, where the cache lives, and
   how big the on-disk cache currently is.
+- **Exposure info box** — a strip of ConsDB exposure properties for the
+  loaded dataId: image type, observation reason, science program,
+  filter, exposure time, target, and (for multi-exposure groups) the
+  "N of M" index — enough to tell *what kind of image* you're looking
+  at, e.g. spotting that a dataId is one half of a CWFS donut pair.
+  Hidden if ConsDB never resolved the dataId (no token / unknown id).
+  The same properties show as a hover tooltip on every dataId link —
+  the night view's histogram-bin and failure-table ids, and the range
+  navigator chips — so you can triage without opening each one.
 - **t₀ selector** — pick between the two reference points the tool
   derives: shutter close (caller-supplied) and the head-node's first
   `Defining visit` for this exposure. Whichever you pick becomes the

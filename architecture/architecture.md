@@ -90,11 +90,16 @@ Sibling docs:
                       the server starts; populates an exposure ServerState
                       ahead of time. Home mode hands over an empty context.
 
-       exposureTimes.py   dataId → shutter-close (TAI) via a ConsDB SQL
-                          endpoint. The endpoint and bearer-token file
-                          are looked up per-site from sites.toml (see
-                          below), so the same dataId can resolve to
-                          different obs_end values depending on the
+       exposureTimes.py   dataId → curated ConsDB *exposure record* via
+                          a SQL endpoint (SELECT * projected to a useful
+                          column subset: obs_end + filter, exp time, image
+                          type, program, reason, group/index, pointing,
+                          seeing). obs_end is the shutter-close (TAI)
+                          t-zero; the rest drive the explore-view info box
+                          and the dataId-link tooltips. The endpoint and
+                          bearer-token file are looked up per-site from
+                          sites.toml (see below), so the same dataId can
+                          resolve to a different record depending on the
                           active site. Persistent per-site on-disk cache
                           at <cache_root>/exposure-times/<site>.json so
                           once-resolved dataIds work offline.
@@ -122,7 +127,7 @@ Sibling docs:
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches per-pod JSONL in parallel, manages the on-disk cache (exact / superset reuse), the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table. No I/O. |
-| `exposureTimes.py` | dataId → shutter-close ISO (TAI) lookup against a ConsDB endpoint. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists results per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure end-times are immutable so the cache never goes stale. Provides `queryIsotBatch` for night-mode prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `appSettings.py`   | Reads / writes `<cache_root>/settings.json`. Schema is open-ended; today the only field is `maxCacheBytes`. Used by the LRU cache eviction in `fetch.evictToFit`. |
@@ -273,6 +278,12 @@ shapes:
   "site": "summit",
   "expId": 2026051900722,
   "tZero": "2026-05-20T08:45:39.267000+00:00",
+  "exposure": {                                  // curated ConsDB record, or null
+    "obs_end": "2026-05-31T04:16:18.199000", "exp_time": 30.0,
+    "physical_filter": "z_20", "img_type": "science",
+    "science_program": "BLOCK-407", "observation_reason": "template_blob_z_33.0",
+    "cur_index": 1, "max_index": 1, ...          // drives the explore-view info box
+  },
   "cacheDir": ".../yagan/rapid-analysis/<window-slug>",
   "cacheBytes": 84115620,
   "meta": { ...fetch metadata, including cacheReuse: "exact"|"superset"|"none" },
@@ -340,7 +351,11 @@ fetch window ended before the pod did.
     { "dataId": 2026052100050, "pod": "...", "group": "aos",
       "excClass": "RuntimeError", "excMessage": "...", "offsetS": 87.2,
       "tIso": "...", "bodyKey": "<pod>@<iso>" }, ...
-  ]
+  ],
+  "exposureInfo": {                              // dataId (string) -> curated ConsDB record
+    "2026052100050": { "img_type": "science", "physical_filter": "z_20",
+                       "observation_reason": "...", ... }, ...
+  }                                              // drives the dataId-link tooltips
 }
 ```
 
@@ -365,7 +380,9 @@ below).
   "nMissing": 3,                              // ids in [start,stop] ConsDB had no row for
   "dataIds": [
     { "expId": 2026051900722, "tZero": "<utc iso>",
-      "nPods": 12, "nTraceback": 0, "hasLogs": true }, ...
+      "nPods": 12, "nTraceback": 0, "hasLogs": true,
+      "exposure": { "img_type": "science", ... } },  // curated record (or null) for the chip tooltip
+    ...
   ]
 }
 ```
@@ -375,7 +392,7 @@ below).
 Returned by `?rangeStart=&rangeStop=&dataId=`. Byte-for-byte the
 exposure payload shape (built by reusing `_buildSummaryPayload` against
 the range's shared summaries with the dataId's own shutter close as
-`tZero`), plus:
+`tZero`, so it carries that dataId's `exposure` record too), plus:
 
 ```jsonc
 {
@@ -446,15 +463,18 @@ generate a multi-megabyte drilldown response. The cap shows up as
 
 ### `GET /api/exposure-time/<dataId>?site=<name>`
 
-dataId → shutter-close ISOT (TAI) lookup, used by the home form to
-resolve a user-typed dataId before kicking off the fetch. The optional
-`site` query param picks which entry from the sites catalog to use;
-omitted = the catalog's `default_site`.
+dataId → curated ConsDB exposure record, used by the home form to
+resolve a user-typed dataId (and show its properties) before kicking
+off the fetch. The optional `site` query param picks which entry from
+the sites catalog to use; omitted = the catalog's `default_site`.
 
-- 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool, "site"}`.
+- 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool,
+  "site", "exposure": {<curated record>}}`. `tZero` is the record's
+  `obs_end`; `exposure` carries the rest (filter, exp time, image type,
+  program, reason, group/index, …) for the explore-view info box.
 - 400 `"No site named '<x>'; known: [...]"` — unknown site.
 - 404 `"No exposure-time record for dataId=N"` — every instrument
-  table searched, no row anywhere.
+  table searched, no row with an `obs_end` anywhere.
 - 502 `"ConsDB query failed: ..."` — typed ConsDB error (5xx, etc.).
 - 503 `"ConsDB token file for site '<name>' not found at <path>. Get a
   token from the relevant RSP and drop it there."` — token missing.
@@ -465,7 +485,7 @@ The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
 is checked first; a cache hit returns immediately with `fromCache:
 true` and no network call. Sites have separate cache files so a
 colliding bare dataId between scopes (BTS simulated vs. summit real)
-can't return the wrong obs_end.
+can't return the wrong record.
 
 ### `GET /api/sites`
 

@@ -1449,6 +1449,35 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .night-tb-body .tb-lvl.tb-error { color: var(--err); }
 
 /* ============================================================
+   ConsDB exposure info box (#exposure-info) — the curated
+   exposure properties for the loaded dataId, shown under the
+   explore-view topbar as a row of labelled chips.
+   ============================================================ */
+#exposure-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: baseline;
+  padding: 7px 18px 8px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+#exposure-info .exp-item {
+  font-family: var(--font-mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+#exposure-info .exp-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-right: 5px;
+}
+
+/* ============================================================
    Range navigator (#range-nav) — shown above the explore
    timeline in range mode. Chip per resolved dataId + prev/next.
    ============================================================ */

@@ -10,9 +10,10 @@ repeat runs into instant loads.
 ```
 ~/.cache/ra_log_explorer/                          ← override with $RA_LOG_EXPLORER_CACHE
 ├── settings.json                                  ← server-side settings (maxCacheBytes)
-├── exposure-times/                                ← persistent dataId → shutter-close (TAI) cache,
-│   ├── summit.json                                  split per site so a colliding dataId between
-│   └── bts.json                                     scopes can't return the wrong obs_end
+├── exposure-times/                                ← persistent dataId → ConsDB exposure record
+│   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
+│   └── bts.json                                     per site so a colliding dataId between scopes
+│                                                    can't return the wrong record
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
         ├── _meta.json                             ← FetchSpec + fetchSchemaVersion +
@@ -224,11 +225,15 @@ button).
 
 ## The exposure-time cache
 
-`<cache_root>/exposure-times/<siteName>.json` maps `dataId → obs_end
-ISO (TAI)` across runs, split per site. It lives outside the
-cluster/namespace tree because:
+`<cache_root>/exposure-times/<siteName>.json` maps `dataId → curated
+ConsDB exposure record` across runs, split per site. Each record is the
+`EXPOSURE_RECORD_COLUMNS` projection of the row — `obs_end` (the
+shutter-close TAI t-zero) plus the human-facing properties (filter, exp
+time, image type, program, reason, group/index, pointing, seeing) that
+feed the explore-view info box and the dataId-link tooltips. It lives
+outside the cluster/namespace tree because:
 
-- exposure end-times are immutable once `cdb_<instrument>.exposure`
+- exposure properties are immutable once `cdb_<instrument>.exposure`
   has a row, so the cache has zero staleness concerns;
 - one machine should not be re-querying ConsDB for the same dataId
   ever, even across log-explorer sessions;
@@ -239,17 +244,20 @@ cluster/namespace tree because:
 The cache is split per site (`exposure-times/summit.json`,
 `exposure-times/bts.json`) because a 13-digit dataId is meaningful
 *within* a site, not globally: BTS simulated exposures can carry an
-id that also exists on the summit, with a completely different
-`obs_end`. `lookupCached(..., siteName=...)` and `storeCached(...,
+id that also exists on the summit, with a completely different record.
+`lookupCachedRecord(..., siteName=...)` and `storeCachedRecord[s](...,
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
 
 The lookup is best-effort: a corrupt JSON file, an unexpected schema,
-or a non-string value all return `None` from `lookupCached` and fall
-through to a fresh ConsDB query (which then overwrites the bad
-record). The store path is the same on every cache hit, miss, and
-batch-resolve, so `rm -r <cache_root>/exposure-times/` is the
-nuclear reset.
+or an unusable value all return `None` from `lookupCachedRecord` and
+fall through to a fresh ConsDB query (which then overwrites the bad
+record). A legacy entry written by the pre-record format (a bare
+`obs_end` string per dataId) is read back as a 1-field record, so an
+existing cache keeps resolving t-zeros across the upgrade — the richer
+columns just backfill on the next fresh query. The store path is the
+same on every cache hit, miss, and batch-resolve, so `rm -r
+<cache_root>/exposure-times/` is the nuclear reset.
 
 ## Future: cleaner subset semantics
 

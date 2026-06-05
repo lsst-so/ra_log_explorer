@@ -155,6 +155,10 @@ class ServerState:
     # fetch time from the request body's `site` field (or derived from
     # the cache path's cluster component when rehydrating from disk).
     siteName: str = ""
+    # Curated ConsDB exposure record for this dataId (filter, exp time,
+    # image type, program, reason, …) — drives the explore-view info box.
+    # None if ConsDB never resolved it (no token, unknown dataId).
+    exposureInfo: exposureTimes.ExposureRecord | None = None
     referencePoints: list[dict] = field(default_factory=list)
 
 
@@ -174,6 +178,9 @@ class NightState:
     # Lazily populated dataId -> shutter-close UTC datetime, used to
     # turn task event timestamps into Δshutter offsets for histograms.
     shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
+    # dataId -> curated ConsDB exposure record, resolved alongside the
+    # shutter closes — used for the dataId-link tooltips in the night view.
+    exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
 
 
 @dataclass
@@ -201,6 +208,9 @@ class RangeState:
     # [startId, stopId] that ConsDB knew about. Ids absent here are the
     # "skipped" integers the user was warned to expect.
     shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
+    # dataId -> curated ConsDB exposure record, resolved alongside the
+    # shutter closes — used for the navigator chip tooltips.
+    exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
 
 
 def rangeKey(startId: int, stopId: int) -> str:
@@ -487,6 +497,10 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "site": state.siteName,
         "expId": state.expId,
         "tZero": state.tZero.isoformat(),
+        # Curated ConsDB exposure record (filter, exp time, image type,
+        # program, reason, …) for the explore-view info box. None if it
+        # was never resolved (no token / unknown dataId).
+        "exposure": state.exposureInfo,
         "cacheDir": str(state.cacheDir),
         "cacheBytes": state.cacheBytes,
         "meta": _toJsonable(state.meta),
@@ -616,7 +630,7 @@ def _prefetchNightShutterCloses(
     needIds = _neededDataIdsForNight(summaries)
     if not needIds:
         return
-    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, job, site)
+    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
 
 
 def _prefetchRangeShutterCloses(state: RangeState, job: FetchJob, site: Site) -> None:
@@ -634,20 +648,25 @@ def _prefetchRangeShutterCloses(state: RangeState, job: FetchJob, site: Site) ->
     needIds = set(range(state.startId, state.stopId + 1))
     if not needIds:
         return
-    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, job, site)
+    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
 
 
 def _resolveShutterClosesInto(
     needIds: set[int],
     target: dict[int, dt.datetime],
+    infoTarget: dict[int, exposureTimes.ExposureRecord],
     job: FetchJob,
     site: Site,
 ) -> None:
-    """Resolve a shutter close (t₀, UTC) for each id in ``needIds`` into
-    ``target`` — on-disk per-site cache first, then one batched ConsDB
-    query for the misses — pushing the ``shutter-close`` progress events
-    the SSE consumer renders. Shared by the night and range post-parse
-    prefetch paths.
+    """Resolve each id in ``needIds`` into ``target`` (shutter close t₀,
+    UTC) and ``infoTarget`` (the full ConsDB exposure record) — on-disk
+    per-site cache first, then one batched ConsDB query for the misses —
+    pushing the ``shutter-close`` progress events the SSE consumer
+    renders. Shared by the night and range post-parse prefetch paths.
+
+    An id counts as resolved only when its record carries a usable
+    ``obs_end`` (the t₀ the histograms need); a record without one is
+    treated as a miss and re-queried.
     """
     job.push({"type": "shutter-close", "phase": "starting", "total": len(needIds), "site": site.name})
 
@@ -655,11 +674,13 @@ def _resolveShutterClosesInto(
     misses: list[int] = []
     cachedHits = 0
     for expId in needIds:
-        iso = exposureTimes.lookupCached(expId, siteName=site.name)
-        if iso is None:
+        rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        iso = exposureTimes.obsEnd(rec)
+        if rec is None or iso is None:
             misses.append(expId)
             continue
         target[expId] = _taiIsoToUtc(iso)
+        infoTarget[expId] = rec
         cachedHits += 1
     job.push(
         {
@@ -693,19 +714,25 @@ def _resolveShutterClosesInto(
         job.push({"type": "shutter-close", "phase": "empty-token", "remaining": len(misses)})
         return
     try:
-        resolved = exposureTimes.queryIsotBatch(misses, token, consdbUrl=site.consdbUrl)
+        resolved = exposureTimes.queryExposureRecordBatch(misses, token, consdbUrl=site.consdbUrl)
     except (exposureTimes.ConsDbError, OSError) as e:
         job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
         return
-    for expId, iso in resolved.items():
-        exposureTimes.storeCached(expId, iso, siteName=site.name)
+    exposureTimes.storeCachedRecords(resolved, siteName=site.name)
+    consdbHits = 0
+    for expId, rec in resolved.items():
+        iso = exposureTimes.obsEnd(rec)
+        if iso is None:
+            continue  # row exists but no obs_end — can't anchor a t₀
         target[expId] = _taiIsoToUtc(iso)
+        infoTarget[expId] = rec
+        consdbHits += 1
     job.push(
         {
             "type": "shutter-close",
             "phase": "done",
-            "consdbHits": len(resolved),
-            "stillMissing": len(misses) - len(resolved),
+            "consdbHits": consdbHits,
+            "stillMissing": len(misses) - consdbHits,
         }
     )
 
@@ -781,6 +808,9 @@ def _buildNightPayload(state: NightState) -> dict:
             "calcZernikesEnd": _toJsonable(histCz),
         },
         "failures": [_toJsonable(r) for r in failures],
+        # dataId (as string) -> curated ConsDB record, for the tooltips on
+        # the histogram-bin and failure-table dataId links.
+        "exposureInfo": {str(eid): rec for eid, rec in state.exposureInfoByExpId.items()},
     }
 
 
@@ -811,6 +841,8 @@ def _buildRangePayload(state: RangeState) -> dict:
             "nPods": podsByExpId.get(expId, 0),
             "nTraceback": tracebackByExpId.get(expId, 0),
             "hasLogs": expId in podsByExpId,
+            # Curated ConsDB record for the navigator chip's tooltip.
+            "exposure": state.exposureInfoByExpId.get(expId),
         }
         for expId in sorted(state.shutterCloseByExpId)
     ]
@@ -852,6 +884,7 @@ def _rangeExposureState(state: RangeState, dataId: int) -> ServerState | None:
         expId=dataId,
         tZero=tZero,
         siteName=state.siteName,
+        exposureInfo=state.exposureInfoByExpId.get(dataId),
         referencePoints=[
             {
                 "label": "shutter close (ConsDB)",
@@ -1177,7 +1210,8 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
     site = _siteForCacheDir(ctx, cacheDir)
     if site is None:
         return None
-    tZeroIso = exposureTimes.lookupCached(expId, siteName=site.name)
+    record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+    tZeroIso = exposureTimes.obsEnd(record)
     if tZeroIso is None:
         return None
     try:
@@ -1194,6 +1228,7 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
         expId=expId,
         tZero=tZero,
         siteName=site.name,
+        exposureInfo=record,
         referencePoints=[
             {
                 "label": "shutter close (caller-supplied)",
@@ -1240,9 +1275,11 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         siteName=site.name,
     )
     for needId in _neededDataIdsForNight(summaries):
-        iso = exposureTimes.lookupCached(needId, siteName=site.name)
-        if iso is not None:
+        record = exposureTimes.lookupCachedRecord(needId, siteName=site.name)
+        iso = exposureTimes.obsEnd(record)
+        if record is not None and iso is not None:
             state.shutterCloseByExpId[needId] = _taiIsoToUtc(iso)
+            state.exposureInfoByExpId[needId] = record
     with ctx.jobs.stateLock:
         ctx.putNightState(state)
     markCacheViewed(cacheDir)
@@ -1321,9 +1358,11 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
         siteName=site.name,
     )
     for expId in range(startId, stopId + 1):
-        iso = exposureTimes.lookupCached(expId, siteName=site.name)
-        if iso is not None:
+        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        iso = exposureTimes.obsEnd(record)
+        if record is not None and iso is not None:
             state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+            state.exposureInfoByExpId[expId] = record
     with ctx.jobs.stateLock:
         ctx.putRangeState(state)
     markCacheViewed(cacheDir)
@@ -1519,6 +1558,11 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 ctx.putRangeState(newRange)
             return
         assert job.expId is not None and job.tZero is not None
+        # The home page resolves the dataId via /api/exposure-time before
+        # firing the fetch, so the full ConsDB record is already in the
+        # per-site cache — read it back for the explore-view info box.
+        # No extra ConsDB call here; None just means no info box.
+        exposureInfo = exposureTimes.lookupCachedRecord(job.expId, siteName=site.name)
         newState = ServerState(
             cacheDir=job.cacheDir,
             cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -1527,6 +1571,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             expId=job.expId,
             tZero=job.tZero,
             siteName=site.name,
+            exposureInfo=exposureInfo,
             referencePoints=[
                 {
                     "label": "shutter close (caller-supplied)",
@@ -1894,20 +1939,25 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             except SitesConfigError as e:
                 self._send_error_json(400, str(e))
                 return
-            # Cache check first: exposure end-times are immutable once
+            # Cache check first: exposure properties are immutable once
             # they exist, so a hit lets us skip the token + network call
             # entirely. This also means a user with no ConsDB token can
             # still resolve any dataId they (or anyone) previously
-            # looked up on this machine for *this* site.
-            cached = exposureTimes.lookupCached(dataId, siteName=site.name)
-            if cached is not None:
+            # looked up on this machine for *this* site. A legacy entry
+            # (obs_end-only string) is read back as a 1-field record, so
+            # the t-zero still resolves even before the richer columns
+            # backfill on the next fresh query.
+            cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name)
+            cachedIso = exposureTimes.obsEnd(cachedRec)
+            if cachedRec is not None and cachedIso is not None:
                 self._send_json(
                     {
                         "dataId": dataId,
-                        "tZero": cached,
+                        "tZero": cachedIso,
                         "scale": "TAI",
                         "fromCache": True,
                         "site": site.name,
+                        "exposure": cachedRec,
                     }
                 )
                 return
@@ -1928,17 +1978,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 self._send_error_json(503, f"ConsDB token file is empty: {path}")
                 return
             try:
-                isot = exposureTimes.queryIsot(dataId, token, consdbUrl=site.consdbUrl)
+                record = exposureTimes.queryExposureRecord(dataId, token, consdbUrl=site.consdbUrl)
             except exposureTimes.ConsDbError as e:
                 self._send_error_json(502, f"ConsDB query failed: {e}")
                 return
             except OSError as e:
                 self._send_error_json(503, f"Could not reach ConsDB: {e}")
                 return
-            if isot is None:
+            isot = exposureTimes.obsEnd(record)
+            if record is None or isot is None:
                 self._send_error_json(404, f"No exposure-time record for dataId={dataId}")
                 return
-            exposureTimes.storeCached(dataId, isot, siteName=site.name)
+            exposureTimes.storeCachedRecord(dataId, record, siteName=site.name)
             self._send_json(
                 {
                     "dataId": dataId,
@@ -1946,6 +1997,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     "scale": "TAI",
                     "fromCache": False,
                     "site": site.name,
+                    "exposure": record,
                 }
             )
 

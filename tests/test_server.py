@@ -1024,6 +1024,9 @@ def _rangeStateForPayload() -> server.RangeState:
         2026051900723: base + dt.timedelta(seconds=30),
         2026051900725: base + dt.timedelta(seconds=90),  # resolved but no logs
     }
+    state.exposureInfoByExpId = {
+        2026051900722: {"obs_end": base.isoformat(), "img_type": "science", "physical_filter": "z_20"},
+    }
     return state
 
 
@@ -1039,6 +1042,17 @@ def test_buildRangePayload_lists_resolved_dataIds_with_overview() -> None:
     assert byId[2026051900723]["nTraceback"] == 1
     assert byId[2026051900722]["hasLogs"] is True
     assert byId[2026051900725]["hasLogs"] is False  # resolved but produced no logs
+    # The curated ConsDB record rides along per dataId for the chip tooltip
+    # (only 722 was resolved here; the others carry None).
+    assert byId[2026051900722]["exposure"]["img_type"] == "science"
+    assert byId[2026051900723]["exposure"] is None
+
+
+def test_buildRangeExposurePayload_carries_exposure_record() -> None:
+    state = _rangeStateForPayload()
+    payload = server._buildRangeExposurePayload(state, 2026051900722)
+    assert payload is not None
+    assert payload["exposure"]["physical_filter"] == "z_20"
 
 
 def test_buildRangeExposurePayload_reuses_exposure_shape_with_query() -> None:
@@ -1056,6 +1070,50 @@ def test_buildRangeExposurePayload_reuses_exposure_shape_with_query() -> None:
 def test_buildRangeExposurePayload_returns_None_for_skipped_id() -> None:
     state = _rangeStateForPayload()
     assert server._buildRangeExposurePayload(state, 2026051900724) is None
+
+
+def test_buildSummaryPayload_carries_exposure_record() -> None:
+    rec = {"obs_end": "2026-05-20T08:45:39.000", "img_type": "science", "physical_filter": "z_20"}
+    state = server.ServerState(
+        cacheDir=Path("/tmp/x"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc),
+        exposureInfo=rec,
+    )
+    payload = server._buildSummaryPayload(state)
+    assert payload["exposure"] == rec
+
+
+def test_buildSummaryPayload_exposure_is_None_when_unresolved() -> None:
+    state = server.ServerState(
+        cacheDir=Path("/tmp/x"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc),
+    )
+    assert server._buildSummaryPayload(state)["exposure"] is None
+
+
+def test_buildNightPayload_exposes_exposureInfo_map_keyed_by_string() -> None:
+    rec = {"obs_end": "2026-05-21T13:00:00.000", "img_type": "science"}
+    state = server.NightState(
+        cacheDir=Path("/tmp/n"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    state.exposureInfoByExpId = {2026052100051: rec}
+    payload = server._buildNightPayload(state)
+    # JSON object keys must be strings, so the map is keyed by str(expId).
+    assert payload["exposureInfo"] == {"2026052100051": rec}
 
 
 # ----- _maybeSetLokiPassword ----------------------------------------------
