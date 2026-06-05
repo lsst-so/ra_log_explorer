@@ -963,6 +963,28 @@ def test_delete_single_cache_window(runningServer: RunningServer, tmpCacheRoot: 
     assert not d.exists()
 
 
+def test_delete_night_cache_window_with_encoded_pods_segment(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Night caches nest under `pods=<slug>`; the client percent-encodes
+    each path segment, so the `=` arrives as `%3D`. The server must decode
+    it before resolving — otherwise the DELETE 404s and the row never goes
+    away (the bug this pins)."""
+    host, port, _ = runningServer
+    slug = "2026-05-30T120000Z__2026-05-31T120000Z"
+    nightDir = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug) / "pods=__aos__"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "_meta.json").write_text(
+        (tmpCacheRoot / "yagan" / "rapid-analysis" / slug / "_meta.json").read_text()
+    )
+    assert nightDir.exists()
+    # Exactly what the browser sends: encodeURIComponent per segment, so the
+    # pods= segment is `pods%3D__aos__`.
+    status, _ = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}/pods%3D__aos__")
+    assert status == 200
+    assert not nightDir.exists()
+
+
 def test_delete_unknown_cache_window(runningServer: RunningServer) -> None:
     host, port, _ = runningServer
     status, body = _delete(host, port, "/api/cache/yagan/rapid-analysis/nope")

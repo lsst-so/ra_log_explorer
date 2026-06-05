@@ -930,6 +930,54 @@ def test_summarizePod_traceback_interleaved_log_line_marks_truncated(tmp_path: P
     assert "self.something()" in s.tracebacks[1].body
 
 
+def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_path: Path) -> None:
+    """A traceback that reaches its terminating exception line but whose
+    class our classifier doesn't recognise (here ``StopIteration`` — no
+    canonical Error/Exception/… suffix) is *complete*, so it must label
+    ``"<unclassified>"`` — never ``"<truncated>"``, which is reserved for
+    genuinely cut-short bodies. The terminating line is still captured in
+    the body so the user can read the type by eye."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            ("2026-05-21T13:00:00.000+00:00", "info", "Running pipeline for 2026052100072 detector 1"),
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
+            ("2026-05-21T13:00:01.002+00:00", "error", "    next(it)"),
+            # Terminating exception line, but StopIteration isn't in the
+            # classifier's suffix set — complete, just unclassifiable.
+            ("2026-05-21T13:00:01.003+00:00", "error", "StopIteration: queue drained"),
+            # A following line so the traceback finalises via the normal
+            # (non-EOF) terminator path.
+            ("2026-05-21T13:00:02.000+00:00", "info", "moving on"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    tb = s.tracebacks[0]
+    assert tb.excClass == "<unclassified>"
+    assert "StopIteration: queue drained" in tb.body
+
+
+def test_summarizePod_complete_traceback_unknown_class_at_eof_marks_unclassified(tmp_path: Path) -> None:
+    """Same as above but the unclassified terminator line is the last
+    line in the pod log: it still finalises as ``"<unclassified>"`` (the
+    terminator was seen before EOF), not ``"<truncated>"``."""
+    p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
+    _writePodLog(
+        p,
+        [
+            ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
+            ("2026-05-21T13:00:01.003+00:00", "error", "custompkg.Halt: shutting down"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    assert s.tracebacks[0].excClass == "<unclassified>"
+
+
 def test_summarizePod_truncated_traceback_fixture(truncatedTracebackJsonl: Path) -> None:
     """End-to-end pin against a real Loki slice (a 20260602 AOS-worker
     `consdbClient.insert(...)` retry burst). The slice contains a

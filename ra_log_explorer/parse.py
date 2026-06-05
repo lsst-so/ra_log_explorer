@@ -696,17 +696,27 @@ class TracebackRecord:
     pod: str
     t: dt.datetime  # time of the "Traceback (most recent…)" leader line
     expId: int | None  # carryover-attributed dataId, if any
-    # e.g. "RuntimeError". Two sentinel values surface incomplete data:
-    #   "<truncated>" — traceback ended before any exception class line
-    #     appeared in the captured body (typically because the log
-    #     forwarder split the traceback across batches and lost the tail,
-    #     or another logger interleaved an INFO line mid-traceback).
-    #   "<unknown>"   — only used as a transient default while the body
-    #     is being collected; flipped to "<truncated>" at finalisation
-    #     if no class match was found.
+    # e.g. "RuntimeError". Three sentinel values surface a non-classified
+    # traceback, kept distinct so the UI can tell them apart:
+    #   "<unclassified>" — the traceback reached its terminating
+    #     exception line (a column-0 ``Foo: …`` shape) but that class
+    #     didn't match our classifier (e.g. ``StopIteration``, or a
+    #     custom class with no canonical Error/Exception/… suffix). The
+    #     record is *complete*; we just couldn't name the type.
+    #   "<truncated>"    — the traceback was genuinely cut short before
+    #     any terminating exception line: the log forwarder lost the
+    #     tail, another logger interleaved a line mid-stack, or the pod
+    #     log simply ended inside the frames.
+    #   "<unknown>"      — transient default while the body is still
+    #     being collected; always resolved to one of the two above at
+    #     finalisation. Never appears on a finished record.
     excClass: str
     excMessage: str  # the rest of the exception line, capped
     body: str  # full traceback text, capped
+    # Set once we observe the traceback's terminating exception line
+    # (classified or not). Drives the <unclassified> vs <truncated>
+    # split in :func:`_finaliseTraceback`.
+    reachedTerminator: bool = False
 
 
 # How many lines / characters to capture for each traceback body. Bodies
@@ -741,6 +751,14 @@ _EXC_CLASS_RE = re.compile(
     r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
     r"(?:\s*:\s*(?P<msg>.*))?$"
 )
+# Broader "this is the terminating exception line of a traceback" shape:
+# a column-0 dotted identifier, optionally followed by ``: message``,
+# WITHOUT requiring the canonical class suffix. A superset of
+# _EXC_CLASS_RE. We use it only to decide whether a traceback *ended*
+# (reached its exception line) versus was cut short — not to name the
+# class. That keeps "complete but unclassifiable" (e.g. ``StopIteration``,
+# a custom ``Halt: …``) labelled <unclassified> rather than <truncated>.
+_EXC_TERMINATOR_RE = re.compile(r"^(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:\s*:\s*.*)?$")
 
 
 def _isTracebackBodyLine(raw: str) -> bool:
@@ -820,7 +838,19 @@ def summarizePod(podLogPath: Path) -> PodSummary:
                 if m and activeTb.excClass == "<unknown>":
                     activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]
                     activeTb.excMessage = (m.group("msg") or "").strip()[:200]
+                    activeTb.reachedTerminator = True
             else:
+                # A non-body line ends the traceback. If it's itself a
+                # column-0 exception-terminator shape we couldn't strictly
+                # classify (StopIteration, a custom Foo: …), the traceback
+                # is *complete* — capture the line and mark it so it lands
+                # as <unclassified>, not <truncated>. A genuinely foreign
+                # interrupt (an INFO line mid-stack) won't match, so it
+                # stays <truncated>.
+                if activeTb.excClass == "<unknown>" and _EXC_TERMINATOR_RE.match(ln.raw):
+                    if len(tbLines) < _TRACEBACK_MAX_LINES:
+                        tbLines.append(ln.raw)
+                    activeTb.reachedTerminator = True
                 _finaliseTraceback(activeTb, tbLines, summary)
                 activeTb = None
                 tbLines = []
@@ -852,18 +882,19 @@ def summarizePod(podLogPath: Path) -> PodSummary:
 def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:
     """Pack `lines` into `record.body` (capped) and attach to `summary`.
 
-    If we never matched an exception class line inside the body, flip
-    the in-progress ``"<unknown>"`` sentinel to ``"<truncated>"`` so the
-    UI can tell "log was cut short before the class line" apart from a
-    real, complete traceback. See the ``excClass`` field doc on
-    :class:`TracebackRecord` for why.
+    Resolve the transient ``"<unknown>"`` excClass sentinel: a traceback
+    that reached its terminating exception line but didn't classify is
+    ``"<unclassified>"`` (complete, type unknown); one that ended before
+    any terminator is ``"<truncated>"`` (genuinely cut short). See the
+    ``excClass`` field doc on :class:`TracebackRecord` for why these are
+    kept distinct.
     """
     body = "\n".join(lines)
     if len(body) > _TRACEBACK_MAX_CHARS:
         body = body[:_TRACEBACK_MAX_CHARS] + "\n…(traceback body truncated)"
     record.body = body
     if record.excClass == "<unknown>":
-        record.excClass = "<truncated>"
+        record.excClass = "<unclassified>" if record.reachedTerminator else "<truncated>"
     summary.tracebacks.append(record)
 
 

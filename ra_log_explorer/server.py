@@ -1958,8 +1958,13 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)(?:/([^/]+))?$", path)
             if m:
-                cluster, namespace, slug = m.group(1), m.group(2), m.group(3)
-                podsSub = m.group(4)  # optional `pods=<slug>` segment
+                # Percent-decode each segment: the client encodeURIComponent's
+                # them, so a night cache's `pods=__aos__` arrives as
+                # `pods%3D__aos__`. Decode before matching, then
+                # _resolveCacheWindow re-validates the decoded form (rejecting
+                # any smuggled `/` or `..`), so this stays traversal-safe.
+                cluster, namespace, slug = unquote(m.group(1)), unquote(m.group(2)), unquote(m.group(3))
+                podsSub = unquote(m.group(4)) if m.group(4) else None  # optional `pods=<slug>` segment
                 target = _resolveCacheWindow(cluster, namespace, slug, podsSub)
                 if target is None:
                     self._send_error_json(404, "No such cache directory")

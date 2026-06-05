@@ -654,9 +654,11 @@ async function deleteCacheWindow(w) {
   if (!window.confirm(
     `Delete cached window?\n\n${w.cluster}/${w.namespace}/${subPath}\n(${humanBytes(w.sizeOnDisk)})`,
   )) return;
-  // For night-mode caches relPath is `<window>/<pods=…>` — we need two
-  // URL segments rather than one. encodeURIComponent each segment so
-  // the `=` in `pods=__aos__` survives intact.
+  // For night-mode caches relPath is `<window>/<pods=…>` — two URL
+  // segments, not one. Split on `/` and encodeURIComponent each segment
+  // (so the `=` in `pods=__aos__` is percent-encoded, not treated as a
+  // query delimiter); the server percent-decodes them back before
+  // resolving the directory.
   const segments = subPath.split('/').map(encodeURIComponent).join('/');
   const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`;
   try {
