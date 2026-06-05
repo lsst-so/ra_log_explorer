@@ -323,12 +323,19 @@ def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.dateti
     ``got < SERVER_QUERY_CAP`` check in :func:`_fetchWindowInto` is what
     actually guarantees no lines were dropped; the count only makes the
     chunking efficient and gives humans a number to sanity-check against.
+    The count covers ``(from, to]`` while the fetch covers ``[from, to)``,
+    so the two can differ by the handful of entries sitting exactly on a
+    window edge — fine for a presizing hint, another reason it's advisory.
     """
-    rangeNs = int((toT - fromT).total_seconds() * 1e9)
-    if rangeNs <= 0:
+    # LogQL range selectors take Prometheus-style durations whose smallest
+    # unit is milliseconds (``ns``/``us`` are rejected). Our windows never
+    # get below ~tens of ms (the MIN_SPLIT_S floor is 1 s), so ms is exact
+    # enough; a sub-ms window is treated as empty.
+    rangeMs = round((toT - fromT).total_seconds() * 1000)
+    if rangeMs <= 0:
         return 0
     matcher = _matcher(spec, pod=pod)
-    query = f"sum(count_over_time({matcher}[{rangeNs}ns]))"
+    query = f"sum(count_over_time({matcher}[{rangeMs}ms]))"
     try:
         out = _run_logcli(
             spec,
@@ -341,26 +348,36 @@ def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.dateti
 
 
 def _parseCountOutput(out: bytes) -> int | None:
-    """Pull the integer sample value out of an instant-query ``-o jsonl``
-    result, tolerant of the exact shape logcli emits.
+    """Pull the integer sample value out of an instant-query result.
 
-    A ``sum(...)`` instant query yields a single vector sample whose value
-    is ``[<ts>, "<count>"]``. We sum any such samples we can find (a bare
-    ``count_over_time`` without ``sum`` would emit one per stream). Returns
-    ``None`` if nothing parses — see :func:`_countOverTime` on why that is
-    safe.
+    logcli's ``-o jsonl`` for a *metric* query is actually a pretty-printed
+    JSON **array** of vector samples (not one object per line), each
+    ``{"metric": {...}, "value": [<ts>, "<count>"]}``. We sum the samples
+    (a ``sum(...)`` yields one; a bare ``count_over_time`` would yield one
+    per stream). A line-by-line fallback covers any other shape. Returns
+    ``None`` if nothing parses — see :func:`_countOverTime` on why safe.
     """
+    text = out.decode("utf-8", "replace").strip()
+    if not text:
+        return None
+    samples: list[object] = []
+    try:
+        obj = json.loads(text)
+        samples = obj if isinstance(obj, list) else [obj]
+    except json.JSONDecodeError:
+        # Fallback: some outputs really are one JSON object per line.
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                samples.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
     total = 0
     found = False
-    for line in out.decode("utf-8", "replace").splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        value = obj.get("value") if isinstance(obj, dict) else None
+    for sample in samples:
+        value = sample.get("value") if isinstance(sample, dict) else None
         # Loki vector sample: value == [<unixSeconds>, "<count>"].
         if isinstance(value, list) and len(value) == 2:
             try:

@@ -572,6 +572,21 @@ def test_parseCountOutput_reads_vector_sample() -> None:
     assert fetch._parseCountOutput(out) == 1717
 
 
+def test_parseCountOutput_reads_pretty_printed_array() -> None:
+    # The real shape logcli emits for `instant-query -o jsonl` on a metric
+    # query: a pretty-printed JSON array of vector samples (NOT one per line).
+    out = b"""[
+  {
+    "metric": {},
+    "value": [
+      1780203600,
+      "44597"
+    ]
+  }
+]"""
+    assert fetch._parseCountOutput(out) == 44597
+
+
 def test_parseCountOutput_sums_per_stream_samples() -> None:
     # A bare count_over_time (no sum) emits one sample per stream; we add them.
     out = (
@@ -603,7 +618,7 @@ def test_countOverTime_builds_instant_query_and_parses(monkeypatch: pytest.Monke
     assert args[0] == "instant-query"
     assert "sum(count_over_time(" in args[1]
     assert 'pod="pod-x"' in args[1]
-    assert "[5000000000ns]" in args[1]  # 5s window expressed in nanoseconds
+    assert "[5000ms]" in args[1]  # 5s window in ms (LogQL rejects ns/us)
     assert any(a.startswith("--now=") for a in args)
 
 
