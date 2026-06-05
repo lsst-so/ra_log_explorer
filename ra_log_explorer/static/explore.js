@@ -110,6 +110,9 @@ async function startExplore(loadedSummary) {
   selectedPod = null;
   collapsedGroups = new Set();
   summary = loadedSummary;
+  if (window.renderFetchBanner) {
+    window.renderFetchBanner(document.getElementById('explore-fetch-banner'), summary);
+  }
   document.getElementById('expId-display').textContent =
     `expId=${summary.expId}  ·  t₀=${summary.tZero}`;
   shutterUtcMs = new Date(summary.tZero).getTime();

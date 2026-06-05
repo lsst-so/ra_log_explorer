@@ -17,7 +17,6 @@ DEFAULT_WORKERS = 8
 DEFAULT_WINDOW_BEFORE_S = 5.0
 DEFAULT_WINDOW_AFTER_S = 5 * 60.0
 DEFAULT_HTTP_PORT = 8765
-DEFAULT_LINE_LIMIT = 50_000  # per-pod safety cap; pods rarely emit this much
 # Range mode fetches one wide window covering [startId, stopId]. The tool is
 # meant for tens of consecutive exposures; this is a fat-finger backstop so a
 # transposed/typo'd pair can't generate a multi-thousand-id ConsDB sweep or a
@@ -167,6 +166,12 @@ class FetchSpec:
     24-hour fetch to the few pod-name patterns we care about (e.g.
     ``.*aos.*``). ``None`` means no filter, i.e. fetch every pod that
     logged anything in the window.
+
+    There is deliberately no per-pod line cap: the per-pod query uses
+    logcli's ``--limit=0`` ("fetch all entries") so a window — especially
+    a full night — is always retrieved in its entirety. A cap would
+    silently tail-drop the busiest pods, which is exactly the failure
+    this tool exists to avoid. See :func:`fetch._fetchOnePod`.
     """
 
     lokiAddr: str
@@ -176,5 +181,4 @@ class FetchSpec:
     fromIso: str  # RFC3339Nano UTC, no timezone suffix per logcli docs
     toIso: str
     workers: int = DEFAULT_WORKERS
-    lineLimit: int = DEFAULT_LINE_LIMIT
     podRegex: str | None = None

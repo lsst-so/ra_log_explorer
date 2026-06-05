@@ -15,6 +15,9 @@ let nightListenersWired = false;
 
 function startNight(summary) {
   nightSummary = summary;
+  if (window.renderFetchBanner) {
+    window.renderFetchBanner(document.getElementById('night-fetch-banner'), summary);
+  }
   document.getElementById('night-dayobs-display').textContent = `dayObs=${summary.dayObs}`;
   document.getElementById('night-window-display').textContent =
     `(${summary.startTime} → ${summary.endTime})`;

@@ -15,7 +15,8 @@ repeat runs into instant loads.
 │   └── bts.json                                     scopes can't return the wrong obs_end
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
-        ├── _meta.json                             ← FetchSpec + per-pod byte counts
+        ├── _meta.json                             ← FetchSpec + fetchSchemaVersion +
+        │                                            per-pod byte counts + fetchComplete
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
@@ -61,16 +62,18 @@ wipe.
    produce new logs inside the window, so the cache would be stale.)
    This is the safety net for an in-progress dayObs in night mode.
 
-2. **Exact hit** if `<requestedDir>/_meta.json` exists and there's no
-   `.partial` flag. Returns the requested directory and the saved
-   meta with `cacheReuse = "exact"`.
+2. **Exact hit** if `<requestedDir>/_meta.json` exists, carries the
+   current `fetchSchemaVersion`, and there's no `.partial` flag.
+   Returns the requested directory and the saved meta with
+   `cacheReuse = "exact"`.
 
 3. **Superset hit** if any other completed cache directory under
    `<cluster>/<namespace>/` (or under `<cluster>/<namespace>/<window>/
-   pods=<slug>/` for night mode) has a window that fully contains the
-   requested one **and the same `podRegex`**. The *smallest* such
-   superset wins. Returns that directory and meta with
-   `cacheReuse = "superset"` plus `cacheReusePath`.
+   pods=<slug>/` for night mode) carries the current
+   `fetchSchemaVersion`, has the same `podRegex`, and a window that
+   fully contains the requested one. The *smallest* such superset wins.
+   Returns that directory and meta with `cacheReuse = "superset"` plus
+   `cacheReusePath`.
 
    Cross-mode reuse is forbidden: an exposure-mode (`podRegex=None`)
    cache is NEVER a valid superset for a night-mode
@@ -80,10 +83,15 @@ wipe.
 
 4. Otherwise **fetch fresh**: create the requested directory, write
    `.partial`, list pods via `logcli series` (honouring `podRegex`
-   if set), fetch each pod in parallel with
-   `--limit=DEFAULT_LINE_LIMIT --forward`, write `_meta.json`, remove
-   `.partial`. Returns the requested directory with
-   `cacheReuse = "none"`.
+   if set), fetch each pod in parallel with `--limit=0 --forward`
+   (every line, no cap — see *Completeness* below), write
+   `_meta.json`, remove `.partial`. Returns the requested directory
+   with `cacheReuse = "none"`.
+
+Steps 2 and 3 ignore any cache whose `fetchSchemaVersion` doesn't match
+the current `CACHE_SCHEMA_VERSION`. That's what keeps a stale snapshot
+written by an older, possibly-truncating version of the tool from being
+silently re-served — it re-fetches instead.
 
 ## Why supersets are safe
 
@@ -100,6 +108,35 @@ events outside the user's nominal window. The timeline / detail UI
 shows events at their true offset relative to t-zero (or
 night-start), so this manifests simply as a wider visible range;
 nothing is mis-attributed.
+
+## Completeness (never silently truncate)
+
+A fetch must return the **whole** window — for a full night, every line
+of every pod. There is deliberately no per-pod line cap: each per-pod
+query uses logcli's `--limit=0` ("fetch all entries"), which paginates
+internally until the stream is exhausted. (The old behaviour capped each
+pod at 50 000 lines with `--forward`, which silently *tail-dropped* the
+busiest pods — so a busy night's late exposures lost their early
+processing and the night histograms were biased late. That bug is what
+`--limit=0` fixes.) Output is streamed straight to the pod's `.jsonl`
+file so a pathologically chatty pod can't exhaust memory.
+
+The only way a fetch can now come up short is a per-pod logcli failure
+(timeout, transient 5xx). Each such failure is recorded in
+`_meta.json`'s `errors` map (`{pod: message}`), and `fetchComplete` is
+`True` iff that map is empty. A partial download left behind by a
+streamed query that died mid-flight is kept (its bytes counted) but the
+pod is still flagged errored. Consumers surface an incomplete fetch
+loudly rather than letting a partial window pass for the whole night:
+
+- **Browser** — a red banner at the top of the explore and night views
+  (`renderFetchBanner` in `app.js`) lists the failed pods.
+- **CLI** — `_warnIfIncompleteFetch` prints an unmissable stderr warning
+  after any fetch (cache hit included).
+
+When the *shape* of what makes a cache trustworthy changes (as the line
+cap → `--limit=0` switch did), bump `CACHE_SCHEMA_VERSION` so older
+caches re-fetch instead of being re-served (see the cache hit policy).
 
 ## The `.partial` flag
 

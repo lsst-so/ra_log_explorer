@@ -295,6 +295,15 @@ shapes:
 `group == "other"` pod as a safety net for unknown roles. `podsAll` is
 every pod that emitted in the window.
 
+`meta` is the fetch's `_meta.json` verbatim. Beyond `cacheReuse`, the
+fields the UI cares about are `fetchComplete` (bool — `false` iff any pod
+failed to download in full) and `errors` (`{pod: message}` for the
+failures). When `fetchComplete` is `false` the explore and night views
+render a loud banner (`renderFetchBanner`); an incomplete night fetch
+otherwise silently biases the Δshutter histograms. `fetchSchemaVersion`
+gates cache reuse (see [caching.md](caching.md)). This same `meta` block
+appears in the night and range payloads below.
+
 `looksTruncatedEnd` is `true` for sfm/aos/step1b/step1b-aos/backlog
 pods that touched this expId but did NOT emit a canonical finish event
 (QUANTUM_DONE / WORKER_REPORT_* / WORKER_BINNED_*) — usually means the

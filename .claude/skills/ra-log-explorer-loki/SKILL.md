@@ -62,9 +62,11 @@ both, even when only one cluster is in scope today.
 Issuing a single broad `query` against the whole namespace and
 post-splitting the lines by pod would be simpler, but it has two
 problems:
-1. The per-stream `--limit` cap (50 000 by default in our `FetchSpec`)
-   is per-query, not per-stream; a broad query truncates noisy pods
-   first and silently drops events from the ones we care about.
+1. We fetch *every* line per pod with `--limit=0` (see below). A single
+   broad query over the whole namespace would be far larger, slower, and
+   harder to bound; per-pod queries keep each download independently
+   sized and isolate one pod's failure (recorded in `_meta.json`'s
+   `errors`) instead of letting it take down the whole window.
 2. The on-disk cache is naturally indexed by pod (one `.jsonl` per pod);
    per-pod queries map straight onto that layout with no post-processing.
 
@@ -78,12 +80,21 @@ If you ever change this, document the trade-off in
 -o jsonl                 one JSON object per line, with labels preserved
 --forward                ascending time order; otherwise we'd need to
                          reverse the file before parsing
---limit=<N>              FetchSpec.lineLimit; default 50_000
+--limit=0                fetch ALL entries — logcli paginates internally
+                         until the stream is exhausted. NEVER reinstate a
+                         finite cap: with --forward a cap silently
+                         tail-drops the busiest pods (which is the exact
+                         bug that biased the night histograms late).
 --from --to              RFC3339Nano UTC strings ending in 'Z'
 ```
 
 Drop any of these at your peril; tests assume the file is in `--forward`
-order and that `labels.detected_level` is present.
+order and that `labels.detected_level` is present, and pin `--limit=0`.
+
+The per-pod query is streamed straight to the pod's `.jsonl`
+(`_run_logcli(spec, [...], stdoutPath=outPath)`) so an uncapped fetch of
+a chatty pod can't blow up memory, and runs under the longer
+`PER_POD_TIMEOUT_S` (1800 s) rather than the series-listing default.
 
 ### Timestamps
 
@@ -104,8 +115,10 @@ the useful range; beyond that you start hitting Loki ingestion-side
 backpressure that manifests as occasional logcli timeouts (`_run_logcli`
 catches and reports those per-pod, so other pods keep going).
 
-If you raise `lineLimit` significantly above 50 000, raise the per-query
-timeout in `_run_logcli` proportionally — 600 s is the current cap.
+The per-pod query is uncapped (`--limit=0`), so a chatty pod over a full
+night paginates many batches. That's why the per-pod timeout is the
+generous `PER_POD_TIMEOUT_S` (1800 s), not the series default — bump it
+further if real nights start hitting it.
 
 ## Error modes you should expect
 
@@ -115,7 +128,11 @@ timeout in `_run_logcli` proportionally — 600 s is the current cap.
   stderr; the most common non-fatal reason is a transient 502/504
   through nginx, retryable by re-running.
 - **`logcli timed out`** — happens when a pod's `.jsonl` is huge or the
-  cluster is busy. Drop `--workers` or narrow the window.
+  cluster is busy. Drop `--workers` or narrow the window. Any per-pod
+  failure (timeout / 5xx) lands in `_meta.json`'s `errors` map and flips
+  `fetchComplete` to `false`; that's surfaced loudly (red banner in the
+  UI, `INCOMPLETE FETCH` on the CLI) because a short window otherwise
+  passes for the whole night. Don't swallow these.
 - **Empty per-pod output but the pod is in `listPods`** — Loki has a
   silent disagreement between the `series` index and the underlying
   blocks (rare but real). Treat as fetched and let the parser see an

@@ -12,12 +12,26 @@ directory contains:
 
 A cache hit re-uses the existing files iff:
   * _meta.json is present and well-formed
+  * _meta.json carries the current ``fetchSchemaVersion`` (so caches
+    written by an older, possibly-truncating version of the tool are
+    never silently re-served — they re-fetch instead)
   * the requested window's end time is in the past at fetch time (so future
     re-runs would not pick up new logs anyway)
   * the cache was completed (no .partial flag file)
 
 If the window extends into the future, we always re-fetch — otherwise we
 would silently return a snapshot from before the window finished.
+
+Completeness
+------------
+Each per-pod query uses logcli's ``--limit=0`` ("fetch all entries"),
+which paginates internally until the stream is exhausted — there is no
+line cap to silently tail-drop the busiest pods. The *only* way a fetch
+can come up short is a per-pod logcli failure (timeout, transient 5xx),
+which is recorded in ``_meta.json``'s ``errors`` map; ``fetchComplete``
+is ``True`` iff that map is empty. Callers surface an incomplete fetch
+loudly rather than letting the user mistake a partial window for the
+whole night.
 
 Superset reuse: when the requested window has no exact match but is fully
 contained within some other cached window for the same (cluster, namespace),
@@ -43,6 +57,18 @@ from pathlib import Path
 from typing import Callable
 
 from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
+
+# Bumped whenever a change to how we fetch makes older caches untrustworthy.
+# v1 (implicit, no field) capped each pod at 50_000 lines and so silently
+# tail-dropped the busiest pods on a full night; v2 fetches every line
+# (logcli --limit=0). A cache without this exact value is re-fetched rather
+# than re-served, so no truncated v1 snapshot can leak into the UI.
+CACHE_SCHEMA_VERSION = 2
+
+# Per-pod query timeout. logcli --limit=0 paginates the whole window, so a
+# very chatty pod over a full night can take a while; this is generous on
+# purpose. The series listing keeps the shorter default in _run_logcli.
+PER_POD_TIMEOUT_S = 1800.0
 
 PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
@@ -72,8 +98,23 @@ class FetchError(RuntimeError):
     pass
 
 
-def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -> bytes:
-    """Run logcli with the spec's connection args plus extras; return stdout."""
+def _run_logcli(
+    spec: FetchSpec,
+    extraArgs: list[str],
+    timeout: float = 300.0,
+    stdoutPath: Path | None = None,
+) -> bytes:
+    """Run logcli with the spec's connection args plus extras.
+
+    When ``stdoutPath`` is given, logcli's stdout is streamed straight to
+    that file (bounded memory — used for the potentially huge per-pod
+    query) and ``b""`` is returned. Otherwise stdout is captured in full
+    and returned (used for the small ``series`` listing).
+
+    On failure the partial file, if any, is left in place: the caller
+    records the pod as errored and a partial download is still better
+    than nothing, as long as we flag it.
+    """
     cmd = [
         "logcli",
         f"--username={spec.username}",
@@ -88,13 +129,12 @@ def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -
             "Export it (or source the shell rc that does) before running."
         )
     try:
-        result = subprocess.run(
-            cmd,
-            check=True,
-            capture_output=True,
-            env=env,
-            timeout=timeout,
-        )
+        if stdoutPath is not None:
+            with open(stdoutPath, "wb") as fh:
+                subprocess.run(cmd, check=True, stdout=fh, stderr=subprocess.PIPE, env=env, timeout=timeout)
+            return b""
+        result = subprocess.run(cmd, check=True, capture_output=True, env=env, timeout=timeout)
+        return result.stdout
     except FileNotFoundError as e:
         raise FetchError("logcli binary not found on PATH") from e
     except subprocess.CalledProcessError as e:
@@ -103,7 +143,6 @@ def _run_logcli(spec: FetchSpec, extraArgs: list[str], timeout: float = 300.0) -
         ) from e
     except subprocess.TimeoutExpired as e:
         raise FetchError(f"logcli timed out after {timeout}s") from e
-    return result.stdout
 
 
 def _matcher(spec: FetchSpec, pod: str | None = None) -> str:
@@ -147,26 +186,34 @@ def _fetchOnePod(
     pod: str,
     outPath: Path,
 ) -> tuple[str, int]:
-    """Fetch logs for a single pod; return (pod, bytes_written)."""
+    """Fetch *all* logs for a single pod; return (pod, bytes_written).
+
+    ``--limit=0`` tells logcli to fetch every entry in the window,
+    paginating internally (correct boundary handling, no dedup gaps)
+    until the stream is exhausted. There is intentionally no line cap:
+    a cap would silently tail-drop the busiest pods, which is precisely
+    the bug this avoids. Output is streamed to ``outPath`` so a pod that
+    emits millions of lines can't blow up memory.
+    """
     matcher = _matcher(spec, pod=pod)
     # `--forward` => time-ordered ascending output; `-o jsonl` => one Loki API
     # JSON object per line which keeps labels (esp. detected_level) intact.
-    out = _run_logcli(
+    _run_logcli(
         spec,
         [
             "query",
             matcher,
             f"--from={spec.fromIso}",
             f"--to={spec.toIso}",
-            f"--limit={spec.lineLimit}",
+            "--limit=0",
             "-o",
             "jsonl",
             "--forward",
         ],
-        timeout=600.0,
+        timeout=PER_POD_TIMEOUT_S,
+        stdoutPath=outPath,
     )
-    outPath.write_bytes(out)
-    return pod, len(out)
+    return pod, outPath.stat().st_size
 
 
 def _parseIso(s: str) -> dt.datetime:
@@ -221,6 +268,8 @@ def findSupersetCache(
             meta = json.loads(metaP.read_text())
         except (OSError, json.JSONDecodeError):
             continue
+        if meta.get("fetchSchemaVersion") != CACHE_SCHEMA_VERSION:
+            continue  # older (possibly truncated) cache — re-fetch, don't reuse
         specMeta = meta.get("spec") or {}
         if specMeta.get("podRegex") != podRegex:
             continue  # different filter scope; on-disk pod set is different
@@ -269,12 +318,15 @@ def fetchAll(
     # exception for the podRegex case.
     cacheEligible = (not forceRefresh) and windowInPast
     if cacheEligible:
-        # Exact-spec cache hit?
+        # Exact-spec cache hit? Only honour it if the cache was written by
+        # the current fetch schema — an older (v1) cache may be truncated,
+        # so we fall through and re-fetch rather than re-serve it.
         if requestedDir.exists() and metaPath.exists() and not partialPath.exists():
             meta = json.loads(metaPath.read_text())
-            meta["fromCache"] = True
-            meta["cacheReuse"] = "exact"
-            return requestedDir, meta
+            if meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "exact"
+                return requestedDir, meta
         # Otherwise, look for a wider cached window that contains us.
         # Superset reuse is only honoured when the pod-filter matches;
         # otherwise an exposure-mode (all-pods) window could pretend to
@@ -312,20 +364,31 @@ def fetchAll(
                 perPodBytes[pod] = nbytes
                 totalBytes += nbytes
             except Exception as e:  # noqa: BLE001 - collect, don't bail
+                # A pod that errored is the only way this fetch can be
+                # incomplete (--limit=0 otherwise gets every line). Record
+                # it so the UI/CLI can shout. A streamed query may have left
+                # a partial file behind; count whatever bytes landed.
                 errors[pod] = str(e)
-                perPodBytes[pod] = 0
+                partialFile = podsDir / f"{pod}.jsonl"
+                partialBytes = partialFile.stat().st_size if partialFile.exists() else 0
+                perPodBytes[pod] = partialBytes
+                totalBytes += partialBytes
             if progress is not None:
                 progress(pod, i, len(pods))
 
     elapsed = time.time() - t0
     meta = {
         "spec": asdict(spec),
+        "fetchSchemaVersion": CACHE_SCHEMA_VERSION,
         "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "elapsed_s": elapsed,
         "pod_count": len(pods),
         "total_bytes": totalBytes,
         "pod_bytes": perPodBytes,
         "errors": errors,
+        # True iff every pod's logs were fetched in full. Any per-pod error
+        # means the window is missing data — surfaced loudly downstream.
+        "fetchComplete": not errors,
         "window_in_past": windowInPast,
         "fromCache": False,
         "cacheReuse": "none",

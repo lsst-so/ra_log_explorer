@@ -97,6 +97,31 @@ def test_build_parser_cache_flush_with_yes() -> None:
     assert ns.yes is True
 
 
+def test_warnIfIncompleteFetch_silent_when_complete(capsys: pytest.CaptureFixture[str]) -> None:
+    cli._warnIfIncompleteFetch({"errors": {}}, "/tmp/cache")
+    assert capsys.readouterr().err == ""
+
+
+def test_warnIfIncompleteFetch_shouts_and_lists_failed_pods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    meta = {"errors": {"aos-worker-7": "logcli timed out", "sfm-runner-1": "rc=1: 502"}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "INCOMPLETE FETCH" in err
+    assert "2 pod(s) failed" in err
+    assert "aos-worker-7" in err and "sfm-runner-1" in err
+    assert "--force-refresh" in err
+
+
+def test_warnIfIncompleteFetch_caps_the_pod_list(capsys: pytest.CaptureFixture[str]) -> None:
+    meta = {"errors": {f"pod-{i}": "boom" for i in range(20)}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "20 pod(s) failed" in err
+    assert "and 8 more" in err  # 20 - 12 shown
+
+
 def test_cmdRun_rejects_partial_args(capsys: pytest.CaptureFixture[str]) -> None:
     """Supplying --exposure-id without --t-zero (or vice-versa) is an error."""
     # We test cmdRun directly rather than main(): main([]) would start the
@@ -176,7 +201,6 @@ def test_cmdCacheInfo_lists_night_caches_under_pods_subdir(
                     "fromIso": "2026-05-21T12:00:00Z",
                     "toIso": "2026-05-22T12:00:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
                 "pod_count": 1,

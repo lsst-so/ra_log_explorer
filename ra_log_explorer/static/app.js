@@ -126,4 +126,62 @@ window.showRange = function showRange(indexSummary) {
   window.startRange(indexSummary);
 };
 
+// ----- incomplete-fetch banner (shared by explore + night views) -----------
+//
+// A fetch is "complete" only when every pod's logs came back in full. With
+// logcli --limit=0 the one way to fall short is a per-pod failure (timeout /
+// transient 5xx), recorded in meta.errors. When that happens the window is
+// missing data — and for the night view that silently biases the Δshutter
+// histograms — so we shout rather than letting a partial window pass for the
+// whole night. `summary.meta.fetchComplete` is the explicit signal; we also
+// treat any non-empty meta.errors as incomplete for older payloads.
+function renderFetchBanner(bannerEl, summary) {
+  if (!bannerEl) return;
+  bannerEl.innerHTML = '';
+  const meta = summary && summary.meta;
+  const errors = (meta && meta.errors) || {};
+  const pods = Object.keys(errors);
+  const complete = meta ? (meta.fetchComplete !== false && pods.length === 0) : true;
+  if (complete) {
+    bannerEl.hidden = true;
+    return;
+  }
+  bannerEl.hidden = false;
+  const total = (meta && meta.pod_count) || pods.length;
+
+  const title = document.createElement('div');
+  title.className = 'fetch-banner-title';
+  title.textContent = `⚠ Incomplete fetch — ${pods.length} of ${total} pods failed to download`;
+  bannerEl.appendChild(title);
+
+  const sub = document.createElement('div');
+  sub.className = 'fetch-banner-sub';
+  sub.textContent =
+    'The logs shown are missing data and may be misleading'
+    + (summary && summary.mode === 'night' ? ' (this skews the Δshutter histograms below).' : '.')
+    + ' Re-fetch with force-refresh to retry.';
+  bannerEl.appendChild(sub);
+
+  const list = document.createElement('ul');
+  list.className = 'fetch-banner-pods';
+  const shown = pods.slice(0, 12);
+  for (const pod of shown) {
+    const li = document.createElement('li');
+    const name = document.createElement('span');
+    name.className = 'mono';
+    name.textContent = pod;
+    li.appendChild(name);
+    li.appendChild(document.createTextNode(` — ${errors[pod]}`));
+    list.appendChild(li);
+  }
+  if (pods.length > shown.length) {
+    const li = document.createElement('li');
+    li.className = 'muted';
+    li.textContent = `+${pods.length - shown.length} more (see _meta.json)`;
+    list.appendChild(li);
+  }
+  bannerEl.appendChild(list);
+}
+window.renderFetchBanner = renderFetchBanner;
+
 bootstrap();

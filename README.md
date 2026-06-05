@@ -427,6 +427,15 @@ look at the pod's `.jsonl` directly under the cache directory. If the
 file is empty, that's Loki returning nothing for the window — usually a
 transient series-index gap. Re-run with `--force-refresh` to pull again.
 
+**Red "Incomplete fetch" banner (or an `INCOMPLETE FETCH` line on the
+CLI)** — one or more pods failed to download in full (a `logcli`
+timeout, or a transient 5xx from Loki), so the window you're looking at
+is missing data. This matters most in night mode, where missing pods
+silently bias the Δshutter histograms. The banner lists the affected
+pods; re-run with `--force-refresh` to retry. (The tool never caps a
+pod's log count — it fetches every line with `logcli --limit=0` — so an
+incomplete fetch is always a fetch *failure*, never a silent truncation.)
+
 **Cache hit when you didn't expect one** — the tool reuses any
 *superset* of the requested window. If you specifically want to refetch,
 pass `--force-refresh`.

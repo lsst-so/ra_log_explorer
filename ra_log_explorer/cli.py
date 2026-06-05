@@ -124,6 +124,29 @@ def _resolveSite(args: argparse.Namespace) -> Site:
     return siteByName(sites, name)
 
 
+def _warnIfIncompleteFetch(meta: dict, cacheDir: object) -> None:
+    """Print a loud stderr warning if the fetch missed any pod's logs.
+
+    ``--limit=0`` means the only way a window comes back short is a per-pod
+    logcli failure (recorded in ``meta['errors']``). Such a window is
+    missing data and easy to mistake for complete, so we make it obvious.
+    """
+    errors = meta.get("errors") or {}
+    if not errors:
+        return
+    nFailed = len(errors)
+    print(
+        f"\n  *** INCOMPLETE FETCH: {nFailed} pod(s) failed to download — "
+        "the logs are MISSING DATA and may be misleading. ***",
+        file=sys.stderr,
+    )
+    for pod, err in list(errors.items())[:12]:
+        print(f"      - {pod}: {err}", file=sys.stderr)
+    if nFailed > 12:
+        print(f"      ... and {nFailed - 12} more (see {cacheDir}/_meta.json)", file=sys.stderr)
+    print("  Re-run with --force-refresh to retry.\n", file=sys.stderr)
+
+
 def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerState:
     """Do the CLI-side fetch + parse and return a populated `ServerState`."""
     tZeroInput = _parseIsoUtc(args.t_zero)
@@ -171,11 +194,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerStat
             f"{humanBytes(meta['total_bytes'])} in {meta['elapsed_s']:.1f}s.",
             file=sys.stderr,
         )
-        if meta.get("errors"):
-            print(
-                f"  WARNING: {len(meta['errors'])} pods failed; see {cacheDir}/_meta.json",
-                file=sys.stderr,
-            )
+    # Loud, unmissable warning whenever the window came back short — in any
+    # branch, cache hit included. An incomplete fetch silently misleads
+    # (e.g. it biases the night Δshutter histograms), so we shout.
+    _warnIfIncompleteFetch(meta, cacheDir)
     cacheBytes = cacheDuSizeBytes(cache_root())
     print(f"Total cache: {humanBytes(cacheBytes)} at {cache_root()}", file=sys.stderr)
 

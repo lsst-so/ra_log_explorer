@@ -158,7 +158,7 @@ def fakeCachedWindow(tmpCacheRoot: Path) -> Path:
         '{"spec": {"lokiAddr": "x", "username": "u", "cluster": "yagan", '
         '"namespace": "rapid-analysis", '
         f'"fromIso": "{fromIso}", "toIso": "{toIso}", '
-        '"workers": 8, "lineLimit": 50000}, '
+        '"workers": 8}, '
         '"pod_count": 1, "total_bytes": 0, "pod_bytes": {}, '
         '"errors": {}, "window_in_past": true, "fromCache": false, '
         '"cacheReuse": "none"}'
