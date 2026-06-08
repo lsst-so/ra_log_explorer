@@ -1114,6 +1114,167 @@ def test_summarizeAll_sorts_pods_deterministically(tmp_path: Path) -> None:
     assert [s.pod for s in summaries] == ["aaa-pod", "mmm-pod", "zzz-pod"]
 
 
+# ----- k8s/events pod-lifecycle classification ----------------------------
+
+# Real-shaped k8s/events lines (flat key=value, quoted msg). The pod is
+# `aosworkerset-2`; these mirror what `logcli query {job="k8s/events",
+# name=…}` returns, sans the outer JSON.
+_POD = "s-lsstcam-run-aos-worker-aosworkerset-2"
+_EV_RESTART = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 objectRV=769552031 eventRV=770405037 "
+    "reportinginstance=yagan01 reportingcontroller=kubelet sourcecomponent=kubelet "
+    'sourcehost=yagan01 reason=Started type=Normal count=2 msg="Started container run-aos-worker"'
+)
+_EV_FIRST_START = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 reportinginstance=yagan01 sourcehost=yagan01 "
+    'reason=Started type=Normal count=1 msg="Started container run-aos-worker"'
+)
+_EV_KILLING = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 reportinginstance=yagan10 sourcehost=yagan10 "
+    'reason=Killing type=Normal count=1 msg="Stopping container run-aos-worker"'
+)
+_EV_OOM = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+    'reason=OOMKilling type=Warning count=1 msg="Memory cgroup out of memory"'
+)
+_EV_BACKOFF = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+    'reason=BackOff type=Warning count=4 msg="Back-off restarting failed container"'
+)
+_EV_UNHEALTHY = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+    'reason=Unhealthy type=Warning count=1 msg="Liveness probe failed"'
+)
+# Noise we drop: an image-pull event, and a StatefulSet (non-Pod) event.
+_EV_PULLED = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+    'reason=Pulled type=Normal count=1 msg="Successfully pulled image \\"alpine:latest\\""'
+)
+_EV_STATEFULSET = (
+    "name=s-lsstcam-run-aos-worker-aosworkerset kind=StatefulSet objectAPIversion=apps/v1 "
+    'reason=SuccessfulDelete type=Normal count=15 msg="delete Pod ... successful"'
+)
+
+
+def _evObj(line: str, ts: str = "2026-06-05T03:19:09+01:00") -> dict:
+    return {"timestamp": ts, "labels": {}, "line": line}
+
+
+def test_parseK8sEventFields_splits_kv_and_quoted_msg() -> None:
+    fields = parse._parseK8sEventFields(_EV_PULLED)
+    assert fields["reason"] == "Pulled"
+    assert fields["count"] == "1"
+    assert fields["kind"] == "Pod"
+    # The quoted msg keeps its spaces and unwinds the escaped inner quotes.
+    assert fields["msg"] == 'Successfully pulled image "alpine:latest"'
+
+
+def test_classifyK8sEvent_started_count2_is_restart() -> None:
+    ev = parse.classifyK8sEvent(_POD, _evObj(_EV_RESTART))
+    assert ev is not None
+    assert ev.kind == "POD_RESTARTED"
+    assert ev.level == "warn"
+    assert ev.flavor == "Started"
+    assert ev.expId is None  # lifecycle events are pod-global, never dataId-keyed
+    assert "restart #2" in ev.message
+    assert "yagan01" in ev.message
+    # 03:19:09 +01:00 == 02:19:09 UTC
+    assert ev.t == dt.datetime(2026, 6, 5, 2, 19, 9, tzinfo=dt.timezone.utc)
+
+
+def test_classifyK8sEvent_started_count1_is_plain_start() -> None:
+    ev = parse.classifyK8sEvent(_POD, _evObj(_EV_FIRST_START))
+    assert ev is not None
+    assert ev.kind == "POD_STARTED"
+    assert ev.level == "info"
+
+
+def test_classifyK8sEvent_killing_oom_backoff_unhealthy() -> None:
+    cases = {
+        _EV_KILLING: ("POD_KILLED", "Killing"),
+        _EV_OOM: ("POD_OOMKILLED", "OOMKilling"),
+        _EV_BACKOFF: ("POD_FAILED", "BackOff"),
+        _EV_UNHEALTHY: ("POD_UNHEALTHY", "Unhealthy"),
+    }
+    for line, (kind, reason) in cases.items():
+        ev = parse.classifyK8sEvent(_POD, _evObj(line))
+        assert ev is not None, line
+        assert ev.kind == kind
+        assert ev.flavor == reason
+
+
+def test_classifyK8sEvent_drops_noise_and_non_pod() -> None:
+    # Image pull is lifecycle chatter; a StatefulSet event names the set,
+    # not the pod. Both must classify to nothing.
+    assert parse.classifyK8sEvent(_POD, _evObj(_EV_PULLED)) is None
+    assert parse.classifyK8sEvent(_POD, _evObj(_EV_STATEFULSET)) is None
+
+
+def test_classifyK8sEvent_returns_None_without_timestamp() -> None:
+    assert parse.classifyK8sEvent(_POD, {"line": _EV_RESTART, "labels": {}}) is None
+
+
+def test_summarizePod_merges_and_sorts_k8s_events(tmp_path: Path) -> None:
+    """An app-log file plus a sibling events file: the lifecycle Event is
+    merged into ``summary.events`` and the combined list stays time-sorted."""
+    podName = _POD
+    appPath = tmp_path / f"{podName}.jsonl"
+    _writePodLog(
+        appPath,
+        [
+            (
+                "2026-06-05T03:19:00.000+01:00",
+                "info",
+                "2026-06-05 02:19:00,000 lsst.ts.wep.task fn INFO   "
+                "Running pipeline for 2026060400222 detector 195",
+            ),
+        ],
+    )
+    eventsPath = tmp_path / "events.jsonl"
+    eventsPath.write_text(
+        json.dumps(_evObj(_EV_KILLING, ts="2026-06-05T03:18:50+01:00"))
+        + "\n"
+        + json.dumps(_evObj(_EV_RESTART, ts="2026-06-05T03:19:09+01:00"))
+        + "\n"
+    )
+    s = parse.summarizePod(appPath, eventsPath)
+    kinds = [e.kind for e in s.events]
+    assert "POD_RESTARTED" in kinds
+    assert "POD_KILLED" in kinds
+    # Combined app + lifecycle events are time-ascending.
+    times = [e.t for e in s.events]
+    assert times == sorted(times)
+
+
+def test_summarizePod_without_events_path_is_app_only(tmp_path: Path) -> None:
+    """The events arg is optional — omitting it (v3 cache, or a pod with no
+    events file) yields exactly the app-log events, no crash."""
+    appPath = tmp_path / f"{_POD}.jsonl"
+    _writePodLog(
+        appPath,
+        [("2026-06-05T03:19:00.000+01:00", "info", "Running pipeline for 2026060400222 detector 195")],
+    )
+    s = parse.summarizePod(appPath)
+    assert not any(e.kind.startswith("POD_") for e in s.events)
+
+
+def test_summarizeAll_merges_pods_events_dir(tmp_path: Path) -> None:
+    """summarizeAll pairs pods/<pod>.jsonl with pods_events/<pod>.jsonl."""
+    cacheDir = tmp_path / "cache"
+    podsDir = cacheDir / "pods"
+    eventsDir = cacheDir / "pods_events"
+    podsDir.mkdir(parents=True)
+    eventsDir.mkdir(parents=True)
+    _writePodLog(
+        podsDir / f"{_POD}.jsonl",
+        [("2026-06-05T03:19:00.000+01:00", "info", "Running pipeline for 2026060400222 detector 195")],
+    )
+    (eventsDir / f"{_POD}.jsonl").write_text(json.dumps(_evObj(_EV_RESTART)) + "\n")
+    summaries = parse.summarizeAll(cacheDir)
+    assert len(summaries) == 1
+    assert any(e.kind == "POD_RESTARTED" for e in summaries[0].events)
+
+
 def test_podsForTimeline_includes_other_group_even_without_match(tmp_path: Path) -> None:
     """``"other"``-group pods are deliberately surfaced regardless of
     whether they touched the dataId — the UI safety net for unknown /

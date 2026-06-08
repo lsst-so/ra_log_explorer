@@ -97,6 +97,43 @@ Any line with `detected_level == "warn"` or `"error"` and a non-empty
 | `WARN`   | `level == "warn"`              | `expId` (only if a bare 13-digit dataId appears in `raw`) |
 | `ERROR`  | `level == "error"`             | `expId` (best-effort, as above) |
 
+### Pod lifecycle events  (from the `k8s/events` stream, not the app log)
+
+These come from a **different Loki stream** (`job="k8s/events"`), fetched
+per pod into `pods_events/<pod>.jsonl` alongside the app logs (see
+[caching.md](caching.md)). Their line shape is **not** the LSST Python log
+format — it's a flat `key=value` record with a quoted `msg="…"` tail:
+
+```
+name=… kind=Pod … reason=Started type=Normal count=2 msg="Started container run-aos-worker"
+```
+
+so they get a separate parse + classify path:
+[`parse.classifyK8sEvent`](../ra_log_explorer/parse.py) (via
+`_parseK8sEventFields`), wholly distinct from `classify`. We surface only
+the reasons that explain a pod dropping off the timeline and drop the rest
+(image pulls, scheduling, sandbox setup, container *create*). Events whose
+`kind` isn't `Pod` (a StatefulSet/ReplicaSet event names the *set*, not the
+pod) are dropped too.
+
+| Kind            | k8s `reason`                                            | level   | Notes |
+|-----------------|----------------------------------------------------------|---------|-------|
+| `POD_RESTARTED` | `Started` with `count ≥ 2`                               | warn    | The container has started before in this pod → it died and was restarted **in place**. The key "explains an abrupt mid-work gap" signal (e.g. an OOM the kernel didn't ship a message for). |
+| `POD_STARTED`   | `Started` with `count == 1`                              | info    | First start of the container; mostly relevant in night-wide windows. |
+| `POD_KILLED`    | `Killing`                                                | warn    | Container being stopped — graceful (rollout/scale-down) or pre-restart. |
+| `POD_OOMKILLED` | reason containing `OOM` (e.g. `OOMKilling`)             | error   | Node-pressure OOM. Note: a *container-limit* OOM emits no k8s event on this cluster (and the kernel line isn't shipped to Loki) — that case shows up only as `POD_RESTARTED`. |
+| `POD_FAILED`    | `Failed`/`BackOff`/`Evicted`/`Preempted`/`NodeNotReady`/`FailedKillPod` | error | Container failed / crash-looping / evicted. |
+| `POD_UNHEALTHY` | `Unhealthy`                                              | warn    | Liveness/readiness probe failed (often precedes a `Killing`). |
+
+All lifecycle kinds share the `POD_` prefix (and are enumerated in
+`parse.LIFECYCLE_EVENT_KINDS`). They carry **no dataId** — `expId` is always
+`None`, since they're pod-global, not per-exposure — so `who`/`detector`/
+`visit`/`taskLabel`/`durationS` are all unset. The specific k8s `reason`
+is kept in `flavor`, and `message` is the event's own text (plus
+`(restart #N)` and the node for a restart). The server includes them on any
+pod already in the timeline, windowed by time rather than by dataId (see
+the `_summaryToDict` note in [architecture.md](architecture.md)).
+
 ### Tracebacks  (captured by `summarizePod`, not `classify`)
 
 Tracebacks are captured separately because they span multiple log

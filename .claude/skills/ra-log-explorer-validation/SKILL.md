@@ -75,7 +75,7 @@ python3 -m ra_log_explorer.cli \
     --no-browser
 ```
 
-Then `curl http://127.0.0.1:8765/api/summary` and spot-check the
+Then `curl http://127.0.0.1:8780/api/summary` and spot-check the
 `referencePoints`, `taskColors`, and pod counts. This needs network +
 `logcli` + `LOKI_PASSWORD`, so it is **not** part of the standard
 validation loop — only do it when the change affects fetching or

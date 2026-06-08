@@ -668,6 +668,56 @@ def test_buildNightPayload_carries_histograms_and_stats() -> None:
     assert payload["failures"][0]["excClass"] == "RuntimeError"
 
 
+def test_buildNightPayload_carries_pod_restarts() -> None:
+    """A POD_RESTARTED lifecycle event lands in the night payload's
+    ``restarts`` list and ``stats.nPodRestarts``, attributed to the dataId
+    the pod was processing at the time."""
+    tShutter = dt.datetime(2026, 6, 5, 2, 17, 30, tzinfo=dt.timezone.utc)
+    tPickup = tShutter + dt.timedelta(seconds=30)
+    tRestart = tShutter + dt.timedelta(seconds=99)
+    pickupEv = parse.Event(pod="p", t=tPickup, kind="WORKER_PICKUP", level="info", expId=2026060400222)
+    restartEv = parse.Event(
+        pod="p",
+        t=tRestart,
+        kind="POD_RESTARTED",
+        level="warn",
+        flavor="Started",
+        message="Started container run-aos-worker (restart #2)  ·  on yagan01",
+    )
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=10,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=tPickup,
+        lastTs=tRestart,
+        expIdsSeen={2026060400222},
+        events=[pickupEv, restartEv],
+        expIdFirstLast={2026060400222: (tPickup, tRestart)},
+    )
+    state = server.NightState(
+        cacheDir=Path("/tmp/dummy"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260604,
+        startTime=dt.datetime(2026, 6, 4, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 6, 5, 12, 0, tzinfo=dt.timezone.utc),
+        shutterCloseByExpId={2026060400222: tShutter},
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["stats"]["nPodRestarts"] == 1
+    assert len(payload["restarts"]) == 1
+    row = payload["restarts"][0]
+    assert row["kind"] == "POD_RESTARTED"
+    assert row["dataId"] == 2026060400222
+    assert row["offsetS"] == pytest.approx(99.0)
+
+
 def test_buildNightPayload_counts_missing_shutter_closes() -> None:
     """``stats.nMissingShutterClose`` surfaces how many dataIds need a
     ConsDB resolve we don't have yet — the UI uses this for a "still

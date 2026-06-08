@@ -16,7 +16,7 @@ DEFAULT_WORKERS = 8
 # A small pre-shutter buffer just covers clock skew between camera / cluster.
 DEFAULT_WINDOW_BEFORE_S = 5.0
 DEFAULT_WINDOW_AFTER_S = 5 * 60.0
-DEFAULT_HTTP_PORT = 8765
+DEFAULT_HTTP_PORT = 8780
 # Range mode fetches one wide window covering [startId, stopId]. The tool is
 # meant for tens of consecutive exposures; this is a fat-finger backstop so a
 # transposed/typo'd pair can't generate a multi-thousand-id ConsDB sweep or a

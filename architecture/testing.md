@@ -131,7 +131,7 @@ python3 -m ra_log_explorer.cli \
     --no-browser
 ```
 
-Then `curl http://127.0.0.1:8765/api/summary?dataId=2026051900722`
+Then `curl http://127.0.0.1:8780/api/summary?dataId=2026051900722`
 and sanity-check:
 
 - `referencePoints` includes both stable refs (shutter close,

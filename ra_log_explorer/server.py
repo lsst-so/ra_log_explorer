@@ -388,8 +388,22 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
             tZero + dt.timedelta(seconds=DEFAULT_WINDOW_AFTER_S),
         )
 
+    # Pod-lifecycle markers (restart/kill/OOM, kind ``POD_*``) are global to
+    # the pod, not keyed to a dataId — and a death typically lands a few
+    # seconds *after* the last work line, outside the tight per-dataId
+    # window. Keep them on the lane whenever they fall in the broad exposure
+    # window, so "the pod died while working on this exposure" stays visible.
+    lifecycleWindow = (
+        tZero - dt.timedelta(seconds=DEFAULT_WINDOW_BEFORE_S),
+        tZero + dt.timedelta(seconds=DEFAULT_WINDOW_AFTER_S),
+    )
+
     relevant: list[parser.Event] = []
     for ev in s.events:
+        if ev.kind.startswith("POD_"):
+            if lifecycleWindow[0] <= ev.t <= lifecycleWindow[1]:
+                relevant.append(ev)
+            continue
         if ev.expId == expId:
             relevant.append(ev)
             continue
@@ -782,6 +796,7 @@ def _buildNightPayload(state: NightState) -> dict:
         dataIds=czIds,
     )
     failures = night.failureRows(state.summaries, shutterCloseByExpId)
+    restarts = night.lifecycleRows(state.summaries, shutterCloseByExpId)
 
     return {
         "loaded": True,
@@ -801,7 +816,11 @@ def _buildNightPayload(state: NightState) -> dict:
             "nPodsWithTraceback": stats.nPodsWithTraceback,
             "nDistinctExceptionClasses": stats.nDistinctExceptionClasses,
             "nMissingShutterClose": nMissingShutter,
+            "nPodRestarts": stats.nPodRestarts,
         },
+        # One row per pod restart / kill / OOM / failure (POD_* lifecycle
+        # events), attributed to the dataId the pod was processing then.
+        "restarts": [_toJsonable(r) for r in restarts],
         "errorsByType": [_toJsonable(r) for r in errType],
         "errorsByPod": [_toJsonable(r) for r in errPod],
         "histograms": {

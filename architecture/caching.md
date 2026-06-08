@@ -20,13 +20,17 @@ repeat runs into instant loads.
     └── <fromSlug>__<toSlug>/                      ← one directory per window
         ├── _meta.json                             ← FetchSpec + fetchSchemaVersion + per-pod
         │                                            byte/line counts + count_over_time oracle +
-        │                                            fetchComplete + errors + incomplete_pods
+        │                                            fetchComplete + errors + incomplete_pods +
+        │                                            pod_event_lines + event_errors
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
         │                                            that triggered fetches landing here
         ├── _range.txt                             ← (range caches only) two lines: startId, stopId
-        ├── pods/<pod>.jsonl                       ← raw Loki JSONL, --forward order
+        ├── pods/<pod>.jsonl                       ← raw Loki JSONL (app logs), --forward order
+        ├── pods_events/<pod>.jsonl                ← raw Loki JSONL (k8s/events lifecycle
+        │                                            stream); auxiliary, never gates
+        │                                            fetchComplete; absent for pods with no events
         ├── .partial                               ← present only while a fetch is in progress
         └── pods=<regex-slug>/                     ← (night caches only) one subdir per Loki
                                                      podRegex; mirrors the layout above and
@@ -34,6 +38,7 @@ repeat runs into instant loads.
             ├── pods.txt
             ├── _last_viewed.txt
             ├── pods/<pod>.jsonl
+            ├── pods_events/<pod>.jsonl
             └── .partial
 ```
 
@@ -81,7 +86,9 @@ explicit and up front and guarantees nothing written by an older
 history: v1 (implicit) capped each pod at 50 000 lines; v2 used
 `--limit=0` but still silently dropped lines on wide busy windows
 (grafana/loki#17270); v3 fetches in count-presized single-batch chunks
-(see *Completeness* below).
+(see *Completeness* below); v4 additionally fetches each pod's
+`k8s/events` lifecycle stream into `pods_events/` — a v3 cache has no such
+tree, so the bump forces a re-fetch to pick up the new markers.
 
 ## Cache hit policy
 
@@ -191,7 +198,15 @@ in `_meta.json` and both setting `fetchComplete=False`:
 `fetchComplete` is `True` iff **both** maps are empty. `_meta.json` also
 carries `pod_lines` (lines written per pod) and `pod_expected` (the
 `count_over_time` oracle per pod, when available) so a human or test can
-sanity-check lines-written against what Loki says was there. Consumers
+sanity-check lines-written against what Loki says was there.
+
+The `k8s/events` lifecycle pass is deliberately **outside** this
+completeness contract: it's a low-volume single-batch query per pod (no
+chunking — restart/kill/OOM events number in the handful, never thousands),
+its line counts land in `_meta.json`'s `pod_event_lines`, and any per-pod
+failure lands in `event_errors` — but neither flips `fetchComplete`. A gap
+in the auxiliary lifecycle stream is "no markers for that pod", not
+"missing data for the window". Consumers
 surface an incomplete fetch loudly rather than letting a partial window
 pass for the whole night:
 

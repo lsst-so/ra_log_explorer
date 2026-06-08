@@ -30,13 +30,13 @@ Sibling docs:
     ┌────────────────────────────┐
     │   fetch.py                 │  parallel per-pod queries, on-disk JSONL cache
     │   (listPods, fetchAll)     │  + LRU eviction + .partial flag + sidecars
-    └─────────────┬──────────────┘
-                  │ pods/<pod>.jsonl
+    └─────────────┬──────────────┘  app logs + k8s/events lifecycle stream
+                  │ pods/<pod>.jsonl  +  pods_events/<pod>.jsonl
                   ▼
     ┌────────────────────────────┐
-    │   parse.py                 │  Loki JSONL → LogLine → Event;
-    │   (summarizeAll)           │  carryover-aware dataId attribution;
-    │                            │  traceback capture into TracebackRecord
+    │   parse.py                 │  Loki JSONL → LogLine → Event (app log);
+    │   (summarizeAll)           │  k8s/events → POD_* lifecycle Event;
+    │                            │  carryover dataId attribution; tracebacks
     └─────────────┬──────────────┘
                   │ list[PodSummary]
                   ▼
@@ -124,8 +124,8 @@ Sibling docs:
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
 | `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant. |
-| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
-| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
+| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
+| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
@@ -204,7 +204,11 @@ Sibling docs:
 - **Event** — a structured fact extracted from one log line: `kind`
   (string, e.g. `HEAD_INCOMING`, `HEAD_DEFINE_VISIT`, `WORKER_PICKUP`,
   `QUANTUM_DONE`) plus optional `expId`, `detector`, `visit`, `who`,
-  `taskLabel`, `durationS`, `flavor`.
+  `taskLabel`, `durationS`, `flavor`. Events also come from the
+  `k8s/events` stream as pod-lifecycle facts (`kind` of `POD_RESTARTED`,
+  `POD_KILLED`, `POD_OOMKILLED`, `POD_FAILED`, `POD_UNHEALTHY`,
+  `POD_STARTED`) — these carry no dataId and put the k8s `reason` in
+  `flavor`. See [parsing.md](parsing.md) for the full taxonomy.
 
 - **Pod group** — coarse classification of a pod by name prefix
   (`head`, `sfm`, `aos`, `step1b`, `step1b-aos`, `mosaic`, `psf-plot`,
@@ -325,6 +329,16 @@ pods that touched this expId but did NOT emit a canonical finish event
 (QUANTUM_DONE / WORKER_REPORT_* / WORKER_BINNED_*) — usually means the
 fetch window ended before the pod did.
 
+Each pod's `events` array also carries any **pod-lifecycle markers**
+(`kind` of `POD_RESTARTED` / `POD_KILLED` / `POD_OOMKILLED` / `POD_FAILED`
+/ `POD_UNHEALTHY` / `POD_STARTED`, with `expId: null` and the k8s `reason`
+in `flavor`). Unlike dataId-keyed events, these are kept whenever they fall
+in the broad exposure window (`tZero - 5 s … tZero + 5 min`), not the tight
+per-dataId window — a pod usually dies a few seconds *after* its last work
+line, so the loose window is what keeps "the pod died here" visible.
+`looksTruncatedEnd` and a `POD_RESTARTED` marker are complementary: the
+former says "no finish event", the latter says *why*.
+
 #### Night payload  (`mode: "night"`)
 
 ```jsonc
@@ -341,10 +355,17 @@ fetch window ended before the pod did.
   "stats": {
     "nVisitsSeen": 612, "nPods": 14, "nTracebacks": 7,
     "nDataIdsWithTraceback": 4, "nPodsWithTraceback": 2,
-    "nDistinctExceptionClasses": 3, "nMissingShutterClose": 0
+    "nDistinctExceptionClasses": 3, "nMissingShutterClose": 0,
+    "nPodRestarts": 2
   },
   "errorsByType": [ { "excClass": "RuntimeError", "count": 5, "sampleMessage": "..." }, ... ],
   "errorsByPod":  [ { "pod": "...", "group": "aos", "count": 3 }, ... ],
+  "restarts": [                                  // POD_* lifecycle events (k8s/events)
+    { "kind": "POD_RESTARTED", "reason": "Started", "pod": "...", "group": "aos",
+      "dataId": 2026060400222,                   // the dataId the pod was processing then
+      "offsetS": 99.0, "tIso": "...",            // offsetS = Δshutter of that dataId, or null
+      "message": "Started container run-aos-worker (restart #2)  ·  on yagan01" }, ...
+  ],
   "histograms": {
     "firstTaskStart":  { "label": "First task pickup (Δshutter)",  "unit": "s",
                          "xMin": ..., "xMax": ..., "binWidth": ...,

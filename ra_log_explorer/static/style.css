@@ -653,6 +653,13 @@ button.ghost.mini.delete:disabled {
 .lg-mosaic { color: #b9710b; }
 .lg-warn   { color: #b15a00; }
 .lg-error  { color: var(--err); }
+/* Pod-lifecycle legend chips — taller/wider swatch to echo the full-height
+   markers on the track. Colours track the .kind-* marker backgrounds. */
+.lg-lifecycle::before { width: 4px; height: 15px; }
+.lg-restart      { color: #d9600f; }
+.lg-killed       { color: #c0392b; }
+.lg-oom          { color: #b00020; }
+.lg-podunhealthy { color: #b15a00; }
 
 /* Task chips (rendered by populateTaskLegend). The chips are appended as
    direct children of #task-legend with no separator, so make the
@@ -1028,6 +1035,41 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .tl-event.kind-oneoff     { background: #006699; opacity: .75; }
 .tl-event.kind-loopslow   { background: #d36100; }
 .tl-event.kind-info       { background: #94a3b8; opacity: .55; }
+
+/* Pod-lifecycle markers (k8s/events: restart / kill / OOM / unhealthy).
+   Full-height, slightly wider, with a white halo so they read as a
+   whole-pod event standing above the inset work ticks. */
+.tl-event.lifecycle {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 0;
+  z-index: 2;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .7);
+}
+.tl-event.kind-restart       { background: #ff7a18; }
+.tl-event.kind-killed        { background: #d05a5a; }
+.tl-event.kind-oom           { background: #b00020; }
+.tl-event.kind-podfail       { background: #b00020; }
+.tl-event.kind-podunhealthy  { background: #e7a200; }
+.tl-event.kind-podstart      { background: #2f9e44; opacity: .5; }
+
+/* Pod-lifecycle pill badges in the night-view "Pod restarts & deaths"
+   table. Colours track the .kind-* timeline markers / .lg-* legend. */
+.life-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+}
+.life-restart      { background: #d9600f; }
+.life-killed       { background: #c0392b; }
+.life-oom          { background: #b00020; }
+.life-podfail      { background: #b00020; }
+.life-podunhealthy { background: #b15a00; }
 
 .tl-t0-marker {
   position: absolute;

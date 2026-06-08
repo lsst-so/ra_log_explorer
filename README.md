@@ -35,7 +35,7 @@ cd ra_log_explorer
 python3 -m ra_log_explorer.cli
 ```
 
-That starts a local server and opens `http://127.0.0.1:8765/` in your
+That starts a local server and opens `http://127.0.0.1:8780/` in your
 browser. Type a 13-digit dataId, click **Fetch & explore**, wait
 ~60–90 s the first time (instant on a repeat). Stop with **Ctrl-C**.
 
@@ -121,7 +121,7 @@ summit ConsDB.)
 | Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only.                                  |
 | `logcli` on your `$PATH`          | `brew install grafana/grafana/logcli` on macOS, or grab a binary from Grafana releases. |
 | `git`                              | There is no PyPI package; you run from a checkout.                                  |
-| A browser                         | The tool opens `http://127.0.0.1:8765/` for you.                                      |
+| A browser                         | The tool opens `http://127.0.0.1:8780/` for you.                                      |
 
 ## Getting started — first run, step by step
 
@@ -147,7 +147,7 @@ python3 -m ra_log_explorer.cli
 ```
 
 That last command starts a local HTTP server and tries to open
-`http://127.0.0.1:8765/` in your default browser. If the browser doesn't
+`http://127.0.0.1:8780/` in your default browser. If the browser doesn't
 open by itself, paste the URL by hand. To stop the server, press
 **Ctrl-C** in the terminal where you launched it.
 
@@ -237,7 +237,13 @@ The browser app has three views:
   warning, and a "gather-only" warning listing any dataIds whose
   step1b (gather) ran with no step1a — physically impossible, so a tell
   that step1a logs were dropped (and a cause of a biased first-task
-  histogram).
+  histogram). It also rolls up **pod restarts & deaths** for the night:
+  a `pod restarts` stat tile and a table of every restart / kill /
+  OOM / failure (from the `k8s/events` stream), each attributed to the
+  dataId the pod was processing at that moment — click it to open that
+  visit. A `restart` is an in-place container restart, usually an OOM,
+  so it's the fastest way to spot "which exposures had a worker die on
+  them tonight".
 
 Inside the explore view:
 
@@ -267,6 +273,9 @@ Inside the explore view:
   the camera closed" reading.
 - **"collapse all" / "expand all"** — toggle every pod group at once.
 - **Events legend** — head-node / worker event icons.
+- **Pod lifecycle legend** — the full-height markers for pod
+  death/restart pulled from Kubernetes events (see below):
+  `restart`, `killed`, `OOM-killed`, `unhealthy`.
 - **Tasks legend** — one colour swatch per pipeline task seen (`isr`,
   `calibrateImage`, `calcZernikesTask`, …). Quantum bars on the
   timeline are coloured to match.
@@ -293,6 +302,20 @@ Inside the explore view:
     a red `TB N` pill in their row name. The cheapest visual scan
     for "where are things going wrong" is to look down the left
     edge of the timeline for red bars.
+  - **Pod death/restart markers.** Alongside each pod's app-log events
+    the timeline draws tall, full-height ticks for Kubernetes pod
+    lifecycle events — pulled from a second Loki stream (`k8s/events`)
+    fetched next to the logs. An orange `restart` tick is the important
+    one: it means the container died and was restarted **in place**, so
+    if a pod's app log just stops mid-exposure with no traceback, the
+    restart tick a few seconds later is usually *why*. Red `killed` /
+    `OOM-killed` / `failed` and amber `unhealthy` ticks cover the
+    explicit cases. Hover any tick for the k8s reason and message.
+    (Caveat: a container that exceeds its own memory limit is killed by
+    the kernel with **no** Kubernetes event, and the kernel's OOM line
+    isn't shipped to Loki — so that common case shows up only as the
+    `restart` tick, not a definitive `OOM-killed`. To confirm OOM, check
+    `kubectl ... lastState.terminated` (`reason: OOMKilled`, exit 137).)
 - **Detail drawer** — click any pod's row to slide up its full parsed
   log, with Δt₀, level, and a filter / "warn-only" / "only lines
   relevant to this dataId" toggle. The relevance check is smarter than
@@ -396,7 +419,7 @@ The first loads after such an upgrade re-fetch and so are slower.
 --username USER          Loki HTTP basic-auth user (default merlin)
 --force-refresh          ignore the cache and re-fetch
 --host HOST              bind address (default 127.0.0.1)
---port PORT              HTTP port (default 8765)
+--port PORT              HTTP port (default 8780)
 --no-serve               with --exposure-id: fetch + parse only, no UI
 --no-browser             launch the UI but don't auto-open a browser tab
 ```
@@ -447,6 +470,16 @@ look at the pod's `.jsonl` directly under the cache directory. If the
 file is empty, that's Loki returning nothing for the window — usually a
 transient series-index gap. Re-run with `--force-refresh` to pull again.
 
+**A pod's log just stops mid-exposure, no traceback, no finish** — look
+for a tall `restart` tick on that pod's lane a few seconds after the last
+line (and an amber `⚠ window` flag on the row). That's a container that
+died and was restarted in place — most often an out-of-memory kill the
+kernel didn't log to us. The `restart` tick comes from the `k8s/events`
+stream the fetch pulls alongside the logs; to *confirm* OOM specifically,
+`kubectl get pod <pod> -n rapid-analysis -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'`
+shows `reason: OOMKilled` and exit code 137 (only until the next restart
+overwrites it).
+
 **Red "Incomplete fetch" banner (or an `INCOMPLETE FETCH` line on the
 CLI)** — one or more pods are missing data, so the window you're looking
 at is incomplete. This matters most in night mode, where missing pods
@@ -470,7 +503,7 @@ with `--force-refresh` to write a tighter cache directory and reload.
 
 **Browser opens but the page is blank / JS error** — check the terminal
 for a Python traceback from the server. Re-run with `--port` set to a
-free port if 8765 is in use.
+free port if 8780 is in use.
 
 ## For developers / contributors
 

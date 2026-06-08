@@ -66,6 +66,14 @@ function showShutterDelta() {
 }
 
 function kindClass(kind, level) {
+  // Pod-lifecycle markers (from the k8s/events stream) — checked first so
+  // their own colour wins over the level-based fallbacks below.
+  if (kind === 'POD_OOMKILLED') return 'kind-oom';
+  if (kind === 'POD_FAILED') return 'kind-podfail';
+  if (kind === 'POD_KILLED') return 'kind-killed';
+  if (kind === 'POD_RESTARTED') return 'kind-restart';
+  if (kind === 'POD_UNHEALTHY') return 'kind-podunhealthy';
+  if (kind === 'POD_STARTED') return 'kind-podstart';
   if (level === 'error') return 'kind-error';
   if (kind === 'WORKER_PICKUP') return 'kind-pickup';
   if (kind === 'WORKER_QG_START' || kind === 'WORKER_QG_BUILT') return 'kind-qg';
@@ -485,6 +493,16 @@ function groupDisplay(group) {
 function makeEventNode(e) {
   const n = document.createElement('div');
   n.className = 'tl-event ' + kindClass(e.kind, e.level);
+  // Pod-lifecycle markers render as a full-height tick (vs the inset work
+  // ticks) so a restart/kill/OOM reads as "the whole pod" at that instant.
+  if (e.kind && e.kind.startsWith('POD_')) {
+    n.classList.add('lifecycle');
+    n.style.left = xForOffset(e.offsetS) + 'px';
+    n.addEventListener('mouseenter', (ev) => showTooltip(ev, e));
+    n.addEventListener('mousemove', moveTooltip);
+    n.addEventListener('mouseleave', hideTooltip);
+    return n;
+  }
   const taskColor = (e.taskLabel && summary.taskColors)
     ? summary.taskColors[e.taskLabel] : null;
   if (e.durationS && e.kind === 'QUANTUM_DONE') {

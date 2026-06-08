@@ -287,6 +287,13 @@
         <span class="lg lg-error">ERROR</span>
       </div>
       <div class="lg-block">
+        <strong>pod lifecycle:</strong>
+        <span class="lg lg-lifecycle lg-restart">restart</span>
+        <span class="lg lg-lifecycle lg-killed">killed</span>
+        <span class="lg lg-lifecycle lg-oom">OOM-killed</span>
+        <span class="lg lg-lifecycle lg-podunhealthy">unhealthy</span>
+      </div>
+      <div class="lg-block">
         <strong>tasks:</strong>
         <span id="task-legend"></span>
       </div>
@@ -395,6 +402,32 @@
               <th>exception</th>
               <th>message</th>
               <th></th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section class="home-card">
+        <h2>Pod restarts &amp; deaths <span class="muted" id="night-restarts-count"></span></h2>
+        <p class="hint">
+          Pod lifecycle events from Kubernetes (the <code>k8s/events</code>
+          stream). A <strong>restart</strong> is an in-place container
+          restart — most often an out-of-memory kill the kernel didn't log
+          to us — so a pod whose work stops mid-visit with no traceback
+          usually has a restart here. Each row is attributed to the dataId
+          the pod was processing at that moment; click it to open that
+          visit.
+        </p>
+        <table id="night-restarts">
+          <thead>
+            <tr>
+              <th>time</th>
+              <th>dataId</th>
+              <th>Δshutter</th>
+              <th>pod</th>
+              <th>event</th>
+              <th>detail</th>
             </tr>
           </thead>
           <tbody></tbody>

@@ -46,6 +46,7 @@ function startNight(summary) {
     summary.histograms.calcZernikesEnd,
   );
   renderFailures(summary.failures);
+  renderRestarts(summary.restarts);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
       // Drop the dayObs key out of the URL bar so a subsequent refresh
@@ -69,6 +70,11 @@ function renderTopStats(stats) {
     { label: 'dataIds w/ traceback', value: stats.nDataIdsWithTraceback },
     { label: 'pods w/ traceback', value: stats.nPodsWithTraceback },
     { label: 'distinct exception classes', value: stats.nDistinctExceptionClasses },
+    {
+      label: 'pod restarts',
+      value: stats.nPodRestarts || 0,
+      accent: (stats.nPodRestarts || 0) > 0 ? 'warn' : null,
+    },
     { label: 'pods in fetch', value: stats.nPods },
   ];
   if (stats.nMissingShutterClose > 0) {
@@ -510,4 +516,67 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
   ));
+}
+
+// ----- pod restarts / deaths table ------------------------------------------
+//
+// POD_* lifecycle events from the k8s/events stream (see parse.classifyK8sEvent).
+// `[label, cssSuffix]` per kind; the cssSuffix matches the `.life-*` badge
+// colours in style.css and the timeline lifecycle markers.
+const LIFECYCLE_LABELS = {
+  POD_RESTARTED: ['restart', 'restart'],
+  POD_KILLED: ['killed', 'killed'],
+  POD_OOMKILLED: ['OOM-killed', 'oom'],
+  POD_FAILED: ['failed', 'podfail'],
+  POD_UNHEALTHY: ['unhealthy', 'podunhealthy'],
+};
+
+function renderRestarts(rows) {
+  const tbody = document.querySelector('#night-restarts tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  rows = rows || [];
+  document.getElementById('night-restarts-count').textContent =
+    `(${rows.length} event${rows.length === 1 ? '' : 's'})`;
+  if (rows.length === 0) {
+    tbody.innerHTML =
+      '<tr><td colspan="6" class="muted">No pod restarts or deaths in this window 🎉</td></tr>';
+    return;
+  }
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));
+    // dataId the pod was processing when it died — clickable into its
+    // per-visit explore view, same as the failures table.
+    const idTd = document.createElement('td');
+    idTd.className = 'mono';
+    if (r.dataId == null) {
+      idTd.textContent = '?';
+    } else {
+      const a = document.createElement('a');
+      a.className = 'mono';
+      a.href = `/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = String(r.dataId);
+      const tip = nightExposureTooltip(r.dataId);
+      if (tip) a.title = tip;
+      idTd.appendChild(a);
+    }
+    tr.appendChild(idTd);
+    tr.appendChild(asTd(r.offsetS == null ? '—' : fmtOffset(r.offsetS), 'mono'));
+    tr.appendChild(asTd(r.pod, 'mono night-pod-cell'));
+    const evTd = document.createElement('td');
+    const [label, cls] = LIFECYCLE_LABELS[r.kind] || [r.kind, 'podfail'];
+    const badge = document.createElement('span');
+    badge.className = `life-badge life-${cls}`;
+    badge.textContent = label;
+    evTd.appendChild(badge);
+    tr.appendChild(evTd);
+    const msgCell = document.createElement('td');
+    msgCell.className = 'night-msg-cell';
+    msgCell.textContent = r.message || r.reason || '';
+    tr.appendChild(msgCell);
+    tbody.appendChild(tr);
+  }
 }

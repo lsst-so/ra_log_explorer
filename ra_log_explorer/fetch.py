@@ -7,9 +7,15 @@ directory contains:
 
   _meta.json          mandatory; records the spec, fetchSchemaVersion,
                       fetched_at, byte/line totals, the count_over_time
-                      oracle per pod, and the two fall-short maps
-                      (errors, incomplete_pods) behind fetchComplete
+                      oracle per pod, the two fall-short maps
+                      (errors, incomplete_pods) behind fetchComplete, and
+                      the per-pod k8s/events line counts
   pods/<pod>.jsonl    one Loki JSONL file per pod that had any output
+  pods_events/<pod>.jsonl  one k8s/events JSONL file per pod (the pod
+                      lifecycle stream: scheduling, start/stop, kills,
+                      OOMs) — low-volume, auxiliary, never gates
+                      fetchComplete; a fetch error here just means no
+                      lifecycle markers for that pod
   pods.txt            cached list of pod names
 
 A cache hit re-uses the existing files iff:
@@ -88,10 +94,13 @@ from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
 # tail-dropped the busiest pods on a full night; v2 fetched with logcli
 # --limit=0 but still silently dropped lines on wide busy windows (Loki bug
 # grafana/loki#17270); v3 fetches in count-presized single-batch chunks and
-# verifies completeness structurally. Bumping this value flushes the whole
-# cache (see ``ensureCacheSchemaCurrent``) and, as a second line of defence,
-# any individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 3
+# verifies completeness structurally; v4 additionally fetches each pod's
+# k8s/events stream into a parallel pods_events/ tree (restart/kill/OOM
+# lifecycle markers) — a v3 cache has no such tree, so it must re-fetch to
+# pick those up. Bumping this value flushes the whole cache (see
+# ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
+# individual cache lacking this exact value is re-fetched, not re-served.
+CACHE_SCHEMA_VERSION = 4
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so
@@ -141,6 +150,11 @@ PARTIAL_FLAG = ".partial"
 META_NAME = "_meta.json"
 PODS_LIST_NAME = "pods.txt"
 PODS_DIR_NAME = "pods"
+# Parallel to PODS_DIR_NAME: one k8s/events JSONL per pod. Kept in its own
+# dir (not mixed into pods/) so the parser's pods/*.jsonl glob still sees
+# only app-log files — the events stream is a different line shape and is
+# read through a separate path (see parse.classifyK8sEvent).
+PODS_EVENTS_DIR_NAME = "pods_events"
 # Per-cache sidecar holding the ISO timestamp of when this window was
 # last opened by the user. Used to LRU-evict old caches when the
 # total on-disk size exceeds the configured max. Living alongside
@@ -278,6 +292,18 @@ def _matcher(spec: FetchSpec, pod: str | None = None) -> str:
     elif spec.podRegex:
         parts.append(f'pod=~"{spec.podRegex}"')
     return "{" + ",".join(parts) + "}"
+
+
+def _eventsMatcher(spec: FetchSpec, pod: str) -> str:
+    """Build the LogQL matcher for one pod's k8s lifecycle events.
+
+    The ``k8s/events`` Loki stream has no ``pod`` label — the involved
+    object's name lives in ``name=`` — so we pin ``name="<pod>"`` plus
+    ``job="k8s/events"``. Scoping by cluster + namespace keeps it fast and
+    means it can never overlap the app-log query (which selects on
+    ``pod=`` with no ``job``).
+    """
+    return f'{{cluster="{spec.cluster}",namespace="{spec.namespace}",' f'job="k8s/events",name="{pod}"}}'
 
 
 def listPods(spec: FetchSpec) -> list[str]:
@@ -560,6 +586,41 @@ def _splitWindowInto(
     return total, complete, reason
 
 
+def _fetchOnePodEvents(spec: FetchSpec, pod: str, outPath: Path) -> int:
+    """Fetch one pod's k8s/events lines into ``outPath``; return line count.
+
+    The ``k8s/events`` stream is low-volume — a pod's whole lifecycle
+    (scheduling, image pulls, container start/stop, kills, OOMs) is a
+    handful of lines over an exposure window and dozens over a night — so
+    unlike the app-log stream it never approaches one batch and needs none
+    of the count-presized chunking #17270 forces on ``_fetchOnePod``. One
+    ``--forward`` single-batch query is enough; the ``--batch`` cap is a
+    backstop so a pathological pod can't stream unbounded.
+
+    Best-effort by contract (see :func:`fetchAll`): the caller treats any
+    raised ``FetchError`` as "no lifecycle markers for this pod", never as
+    a hard fetch failure — the app logs are what completeness is judged on.
+    """
+    matcher = _eventsMatcher(spec, pod)
+    _run_logcli(
+        spec,
+        [
+            "query",
+            matcher,
+            f"--from={spec.fromIso}",
+            f"--to={spec.toIso}",
+            "--limit=0",
+            f"--batch={SERVER_QUERY_CAP}",
+            "-o",
+            "jsonl",
+            "--forward",
+        ],
+        timeout=COUNT_TIMEOUT_S,
+        stdoutPath=outPath,
+    )
+    return _countLines(outPath)
+
+
 def _parseIso(s: str) -> dt.datetime:
     """Parse an ISO-8601 string into an aware UTC datetime."""
     t = dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -687,9 +748,11 @@ def fetchAll(
     # No usable cache — fetch fresh into the requested dir.
     ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
+    podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
     podsListPath = requestedDir / PODS_LIST_NAME
     partialPath.write_text("")
     podsDir.mkdir(parents=True, exist_ok=True)
+    podsEventsDir.mkdir(parents=True, exist_ok=True)
 
     t0 = time.time()
     pods = listPods(spec)
@@ -730,6 +793,23 @@ def fetchAll(
             if progress is not None:
                 progress(pod, i, len(pods))
 
+    # Second, far cheaper pass: each pod's k8s/events lifecycle stream into
+    # the parallel pods_events/ tree. Auxiliary by design — a failure here
+    # is recorded but never flips fetchComplete or strands the fetch; it
+    # just means that pod gets no restart/kill/OOM markers on the timeline.
+    perPodEventLines: dict[str, int] = {}
+    eventErrors: dict[str, str] = {}
+    with ThreadPoolExecutor(max_workers=spec.workers) as ex:
+        eventFutures = {
+            ex.submit(_fetchOnePodEvents, spec, pod, podsEventsDir / f"{pod}.jsonl"): pod for pod in pods
+        }
+        for evFut in as_completed(eventFutures):
+            pod = eventFutures[evFut]
+            try:
+                perPodEventLines[pod] = evFut.result()
+            except Exception as e:  # noqa: BLE001 - auxiliary; collect, don't bail
+                eventErrors[pod] = str(e)
+
     elapsed = time.time() - t0
     meta = {
         "spec": asdict(spec),
@@ -747,7 +827,13 @@ def fetchAll(
         "incomplete_pods": incompletePods,
         # True iff every pod's logs were fetched in full: no hard failure and
         # every chunk proved lossless. Either map non-empty => missing data.
+        # Deliberately ignores the k8s/events pass below — that stream is
+        # auxiliary, so a gap in it is not "missing data" for the window.
         "fetchComplete": not errors and not incompletePods,
+        # k8s/events lifecycle stream (auxiliary): lines fetched per pod, and
+        # any per-pod fetch error. Neither gates fetchComplete.
+        "pod_event_lines": perPodEventLines,
+        "event_errors": eventErrors,
         "window_in_past": windowInPast,
         "fromCache": False,
         "cacheReuse": "none",
@@ -759,6 +845,10 @@ def fetchAll(
 
 def loadPodLogPath(cacheDir: Path, pod: str) -> Path:
     return cacheDir / PODS_DIR_NAME / f"{pod}.jsonl"
+
+
+def loadPodEventsLogPath(cacheDir: Path, pod: str) -> Path:
+    return cacheDir / PODS_EVENTS_DIR_NAME / f"{pod}.jsonl"
 
 
 def loadCacheMeta(cacheDir: Path) -> dict:
