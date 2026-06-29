@@ -47,6 +47,7 @@ let siteSwitcherWired = false;  // guard: startHome() re-runs on every back-home
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
 let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
+let tZeroIsManual = false;      // true when resolvedTZero was hand-entered (ConsDB couldn't resolve it)
 let lookupTimer = null;         // debounce timer for the dataId input
 let lookupSeq = 0;              // sequence number to ignore stale lookup responses
 
@@ -122,8 +123,10 @@ async function loadSiteCatalog() {
     localStorage.setItem(LS.site, sel.value);
     // A site switch changes which ConsDB the lookup hits AND which
     // per-site exposure-time cache we read, so any pending dataId
-    // resolution must re-run.
+    // resolution must re-run (and any manual entry belonged to the old
+    // site's missing record).
     clearResolvedTZero();
+    hideManualEntry();
     clearRangeSlot(rangeStartSlot);
     clearRangeSlot(rangeStopSlot);
     triggerLookupIfReady();
@@ -349,8 +352,13 @@ function readFormValues() {
   if (password) out.password = password;
   // Always TAI; the server applies the -37 s conversion. We deliberately
   // never expose a UTC opt-out in the UI now that timings come from a
-  // service that's TAI by construction.
+  // service that's TAI by construction (and a manual entry is, by the
+  // label next to the field, a TAI shutter close too).
   out.tZero = resolvedTZero;
+  // Tell the server this t-zero was hand-entered (ConsDB couldn't resolve
+  // the dataId) so it persists it to the exposure-time cache and the
+  // explore view can be reopened/refreshed without re-typing.
+  if (tZeroIsManual) out.tZeroManual = true;
   return out;
 }
 
@@ -368,12 +376,90 @@ function setTZeroStatus(text, kind /* 'info' | 'ok' | 'error' */) {
 function clearResolvedTZero() {
   resolvedTZero = null;
   resolvedForExpId = null;
+  tZeroIsManual = false;
 }
 
 function updateSubmitButton() {
   const submit = document.getElementById('fetch-submit');
   // Allow re-submitting an already-typed dataId without forcing a refetch.
   submit.disabled = !resolvedTZero;
+}
+
+// ----- manual shutter-close fallback --------------------------------------
+//
+// When ConsDB is down/unreachable or has no row for the dataId, the
+// automatic lookup can't produce a t-zero. Rather than dead-end, we reveal
+// a text field so the user can type the shutter close themselves (TAI,
+// ISO-8601 — the same convention ConsDB's obs_end and the CLI's --t-zero
+// use). A valid entry drives the same resolvedTZero the submit path reads.
+
+// ISO-8601 local time, no timezone: YYYY-MM-DD(T| )HH:MM:SS with optional
+// fractional seconds — matches the obs_end / Butler `.isot` form and the
+// example placeholder. A trailing Z / offset is rejected on purpose: the
+// value is interpreted as TAI wall-clock, so a UTC marker would mislead.
+const MANUAL_TZERO_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,6})?$/;
+
+function setManualStatus(text, kind /* 'info' | 'ok' | 'error' */) {
+  const el = document.getElementById('manual-tzero-status');
+  el.textContent = text;
+  el.classList.remove('ok', 'error');
+  if (kind === 'ok') el.classList.add('ok');
+  if (kind === 'error') el.classList.add('error');
+}
+
+function hideManualEntry() {
+  // Hide and reset — a fresh dataId (or a successful lookup) starts clean.
+  // The block's own line stays purely instructional; the main #tzero-status
+  // line above owns the "why ConsDB couldn't resolve this" message.
+  const row = document.getElementById('manual-tzero');
+  row.hidden = true;
+  document.getElementById('fetch-form').elements.manualTZero.value = '';
+  setManualStatus('enter the shutter close as TAI ISO-8601, e.g. 2026-06-24T14:38:41.380663', 'info');
+}
+
+function revealManualEntry() {
+  // Show the field (keeping whatever the user already typed) and evaluate
+  // it, so a re-fired lookup failure leaves a valid entry still applied.
+  document.getElementById('manual-tzero').hidden = false;
+  applyManualTZero();
+}
+
+function applyManualTZero() {
+  const raw = document.getElementById('fetch-form').elements.manualTZero.value.trim();
+  const expId = currentExposureId();
+  if (expId === null) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('enter a valid 13-digit dataId first', 'error');
+    updateSubmitButton();
+    return;
+  }
+  if (!raw) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('type the shutter-close timestamp, e.g. 2026-06-24T14:38:41.380663 (TAI)', 'info');
+    updateSubmitButton();
+    return;
+  }
+  if (!MANUAL_TZERO_RE.test(raw)) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('expected ISO-8601 TAI like 2026-06-24T14:38:41.380663 (no timezone)', 'error');
+    updateSubmitButton();
+    return;
+  }
+  resolvedTZero = raw;
+  resolvedForExpId = expId;
+  tZeroIsManual = true;
+  setManualStatus('this manual shutter close overrides ConsDB for this dataId', 'ok');
+  // Flip the main status green too — it's the affordance the user already
+  // associates with "resolved, ready to fetch".
+  setTZeroStatus(`manual shutter close (TAI): ${raw}`, 'ok');
+}
+
+// The exposureId field as a finite 13-digit int, or null if it isn't one.
+function currentExposureId() {
+  const raw = document.getElementById('fetch-form').elements.exposureId.value.trim();
+  if (raw.length !== DATAID_LENGTH) return null;
+  const expId = parseInt(raw, 10);
+  return Number.isFinite(expId) ? expId : null;
 }
 
 // dataIds are 13 digits: YYYYMMDDSSSSS. Anything shorter is still
@@ -408,7 +494,8 @@ function triggerLookupIfReady() {
   }
   // If we already resolved this exact dataId, don't re-request.
   if (resolvedForExpId === expId && resolvedTZero) {
-    setTZeroStatus(`shutter close (TAI): ${resolvedTZero}`, 'ok');
+    const prefix = tZeroIsManual ? 'manual shutter close (TAI)' : 'shutter close (TAI)';
+    setTZeroStatus(`${prefix}: ${resolvedTZero}`, 'ok');
     return;
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
@@ -423,30 +510,46 @@ function triggerLookupIfReady() {
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer
-      if (r.ok && body.tZero) {
+      if (r.ok && body.manual && body.tZero) {
+        // ConsDB couldn't answer, but a manual stand-in was cached earlier
+        // (this machine, or another tab). Pre-fill it into the editable
+        // field and let revealManualEntry() validate + apply it, so the
+        // user sees their prior value and can re-fetch or amend it.
+        document.getElementById('fetch-form').elements.manualTZero.value = body.tZero;
+        revealManualEntry();
+      } else if (r.ok && body.tZero) {
         resolvedTZero = body.tZero;
         resolvedForExpId = expId;
+        tZeroIsManual = false;
         setTZeroStatus(`shutter close (TAI): ${body.tZero}`, 'ok');
+        hideManualEntry();
       } else if (r.status === 404) {
         clearResolvedTZero();
-        setTZeroStatus(`no exposure-time record for ${expId}`, 'error');
+        setTZeroStatus(`no exposure-time record for ${expId} — enter the shutter close manually below`, 'error');
+        revealManualEntry();
       } else if (r.status === 503) {
         clearResolvedTZero();
         setTZeroStatus(body.error || 'RSP token / ConsDB lookup not configured', 'error');
+        revealManualEntry();
       } else {
         clearResolvedTZero();
-        setTZeroStatus(`lookup failed: ${body.error || r.status}`, 'error');
+        setTZeroStatus(`lookup failed: ${body.error || r.status} — enter the shutter close manually below`, 'error');
+        revealManualEntry();
       }
     })
     .catch((e) => {
       if (mySeq !== lookupSeq) return;
       clearResolvedTZero();
-      setTZeroStatus(`lookup failed: ${e}`, 'error');
+      setTZeroStatus(`lookup failed: ${e} — enter the shutter close manually below`, 'error');
+      revealManualEntry();
     });
 }
 
 function scheduleLookup() {
   clearResolvedTZero();
+  // A new/edited dataId starts fresh — drop any manual entry from the
+  // previous one; the impending lookup re-reveals it only if it fails.
+  hideManualEntry();
   setTZeroStatus('typing...', 'info');
   if (lookupTimer) clearTimeout(lookupTimer);
   lookupTimer = setTimeout(triggerLookupIfReady, 300);
@@ -1084,6 +1187,8 @@ function wireHomeListeners() {
   document.getElementById('range-form').addEventListener('submit', startRangeFetch);
   const expIdInput = document.getElementById('fetch-form').elements.exposureId;
   expIdInput.addEventListener('input', scheduleLookup);
+  // Manual shutter-close fallback (shown only when the ConsDB lookup fails).
+  document.getElementById('fetch-form').elements.manualTZero.addEventListener('input', applyManualTZero);
   const rangeForm = document.getElementById('range-form');
   rangeForm.elements.rangeStart.addEventListener('input', () => scheduleRangeLookup(rangeStartSlot));
   rangeForm.elements.rangeStop.addEventListener('input', () => scheduleRangeLookup(rangeStopSlot));

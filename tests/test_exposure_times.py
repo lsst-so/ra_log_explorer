@@ -63,6 +63,32 @@ def test_obsEnd_extracts_string_or_None() -> None:
     assert exposureTimes.obsEnd(None) is None
 
 
+# ----- manualRecord / isManual ----------------------------------------------
+
+
+def test_manualRecord_carries_obsEnd_and_is_tagged() -> None:
+    rec = exposureTimes.manualRecord("2026-06-24T14:38:41.380663")
+    assert exposureTimes.obsEnd(rec) == "2026-06-24T14:38:41.380663"
+    assert exposureTimes.isManual(rec) is True
+
+
+def test_isManual_false_for_consdb_record_and_none() -> None:
+    # A real ConsDB record (no _manual tag) and a missing record are both
+    # "not manual" — the distinction is what keeps a hand-entered stand-in
+    # from shadowing immutable ConsDB truth on later lookups.
+    assert exposureTimes.isManual({"obs_end": "2026-06-24T14:38:41.380663"}) is False
+    assert exposureTimes.isManual(None) is False
+
+
+def test_manualRecord_roundtrips_through_the_cache(tmpCacheRoot: Path) -> None:
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    back = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(back) is True
+    assert exposureTimes.obsEnd(back) == "2026-06-24T14:38:41.380663"
+
+
 # ----- queryExposureRecord --------------------------------------------------
 
 

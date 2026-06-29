@@ -292,7 +292,7 @@ shapes:
   "cacheBytes": 84115620,
   "meta": { ...fetch metadata, including cacheReuse: "exact"|"superset"|"none" },
   "referencePoints": [
-    { "label": "shutter close (caller-supplied)", "offsetS": 0.0, ... },
+    { "label": "shutter close (caller-supplied)", "offsetS": 0.0, ... },  // or "(manual)" if hand-entered
     { "label": "head node first defined visit",   "offsetS": 6.95, ... }
   ],
   "taskColors":  { "isr": "#d4801f", "calibrateImage": "#1a9c8c", ... },
@@ -499,9 +499,11 @@ off the fetch. The optional `site` query param picks which entry from
 the sites catalog to use; omitted = the catalog's `default_site`.
 
 - 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool,
-  "site", "exposure": {<curated record>}}`. `tZero` is the record's
-  `obs_end`; `exposure` carries the rest (filter, exp time, image type,
-  program, reason, group/index, …) for the explore-view info box.
+  "manual": bool, "site", "exposure": {<curated record>}}`. `tZero` is
+  the record's `obs_end`; `exposure` carries the rest (filter, exp time,
+  image type, program, reason, group/index, …) for the explore-view info
+  box. `manual: true` flags a hand-entered stand-in (see below) rather
+  than a ConsDB value.
 - 400 `"No site named '<x>'; known: [...]"` — unknown site.
 - 404 `"No exposure-time record for dataId=N"` — every instrument
   table searched, no row with an `obs_end` anywhere.
@@ -512,10 +514,21 @@ the sites catalog to use; omitted = the catalog's `default_site`.
   blank.
 
 The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
-is checked first; a cache hit returns immediately with `fromCache:
-true` and no network call. Sites have separate cache files so a
-colliding bare dataId between scopes (BTS simulated vs. summit real)
+is checked first; a *ConsDB-sourced* cache hit returns immediately with
+`fromCache: true` and no network call. Sites have separate cache files
+so a colliding bare dataId between scopes (BTS simulated vs. summit real)
 can't return the wrong record.
+
+**Manual stand-ins.** When ConsDB is down or has no row for a dataId, the
+home form lets the user type a shutter close by hand (`POST /api/fetch`
+with `tZeroManual: true`, below), which persists a `_manual`-tagged
+record to the same per-site cache. Because a manual value is a stand-in —
+not the immutable truth a ConsDB row is — this endpoint treats it as a
+*fallback*, not an authoritative cache hit: a `_manual` record does **not**
+short-circuit the lookup; ConsDB is still queried, and the manual value is
+only returned (with `manual: true`, and one of the error statuses' would-be
+message suppressed) when ConsDB still can't resolve the dataId. A later
+real ConsDB hit overwrites the stand-in.
 
 ### `GET /api/sites`
 
@@ -611,6 +624,7 @@ persisted):
   "exposureId": 2026051900722,         // required, integer
   "tZero":      "2026-05-20T08:46:16.267",  // required, ISO-8601
   "tZeroUtc":   false,                 // optional; default false (treat as TAI)
+  "tZeroManual": false,                // optional; true ⇒ tZero was hand-entered
   "site":       "summit",              // optional; falls back to default_site
   "username":   "merlin", "password": "...",
   "workers":    8,
@@ -621,6 +635,15 @@ persisted):
 `cluster` / `namespace` / `lokiAddr` are *derived* server-side from
 the named site — clients no longer send them. An unknown site returns
 `400 Bad Request`.
+
+`tZeroManual: true` marks a shutter close the user typed by hand because
+ConsDB couldn't resolve the dataId. The server persists it as a
+`_manual`-tagged record in the per-site exposure-time cache (in TAI form,
+the inverse of the `obs_end → tZero` conversion), so the resulting
+explore view can be reopened or refreshed without re-typing. The
+exposure's reference point is then labelled `shutter close (manual)`
+instead of `shutter close (caller-supplied)`. See
+`GET /api/exposure-time` for how the stand-in is treated on later lookups.
 
 Response: `202 Accepted`, `{"jobId": "<12-char hex>"}`. Validation
 errors return `400` with `{"error": "..."}`.

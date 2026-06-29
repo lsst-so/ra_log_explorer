@@ -168,6 +168,15 @@ In the browser:
 2. Type a **dataId** (e.g. `2026051900722`) in the *Explore exposure
    processing* card. After ~300 ms the tool resolves the shutter
    close time and shows it inline under the input.
+   - **ConsDB down or missing the entry?** If the lookup can't resolve
+     the dataId (ConsDB unreachable, no token, or no row for that id), a
+     **manual shutter close** field appears under the input. Type the
+     timestamp yourself in TAI ISO-8601 — e.g. `2026-06-24T14:38:41.380663`,
+     the same convention as ConsDB's `obs_end` and the CLI's `--t-zero` —
+     and the fetch proceeds with that value. It's remembered for this
+     dataId (cached under the active site) so reopening or refreshing the
+     view doesn't ask again; a real ConsDB value, once reachable, takes
+     precedence. Manual entry is single-dataId only — not range or night.
 3. Optional *per-exposure tuning* (window before / after t₀) lives
    in a small details fold on the exposure form. Cluster, namespace,
    Loki URL and ConsDB token file all come from the active site, so
@@ -455,7 +464,18 @@ won't see it.
 picked a site whose token file isn't on this machine. Either drop the
 right token at the named path (see [Sites](#sites) for the matrix), or
 switch the top-bar site picker back to one you do have a token for.
-Cached dataIds still resolve without a token.
+Cached dataIds still resolve without a token. (For a one-off where you
+can't fix the token but know the shutter close, use the **manual
+shutter close** field that appears under the dataId input — see step 2
+of *Getting started*.)
+
+**"No exposure-time record for dataId=N" / ConsDB unreachable** — ConsDB
+either has no row for that id yet or is down. The **manual shutter close**
+field appears under the input; type the timestamp in TAI ISO-8601
+(`2026-06-24T14:38:41.380663`) and fetch with it. The value is cached for
+that dataId under the active site, and a real ConsDB value supersedes it
+once reachable. This is single-dataId only — the range and night forms
+have no manual fallback.
 
 **Shutter close looks off after switching sites** — sanity check that
 you're on the right site. The summit cluster's dataIds resolve against

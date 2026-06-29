@@ -935,6 +935,136 @@ def test_exposure_time_400_for_unknown_site(runningServer: RunningServer) -> Non
     assert "No site" in body["error"]
 
 
+# ----- manual shutter-close stand-ins --------------------------------------
+
+
+def test_exposure_time_manual_standin_does_not_block_consdb(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """A manual stand-in is a fallback, not immutable truth — unlike a real
+    ConsDB cache hit it must NOT short-circuit the lookup. ConsDB is still
+    queried and its (authoritative) value wins, overwriting the stand-in."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-05-20T00:00:00.000000"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, "2026-05-20T08:46:16.267000")  # a different, real value
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is False
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"  # ConsDB, not the stand-in
+    # And the real value has superseded the stand-in in the cache.
+    rec = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(rec) is False
+
+
+def test_exposure_time_falls_back_to_manual_when_token_missing(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """With no token (ConsDB unreachable for this user) a previously-stored
+    manual stand-in is surfaced rather than the 503 — so a one-off manual
+    fetch survives a browser refresh."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    # Token deliberately absent.
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is True
+    assert body["fromCache"] is True
+    assert body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
+def test_exposure_time_falls_back_to_manual_on_consdb_404(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """ConsDB has a token but no row for the id → the manual stand-in is
+    returned instead of the 404."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, None)  # no row anywhere
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is True
+    assert body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
+def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch flagged ``tZeroManual`` persists a ``_manual`` exposure
+    record (so the explore view reopens without re-typing) and the loaded
+    state's reference point is labelled ``shutter close (manual)``."""
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        cacheDir = tmpCacheRoot / "fake-manual"
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch",
+        {
+            "exposureId": 2026051900722,
+            "tZero": "2026-06-24T14:38:41.380663",
+            "tZeroManual": True,
+        },
+    )
+    assert status == 202, body
+
+    # The stand-in lands in the cache immediately (at request time), tagged.
+    rec = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(rec) is True
+    assert exposureTimes.obsEnd(rec) == "2026-06-24T14:38:41.380663"
+
+    jobId = body["jobId"]
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    with ctx.jobs.stateLock:
+        loaded = ctx.getExposureState(2026051900722)
+    assert loaded is not None
+    assert loaded.referencePoints[0]["label"] == "shutter close (manual)"
+
+
 def test_sites_endpoint_returns_catalog(runningServer: RunningServer) -> None:
     """``/api/sites`` exposes the catalog so the UI can render the
     switcher; token-file paths are stripped because they're server-side

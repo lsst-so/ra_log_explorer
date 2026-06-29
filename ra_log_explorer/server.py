@@ -756,6 +756,26 @@ def _taiIsoToUtc(taiIso: str) -> dt.datetime:
     return parser._parseTimestamp(taiIso + "Z") - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
 
 
+def _utcToTaiIso(t: dt.datetime) -> str:
+    """Inverse of :func:`_taiIsoToUtc`: a UTC datetime → the ConsDB-style
+    TAI ``obs_end`` string (no timezone, microsecond precision).
+
+    Used to persist a hand-entered shutter close into the per-site
+    exposure-time cache in the same TAI form a real ConsDB row carries.
+    """
+    tai = t.astimezone(dt.timezone.utc) + dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+    return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
+def _shutterCloseLabel(record: exposureTimes.ExposureRecord | None) -> str:
+    """Reference-point label for a caller-supplied t-zero, distinguishing a
+    hand-entered stand-in from one that came (via the home form) from ConsDB.
+    """
+    if exposureTimes.isManual(record):
+        return "shutter close (manual)"
+    return "shutter close (caller-supplied)"
+
+
 def _buildNightPayload(state: NightState) -> dict:
     """Roll the night up into the per-page payload the JS consumes.
 
@@ -1255,7 +1275,7 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
         exposureInfo=record,
         referencePoints=[
             {
-                "label": "shutter close (caller-supplied)",
+                "label": _shutterCloseLabel(record),
                 "t": tZero.isoformat(),
                 "offsetS": 0.0,
                 "source": "shutter close",
@@ -1598,7 +1618,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             exposureInfo=exposureInfo,
             referencePoints=[
                 {
-                    "label": "shutter close (caller-supplied)",
+                    "label": _shutterCloseLabel(exposureInfo),
                     "t": job.tZero.isoformat(),
                     "offsetS": 0.0,
                     "source": "shutter close",
@@ -1973,21 +1993,48 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             # backfill on the next fresh query.
             cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name)
             cachedIso = exposureTimes.obsEnd(cachedRec)
-            if cachedRec is not None and cachedIso is not None:
+            cachedManual = exposureTimes.isManual(cachedRec)
+            # A *real* (ConsDB-sourced) cached record is immutable truth —
+            # return it with no network call. A *manual* stand-in only fills
+            # in for when ConsDB couldn't answer, so we still try ConsDB
+            # first and fall back to the manual value below if it can't.
+            if cachedRec is not None and cachedIso is not None and not cachedManual:
                 self._send_json(
                     {
                         "dataId": dataId,
                         "tZero": cachedIso,
                         "scale": "TAI",
                         "fromCache": True,
+                        "manual": False,
                         "site": site.name,
                         "exposure": cachedRec,
                     }
                 )
                 return
+
+            def fallbackOrError(status: int, msg: str) -> None:
+                # Prefer a real ConsDB answer; only when ConsDB can't resolve
+                # the dataId do we surface a previously-stored manual stand-in
+                # (so a transient ConsDB outage doesn't strand the user). With
+                # no stand-in, the original error stands.
+                if cachedRec is not None and cachedIso is not None:
+                    self._send_json(
+                        {
+                            "dataId": dataId,
+                            "tZero": cachedIso,
+                            "scale": "TAI",
+                            "fromCache": True,
+                            "manual": True,
+                            "site": site.name,
+                            "exposure": cachedRec,
+                        }
+                    )
+                else:
+                    self._send_error_json(status, msg)
+
             path = site.consdbTokenFile
             if not path.exists():
-                self._send_error_json(
+                fallbackOrError(
                     503,
                     f"ConsDB token file for site {site.name!r} not found at {path}. "
                     "Get a token from the relevant RSP and drop it there.",
@@ -1996,23 +2043,24 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             try:
                 token = exposureTimes.readToken(path)
             except OSError as e:
-                self._send_error_json(503, f"Could not read ConsDB token file: {e}")
+                fallbackOrError(503, f"Could not read ConsDB token file: {e}")
                 return
             if not token:
-                self._send_error_json(503, f"ConsDB token file is empty: {path}")
+                fallbackOrError(503, f"ConsDB token file is empty: {path}")
                 return
             try:
                 record = exposureTimes.queryExposureRecord(dataId, token, consdbUrl=site.consdbUrl)
             except exposureTimes.ConsDbError as e:
-                self._send_error_json(502, f"ConsDB query failed: {e}")
+                fallbackOrError(502, f"ConsDB query failed: {e}")
                 return
             except OSError as e:
-                self._send_error_json(503, f"Could not reach ConsDB: {e}")
+                fallbackOrError(503, f"Could not reach ConsDB: {e}")
                 return
             isot = exposureTimes.obsEnd(record)
             if record is None or isot is None:
-                self._send_error_json(404, f"No exposure-time record for dataId={dataId}")
+                fallbackOrError(404, f"No exposure-time record for dataId={dataId}")
                 return
+            # A real hit supersedes any manual stand-in we'd stored earlier.
             exposureTimes.storeCachedRecord(dataId, record, siteName=site.name)
             self._send_json(
                 {
@@ -2020,6 +2068,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     "tZero": isot,
                     "scale": "TAI",
                     "fromCache": False,
+                    "manual": False,
                     "site": site.name,
                     "exposure": record,
                 }
@@ -2066,6 +2115,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
+                # A hand-entered shutter close (the dataId didn't resolve via
+                # ConsDB) is persisted to the per-site exposure-time cache as
+                # a tagged stand-in, so reopening or refreshing the explore
+                # view finds a t-zero without the user re-typing it.
+                if body.get("tZeroManual"):
+                    exposureTimes.storeCachedRecord(
+                        expId, exposureTimes.manualRecord(_utcToTaiIso(tZero)), siteName=site.name
+                    )
                 # The password — if any — is consumed by the fetch worker
                 # thread (it sets LOKI_PASSWORD in the subprocess env) and
                 # never persisted, returned, or logged.

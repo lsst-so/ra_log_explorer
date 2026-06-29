@@ -601,6 +601,16 @@ def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
     assert out == expected
 
 
+def test_utcToTaiIso_inverts_taiIsoToUtc() -> None:
+    """Persisting a hand-entered shutter close depends on this inverse: a
+    UTC tZero must serialise back to the exact TAI ``obs_end`` string it
+    came from, so the manual value round-trips through the per-site cache.
+    """
+    taiIso = "2026-06-24T14:38:41.380663"
+    utc = server._taiIsoToUtc(taiIso)
+    assert server._utcToTaiIso(utc) == taiIso
+
+
 # ----- _buildNightPayload --------------------------------------------------
 
 

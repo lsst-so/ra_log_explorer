@@ -119,6 +119,25 @@ def obsEnd(record: ExposureRecord | None) -> str | None:
     return v if isinstance(v, str) else None
 
 
+# A hand-entered shutter close: the user typed a timestamp because ConsDB
+# was down/unreachable or had no row for the dataId. We persist it to the
+# same per-site cache as a real record (so the explore view can be
+# reopened/refreshed without re-typing), but tag it so the live lookup
+# still prefers a real ConsDB answer once one becomes available — a manual
+# value is a stand-in, not the immutable truth a ConsDB row is.
+MANUAL_RECORD_KEY = "_manual"
+
+
+def manualRecord(obsEndTai: str) -> ExposureRecord:
+    """Build a minimal manual exposure record carrying just ``obs_end``."""
+    return {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+
+
+def isManual(record: ExposureRecord | None) -> bool:
+    """True if ``record`` is a hand-entered stand-in (see :func:`manualRecord`)."""
+    return bool(record and record.get(MANUAL_RECORD_KEY))
+
+
 def queryExposureRecord(
     dataId: int, token: str, *, consdbUrl: str, instrument: str | None = None
 ) -> ExposureRecord | None:
