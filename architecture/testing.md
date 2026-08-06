@@ -181,3 +181,45 @@ window: chunker 56212 vs oracle 56227; the old `--limit=0` got 54091.)
 The first run for a given window takes 60–90 s (exposure) to
 several minutes (night). A second run for the same — or any
 overlapping — window is instant thanks to superset reuse.
+
+## Container smoke test
+
+The deployed form of the tool is a container image (see the
+[Dockerfile](../Dockerfile) and the *Running as a deployed service*
+section of the [README](../README.md)). Nothing in the unit suite
+exercises the image, so build and poke it by hand before shipping a
+change that touches the Dockerfile, the base path, or anything the
+deployment configures through the environment:
+
+```bash
+docker build -t ra-log-explorer:local .
+
+# Run it the way the deployment does: read-only root filesystem, every
+# writable path a mounted volume, and a one-site catalog with no ConsDB
+# token. If it works here it will work in the pod.
+docker run --rm --read-only \
+  --tmpfs /tmp --tmpfs /var/cache/ra-log-explorer --tmpfs /var/lib/ra-log-explorer \
+  -v "$PWD/sites:/etc/ra-log-explorer:ro" -p 8080:8080 \
+  -e RA_LOG_EXPLORER_BASE_PATH=/log-explorer \
+  -e RA_LOG_EXPLORER_CACHE=/var/cache/ra-log-explorer \
+  -e RA_LOG_EXPLORER_CONFIG_DIR=/var/lib/ra-log-explorer \
+  -e RA_LOG_EXPLORER_SITES_FILE=/etc/ra-log-explorer/sites.toml \
+  -e LOKI_USERNAME=omega \
+  ra-log-explorer:local
+```
+
+Worth checking, in this order — each one has failed for real:
+
+- `curl localhost:8080/log-explorer/healthz` → `{"status": "ok"}`.
+  This is the readiness probe; if it 404s the pod never joins the
+  Service and the deployment wedges.
+- `curl localhost:8080/` → 404. Paths outside the base path belong to
+  other apps on the same hostname.
+- `curl localhost:8080/log-explorer/ | grep static` → every asset URL
+  carries the prefix and no `__BASE_PATH__` survives. A leftover
+  placeholder is a blank page in the browser.
+- `PUT /log-explorer/api/settings` succeeds — proves the config
+  directory is writable despite the read-only root filesystem.
+- `docker exec … logcli --version` reports the pinned version, and a
+  query against the real Loki fails with a `401` rather than a TLS
+  error — the latter would mean the image has no CA bundle.
