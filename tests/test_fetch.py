@@ -618,8 +618,44 @@ def test_countOverTime_builds_instant_query_and_parses(monkeypatch: pytest.Monke
     assert args[0] == "instant-query"
     assert "sum(count_over_time(" in args[1]
     assert 'pod="pod-x"' in args[1]
-    assert "[5000ms]" in args[1]  # 5s window in ms (LogQL rejects ns/us)
+    # 5s window in ms (LogQL rejects ns/us), plus the 1ms superset pad.
+    assert "[5001ms]" in args[1]
     assert any(a.startswith("--now=") for a in args)
+
+
+def test_countOverTime_range_is_a_strict_superset_of_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selector covers ``(to - range, to]`` but the fetch covers
+    ``[from, to)``, and a zero count skips the chunk's fetch entirely — so
+    the range must round *up* and pad, never truncate. A sub-ms fraction
+    that ``round()`` would have discarded is the case that used to lose a
+    line sitting on the window's left edge."""
+    captured: dict[str, Any] = {}
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        captured["args"] = list(extraArgs)
+        return b'{"metric":{},"value":[1,"0"]}\n'
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    # 2000.4 ms: round() gives 2000 (narrower than the window), ceil gives 2001.
+    toT = fromT + dt.timedelta(microseconds=2_000_400)
+    assert fetch._countOverTime(_stubSpec(), "pod-x", fromT, toT) == 0
+    assert "[2002ms]" in captured["args"][1]
+
+
+def test_countOverTime_treats_empty_window_as_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zero-width (or inverted) window is empty by construction — no query,
+    and no ``ceil(0) + 1`` turning it into a live 1ms range selector."""
+
+    def boom(*_a: Any, **_kw: Any) -> bytes:
+        raise AssertionError("should not query Loki for an empty window")
+
+    monkeypatch.setattr(fetch, "_run_logcli", boom)
+    t = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    assert fetch._countOverTime(_stubSpec(), "p", t, t) == 0
+    assert fetch._countOverTime(_stubSpec(), "p", t, t - dt.timedelta(seconds=1)) == 0
 
 
 def test_countOverTime_returns_None_on_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:

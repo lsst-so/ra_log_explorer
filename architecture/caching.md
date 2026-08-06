@@ -167,7 +167,13 @@ of *single-batch* queries:
   aggregation — it never paginates entries, so it is exact and immune to
   the bug. `_countOverTime` uses it to learn how many lines a window
   holds and split the time range into chunks targeting
-  `CHUNK_TARGET_LINES` (< the batch size) each.
+  `CHUNK_TARGET_LINES` (< the batch size) each. A window the oracle says
+  is **empty** is skipped without a query at all, so the range selector
+  is deliberately padded (rounded up, plus 1 ms) to be a strict superset
+  of the fetched window: the selector covers `(to - range, to]` while the
+  fetch covers `[from, to)`, and an exactly-sized range would sit
+  narrower at the left edge. Over-counting only ever costs an empty
+  query; under-counting would silently skip a live chunk.
 - **Fetch one batch and verify structurally.** Each chunk is fetched with
   `--batch=SERVER_QUERY_CAP` (set equal to the cluster's
   `max_entries_limit_per_query`). A chunk is trusted **only** when

@@ -347,21 +347,33 @@ def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.dateti
     chunks by (and record for transparency).
 
     Best-effort: any failure (logcli error, unparseable output) returns
-    ``None``. Correctness never depends on this — the single-batch
+    ``None``. Correctness never depends on the *value* — the single-batch
     ``got < SERVER_QUERY_CAP`` check in :func:`_fetchWindowInto` is what
     actually guarantees no lines were dropped; the count only makes the
     chunking efficient and gives humans a number to sanity-check against.
-    The count covers ``(from, to]`` while the fetch covers ``[from, to)``,
-    so the two can differ by the handful of entries sitting exactly on a
-    window edge — fine for a presizing hint, another reason it's advisory.
+
+    Correctness *does* depend on it never under-counting, because a zero
+    short-circuits the fetch of that window entirely (see
+    :func:`_fetchWindowInto`). The range is padded to guarantee that: see
+    the comment on ``rangeMs`` below. The count may therefore run a hair
+    high — harmless, it only ever costs a query that comes back empty.
     """
     # LogQL range selectors take Prometheus-style durations whose smallest
-    # unit is milliseconds (``ns``/``us`` are rejected). Our windows never
-    # get below ~tens of ms (the MIN_SPLIT_S floor is 1 s), so ms is exact
-    # enough; a sub-ms window is treated as empty.
-    rangeMs = round((toT - fromT).total_seconds() * 1000)
-    if rangeMs <= 0:
+    # unit is milliseconds (``ns``/``us`` are rejected).
+    #
+    # The selector covers ``(toT - rangeMs, toT]`` while the fetch covers
+    # ``[fromT, toT)``, so an exactly-sized range sits *narrower* than the
+    # window at its left edge — it excludes ``fromT`` itself, and rounding
+    # to whole ms can clip up to another ~0.5 ms. A line in that sliver, in
+    # a window with nothing else in it, would make the oracle say "empty"
+    # and the chunk would be skipped without ever being fetched: a silent
+    # drop, reported complete. Rounding *up* plus 1 ms of pad makes the
+    # counted range a strict superset of the fetched window, so a zero
+    # count is now proof the window really is empty.
+    spanMs = (toT - fromT).total_seconds() * 1000
+    if spanMs <= 0:
         return 0
+    rangeMs = math.ceil(spanMs) + 1
     matcher = _matcher(spec, pod=pod)
     query = f"sum(count_over_time({matcher}[{rangeMs}ms]))"
     try:
@@ -522,7 +534,10 @@ def _fetchWindowInto(
     if expected is None:
         expected = _countOverTime(spec, pod, fromT, toT)
     if expected == 0:
-        return 0, True, ""  # oracle says empty — no query needed
+        # Safe to skip the query outright: the oracle's range is padded to be
+        # a strict superset of this window (see :func:`_countOverTime`), so a
+        # zero here can't be hiding a line sitting on the left edge.
+        return 0, True, ""
     span = (toT - fromT).total_seconds()
     # Oracle already proves this won't fit one batch: split up front rather
     # than waste a fetch we know will paginate (and be discarded).

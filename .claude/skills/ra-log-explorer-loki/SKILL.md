@@ -94,6 +94,11 @@ back full and logcli asks for another. `_fetchOnePod` exploits that:
   exact oracle. It's a *server-side aggregation* (no entry pagination), so
   it's immune to the bug — `1717 == 1717` on a complete window. Use it to
   presize chunks (target `CHUNK_TARGET_LINES`, below the batch size).
+  Mind the interval mismatch: a `[range]` selector at `--now=to` covers
+  `(to - range, to]`, but the fetch covers `[from, to)`. Round the range
+  **up** and pad it (we add 1 ms) so the count is a strict superset —
+  a zero count short-circuits the chunk's fetch entirely, so an
+  under-count there is a silent dropped line.
 - **`_queryWindowToFile`** fetches one chunk with
   `--batch=SERVER_QUERY_CAP`. A chunk is trusted **only** when
   `got < SERVER_QUERY_CAP` — proof it completed in one un-paginated
