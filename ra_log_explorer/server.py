@@ -46,6 +46,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import appSettings, exposureTimes, night
 from . import parse as parser
 from .config import (
+    DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
     NIGHT_AOS_POD_REGEX,
@@ -1699,7 +1700,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             """Serve the single-page shell with the base path substituted in.
 
             ``timeline.html`` carries a literal ``__BASE_PATH__`` everywhere a
-            URL back to us appears. Substituting at request time (rather than
+            URL back to us appears, and a ``__LOKI_USERNAME__`` in the
+            credentials form. Substituting at request time (rather than
             baking it in at build time, as a bundler would) keeps the image
             environment-agnostic and keeps the no-build-step edit-and-reload
             loop working locally, where the base path is empty.
@@ -1708,7 +1710,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if not path.exists():
                 self.send_error(404, f"Not found: {path.name}")
                 return
-            body = path.read_text().replace("__BASE_PATH__", ctx.basePath).encode("utf-8")
+            text = path.read_text()
+            for placeholder, value in (
+                ("__BASE_PATH__", ctx.basePath),
+                # The Loki user the server authenticates as unless the
+                # browser overrides it. Rendered in rather than written into
+                # the HTML so a deployment's service account is what the
+                # field offers, instead of whoever the template was written
+                # for.
+                ("__LOKI_USERNAME__", DEFAULT_USERNAME),
+            ):
+                text = text.replace(placeholder, value)
+            body = text.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.send_header("Content-Length", str(len(body)))

@@ -2371,3 +2371,17 @@ def test_post_and_delete_also_honour_the_base_path(mountedServer: RunningServer)
     # without letting the handler persist anything.
     assert _put(host, port, "/log-explorer/api/settings", "not json")[0] == 400
     assert _put(host, port, "/api/settings", "not json")[0] == 404
+
+
+def test_index_offers_the_servers_loki_username(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The credentials form must offer whatever user the server will
+    actually authenticate as. Writing a name into the HTML instead would
+    make a deployment send its template author's username to Loki and fail
+    every fetch."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert "__LOKI_USERNAME__" not in html
+    assert f'name="username" value="{serverModule.DEFAULT_USERNAME}"' in html
