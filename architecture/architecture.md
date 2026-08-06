@@ -530,6 +530,18 @@ only returned (with `manual: true`, and one of the error statuses' would-be
 message suppressed) when ConsDB still can't resolve the dataId. A later
 real ConsDB hit overwrites the stand-in.
 
+**This policy is global, not per-endpoint.** The night and range prefetch
+path (`_resolveShutterClosesInto`, which resolves hundreds of ids in one
+batch) applies the same rule: a `_manual` record anchors its id
+immediately *and* joins the ConsDB batch, so a real row supersedes it as
+soon as ConsDB can answer. Were it treated as an ordinary cache hit, one
+manual entry made during an outage would anchor that dataId in every
+future night/range view forever, silently biasing every Δshutter offset
+and histogram computed from it. The path's `shutter-close` progress
+events carry `manualStandins` (how many hits were provisional) alongside
+`cacheHits`, and `remaining` / `stillMissing` count only ids with no t₀
+at all — a re-queried stand-in is anchored, not missing.
+
 ### `GET /api/sites`
 
 Return the per-deployment site catalog plus the default site name.
@@ -727,13 +739,19 @@ is one JSON event (`{"type": ...}`):
   `_resolveShutterClosesInto`). Phases:
     - `starting`: `{ total }` (number of dataIds we'll try to
        resolve)
-    - `cache-checked`: `{ cacheHits, remaining }` — after the
-       on-disk shutter-close cache pass.
+    - `cache-checked`: `{ cacheHits, manualStandins, remaining }` —
+       after the on-disk shutter-close cache pass. `manualStandins`
+       counts `_manual` hits, which anchor their id *and* still join
+       the ConsDB batch so a real row can supersede them.
     - `no-token`: `{ remaining, tokenPath }` — token file missing;
        remaining dataIds can't be resolved.
     - `empty-token`: `{ remaining }` — token file blank.
     - `consdb-error`: `{ error }` — typed ConsDB error.
     - `done`: `{ consdbHits, stillMissing }` — happy path.
+
+  `remaining` / `stillMissing` count only dataIds left with **no** t₀ at
+  all; a manual stand-in that ConsDB still couldn't supersede is anchored,
+  so it is not counted as missing.
 - `done`: `{ kind, expId, tZero, dayObs, startId, stopId, cacheDir,
   cacheReuse, podCount, totalBytes, elapsedS }` — after the server's
   keyed `ServerState` / `NightState` / `RangeState` slot has been

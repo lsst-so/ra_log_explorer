@@ -358,9 +358,11 @@ def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> 
 
     Best-effort: any I/O error is swallowed (the cache is purely an
     optimisation). Records never need to be invalidated — once a
-    ``cdb_*.exposure`` row exists in ConsDB, it's immutable. Taking the
-    whole batch in one rewrite keeps a night-prefetch of hundreds of
-    dataIds from re-serialising the file once per id.
+    ``cdb_*.exposure`` row exists in ConsDB, it's immutable. They are
+    plainly overwritten, though, which is how a real record supersedes a
+    ``_manual`` stand-in (see :func:`manualRecord`). Taking the whole
+    batch in one rewrite keeps a night-prefetch of hundreds of dataIds
+    from re-serialising the file once per id.
     """
     if not records:
         return

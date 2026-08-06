@@ -681,12 +681,22 @@ def _resolveShutterClosesInto(
     An id counts as resolved only when its record carries a usable
     ``obs_end`` (the t₀ the histograms need); a record without one is
     treated as a miss and re-queried.
+
+    A ``_manual`` stand-in (see :func:`exposureTimes.manualRecord`) anchors
+    its id straight away but is *also* re-queried, exactly as
+    ``GET /api/exposure-time`` does: a hand-entered value is a fallback for
+    when ConsDB couldn't answer, not the immutable truth a ConsDB row is,
+    so a real record must be able to supersede it. Without that, one manual
+    entry made during a ConsDB outage would anchor that dataId in every
+    future night/range view forever, silently biasing every Δshutter offset
+    and histogram derived from it.
     """
     job.push({"type": "shutter-close", "phase": "starting", "total": len(needIds), "site": site.name})
 
     # 1) Cache lookups — free, instant.
     misses: list[int] = []
     cachedHits = 0
+    manualStandins = 0
     for expId in needIds:
         rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
         iso = exposureTimes.obsEnd(rec)
@@ -695,13 +705,28 @@ def _resolveShutterClosesInto(
             continue
         target[expId] = _taiIsoToUtc(iso)
         infoTarget[expId] = rec
-        cachedHits += 1
+        if exposureTimes.isManual(rec):
+            misses.append(expId)  # anchored provisionally; ConsDB may supersede
+            manualStandins += 1
+        else:
+            cachedHits += 1
+
+    def unanchored() -> int:
+        """How many of ``misses`` still have no t₀ at all.
+
+        Manual stand-ins sit in ``misses`` so they get re-queried, but they
+        are already anchored — counting them as "remaining" would report a
+        fully-resolved night as partly missing.
+        """
+        return sum(1 for expId in misses if expId not in target)
+
     job.push(
         {
             "type": "shutter-close",
             "phase": "cache-checked",
             "cacheHits": cachedHits,
-            "remaining": len(misses),
+            "manualStandins": manualStandins,
+            "remaining": unanchored(),
         }
     )
     if not misses:
@@ -714,7 +739,7 @@ def _resolveShutterClosesInto(
             {
                 "type": "shutter-close",
                 "phase": "no-token",
-                "remaining": len(misses),
+                "remaining": unanchored(),
                 "tokenPath": str(tokenPath),
                 "site": site.name,
             }
@@ -725,13 +750,14 @@ def _resolveShutterClosesInto(
     except OSError:
         token = ""
     if not token:
-        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": len(misses)})
+        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": unanchored()})
         return
     try:
         resolved = exposureTimes.queryExposureRecordBatch(misses, token, consdbUrl=site.consdbUrl)
     except (exposureTimes.ConsDbError, OSError) as e:
         job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
         return
+    # Overwrites any `_manual` stand-in for these ids, on disk and in memory.
     exposureTimes.storeCachedRecords(resolved, siteName=site.name)
     consdbHits = 0
     for expId, rec in resolved.items():
@@ -746,7 +772,7 @@ def _resolveShutterClosesInto(
             "type": "shutter-close",
             "phase": "done",
             "consdbHits": consdbHits,
-            "stillMissing": len(misses) - consdbHits,
+            "stillMissing": unanchored(),
         }
     )
 

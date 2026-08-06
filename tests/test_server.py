@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from ra_log_explorer import config, parse, server
-from ra_log_explorer.jobs import JobManager
+from ra_log_explorer import config, exposureTimes, parse, server, sites
+from ra_log_explorer.jobs import FetchJob, JobManager
 
 from .conftest import FakeSiteCatalog
 
@@ -1239,3 +1241,136 @@ def test_isoForLogcli_emits_Z_suffix_and_utc() -> None:
     s = server._isoForLogcli(t)
     assert s.endswith("Z")
     assert "08:45:39" in s  # the +01:00 input projected to UTC
+
+
+# ----- _resolveShutterClosesInto (night / range prefetch) -----------------
+
+
+def _prefetchJob(siteCatalog: FakeSiteCatalog) -> tuple[FetchJob, sites.Site]:
+    """A night FetchJob + the summit Site, for driving the prefetch path."""
+    spec = config.FetchSpec(
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-05-20T08:00:00Z",
+        toIso="2026-05-20T09:00:00Z",
+        username="u",
+        lokiAddr="https://loki.example",
+    )
+    job = JobManager().createNightJob(spec, 20260520, siteName="summit")
+    site = next(s for s in siteCatalog.catalog if s.name == "summit")
+    return job, site
+
+
+def _phase(job: FetchJob, name: str) -> dict[str, Any]:
+    """The single progress event with ``phase == name``."""
+    return next(e for e in job.events if e.get("phase") == name)
+
+
+def test_resolveShutterCloses_requeries_manual_standins(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `_manual` stand-in anchors its id *and* still joins the ConsDB
+    batch, so a real row supersedes it. Treating it as an ordinary cache
+    hit would freeze one hand-typed value into every future night/range
+    view of that dataId — silently biasing every Δshutter derived from it.
+    """
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-05-20T00:00:00.000000"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    queried: list[list[int]] = []
+
+    def fakeBatch(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        queried.append(sorted(dataIds))
+        return {2026052000001: {"obs_end": "2026-05-20T08:46:16.267000", "physical_filter": "r"}}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert queried == [[2026052000001]]  # the stand-in was re-queried
+    # ConsDB's value won, in memory and on disk.
+    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert info[2026052000001]["physical_filter"] == "r"
+    stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
+    assert exposureTimes.isManual(stored) is False
+    checked = _phase(job, "cache-checked")
+    assert checked["cacheHits"] == 0 and checked["manualStandins"] == 1
+    assert checked["remaining"] == 0  # anchored provisionally, so not "missing"
+    assert _phase(job, "done")["stillMissing"] == 0
+
+
+def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stand-in is a *fallback*: when the re-query comes back empty it
+    stays put, and the id is reported anchored rather than missing."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+
+    def emptyBatch(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", emptyBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
+    assert exposureTimes.isManual(stored) is True
+    assert _phase(job, "done")["stillMissing"] == 0
+
+
+def test_resolveShutterCloses_manual_survives_a_missing_token(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """No token means no re-query at all — the stand-in still anchors the
+    id, and `remaining` counts only the genuinely unresolvable one."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    # Token deliberately absent.
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert 2026052000002 not in target
+    assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
+
+
+def test_resolveShutterCloses_real_cache_hit_skips_consdb(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flip side: a genuine ConsDB-sourced record *is* immutable truth,
+    so it must still short-circuit the batch query entirely."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, {"obs_end": "2026-05-20T08:46:16.267000"}, siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+
+    def boom(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        raise AssertionError("a real cache hit must not hit ConsDB")
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", boom)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    checked = _phase(job, "cache-checked")
+    assert checked["cacheHits"] == 1 and checked["manualStandins"] == 0
