@@ -66,6 +66,14 @@ function showShutterDelta() {
 }
 
 function kindClass(kind, level) {
+  // Pod-lifecycle markers (from the k8s/events stream) — checked first so
+  // their own colour wins over the level-based fallbacks below.
+  if (kind === 'POD_OOMKILLED') return 'kind-oom';
+  if (kind === 'POD_FAILED') return 'kind-podfail';
+  if (kind === 'POD_KILLED') return 'kind-killed';
+  if (kind === 'POD_RESTARTED') return 'kind-restart';
+  if (kind === 'POD_UNHEALTHY') return 'kind-podunhealthy';
+  if (kind === 'POD_STARTED') return 'kind-podstart';
   if (level === 'error') return 'kind-error';
   if (kind === 'WORKER_PICKUP') return 'kind-pickup';
   if (kind === 'WORKER_QG_START' || kind === 'WORKER_QG_BUILT') return 'kind-qg';
@@ -101,6 +109,74 @@ function groupOrder() {
   ];
 }
 
+// ----- ConsDB exposure properties (info box + shared tooltip) ---------------
+
+// Curated ConsDB exposure record → ordered [label, value] display items.
+// `compact` keeps only the "what kind of image is this" essentials (used
+// for the dataId-link tooltips in the night + range views); the full set
+// adds observing context for the explore-view info box. Null / blank
+// columns are skipped so a sparse record doesn't render empty rows.
+function exposureInfoItems(rec, compact) {
+  if (!rec) return [];
+  const items = [];
+  const push = (label, val) => {
+    if (val !== null && val !== undefined && val !== '') items.push([label, String(val)]);
+  };
+  const num = (v, dp) => (v === null || v === undefined ? null : Number(v).toFixed(dp));
+  push('image type', rec.img_type);
+  push('reason', rec.observation_reason);
+  push('program', rec.science_program);
+  push('filter', rec.physical_filter);
+  if (rec.exp_time !== null && rec.exp_time !== undefined) push('exp time', `${num(rec.exp_time, 1)} s`);
+  push('target', rec.target_name);
+  // cur/max index is the tell-tale for a multi-exposure group (e.g. a
+  // CWFS intra/extra-focal pair shows "1 of 2").
+  if (rec.max_index !== null && rec.max_index !== undefined && Number(rec.max_index) > 1) {
+    push('in group', `${rec.cur_index} of ${rec.max_index}`);
+  }
+  if (compact) return items;
+  push('group', rec.group_id);
+  push('airmass', num(rec.airmass, 2));
+  if (rec.dimm_seeing !== null && rec.dimm_seeing !== undefined) push('seeing', `${num(rec.dimm_seeing, 2)}″`);
+  if (rec.s_ra !== null && rec.s_ra !== undefined && rec.s_dec !== null && rec.s_dec !== undefined) {
+    push('RA, Dec', `${num(rec.s_ra, 3)}°, ${num(rec.s_dec, 3)}°`);
+  }
+  if (rec.sky_rotation !== null && rec.sky_rotation !== undefined) push('rot', `${num(rec.sky_rotation, 1)}°`);
+  push('name', rec.exposure_name);
+  return items;
+}
+
+// Multi-line "label: value" string for a title= tooltip. '' when there's
+// no record (so callers can assign it unconditionally). Shared with the
+// night + range views via window.
+function exposureInfoTooltip(rec) {
+  const items = exposureInfoItems(rec, true);
+  return items.map(([l, v]) => `${l}: ${v}`).join('\n');
+}
+window.exposureInfoTooltip = exposureInfoTooltip;
+
+function renderExposureInfoBox(rec) {
+  const box = document.getElementById('exposure-info');
+  if (!box) return;
+  box.innerHTML = '';
+  const items = exposureInfoItems(rec, false);
+  if (!items.length) {
+    box.hidden = true;
+    return;
+  }
+  for (const [label, value] of items) {
+    const span = document.createElement('span');
+    span.className = 'exp-item';
+    const lab = document.createElement('span');
+    lab.className = 'exp-label';
+    lab.textContent = label;
+    span.appendChild(lab);
+    span.appendChild(document.createTextNode(value));
+    box.appendChild(span);
+  }
+  box.hidden = false;
+}
+
 // ----- entry point ----------------------------------------------------------
 
 async function startExplore(loadedSummary) {
@@ -110,8 +186,12 @@ async function startExplore(loadedSummary) {
   selectedPod = null;
   collapsedGroups = new Set();
   summary = loadedSummary;
+  if (window.renderFetchBanner) {
+    window.renderFetchBanner(document.getElementById('explore-fetch-banner'), summary);
+  }
   document.getElementById('expId-display').textContent =
     `expId=${summary.expId}  ·  t₀=${summary.tZero}`;
+  renderExposureInfoBox(summary.exposure);
   shutterUtcMs = new Date(summary.tZero).getTime();
   populateRefSelect();
   populateTaskLegend();
@@ -413,6 +493,16 @@ function groupDisplay(group) {
 function makeEventNode(e) {
   const n = document.createElement('div');
   n.className = 'tl-event ' + kindClass(e.kind, e.level);
+  // Pod-lifecycle markers render as a full-height tick (vs the inset work
+  // ticks) so a restart/kill/OOM reads as "the whole pod" at that instant.
+  if (e.kind && e.kind.startsWith('POD_')) {
+    n.classList.add('lifecycle');
+    n.style.left = xForOffset(e.offsetS) + 'px';
+    n.addEventListener('mouseenter', (ev) => showTooltip(ev, e));
+    n.addEventListener('mousemove', moveTooltip);
+    n.addEventListener('mouseleave', hideTooltip);
+    return n;
+  }
   const taskColor = (e.taskLabel && summary.taskColors)
     ? summary.taskColors[e.taskLabel] : null;
   if (e.durationS && e.kind === 'QUANTUM_DONE') {
@@ -532,7 +622,12 @@ async function selectPod(pod) {
   document.getElementById('detail-title').textContent = pod;
   document.getElementById('detail-body').textContent = 'loading...';
   if (!podDetailCache[pod]) {
-    const r = await fetch(`/api/pod/${pod}?dataId=${encodeURIComponent(summary.expId)}`);
+    // In range mode the timeline payload carries a podDetailQuery that
+    // routes the lookup back through the range state (so offsets anchor
+    // at this dataId's shutter close); single-exposure mode just keys
+    // off the loaded dataId.
+    const q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
+    const r = await fetch(`/api/pod/${pod}?${q}`);
     podDetailCache[pod] = await r.json();
   }
   renderDetail();
@@ -603,6 +698,9 @@ function wireExploreListeners() {
   document.getElementById('groups-collapse-all').addEventListener('click', collapseAllGroups);
   document.getElementById('groups-expand-all').addEventListener('click', expandAllGroups);
   document.getElementById('back-home').addEventListener('click', () => {
+    // Drop the exposure key out of the URL bar so a subsequent refresh
+    // lands on home — not back on whatever exposure we just left.
+    history.replaceState({}, '', window.location.pathname);
     if (window.showHome) window.showHome();
   });
   window.addEventListener('keydown', (e) => {

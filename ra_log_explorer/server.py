@@ -17,7 +17,8 @@ HTTP surface (see ``architecture/architecture.md`` for the full schema):
   GET    /api/cache                               list of cached windows on disk
   DELETE /api/cache                               delete the entire cache
   DELETE /api/cache/<cluster>/<ns>/<slug>[/<pods=…>]  delete one cached window
-  GET    /api/exposure-time/<dataId>              dataId -> shutter-close (TAI) lookup
+  GET    /api/exposure-time/<dataId>?site=<name>  dataId -> shutter-close (TAI) lookup
+  GET    /api/sites                               site catalog (cluster + ConsDB pairings)
   GET    /api/settings                            current persisted server-side settings
   PUT    /api/settings                            update server-side settings
   POST   /api/fetch                               start an exposure fetch; returns {jobId}
@@ -45,6 +46,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 from . import appSettings, exposureTimes, night
 from . import parse as parser
 from .config import (
+    DEFAULT_WINDOW_AFTER_S,
+    DEFAULT_WINDOW_BEFORE_S,
     NIGHT_AOS_POD_REGEX,
     FetchSpec,
     cache_root,
@@ -59,11 +62,14 @@ from .fetch import (
     evictToFit,
     getCacheExposureIds,
     getCacheLastViewed,
+    getCacheRange,
     loadCacheMeta,
     loadPodLogPath,
+    markCacheRange,
     markCacheViewed,
 )
 from .jobs import FetchJob, JobManager
+from .sites import Site, SitesConfigError, siteByCluster, siteByName
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -144,6 +150,15 @@ class ServerState:
     summaries: list[parser.PodSummary]
     expId: int
     tZero: dt.datetime
+    # Name of the site this exposure belongs to ("summit" | "bts" | …).
+    # Drives ConsDB lookups and per-site cache scoping; populated at
+    # fetch time from the request body's `site` field (or derived from
+    # the cache path's cluster component when rehydrating from disk).
+    siteName: str = ""
+    # Curated ConsDB exposure record for this dataId (filter, exp time,
+    # image type, program, reason, …) — drives the explore-view info box.
+    # None if ConsDB never resolved it (no token, unknown dataId).
+    exposureInfo: exposureTimes.ExposureRecord | None = None
     referencePoints: list[dict] = field(default_factory=list)
 
 
@@ -158,9 +173,49 @@ class NightState:
     dayObs: int
     startTime: dt.datetime  # noon UTC of dayObs (start of dayObs)
     endTime: dt.datetime  # noon UTC of dayObs + 1
+    # See ``ServerState.siteName``.
+    siteName: str = ""
     # Lazily populated dataId -> shutter-close UTC datetime, used to
     # turn task event timestamps into Δshutter offsets for histograms.
     shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
+    # dataId -> curated ConsDB exposure record, resolved alongside the
+    # shutter closes — used for the dataId-link tooltips in the night view.
+    exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
+
+
+@dataclass
+class RangeState:
+    """A loaded contiguous range of exposures, fetched as one wide window.
+
+    Structurally this is one exposure-style cache (all pods, single
+    window) parsed once into ``summaries`` and held in memory. The
+    per-dataId timeline for any exposure in the range is computed on
+    demand from these shared summaries, anchored at that dataId's own
+    shutter close (``shutterCloseByExpId``) — no re-fetch, no re-parse.
+    """
+
+    cacheDir: Path
+    cacheBytes: int
+    meta: dict
+    summaries: list[parser.PodSummary]
+    startId: int
+    stopId: int
+    fromTime: dt.datetime  # fetch window start (UTC)
+    toTime: dt.datetime  # fetch window end (UTC)
+    # See ``ServerState.siteName``.
+    siteName: str = ""
+    # dataId -> shutter-close (t₀) UTC datetime for every exposure in
+    # [startId, stopId] that ConsDB knew about. Ids absent here are the
+    # "skipped" integers the user was warned to expect.
+    shutterCloseByExpId: dict[int, dt.datetime] = field(default_factory=dict)
+    # dataId -> curated ConsDB exposure record, resolved alongside the
+    # shutter closes — used for the navigator chip tooltips.
+    exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
+
+
+def rangeKey(startId: int, stopId: int) -> str:
+    """The dict key / URL identifier for a loaded range."""
+    return f"{startId}-{stopId}"
 
 
 # How many parsed exposures / nights we keep loaded in memory at once.
@@ -178,11 +233,27 @@ class ServerContext:
     tab. Each maps a key (exposureId / dayObs) to its parsed state.
     Access is LRU-ordered so the least-recently-used entries are first
     to be evicted when we go over :data:`_MAX_LOADED_STATES`.
+
+    ``sites`` is the per-deployment catalog (see :mod:`.sites`), loaded
+    once at process start; ``defaultSiteName`` is the catalog's named
+    fallback when a request body / query string omits ``site``.
     """
 
     jobs: JobManager
+    sites: list[Site] = field(default_factory=list)
+    defaultSiteName: str = ""
     exposureStates: "OrderedDict[int, ServerState]" = field(default_factory=OrderedDict)
     nightStates: "OrderedDict[int, NightState]" = field(default_factory=OrderedDict)
+    # Keyed by ``rangeKey(startId, stopId)``.
+    rangeStates: "OrderedDict[str, RangeState]" = field(default_factory=OrderedDict)
+
+    def siteForRequest(self, name: str | None) -> Site:
+        """Return the named site, falling back to the catalog default
+        when ``name`` is missing or blank. Raises
+        :class:`SitesConfigError` for an unknown name so the handler
+        surfaces a 400.
+        """
+        return siteByName(self.sites, name or self.defaultSiteName)
 
     def getExposureState(self, expId: int) -> ServerState | None:
         s = self.exposureStates.get(expId)
@@ -208,6 +279,19 @@ class ServerContext:
         while len(self.nightStates) > _MAX_LOADED_STATES:
             self.nightStates.popitem(last=False)
 
+    def getRangeState(self, key: str) -> RangeState | None:
+        s = self.rangeStates.get(key)
+        if s is not None:
+            self.rangeStates.move_to_end(key)
+        return s
+
+    def putRangeState(self, state: RangeState) -> None:
+        key = rangeKey(state.startId, state.stopId)
+        self.rangeStates[key] = state
+        self.rangeStates.move_to_end(key)
+        while len(self.rangeStates) > _MAX_LOADED_STATES:
+            self.rangeStates.popitem(last=False)
+
     def evictByCacheDir(self, target: Path) -> None:
         """Evict any loaded state whose cacheDir matches ``target``.
 
@@ -222,6 +306,9 @@ class ServerContext:
         staleNight = [k for k, v in self.nightStates.items() if v.cacheDir.resolve() == targetR]
         for k in staleNight:
             del self.nightStates[k]
+        staleRange = [rk for rk, v in self.rangeStates.items() if v.cacheDir.resolve() == targetR]
+        for rk in staleRange:
+            del self.rangeStates[rk]
 
 
 def _toJsonable(obj: Any) -> Any:
@@ -283,15 +370,40 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
     cluttering the per-pod timeline.
     """
     targeted = [ev for ev in s.events if ev.expId == expId]
-    window: tuple[dt.datetime, dt.datetime] | None = None
     if targeted:
         window = (
             targeted[0].t - dt.timedelta(seconds=3),
             targeted[-1].t + dt.timedelta(seconds=3),
         )
+    else:
+        # No classified events for this dataId in this pod (e.g. an
+        # 'other'-group pod, or one that only mentioned the id in passing).
+        # Anchor the untagged-event window on t₀ instead of keeping
+        # *everything* — that matters whenever the cache window is much
+        # wider than one exposure (range mode, or a superset-reuse
+        # single-exposure view), where "keep all untagged" would pull the
+        # whole span's warnings into this one dataId's timeline.
+        window = (
+            tZero - dt.timedelta(seconds=DEFAULT_WINDOW_BEFORE_S),
+            tZero + dt.timedelta(seconds=DEFAULT_WINDOW_AFTER_S),
+        )
+
+    # Pod-lifecycle markers (restart/kill/OOM, kind ``POD_*``) are global to
+    # the pod, not keyed to a dataId — and a death typically lands a few
+    # seconds *after* the last work line, outside the tight per-dataId
+    # window. Keep them on the lane whenever they fall in the broad exposure
+    # window, so "the pod died while working on this exposure" stays visible.
+    lifecycleWindow = (
+        tZero - dt.timedelta(seconds=DEFAULT_WINDOW_BEFORE_S),
+        tZero + dt.timedelta(seconds=DEFAULT_WINDOW_AFTER_S),
+    )
 
     relevant: list[parser.Event] = []
     for ev in s.events:
+        if ev.kind in parser.LIFECYCLE_EVENT_KINDS:
+            if lifecycleWindow[0] <= ev.t <= lifecycleWindow[1]:
+                relevant.append(ev)
+            continue
         if ev.expId == expId:
             relevant.append(ev)
             continue
@@ -299,12 +411,7 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
             continue  # explicitly tagged to a different exposure
         # Untagged event (typically a generic WARN/ERROR). Keep iff it
         # falls inside this pod's working window for the target exposure.
-        if window is None:
-            # Pod has no explicit target events at all (e.g. head node only
-            # references the exposure transitively via expRecord). Keep
-            # untagged events so the user can still see warnings.
-            relevant.append(ev)
-        elif window[0] <= ev.t <= window[1]:
+        if window[0] <= ev.t <= window[1]:
             relevant.append(ev)
 
     # ----- per-pod summary stats for the hover tooltip ---------------------
@@ -401,8 +508,13 @@ def _buildSummaryPayload(state: ServerState) -> dict:
     return {
         "loaded": True,
         "mode": "exposure",
+        "site": state.siteName,
         "expId": state.expId,
         "tZero": state.tZero.isoformat(),
+        # Curated ConsDB exposure record (filter, exp time, image type,
+        # program, reason, …) for the explore-view info box. None if it
+        # was never resolved (no token / unknown dataId).
+        "exposure": state.exposureInfo,
         "cacheDir": str(state.cacheDir),
         "cacheBytes": state.cacheBytes,
         "meta": _toJsonable(state.meta),
@@ -509,7 +621,7 @@ def _neededDataIdsForNight(
 
 
 def _prefetchNightShutterCloses(
-    state: NightState, summaries: Iterable[parser.PodSummary], job: FetchJob
+    state: NightState, summaries: Iterable[parser.PodSummary], job: FetchJob, site: Site
 ) -> None:
     """Populate ``state.shutterCloseByExpId`` for everything the night
     view will need to render histograms + failure Δshutter offsets.
@@ -518,11 +630,12 @@ def _prefetchNightShutterCloses(
     /api/summary request that follows is instant. We:
 
     * collect every dataId we'll need to plot,
-    * read whatever's already in the on-disk exposure-time cache,
-    * batch-query ConsDB for the rest (one ``SELECT … IN (…)`` per
-      instrument with a hard chunk size so a huge IN-list doesn't
-      blow ConsDB's SQL length limit),
-    * persist everything new back to the on-disk cache so the next
+    * read whatever's already in the on-disk per-site exposure-time
+      cache,
+    * batch-query ``site.consdbUrl`` for the rest (one
+      ``SELECT … IN (…)`` per instrument with a hard chunk size so a
+      huge IN-list doesn't blow ConsDB's SQL length limit),
+    * persist everything new back to the per-site cache so the next
       night-fetch over the same dataIds starts instant.
 
     Pushes progress events to ``job.events`` so the SSE consumer can
@@ -531,63 +644,135 @@ def _prefetchNightShutterCloses(
     needIds = _neededDataIdsForNight(summaries)
     if not needIds:
         return
+    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
 
-    job.push({"type": "shutter-close", "phase": "starting", "total": len(needIds)})
+
+def _prefetchRangeShutterCloses(state: RangeState, job: FetchJob, site: Site) -> None:
+    """Populate ``state.shutterCloseByExpId`` with a t₀ for every dataId
+    in ``[startId, stopId]``.
+
+    The candidate set is the full integer span — ConsDB is the source of
+    truth for which of those are real exposures; the integers it has no
+    row for are the "skipped" ones the navigator simply omits. Runs as
+    part of the range-fetch job's parsing phase (after the start/stop
+    anchors are already seeded) so the /api/summary that follows is
+    instant; pushes the same ``shutter-close`` progress events night mode
+    does.
+    """
+    needIds = set(range(state.startId, state.stopId + 1))
+    if not needIds:
+        return
+    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
+
+
+def _resolveShutterClosesInto(
+    needIds: set[int],
+    target: dict[int, dt.datetime],
+    infoTarget: dict[int, exposureTimes.ExposureRecord],
+    job: FetchJob,
+    site: Site,
+) -> None:
+    """Resolve each id in ``needIds`` into ``target`` (shutter close t₀,
+    UTC) and ``infoTarget`` (the full ConsDB exposure record) — on-disk
+    per-site cache first, then one batched ConsDB query for the misses —
+    pushing the ``shutter-close`` progress events the SSE consumer
+    renders. Shared by the night and range post-parse prefetch paths.
+
+    An id counts as resolved only when its record carries a usable
+    ``obs_end`` (the t₀ the histograms need); a record without one is
+    treated as a miss and re-queried.
+
+    A ``_manual`` stand-in (see :func:`exposureTimes.manualRecord`) anchors
+    its id straight away but is *also* re-queried, exactly as
+    ``GET /api/exposure-time`` does: a hand-entered value is a fallback for
+    when ConsDB couldn't answer, not the immutable truth a ConsDB row is,
+    so a real record must be able to supersede it. Without that, one manual
+    entry made during a ConsDB outage would anchor that dataId in every
+    future night/range view forever, silently biasing every Δshutter offset
+    and histogram derived from it.
+    """
+    job.push({"type": "shutter-close", "phase": "starting", "total": len(needIds), "site": site.name})
 
     # 1) Cache lookups — free, instant.
     misses: list[int] = []
     cachedHits = 0
+    manualStandins = 0
     for expId in needIds:
-        iso = exposureTimes.lookupCached(expId)
-        if iso is None:
+        rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        iso = exposureTimes.obsEnd(rec)
+        if rec is None or iso is None:
             misses.append(expId)
             continue
-        state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
-        cachedHits += 1
+        target[expId] = _taiIsoToUtc(iso)
+        infoTarget[expId] = rec
+        if exposureTimes.isManual(rec):
+            misses.append(expId)  # anchored provisionally; ConsDB may supersede
+            manualStandins += 1
+        else:
+            cachedHits += 1
+
+    def unanchored() -> int:
+        """How many of ``misses`` still have no t₀ at all.
+
+        Manual stand-ins sit in ``misses`` so they get re-queried, but they
+        are already anchored — counting them as "remaining" would report a
+        fully-resolved night as partly missing.
+        """
+        return sum(1 for expId in misses if expId not in target)
+
     job.push(
         {
             "type": "shutter-close",
             "phase": "cache-checked",
             "cacheHits": cachedHits,
-            "remaining": len(misses),
+            "manualStandins": manualStandins,
+            "remaining": unanchored(),
         }
     )
     if not misses:
         return
 
     # 2) Batch ConsDB queries (one per instrument, chunked) — needs a token.
-    tokenPath = exposureTimes.rspTokenFilePath()
+    tokenPath = site.consdbTokenFile
     if not tokenPath.exists():
         job.push(
             {
                 "type": "shutter-close",
                 "phase": "no-token",
-                "remaining": len(misses),
+                "remaining": unanchored(),
                 "tokenPath": str(tokenPath),
+                "site": site.name,
             }
         )
         return
     try:
-        token = exposureTimes.readRspToken(tokenPath)
+        token = exposureTimes.readToken(tokenPath)
     except OSError:
         token = ""
     if not token:
-        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": len(misses)})
+        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": unanchored()})
         return
     try:
-        resolved = exposureTimes.queryIsotBatch(misses, token)
+        resolved = exposureTimes.queryExposureRecordBatch(misses, token, consdbUrl=site.consdbUrl)
     except (exposureTimes.ConsDbError, OSError) as e:
         job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
         return
-    for expId, iso in resolved.items():
-        exposureTimes.storeCached(expId, iso)
-        state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+    # Overwrites any `_manual` stand-in for these ids, on disk and in memory.
+    exposureTimes.storeCachedRecords(resolved, siteName=site.name)
+    consdbHits = 0
+    for expId, rec in resolved.items():
+        iso = exposureTimes.obsEnd(rec)
+        if iso is None:
+            continue  # row exists but no obs_end — can't anchor a t₀
+        target[expId] = _taiIsoToUtc(iso)
+        infoTarget[expId] = rec
+        consdbHits += 1
     job.push(
         {
             "type": "shutter-close",
             "phase": "done",
-            "consdbHits": len(resolved),
-            "stillMissing": len(misses) - len(resolved),
+            "consdbHits": consdbHits,
+            "stillMissing": unanchored(),
         }
     )
 
@@ -595,6 +780,26 @@ def _prefetchNightShutterCloses(
 def _taiIsoToUtc(taiIso: str) -> dt.datetime:
     """Parse a ConsDB ``obs_end`` (TAI ISO, no tz) into a UTC datetime."""
     return parser._parseTimestamp(taiIso + "Z") - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+
+
+def _utcToTaiIso(t: dt.datetime) -> str:
+    """Inverse of :func:`_taiIsoToUtc`: a UTC datetime → the ConsDB-style
+    TAI ``obs_end`` string (no timezone, microsecond precision).
+
+    Used to persist a hand-entered shutter close into the per-site
+    exposure-time cache in the same TAI form a real ConsDB row carries.
+    """
+    tai = t.astimezone(dt.timezone.utc) + dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+    return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
+
+def _shutterCloseLabel(record: exposureTimes.ExposureRecord | None) -> str:
+    """Reference-point label for a caller-supplied t-zero, distinguishing a
+    hand-entered stand-in from one that came (via the home form) from ConsDB.
+    """
+    if exposureTimes.isManual(record):
+        return "shutter close (manual)"
+    return "shutter close (caller-supplied)"
 
 
 def _buildNightPayload(state: NightState) -> dict:
@@ -610,6 +815,7 @@ def _buildNightPayload(state: NightState) -> dict:
     errPod = night.errorsByPod(state.summaries)
     firstStarts = night.firstTaskStartByDataId(state.summaries)
     czEnds = night.calcZernikesEndByDataId(state.summaries)
+    gatherOnly = night.gatherOnlyDataIds(state.summaries)
     shutterCloseByExpId = state.shutterCloseByExpId
 
     # Keep this in lockstep with the prefetch path so the
@@ -636,10 +842,12 @@ def _buildNightPayload(state: NightState) -> dict:
         dataIds=czIds,
     )
     failures = night.failureRows(state.summaries, shutterCloseByExpId)
+    restarts = night.lifecycleRows(state.summaries, shutterCloseByExpId)
 
     return {
         "loaded": True,
         "mode": "night",
+        "site": state.siteName,
         "dayObs": state.dayObs,
         "startTime": state.startTime.isoformat(),
         "endTime": state.endTime.isoformat(),
@@ -654,7 +862,11 @@ def _buildNightPayload(state: NightState) -> dict:
             "nPodsWithTraceback": stats.nPodsWithTraceback,
             "nDistinctExceptionClasses": stats.nDistinctExceptionClasses,
             "nMissingShutterClose": nMissingShutter,
+            "nPodRestarts": stats.nPodRestarts,
         },
+        # One row per pod restart / kill / OOM / failure (POD_* lifecycle
+        # events), attributed to the dataId the pod was processing then.
+        "restarts": [_toJsonable(r) for r in restarts],
         "errorsByType": [_toJsonable(r) for r in errType],
         "errorsByPod": [_toJsonable(r) for r in errPod],
         "histograms": {
@@ -662,7 +874,112 @@ def _buildNightPayload(state: NightState) -> dict:
             "calcZernikesEnd": _toJsonable(histCz),
         },
         "failures": [_toJsonable(r) for r in failures],
+        # dataIds with gather (step1b) activity but no step1a precursor —
+        # physically impossible, so a tell that the fetch dropped step1a
+        # lines. The UI surfaces these as a data-completeness warning.
+        "gatherOnly": gatherOnly,
+        # dataId (as string) -> curated ConsDB record, for the tooltips on
+        # the histogram-bin and failure-table dataId links.
+        "exposureInfo": {str(eid): rec for eid, rec in state.exposureInfoByExpId.items()},
     }
+
+
+# ----- range payload --------------------------------------------------------
+
+
+def _buildRangePayload(state: RangeState) -> dict:
+    """The lightweight range *index* payload (``mode: "range"``).
+
+    Carries one entry per resolved dataId (a small per-exposure overview
+    so the navigator can flag failures at a glance) but no pod/event
+    arrays — those are fetched per-dataId on demand via
+    :func:`_buildRangeExposurePayload`.
+    """
+    tracebackByExpId: dict[int, int] = {}
+    podsByExpId: dict[int, int] = {}
+    for s in state.summaries:
+        for eid in s.expIdsSeen:
+            podsByExpId[eid] = podsByExpId.get(eid, 0) + 1
+        for tb in s.tracebacks:
+            if tb.expId is not None:
+                tracebackByExpId[tb.expId] = tracebackByExpId.get(tb.expId, 0) + 1
+
+    dataIds = [
+        {
+            "expId": expId,
+            "tZero": state.shutterCloseByExpId[expId].isoformat(),
+            "nPods": podsByExpId.get(expId, 0),
+            "nTraceback": tracebackByExpId.get(expId, 0),
+            "hasLogs": expId in podsByExpId,
+            # Curated ConsDB record for the navigator chip's tooltip.
+            "exposure": state.exposureInfoByExpId.get(expId),
+        }
+        for expId in sorted(state.shutterCloseByExpId)
+    ]
+    nCandidates = state.stopId - state.startId + 1
+    return {
+        "loaded": True,
+        "mode": "range",
+        "site": state.siteName,
+        "startId": state.startId,
+        "stopId": state.stopId,
+        "fromTime": state.fromTime.isoformat(),
+        "toTime": state.toTime.isoformat(),
+        "cacheDir": str(state.cacheDir),
+        "cacheBytes": state.cacheBytes,
+        "meta": _toJsonable(state.meta),
+        # Integers in [start, stop] with no ConsDB row — the "skipped" ones.
+        "nMissing": nCandidates - len(state.shutterCloseByExpId),
+        "dataIds": dataIds,
+    }
+
+
+def _rangeExposureState(state: RangeState, dataId: int) -> ServerState | None:
+    """Build a transient :class:`ServerState` for one dataId in the range.
+
+    Shares the range's already-parsed ``summaries`` and points t₀ at that
+    dataId's own shutter close, so the per-exposure helpers
+    (:func:`_buildSummaryPayload`, :func:`_podDetail`) can be reused
+    verbatim. Returns ``None`` if we never resolved a shutter close for
+    this dataId (a skipped integer).
+    """
+    tZero = state.shutterCloseByExpId.get(dataId)
+    if tZero is None:
+        return None
+    return ServerState(
+        cacheDir=state.cacheDir,
+        cacheBytes=state.cacheBytes,
+        meta=state.meta,
+        summaries=state.summaries,
+        expId=dataId,
+        tZero=tZero,
+        siteName=state.siteName,
+        exposureInfo=state.exposureInfoByExpId.get(dataId),
+        referencePoints=[
+            {
+                "label": "shutter close (ConsDB)",
+                "t": tZero.isoformat(),
+                "offsetS": 0.0,
+                "source": "shutter close",
+            }
+        ],
+    )
+
+
+def _buildRangeExposurePayload(state: RangeState, dataId: int) -> dict | None:
+    """The per-dataId timeline payload for a range — the same shape the
+    single-exposure explore view consumes, plus a ``podDetailQuery`` so
+    the client routes pod-detail fetches back through the range state.
+    """
+    transient = _rangeExposureState(state, dataId)
+    if transient is None:
+        return None
+    payload = _buildSummaryPayload(transient)
+    payload["mode"] = "range-exposure"
+    payload["podDetailQuery"] = f"rangeStart={state.startId}&rangeStop={state.stopId}&dataId={dataId}"
+    payload["startId"] = state.startId
+    payload["stopId"] = state.stopId
+    return payload
 
 
 # How much surrounding context to ship with a single traceback. A busy
@@ -803,11 +1120,20 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
     except (OSError, json.JSONDecodeError):
         return
     spec = meta.get("spec") or {}
-    kind = "night" if spec.get("podRegex") else "exposure"
+    # A range cache is exposure-style (no podRegex) but carries a
+    # `_range.txt` sidecar; that marker wins over plain "exposure".
+    rangeBounds = None if spec.get("podRegex") else getCacheRange(window)
+    if spec.get("podRegex"):
+        kind = "night"
+    elif rangeBounds is not None:
+        kind = "range"
+    else:
+        kind = "exposure"
     lastViewed = getCacheLastViewed(window)
-    # Only exposure caches carry the dataId sidecar (night caches are
-    # keyed by dayObs already, recoverable below).
-    exposureIds: list[int] = [] if kind == "night" else getCacheExposureIds(window)
+    # Only plain exposure caches carry the dataId sidecar (night caches
+    # are keyed by dayObs, range caches by their bounds — both recovered
+    # below).
+    exposureIds: list[int] = getCacheExposureIds(window) if kind == "exposure" else []
     # For night caches the dayObs is recoverable from the window start
     # (noon UTC of dayObs). For exposure caches there's no single
     # dataId in the meta — the UI looks it up against the loaded state
@@ -832,6 +1158,8 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             "podFilter": spec.get("podRegex"),
             "kind": kind,
             "dayObs": dayObs,
+            "rangeStart": rangeBounds[0] if rangeBounds else None,
+            "rangeStop": rangeBounds[1] if rangeBounds else None,
             "exposureIds": exposureIds,
             "fromIso": spec.get("fromIso"),
             "toIso": spec.get("toIso"),
@@ -940,11 +1268,20 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
     table in another tab) without forcing a re-fetch — the cache + the
     on-disk exposure-time record together carry everything we need to
     rebuild the in-memory state. Returns ``None`` if either is missing.
+
+    The site is derived from the cache path's cluster component (the
+    layout is ``<cache_root>/<cluster>/<namespace>/<window>/…``), so the
+    right per-site exposure-time cache gets consulted for the shutter
+    close.
     """
     cacheDir = _findExposureCacheDir(expId)
     if cacheDir is None:
         return None
-    tZeroIso = exposureTimes.lookupCached(expId)
+    site = _siteForCacheDir(ctx, cacheDir)
+    if site is None:
+        return None
+    record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+    tZeroIso = exposureTimes.obsEnd(record)
     if tZeroIso is None:
         return None
     try:
@@ -960,9 +1297,11 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
         summaries=summaries,
         expId=expId,
         tZero=tZero,
+        siteName=site.name,
+        exposureInfo=record,
         referencePoints=[
             {
-                "label": "shutter close (caller-supplied)",
+                "label": _shutterCloseLabel(record),
                 "t": tZero.isoformat(),
                 "offsetS": 0.0,
                 "source": "shutter close",
@@ -987,6 +1326,9 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
     cacheDir = _findNightCacheDir(dayObs)
     if cacheDir is None:
         return None
+    site = _siteForCacheDir(ctx, cacheDir)
+    if site is None:
+        return None
     try:
         meta = loadCacheMeta(cacheDir)
     except (OSError, json.JSONDecodeError, FileNotFoundError):
@@ -1000,15 +1342,124 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         dayObs=dayObs,
         startTime=dayObsStartUtc(dayObs),
         endTime=dayObsEndUtc(dayObs),
+        siteName=site.name,
     )
     for needId in _neededDataIdsForNight(summaries):
-        iso = exposureTimes.lookupCached(needId)
-        if iso is not None:
+        record = exposureTimes.lookupCachedRecord(needId, siteName=site.name)
+        iso = exposureTimes.obsEnd(record)
+        if record is not None and iso is not None:
             state.shutterCloseByExpId[needId] = _taiIsoToUtc(iso)
+            state.exposureInfoByExpId[needId] = record
     with ctx.jobs.stateLock:
         ctx.putNightState(state)
     markCacheViewed(cacheDir)
     return state
+
+
+def _findRangeCacheDir(startId: int, stopId: int) -> Path | None:
+    """Return the most-recently-fetched range cache for ``[startId, stopId]``.
+
+    Range caches are exposure-style (top-level, all pods) and identified
+    by the ``_range.txt`` sidecar, so we walk the same depth as
+    :func:`_findExposureCacheDir` and match on the recorded bounds.
+    """
+    root = cache_root()
+    if not root.exists():
+        return None
+    best: tuple[str, Path] | None = None
+    for cluster in root.iterdir():
+        if not cluster.is_dir():
+            continue
+        for ns in cluster.iterdir():
+            if not ns.is_dir():
+                continue
+            for window in ns.iterdir():
+                if not window.is_dir():
+                    continue
+                metaPath = window / META_NAME
+                if not metaPath.exists() or (window / PARTIAL_FLAG).exists():
+                    continue
+                if getCacheRange(window) != (startId, stopId):
+                    continue
+                try:
+                    meta = json.loads(metaPath.read_text())
+                except (OSError, json.JSONDecodeError):
+                    continue
+                fetchedAt = str(meta.get("fetched_at") or "")
+                if best is None or fetchedAt > best[0]:
+                    best = (fetchedAt, window)
+    return best[1] if best else None
+
+
+def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeState | None:
+    """Reconstruct a :class:`RangeState` from disk, if possible.
+
+    Mirrors :func:`_loadNightFromCache`: shutter closes are read from the
+    on-disk per-site cache only (no ConsDB call — there's no SSE channel
+    on a sync /api/summary request), so any dataId not already cached
+    locally stays absent until a real fetch fills it in.
+    """
+    cacheDir = _findRangeCacheDir(startId, stopId)
+    if cacheDir is None:
+        return None
+    site = _siteForCacheDir(ctx, cacheDir)
+    if site is None:
+        return None
+    try:
+        meta = loadCacheMeta(cacheDir)
+    except (OSError, json.JSONDecodeError, FileNotFoundError):
+        return None
+    spec = meta.get("spec") or {}
+    try:
+        fromTime = dt.datetime.fromisoformat(str(spec.get("fromIso")).replace("Z", "+00:00"))
+        toTime = dt.datetime.fromisoformat(str(spec.get("toIso")).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    summaries = parser.summarizeAll(cacheDir)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=cacheDuSizeBytes(cache_root()),
+        meta=meta,
+        summaries=summaries,
+        startId=startId,
+        stopId=stopId,
+        fromTime=fromTime,
+        toTime=toTime,
+        siteName=site.name,
+    )
+    for expId in range(startId, stopId + 1):
+        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        iso = exposureTimes.obsEnd(record)
+        if record is not None and iso is not None:
+            state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+            state.exposureInfoByExpId[expId] = record
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+    markCacheViewed(cacheDir)
+    return state
+
+
+def _siteForCacheDir(ctx: ServerContext, cacheDir: Path) -> Site | None:
+    """Return the catalog site whose ``cluster`` matches this cache dir.
+
+    The cache layout encodes cluster as the first path component under
+    ``cache_root()``, e.g.
+    ``<cache_root>/yagan/rapid-analysis/<window>/…``. We rely on that
+    to figure out which ConsDB / per-site exposure-time cache to use
+    when reconstructing state from disk. Returns ``None`` if the
+    cluster has no site mapping (a stale cache from a removed entry).
+    """
+    try:
+        rel = cacheDir.resolve().relative_to(cache_root().resolve())
+    except (OSError, ValueError):
+        return None
+    parts = rel.parts
+    if not parts:
+        return None
+    try:
+        return siteByCluster(ctx.sites, parts[0])
+    except SitesConfigError:
+        return None
 
 
 # A cache path component must be a "safe" basename — no path separators,
@@ -1076,6 +1527,7 @@ def _deleteCacheRoot(ctx: "ServerContext") -> None:
     with ctx.jobs.stateLock:
         ctx.exposureStates.clear()
         ctx.nightStates.clear()
+        ctx.rangeStates.clear()
     root = cache_root()
     if root.exists():
         shutil.rmtree(root)
@@ -1121,6 +1573,14 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         settings = appSettings.loadAppSettings()
         evictToFit(settings.maxCacheBytes, exempt=[job.cacheDir])
         summaries = parser.summarizeAll(job.cacheDir)
+        # Sites are validated when the request comes in, so this should
+        # always succeed for a job we actually started. Bail out on the
+        # paranoid edge case (stale catalog reload) rather than crashing
+        # the worker thread.
+        try:
+            site = siteByName(ctx.sites, job.siteName)
+        except SitesConfigError:
+            return
         if job.kind == "night":
             assert job.dayObs is not None
             newNight = NightState(
@@ -1131,6 +1591,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 dayObs=job.dayObs,
                 startTime=dayObsStartUtc(job.dayObs),
                 endTime=dayObsEndUtc(job.dayObs),
+                siteName=site.name,
             )
             # Resolve shutter closes for every dataId we'll need before
             # publishing the state, so the /api/summary response is
@@ -1138,11 +1599,40 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             # This can take a few seconds for a busy night (hundreds of
             # dataIds), so we report progress to the SSE stream while
             # we work.
-            _prefetchNightShutterCloses(newNight, summaries, job)
+            _prefetchNightShutterCloses(newNight, summaries, job, site)
             with ctx.jobs.stateLock:
                 ctx.putNightState(newNight)
             return
+        if job.kind == "range":
+            assert job.startId is not None and job.stopId is not None
+            assert job.tZeroStart is not None and job.tZeroStop is not None
+            newRange = RangeState(
+                cacheDir=job.cacheDir,
+                cacheBytes=cacheDuSizeBytes(cache_root()),
+                meta=job.meta,
+                summaries=summaries,
+                startId=job.startId,
+                stopId=job.stopId,
+                fromTime=dt.datetime.fromisoformat(job.spec.fromIso.replace("Z", "+00:00")),
+                toTime=dt.datetime.fromisoformat(job.spec.toIso.replace("Z", "+00:00")),
+                siteName=site.name,
+            )
+            # Seed the two anchors the client already resolved so even a
+            # token-less server has start + stop; the prefetch fills the
+            # middle (and re-confirms these from cache).
+            newRange.shutterCloseByExpId[job.startId] = job.tZeroStart
+            newRange.shutterCloseByExpId[job.stopId] = job.tZeroStop
+            _prefetchRangeShutterCloses(newRange, job, site)
+            markCacheRange(job.cacheDir, job.startId, job.stopId)
+            with ctx.jobs.stateLock:
+                ctx.putRangeState(newRange)
+            return
         assert job.expId is not None and job.tZero is not None
+        # The home page resolves the dataId via /api/exposure-time before
+        # firing the fetch, so the full ConsDB record is already in the
+        # per-site cache — read it back for the explore-view info box.
+        # No extra ConsDB call here; None just means no info box.
+        exposureInfo = exposureTimes.lookupCachedRecord(job.expId, siteName=site.name)
         newState = ServerState(
             cacheDir=job.cacheDir,
             cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -1150,9 +1640,11 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             summaries=summaries,
             expId=job.expId,
             tZero=job.tZero,
+            siteName=site.name,
+            exposureInfo=exposureInfo,
             referencePoints=[
                 {
-                    "label": "shutter close (caller-supplied)",
+                    "label": _shutterCloseLabel(exposureInfo),
                     "t": job.tZero.isoformat(),
                     "offsetS": 0.0,
                     "source": "shutter close",
@@ -1255,10 +1747,17 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/summary":
                 # ?dataId=<int> selects a loaded exposure; ?dayObs=<int>
-                # selects a loaded night; no params -> home view shape.
+                # selects a loaded night; ?rangeStart=&rangeStop= selects a
+                # loaded range (+ optional &dataId= for one exposure's
+                # timeline within it); no params -> home view shape.
                 qs = parse_qs(url.query)
                 dataIdRaw = qs.get("dataId", [""])[0] or None
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
+                rangeStartRaw = qs.get("rangeStart", [""])[0] or None
+                rangeStopRaw = qs.get("rangeStop", [""])[0] or None
+                if rangeStartRaw is not None and rangeStopRaw is not None:
+                    self._handle_range_summary(rangeStartRaw, rangeStopRaw, dataIdRaw)
+                    return
                 if dataIdRaw is not None:
                     try:
                         dataId = int(dataIdRaw)
@@ -1328,9 +1827,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 qs = parse_qs(url.query)
                 dataIdRaw = qs.get("dataId", [""])[0] or None
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
+                rangeStartRaw = qs.get("rangeStart", [""])[0] or None
+                rangeStopRaw = qs.get("rangeStop", [""])[0] or None
                 pod = path[len("/api/pod/") :]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
                     self.send_error(400, "Invalid pod name")
+                    return
+                if rangeStartRaw is not None and rangeStopRaw is not None and dataIdRaw is not None:
+                    self._handle_range_pod(rangeStartRaw, rangeStopRaw, dataIdRaw, pod)
                     return
                 if dataIdRaw is not None:
                     try:
@@ -1358,7 +1862,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     self._send_json(_podDetailForNight(nightState, pod))
                     return
-                self._send_error_json(400, "Provide ?dataId=<int> or ?dayObs=<int>")
+                self._send_error_json(
+                    400, "Provide ?dataId=<int>, ?dayObs=<int>, or ?rangeStart=&rangeStop=&dataId="
+                )
                 return
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
@@ -1378,12 +1884,29 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     }
                 )
                 return
+            if path == "/api/sites":
+                self._send_json(
+                    {
+                        "default_site": ctx.defaultSiteName,
+                        "sites": [
+                            {
+                                "name": s.name,
+                                "cluster": s.cluster,
+                                "namespace": s.namespace,
+                                "lokiAddr": s.lokiAddr,
+                                "consdbUrl": s.consdbUrl,
+                            }
+                            for s in ctx.sites
+                        ],
+                    }
+                )
+                return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
                 qs = parse_qs(url.query)
-                tokenFileValues = qs.get("tokenFile")
-                tokenFileOverride: str | None = tokenFileValues[0] if tokenFileValues else None
-                self._handle_exposure_time(int(m.group(1)), tokenFileOverride)
+                siteValues = qs.get("site")
+                siteName: str | None = siteValues[0] if siteValues else None
+                self._handle_exposure_time(int(m.group(1)), siteName)
                 return
             m = re.match(r"^/api/fetch/([A-Za-z0-9]+)/status$", path)
             if m:
@@ -1396,9 +1919,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         "jobId": job.jobId,
                         "status": job.status,
                         "kind": job.kind,
+                        "site": job.siteName,
                         "expId": job.expId,
                         "tZero": job.tZero.isoformat() if job.tZero else None,
                         "dayObs": job.dayObs,
+                        "startId": job.startId,
+                        "stopId": job.stopId,
                         "fromIso": job.spec.fromIso,
                         "toIso": job.spec.toIso,
                         "startedAt": job.startedAt.isoformat() if job.startedAt else None,
@@ -1422,46 +1948,157 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         # ----- handler bodies (kept out of do_GET so they don't bloat it) -----
 
-        def _handle_exposure_time(self, dataId: int, tokenFileOverride: str | None) -> None:
-            # Cache check first: exposure end-times are immutable once
-            # they exist, so a hit lets us skip the token + network call
-            # entirely. This also means a user with no RSP token can
-            # still resolve any dataId they (or anyone) previously
-            # looked up on this machine.
-            cached = exposureTimes.lookupCached(dataId)
-            if cached is not None:
-                self._send_json({"dataId": dataId, "tZero": cached, "scale": "TAI", "fromCache": True})
+        def _handle_range_summary(self, rangeStartRaw: str, rangeStopRaw: str, dataIdRaw: str | None) -> None:
+            """Serve the range index payload, or one dataId's timeline
+            within it when ``dataId`` is also supplied."""
+            try:
+                startId = int(rangeStartRaw)
+                stopId = int(rangeStopRaw)
+            except ValueError:
+                self._send_error_json(400, "rangeStart / rangeStop must be integers")
                 return
-            path = exposureTimes.rspTokenFilePath(tokenFileOverride)
+            with ctx.jobs.stateLock:
+                state = ctx.getRangeState(rangeKey(startId, stopId))
+            if state is None:
+                state = _loadRangeFromCache(ctx, startId, stopId)
+            if state is None:
+                self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                return
+            markCacheViewed(state.cacheDir)
+            if dataIdRaw is not None:
+                try:
+                    dataId = int(dataIdRaw)
+                except ValueError:
+                    self._send_error_json(400, "dataId must be an integer")
+                    return
+                payload = _buildRangeExposurePayload(state, dataId)
+                if payload is None:
+                    self._send_error_json(404, f"dataId {dataId} is not in range [{startId}, {stopId}]")
+                    return
+                self._send_json(payload)
+                return
+            self._send_json(_buildRangePayload(state))
+
+        def _handle_range_pod(self, rangeStartRaw: str, rangeStopRaw: str, dataIdRaw: str, pod: str) -> None:
+            try:
+                startId = int(rangeStartRaw)
+                stopId = int(rangeStopRaw)
+                dataId = int(dataIdRaw)
+            except ValueError:
+                self._send_error_json(400, "rangeStart / rangeStop / dataId must be integers")
+                return
+            with ctx.jobs.stateLock:
+                state = ctx.getRangeState(rangeKey(startId, stopId))
+            if state is None:
+                self._send_error_json(404, f"No range loaded for [{startId}, {stopId}]")
+                return
+            transient = _rangeExposureState(state, dataId)
+            if transient is None:
+                self._send_error_json(404, f"dataId {dataId} is not in range [{startId}, {stopId}]")
+                return
+            self._send_json(_podDetail(transient, pod))
+
+        def _handle_exposure_time(self, dataId: int, siteName: str | None) -> None:
+            # Site picks the (consdbUrl, tokenFile) pair AND which
+            # per-site cache file the resolved iso lands in. The same
+            # dataId means different things at different sites — BTS
+            # simulated values can collide with summit real-camera ids
+            # — so we never mix them.
+            try:
+                site = ctx.siteForRequest(siteName)
+            except SitesConfigError as e:
+                self._send_error_json(400, str(e))
+                return
+            # Cache check first: exposure properties are immutable once
+            # they exist, so a hit lets us skip the token + network call
+            # entirely. This also means a user with no ConsDB token can
+            # still resolve any dataId they (or anyone) previously
+            # looked up on this machine for *this* site. A legacy entry
+            # (obs_end-only string) is read back as a 1-field record, so
+            # the t-zero still resolves even before the richer columns
+            # backfill on the next fresh query.
+            cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name)
+            cachedIso = exposureTimes.obsEnd(cachedRec)
+            cachedManual = exposureTimes.isManual(cachedRec)
+            # A *real* (ConsDB-sourced) cached record is immutable truth —
+            # return it with no network call. A *manual* stand-in only fills
+            # in for when ConsDB couldn't answer, so we still try ConsDB
+            # first and fall back to the manual value below if it can't.
+            if cachedRec is not None and cachedIso is not None and not cachedManual:
+                self._send_json(
+                    {
+                        "dataId": dataId,
+                        "tZero": cachedIso,
+                        "scale": "TAI",
+                        "fromCache": True,
+                        "manual": False,
+                        "site": site.name,
+                        "exposure": cachedRec,
+                    }
+                )
+                return
+
+            def fallbackOrError(status: int, msg: str) -> None:
+                # Prefer a real ConsDB answer; only when ConsDB can't resolve
+                # the dataId do we surface a previously-stored manual stand-in
+                # (so a transient ConsDB outage doesn't strand the user). With
+                # no stand-in, the original error stands.
+                if cachedRec is not None and cachedIso is not None:
+                    self._send_json(
+                        {
+                            "dataId": dataId,
+                            "tZero": cachedIso,
+                            "scale": "TAI",
+                            "fromCache": True,
+                            "manual": True,
+                            "site": site.name,
+                            "exposure": cachedRec,
+                        }
+                    )
+                else:
+                    self._send_error_json(status, msg)
+
+            path = site.consdbTokenFile
             if not path.exists():
-                self._send_error_json(
+                fallbackOrError(
                     503,
-                    f"RSP token file not found at {path}. "
-                    f"Set the path in the home page Credentials card "
-                    f"or via the {exposureTimes.RSP_TOKEN_FILE_ENV} env var.",
+                    f"ConsDB token file for site {site.name!r} not found at {path}. "
+                    "Get a token from the relevant RSP and drop it there.",
                 )
                 return
             try:
-                token = exposureTimes.readRspToken(path)
+                token = exposureTimes.readToken(path)
             except OSError as e:
-                self._send_error_json(503, f"Could not read RSP token file: {e}")
+                fallbackOrError(503, f"Could not read ConsDB token file: {e}")
                 return
             if not token:
-                self._send_error_json(503, f"RSP token file is empty: {path}")
+                fallbackOrError(503, f"ConsDB token file is empty: {path}")
                 return
             try:
-                isot = exposureTimes.queryIsot(dataId, token)
+                record = exposureTimes.queryExposureRecord(dataId, token, consdbUrl=site.consdbUrl)
             except exposureTimes.ConsDbError as e:
-                self._send_error_json(502, f"ConsDB query failed: {e}")
+                fallbackOrError(502, f"ConsDB query failed: {e}")
                 return
             except OSError as e:
-                self._send_error_json(503, f"Could not reach ConsDB: {e}")
+                fallbackOrError(503, f"Could not reach ConsDB: {e}")
                 return
-            if isot is None:
-                self._send_error_json(404, f"No exposure-time record for dataId={dataId}")
+            isot = exposureTimes.obsEnd(record)
+            if record is None or isot is None:
+                fallbackOrError(404, f"No exposure-time record for dataId={dataId}")
                 return
-            exposureTimes.storeCached(dataId, isot)
-            self._send_json({"dataId": dataId, "tZero": isot, "scale": "TAI", "fromCache": False})
+            # A real hit supersedes any manual stand-in we'd stored earlier.
+            exposureTimes.storeCachedRecord(dataId, record, siteName=site.name)
+            self._send_json(
+                {
+                    "dataId": dataId,
+                    "tZero": isot,
+                    "scale": "TAI",
+                    "fromCache": False,
+                    "manual": False,
+                    "site": site.name,
+                    "exposure": record,
+                }
+            )
 
         def do_DELETE(self) -> None:  # noqa: N802
             url = urlparse(self.path)
@@ -1472,8 +2109,13 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)(?:/([^/]+))?$", path)
             if m:
-                cluster, namespace, slug = m.group(1), m.group(2), m.group(3)
-                podsSub = m.group(4)  # optional `pods=<slug>` segment
+                # Percent-decode each segment: the client encodeURIComponent's
+                # them, so a night cache's `pods=__aos__` arrives as
+                # `pods%3D__aos__`. Decode before matching, then
+                # _resolveCacheWindow re-validates the decoded form (rejecting
+                # any smuggled `/` or `..`), so this stays traversal-safe.
+                cluster, namespace, slug = unquote(m.group(1)), unquote(m.group(2)), unquote(m.group(3))
+                podsSub = unquote(m.group(4)) if m.group(4) else None  # optional `pods=<slug>` segment
                 target = _resolveCacheWindow(cluster, namespace, slug, podsSub)
                 if target is None:
                     self._send_error_json(404, "No such cache directory")
@@ -1495,15 +2137,23 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 # where the client didn't supply a value. We never trust the
                 # client to set arbitrary host/proto values for logcli.
                 try:
-                    spec, expId, tZero, password = _buildSpecFromRequest(body)
+                    spec, site, expId, tZero, password = _buildSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
+                # A hand-entered shutter close (the dataId didn't resolve via
+                # ConsDB) is persisted to the per-site exposure-time cache as
+                # a tagged stand-in, so reopening or refreshing the explore
+                # view finds a t-zero without the user re-typing it.
+                if body.get("tZeroManual"):
+                    exposureTimes.storeCachedRecord(
+                        expId, exposureTimes.manualRecord(_utcToTaiIso(tZero)), siteName=site.name
+                    )
                 # The password — if any — is consumed by the fetch worker
                 # thread (it sets LOKI_PASSWORD in the subprocess env) and
                 # never persisted, returned, or logged.
                 _maybeSetLokiPassword(password)
-                job = ctx.jobs.createJob(spec, expId, tZero)
+                job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
@@ -1514,12 +2164,32 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
                 try:
-                    spec, dayObs, password = _buildNightSpecFromRequest(body)
+                    spec, site, dayObs, password = _buildNightSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
                 _maybeSetLokiPassword(password)
-                job = ctx.jobs.createNightJob(spec, dayObs)
+                job = ctx.jobs.createNightJob(spec, dayObs, siteName=site.name)
+                ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
+                self._send_json({"jobId": job.jobId}, status=202)
+                return
+            if url.path == "/api/fetch-range":
+                try:
+                    body = _readJsonBody(self)
+                except json.JSONDecodeError as e:
+                    self._send_error_json(400, f"Bad JSON body: {e}")
+                    return
+                try:
+                    spec, site, startId, stopId, tZeroStart, tZeroStop, password = _buildRangeSpecFromRequest(
+                        ctx, body
+                    )
+                except ValueError as e:
+                    self._send_error_json(400, str(e))
+                    return
+                _maybeSetLokiPassword(password)
+                job = ctx.jobs.createRangeJob(
+                    spec, startId, stopId, tZeroStart, tZeroStop, siteName=site.name
+                )
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
@@ -1583,21 +2253,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 # ----- request body helpers -------------------------------------------------
 
 
-def _buildSpecFromRequest(body: dict) -> tuple[FetchSpec, int, dt.datetime, str | None]:
-    """Translate a JSON fetch request body into (FetchSpec, expId, tZero, password).
+def _buildSpecFromRequest(
+    ctx: ServerContext, body: dict
+) -> tuple[FetchSpec, Site, int, dt.datetime, str | None]:
+    """Translate a JSON fetch request body into (FetchSpec, Site, expId, tZero, password).
 
-    Raises ``ValueError`` for client-fixable mistakes (missing fields,
-    unparseable timestamp); the handler converts those into a 400 response.
+    The body's ``site`` field selects which site catalog entry to pull
+    ``lokiAddr`` / ``cluster`` / ``namespace`` from; the client no
+    longer sets those individually. Raises ``ValueError`` for
+    client-fixable mistakes (missing fields, unparseable timestamp,
+    unknown site); the handler converts those into a 400 response.
     """
-    from .config import (
-        DEFAULT_CLUSTER,
-        DEFAULT_LOKI_ADDR,
-        DEFAULT_NAMESPACE,
-        DEFAULT_USERNAME,
-        DEFAULT_WINDOW_AFTER_S,
-        DEFAULT_WINDOW_BEFORE_S,
-        DEFAULT_WORKERS,
-    )
+    from .config import DEFAULT_USERNAME, DEFAULT_WINDOW_AFTER_S, DEFAULT_WINDOW_BEFORE_S, DEFAULT_WORKERS
 
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
@@ -1619,16 +2286,20 @@ def _buildSpecFromRequest(body: dict) -> tuple[FetchSpec, int, dt.datetime, str 
     else:
         tZero = tZeroInput - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
 
-    windowBefore = float(body.get("windowBefore", DEFAULT_WINDOW_BEFORE_S))
-    windowAfter = float(body.get("windowAfter", DEFAULT_WINDOW_AFTER_S))
+    windowBefore = _floatField(body, "windowBefore", DEFAULT_WINDOW_BEFORE_S)
+    windowAfter = _floatField(body, "windowAfter", DEFAULT_WINDOW_AFTER_S)
     fromT = tZero - dt.timedelta(seconds=windowBefore)
     toT = tZero + dt.timedelta(seconds=windowAfter)
 
+    try:
+        site = ctx.siteForRequest(body.get("site"))
+    except SitesConfigError as e:
+        raise ValueError(str(e)) from e
     spec = FetchSpec(
-        lokiAddr=str(body.get("lokiAddr") or DEFAULT_LOKI_ADDR),
+        lokiAddr=site.lokiAddr,
         username=str(body.get("username") or DEFAULT_USERNAME),
-        cluster=str(body.get("cluster") or DEFAULT_CLUSTER),
-        namespace=str(body.get("namespace") or DEFAULT_NAMESPACE),
+        cluster=site.cluster,
+        namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
         workers=int(body.get("workers") or DEFAULT_WORKERS),
@@ -1636,18 +2307,12 @@ def _buildSpecFromRequest(body: dict) -> tuple[FetchSpec, int, dt.datetime, str 
     password = body.get("password")
     if password is not None:
         password = str(password)
-    return spec, expId, tZero, password
+    return spec, site, expId, tZero, password
 
 
-def _buildNightSpecFromRequest(body: dict) -> tuple[FetchSpec, int, str | None]:
-    """Translate a JSON night-fetch request body into (FetchSpec, dayObs, password)."""
-    from .config import (
-        DEFAULT_CLUSTER,
-        DEFAULT_LOKI_ADDR,
-        DEFAULT_NAMESPACE,
-        DEFAULT_USERNAME,
-        DEFAULT_WORKERS,
-    )
+def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, str | None]:
+    """Translate a JSON night-fetch request body into (FetchSpec, Site, dayObs, password)."""
+    from .config import DEFAULT_USERNAME, DEFAULT_WORKERS
 
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
@@ -1664,11 +2329,15 @@ def _buildNightSpecFromRequest(body: dict) -> tuple[FetchSpec, int, str | None]:
     fromT = dayObsStartUtc(dayObs)
     toT = dayObsEndUtc(dayObs)
 
+    try:
+        site = ctx.siteForRequest(body.get("site"))
+    except SitesConfigError as e:
+        raise ValueError(str(e)) from e
     spec = FetchSpec(
-        lokiAddr=str(body.get("lokiAddr") or DEFAULT_LOKI_ADDR),
+        lokiAddr=site.lokiAddr,
         username=str(body.get("username") or DEFAULT_USERNAME),
-        cluster=str(body.get("cluster") or DEFAULT_CLUSTER),
-        namespace=str(body.get("namespace") or DEFAULT_NAMESPACE),
+        cluster=site.cluster,
+        namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
         workers=int(body.get("workers") or DEFAULT_WORKERS),
@@ -1677,7 +2346,100 @@ def _buildNightSpecFromRequest(body: dict) -> tuple[FetchSpec, int, str | None]:
     password = body.get("password")
     if password is not None:
         password = str(password)
-    return spec, dayObs, password
+    return spec, site, dayObs, password
+
+
+def _buildRangeSpecFromRequest(
+    ctx: ServerContext, body: dict
+) -> tuple[FetchSpec, Site, int, int, dt.datetime, dt.datetime, str | None]:
+    """Translate a JSON range-fetch body into (FetchSpec, Site, startId,
+    stopId, tZeroStartUtc, tZeroStopUtc, password).
+
+    The window is one wide span: ``[tZeroStart - windowBefore,
+    tZeroStop + windowAfter]`` with no pod filter (all pods, like a single
+    exposure). The client resolves the two shutter-close anchors up front
+    and passes them as ``tZeroStart`` / ``tZeroStop`` (TAI by default).
+    """
+    from .config import (
+        DEFAULT_USERNAME,
+        DEFAULT_WINDOW_AFTER_S,
+        DEFAULT_WINDOW_BEFORE_S,
+        DEFAULT_WORKERS,
+        MAX_RANGE_SPAN,
+    )
+
+    if not isinstance(body, dict):
+        raise ValueError("Request body must be a JSON object")
+
+    startId = _requireRangeInt(body, "rangeStart")
+    stopId = _requireRangeInt(body, "rangeStop")
+    if stopId <= startId:
+        raise ValueError("rangeStop must be greater than rangeStart")
+    if stopId - startId > MAX_RANGE_SPAN:
+        raise ValueError(
+            f"range span {stopId - startId} exceeds the {MAX_RANGE_SPAN}-exposure limit "
+            "(this mode is for tens of consecutive exposures)"
+        )
+
+    tZeroStart = _parseRangeAnchor(body, "tZeroStart")
+    tZeroStop = _parseRangeAnchor(body, "tZeroStop")
+    if not body.get("tZeroUtc", False):
+        tZeroStart = tZeroStart - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+        tZeroStop = tZeroStop - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
+
+    windowBefore = _floatField(body, "windowBefore", DEFAULT_WINDOW_BEFORE_S)
+    windowAfter = _floatField(body, "windowAfter", DEFAULT_WINDOW_AFTER_S)
+    fromT = tZeroStart - dt.timedelta(seconds=windowBefore)
+    toT = tZeroStop + dt.timedelta(seconds=windowAfter)
+
+    try:
+        site = ctx.siteForRequest(body.get("site"))
+    except SitesConfigError as e:
+        raise ValueError(str(e)) from e
+    spec = FetchSpec(
+        lokiAddr=site.lokiAddr,
+        username=str(body.get("username") or DEFAULT_USERNAME),
+        cluster=site.cluster,
+        namespace=site.namespace,
+        fromIso=_isoForLogcli(fromT),
+        toIso=_isoForLogcli(toT),
+        workers=int(body.get("workers") or DEFAULT_WORKERS),
+    )
+    password = body.get("password")
+    if password is not None:
+        password = str(password)
+    return spec, site, startId, stopId, tZeroStart, tZeroStop, password
+
+
+def _requireRangeInt(body: dict, field: str) -> int:
+    raw = body.get(field)
+    if raw is None:
+        raise ValueError(f"{field} is required")
+    try:
+        return int(raw)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{field} must be an integer") from e
+
+
+def _parseRangeAnchor(body: dict, field: str) -> dt.datetime:
+    raw = body.get(field)
+    if not raw:
+        raise ValueError(f"{field} is required (ISO-8601 string)")
+    return _parseClientIso(str(raw))
+
+
+def _floatField(body: dict, field: str, default: float) -> float:
+    """Parse a float body field, treating missing / null / blank as the
+    default — an empty browser number input serializes to JSON ``null``,
+    and ``float(None)`` would otherwise raise an *uncaught* ``TypeError``
+    (the handler only catches ``ValueError``), dropping the connection
+    with no response. A genuinely non-numeric string still raises
+    ``ValueError`` → 400. ``0`` is preserved (a legitimate window).
+    """
+    val = body.get(field)
+    if val is None or val == "":
+        return default
+    return float(val)
 
 
 def _parseClientIso(s: str) -> dt.datetime:

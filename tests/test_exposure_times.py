@@ -12,80 +12,112 @@ import pytest
 
 from ra_log_explorer import exposureTimes
 
+# A throwaway URL used for every call below. The point of these tests is the
+# helper's behaviour around the response shape, not its URL routing — the URL
+# is parametrised on every call so callers can never accidentally share state
+# across sites.
+URL = "https://consdb-under-test.example/consdb/query"
+
+# A realistic-ish ConsDB row, as `(columns, row)`. We always SELECT * now and
+# project to EXPOSURE_RECORD_COLUMNS, so responses carry more than obs_end —
+# including a couple of columns (``controller``) we deliberately drop.
+_FULL_COLS = ["exposure_id", "obs_end", "physical_filter", "img_type", "exp_time", "controller"]
+
+
+def _fullRow(eid: int, iso: str) -> list:
+    return [eid, iso, "z_20", "science", 30.0, "O"]
+
 
 def _stubResponse(payload: dict) -> io.BytesIO:
     """Return a file-like that mimics what `urlopen` yields."""
     return io.BytesIO(json.dumps(payload).encode("utf-8"))
 
 
-# ----- rspTokenFilePath -----------------------------------------------------
+# ----- readToken -----------------------------------------------------------
 
 
-def test_rspTokenFilePath_uses_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
-    assert exposureTimes.rspTokenFilePath() == exposureTimes.DEFAULT_RSP_TOKEN_FILE
-
-
-def test_rspTokenFilePath_reads_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    p = tmp_path / "tok"
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(p))
-    assert exposureTimes.rspTokenFilePath() == p
-
-
-def test_rspTokenFilePath_override_wins_over_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    envP = tmp_path / "env"
-    overP = tmp_path / "override"
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(envP))
-    assert exposureTimes.rspTokenFilePath(str(overP)) == overP
-
-
-def test_rspTokenFilePath_expands_tilde(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
-    out = exposureTimes.rspTokenFilePath("~/some/token")
-    # ~ must be expanded; the resulting path shouldn't start with `~`.
-    assert not str(out).startswith("~")
-    assert str(out).endswith("/some/token")
-
-
-# ----- readRspToken ---------------------------------------------------------
-
-
-def test_readRspToken_strips_whitespace(tmp_path: Path) -> None:
+def test_readToken_strips_whitespace(tmp_path: Path) -> None:
     p = tmp_path / "tok"
     p.write_text("  abc-def\n")
-    assert exposureTimes.readRspToken(p) == "abc-def"
+    assert exposureTimes.readToken(p) == "abc-def"
 
 
-def test_readRspToken_returns_empty_for_whitespace_only(tmp_path: Path) -> None:
+def test_readToken_returns_empty_for_whitespace_only(tmp_path: Path) -> None:
     p = tmp_path / "tok"
     p.write_text("   \n  ")
-    assert exposureTimes.readRspToken(p) == ""
+    assert exposureTimes.readToken(p) == ""
 
 
-def test_readRspToken_raises_for_missing_file(tmp_path: Path) -> None:
+def test_readToken_raises_for_missing_file(tmp_path: Path) -> None:
     with pytest.raises(OSError):
-        exposureTimes.readRspToken(tmp_path / "nope")
+        exposureTimes.readToken(tmp_path / "nope")
 
 
-# ----- queryIsot ------------------------------------------------------------
+# ----- obsEnd ---------------------------------------------------------------
 
 
-def test_queryIsot_returns_obs_end_on_first_instrument_match(
+def test_obsEnd_extracts_string_or_None() -> None:
+    assert exposureTimes.obsEnd({"obs_end": "2026-05-20T08:46:16.267000"}) == "2026-05-20T08:46:16.267000"
+    assert exposureTimes.obsEnd({"img_type": "science"}) is None  # no obs_end key
+    assert exposureTimes.obsEnd({"obs_end": 12345}) is None  # non-string
+    assert exposureTimes.obsEnd(None) is None
+
+
+# ----- manualRecord / isManual ----------------------------------------------
+
+
+def test_manualRecord_carries_obsEnd_and_is_tagged() -> None:
+    rec = exposureTimes.manualRecord("2026-06-24T14:38:41.380663")
+    assert exposureTimes.obsEnd(rec) == "2026-06-24T14:38:41.380663"
+    assert exposureTimes.isManual(rec) is True
+
+
+def test_isManual_false_for_consdb_record_and_none() -> None:
+    # A real ConsDB record (no _manual tag) and a missing record are both
+    # "not manual" — the distinction is what keeps a hand-entered stand-in
+    # from shadowing immutable ConsDB truth on later lookups.
+    assert exposureTimes.isManual({"obs_end": "2026-06-24T14:38:41.380663"}) is False
+    assert exposureTimes.isManual(None) is False
+
+
+def test_manualRecord_roundtrips_through_the_cache(tmpCacheRoot: Path) -> None:
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    back = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(back) is True
+    assert exposureTimes.obsEnd(back) == "2026-06-24T14:38:41.380663"
+
+
+# ----- queryExposureRecord --------------------------------------------------
+
+
+def test_queryExposureRecord_returns_projected_record_on_first_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: list[Any] = []
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seen.append((req.get_full_url(), req.data, dict(req.header_items())))
-        return _stubResponse({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]})
+        return _stubResponse(
+            {"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")]}
+        )
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    iso = exposureTimes.queryIsot(2026051900722, "TOKEN")
-    assert iso == "2026-05-20T08:46:16.267000"
+    rec = exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL)
+    assert rec is not None
+    # Curated columns are kept...
+    assert rec["obs_end"] == "2026-05-20T08:46:16.267000"
+    assert rec["physical_filter"] == "z_20"
+    assert rec["img_type"] == "science"
+    assert rec["exp_time"] == 30.0
+    assert exposureTimes.obsEnd(rec) == "2026-05-20T08:46:16.267000"
+    # ...and a non-curated column is dropped from the stored record.
+    assert "controller" not in rec
     # Only one HTTP call needed: the lsstcam table matched first.
     assert len(seen) == 1
     url, body, headers = seen[0]
-    assert url == exposureTimes.CONSDB_URL
+    assert url == URL
     parsedBody = json.loads(body.decode("utf-8"))
     assert "cdb_lsstcam.exposure" in parsedBody["query"]
     assert "2026051900722" in parsedBody["query"]
@@ -95,17 +127,45 @@ def test_queryIsot_returns_obs_end_on_first_instrument_match(
     assert "TOKEN" not in body.decode("utf-8")
 
 
-def test_queryIsot_falls_through_instruments_until_a_match(
+def test_queryExposureRecord_sends_select_star(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The wire query is part of the contract with ConsDB; SELECT * is
+    what makes the projection robust to per-instrument column gaps. Pin
+    its shape so a refactor can't silently change it."""
+    seen: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        seen.append(json.loads(req.data.decode("utf-8"))["query"])
+        return _stubResponse({"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "x")]})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
+    assert seen == ["SELECT * FROM cdb_lsstcam.exposure WHERE exposure_id = 2026051900722"]
+
+
+def test_queryExposureRecord_uses_the_caller_supplied_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A single process can talk to multiple ConsDB endpoints in one run
+    — pin that the URL kwarg actually reaches urlopen so a regression
+    can't silently route everything back to a hard-coded default."""
+    seen: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        seen.append(req.get_full_url())
+        return _stubResponse({"columns": _FULL_COLS, "data": [_fullRow(1, "x")]})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    exposureTimes.queryExposureRecord(1, "TOK", consdbUrl="https://summit.example/q", instrument="lsstcam")
+    exposureTimes.queryExposureRecord(1, "TOK", consdbUrl="https://bts.example/q", instrument="lsstcam")
+    assert seen == ["https://summit.example/q", "https://bts.example/q"]
+
+
+def test_queryExposureRecord_falls_through_instruments_until_a_match(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """If the first instrument's table returns no rows, the loop falls
-    through to the next. Here we make lsstcam return empty and latiss
-    return the row."""
     seen: list[str] = []
     payloads: Any = iter(
         [
-            {"columns": ["obs_end"], "data": []},  # lsstcam — empty
-            {"columns": ["obs_end"], "data": [["2026-05-20T09:00:00.000"]]},  # latiss
+            {"columns": _FULL_COLS, "data": []},  # lsstcam — empty
+            {"columns": _FULL_COLS, "data": [_fullRow(2026052000100, "2026-05-20T09:00:00.000")]},  # latiss
         ]
     )
 
@@ -114,46 +174,48 @@ def test_queryIsot_falls_through_instruments_until_a_match(
         return _stubResponse(next(payloads))
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    iso = exposureTimes.queryIsot(2026052000100, "TOKEN")
-    assert iso == "2026-05-20T09:00:00.000"
+    rec = exposureTimes.queryExposureRecord(2026052000100, "TOKEN", consdbUrl=URL)
+    assert exposureTimes.obsEnd(rec) == "2026-05-20T09:00:00.000"
     assert "cdb_lsstcam.exposure" in seen[0]
     assert "cdb_latiss.exposure" in seen[1]
 
 
-def test_queryIsot_returns_None_when_all_instruments_empty(
+def test_queryExposureRecord_returns_None_when_all_instruments_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
-        return _stubResponse({"columns": ["obs_end"], "data": []})
+        return _stubResponse({"columns": _FULL_COLS, "data": []})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    assert exposureTimes.queryIsot(2026051900722, "TOKEN") is None
+    assert exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL) is None
 
 
-def test_queryIsot_uses_only_the_given_instrument_when_specified(
+def test_queryExposureRecord_uses_only_the_given_instrument_when_specified(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     seen: list[str] = []
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seen.append(json.loads(req.data.decode("utf-8"))["query"])
-        return _stubResponse({"columns": ["obs_end"], "data": [["x"]]})
+        return _stubResponse({"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "x")]})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="latiss")
+    exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="latiss")
     assert len(seen) == 1
     assert "cdb_latiss.exposure" in seen[0]
 
 
-def test_queryIsot_returns_None_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_queryExposureRecord_returns_None_for_404(monkeypatch: pytest.MonkeyPatch) -> None:
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         raise HTTPError(req.get_full_url(), 404, "not found", {}, None)  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    assert exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam") is None
+    assert (
+        exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam") is None
+    )
 
 
-def test_queryIsot_raises_ConsDbError_for_other_HTTP_errors(
+def test_queryExposureRecord_raises_ConsDbError_for_other_HTTP_errors(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
@@ -161,10 +223,10 @@ def test_queryIsot_raises_ConsDbError_for_other_HTTP_errors(
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     with pytest.raises(exposureTimes.ConsDbError):
-        exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam")
+        exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
 
 
-def test_queryIsot_treats_500_UndefinedTable_as_no_row(
+def test_queryExposureRecord_treats_500_UndefinedTable_as_no_row(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """ConsDB returns HTTP 500 with a psycopg2 ``UndefinedTable`` body
@@ -172,12 +234,8 @@ def test_queryIsot_treats_500_UndefinedTable_as_no_row(
     instrument rather than blowing up the whole lookup."""
     seen: list[str] = []
     undefBody = b'{"message":"(psycopg2.errors.UndefinedTable) relation does not exist"}'
-    payloads = iter(
-        [
-            ("undefined", undefBody),
-            ("hit", json.dumps({"columns": ["obs_end"], "data": [["x"]]}).encode("utf-8")),
-        ]
-    )
+    hitBody = json.dumps({"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "x")]}).encode("utf-8")
+    payloads = iter([("undefined", undefBody), ("hit", hitBody)])
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         kind, body = next(payloads)
@@ -193,12 +251,12 @@ def test_queryIsot_treats_500_UndefinedTable_as_no_row(
         return io.BytesIO(body)
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    iso = exposureTimes.queryIsot(2026051900722, "TOKEN")
-    assert iso == "x"
+    rec = exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL)
+    assert exposureTimes.obsEnd(rec) == "x"
     assert len(seen) == 2  # lsstcam 500 -> latiss hit
 
 
-def test_queryIsot_raises_for_500_that_is_not_UndefinedTable(
+def test_queryExposureRecord_raises_for_500_that_is_not_UndefinedTable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Generic ConsDB 500s — DB down, transient outage, etc. — bubble
@@ -216,48 +274,27 @@ def test_queryIsot_raises_for_500_that_is_not_UndefinedTable(
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     with pytest.raises(exposureTimes.ConsDbError):
-        exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam")
+        exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
 
 
-# ----- on-disk cache -------------------------------------------------------
+def test_queryExposureRecord_returns_record_even_without_obs_end(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row that's missing the obs_end column still yields a record (the
+    row exists); it's ``obsEnd`` that returns None so the caller decides
+    what to do. The row isn't silently dropped as "no such exposure"."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        return _stubResponse({"columns": ["exposure_id", "img_type"], "data": [[2026051900722, "science"]]})
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    rec = exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
+    assert rec == {"exposure_id": 2026051900722, "img_type": "science"}
+    assert exposureTimes.obsEnd(rec) is None
 
 
-def test_lookupCached_returns_None_when_file_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    assert exposureTimes.lookupCached(2026051900722) is None
+# ----- queryExposureRecordBatch ---------------------------------------------
 
 
-def test_storeCached_then_lookupCached_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
-    assert exposureTimes.lookupCached(2026051900722) == "2026-05-20T08:46:16.267000"
-
-
-def test_storeCached_appends_without_clobbering(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    exposureTimes.storeCached(2026051900722, "iso-a")
-    exposureTimes.storeCached(2026051900723, "iso-b")
-    assert exposureTimes.lookupCached(2026051900722) == "iso-a"
-    assert exposureTimes.lookupCached(2026051900723) == "iso-b"
-
-
-def test_lookupCached_tolerates_corrupt_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text("not-json{")
-    assert exposureTimes.lookupCached(2026051900722) is None
-
-
-def test_lookupCached_tolerates_unexpected_schema(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath()
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(["not", "a", "dict"]))
-    assert exposureTimes.lookupCached(2026051900722) is None
-
-
-def test_queryIsotBatch_returns_resolved_in_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_queryExposureRecordBatch_returns_resolved_in_one_call(monkeypatch: pytest.MonkeyPatch) -> None:
     """The whole point of the batch helper is one round trip per
     instrument, not one per dataId."""
     callCount = 0
@@ -266,29 +303,28 @@ def test_queryIsotBatch_returns_resolved_in_one_call(monkeypatch: pytest.MonkeyP
         nonlocal callCount
         callCount += 1
         sentSql = json.loads(req.data.decode("utf-8"))["query"]
-        assert "IN (" in sentSql
+        assert "SELECT * FROM" in sentSql and "IN (" in sentSql
         return _stubResponse(
             {
-                "columns": ["exposure_id", "obs_end"],
+                "columns": _FULL_COLS,
                 "data": [
-                    [2026051900722, "2026-05-20T08:46:16.267000"],
-                    [2026051900723, "2026-05-20T08:47:02.724000"],
+                    _fullRow(2026051900722, "2026-05-20T08:46:16.267000"),
+                    _fullRow(2026051900723, "2026-05-20T08:47:02.724000"),
                 ],
             }
         )
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([2026051900722, 2026051900723], "TOKEN")
-    assert out == {
-        2026051900722: "2026-05-20T08:46:16.267000",
-        2026051900723: "2026-05-20T08:47:02.724000",
-    }
+    out = exposureTimes.queryExposureRecordBatch([2026051900722, 2026051900723], "TOKEN", consdbUrl=URL)
+    assert set(out) == {2026051900722, 2026051900723}
+    assert exposureTimes.obsEnd(out[2026051900722]) == "2026-05-20T08:46:16.267000"
+    assert out[2026051900723]["physical_filter"] == "z_20"
     # One call: lsstcam matched everything, so we don't even try the
     # other instruments.
     assert callCount == 1
 
 
-def test_queryIsotBatch_falls_through_to_other_instruments(
+def test_queryExposureRecordBatch_falls_through_to_other_instruments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """If lsstcam returns only some rows, the helper queries the next
@@ -300,49 +336,39 @@ def test_queryIsotBatch_falls_through_to_other_instruments(
         seenQueries.append(sql)
         if "cdb_lsstcam." in sql:
             return _stubResponse(
-                {
-                    "columns": ["exposure_id", "obs_end"],
-                    "data": [[2026051900722, "2026-05-20T08:46:16.267000"]],
-                }
+                {"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")]}
             )
         return _stubResponse(
-            {
-                "columns": ["exposure_id", "obs_end"],
-                "data": [[2026052000100, "2026-05-20T09:00:00.000000"]],
-            }
+            {"columns": _FULL_COLS, "data": [_fullRow(2026052000100, "2026-05-20T09:00:00.000000")]}
         )
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([2026051900722, 2026052000100], "TOKEN")
-    assert out == {
-        2026051900722: "2026-05-20T08:46:16.267000",
-        2026052000100: "2026-05-20T09:00:00.000000",
-    }
+    out = exposureTimes.queryExposureRecordBatch([2026051900722, 2026052000100], "TOKEN", consdbUrl=URL)
+    assert set(out) == {2026051900722, 2026052000100}
     assert "cdb_lsstcam." in seenQueries[0]
     assert "cdb_latiss." in seenQueries[1]
 
 
-def test_queryIsotBatch_chunks_oversized_in_lists(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_queryExposureRecordBatch_chunks_oversized_in_lists(monkeypatch: pytest.MonkeyPatch) -> None:
     """A huge IN-list would blow ConsDB's SQL-length limit. The helper
     chunks itself so this can't happen."""
     seenQueries: list[str] = []
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         seenQueries.append(json.loads(req.data.decode("utf-8"))["query"])
-        return _stubResponse({"columns": ["exposure_id", "obs_end"], "data": []})
+        return _stubResponse({"columns": _FULL_COLS, "data": []})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     ids = list(range(2026051900000, 2026051901500))  # 1500 dataIds
-    exposureTimes.queryIsotBatch(ids, "TOKEN", chunkSize=500)
+    exposureTimes.queryExposureRecordBatch(ids, "TOKEN", consdbUrl=URL, chunkSize=500)
     # 1500 / 500 = 3 chunks per instrument; loop short-circuits since
     # we never resolve anything, so all 4 instruments are tried.
     assert len(seenQueries) == 3 * 4
 
 
-def test_queryIsotBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A 500 UndefinedTable from one instrument shouldn't fail the
-    whole batch — the helper should silently fall through to the next
-    instrument."""
+def test_queryExposureRecordBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A 500 UndefinedTable from one instrument shouldn't fail the whole
+    batch — the helper should silently fall through to the next."""
     calls: list[str] = []
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
@@ -356,69 +382,80 @@ def test_queryIsotBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.Monk
                 {},  # type: ignore[arg-type]
                 io.BytesIO(b'{"detail":"UndefinedTable: table not found"}'),
             )
-        # latiss returns one row.
         return _stubResponse(
-            {
-                "columns": ["exposure_id", "obs_end"],
-                "data": [[2026051900722, "2026-05-20T08:46:16.267000"]],
-            }
+            {"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")]}
         )
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
-    assert out == {2026051900722: "2026-05-20T08:46:16.267000"}
-    # lsstcam tried first and 500'd → moved on to latiss → resolved.
+    out = exposureTimes.queryExposureRecordBatch([2026051900722], "TOKEN", consdbUrl=URL)
+    assert set(out) == {2026051900722}
     assert "cdb_lsstcam." in calls[0]
     assert "cdb_latiss." in calls[1]
 
 
-def test_queryIsotBatch_skips_rows_with_missing_columns(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If the batch response is missing exposure_id or obs_end columns
-    entirely, the batch silently yields nothing rather than indexing
-    into a malformed row."""
+def test_queryExposureRecordBatch_skips_rows_without_exposure_id_column(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the batch response has no exposure_id column we can't key the
+    rows, so the chunk yields nothing rather than mis-indexing."""
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         return _stubResponse({"columns": ["something_else"], "data": [["x"]]})
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
+    out = exposureTimes.queryExposureRecordBatch([2026051900722], "TOKEN", consdbUrl=URL)
     assert out == {}
 
 
-def test_queryIsotBatch_skips_rows_with_unexpected_shape(
+def test_queryExposureRecordBatch_skips_rows_with_unexpected_shape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A row with an unexpected element shape (e.g. ``None`` instead of
-    an int dataId) shouldn't break the batch — that row is just
-    skipped."""
+    """A row with an unparseable exposure_id (e.g. ``None``) shouldn't
+    break the batch — that row is just skipped."""
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         return _stubResponse(
             {
-                "columns": ["exposure_id", "obs_end"],
+                "columns": _FULL_COLS,
                 "data": [
-                    [None, "2026-05-20T08:46:16.267000"],
-                    [2026051900722, "2026-05-20T08:46:16.267000"],
+                    _fullRow(2026051900722, "2026-05-20T08:46:16.267000"),
+                    [None, "2026-05-20T08:46:16.267000", "z_20", "science", 30.0, "O"],
                 ],
             }
         )
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([2026051900722], "TOKEN")
+    out = exposureTimes.queryExposureRecordBatch([2026051900722], "TOKEN", consdbUrl=URL)
     # The valid row landed; the None-id row got dropped.
-    assert out == {2026051900722: "2026-05-20T08:46:16.267000"}
+    assert set(out) == {2026051900722}
+
+
+def test_queryExposureRecordBatch_empty_input_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An empty input list must short-circuit without any HTTP call —
+    the prefetch path calls this with the set of unresolved ids, which
+    may legitimately be empty."""
+
+    def fakeUrlopen(*_a: Any, **_kw: Any) -> Any:
+        raise AssertionError("urlopen called for empty batch")
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryExposureRecordBatch([], "TOKEN", consdbUrl=URL)
+    assert out == {}
+
+
+# ----- _postQuery -----------------------------------------------------------
 
 
 def test_postQuery_treats_400_as_empty_result(monkeypatch: pytest.MonkeyPatch) -> None:
     """A 400 from ConsDB (typically "no such row" / "invalid query")
-    should surface as an empty payload, not as a ConsDbError that
-    aborts the whole batch."""
+    should surface as an empty payload, not as a ConsDbError that aborts
+    the whole batch."""
 
     def fakeUrlopen(req: Any, **_kw: Any) -> Any:
         raise HTTPError("https://x", 400, "Bad Request", {}, io.BytesIO(b""))  # type: ignore[arg-type]
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes._postQuery("SELECT 1", "TOKEN")
+    out = exposureTimes._postQuery("SELECT 1", "TOKEN", consdbUrl=URL)
     assert out == {"columns": [], "data": []}
 
 
@@ -431,64 +468,128 @@ def test_postQuery_raises_ConsDbError_for_503(monkeypatch: pytest.MonkeyPatch) -
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     with pytest.raises(exposureTimes.ConsDbError, match="503"):
-        exposureTimes._postQuery("SELECT 1", "TOKEN")
+        exposureTimes._postQuery("SELECT 1", "TOKEN", consdbUrl=URL)
 
 
-def test_storeCached_recovers_from_corrupt_existing_file(
+# ----- on-disk cache --------------------------------------------------------
+
+_REC = {"obs_end": "2026-05-20T08:46:16.267000", "physical_filter": "z_20", "img_type": "science"}
+
+
+def test_lookupCachedRecord_returns_None_when_file_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """If the existing cache file is corrupt, ``storeCached`` should
-    silently overwrite it with a fresh single-entry map rather than
-    refusing to record the new value."""
-    cachePath = tmp_path / "exposure-times.json"
-    cachePath.write_text("this is not json")
-    monkeypatch.setattr(exposureTimes, "cachedExposureTimesPath", lambda: cachePath)
-    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
-    data = json.loads(cachePath.read_text())
-    assert data == {"2026051900722": "2026-05-20T08:46:16.267000"}
-
-
-def test_queryIsot_handles_missing_obs_end_column(monkeypatch: pytest.MonkeyPatch) -> None:
-    """If the response schema unexpectedly omits the obs_end column we
-    return None rather than crashing."""
-
-    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
-        return _stubResponse({"columns": ["something_else"], "data": [["x"]]})
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    assert exposureTimes.queryIsot(2026051900722, "TOKEN", instrument="lsstcam") is None
-
-
-def test_queryIsotBatch_empty_input_is_noop(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty input list must short-circuit without any HTTP call —
-    the night-mode prefetch path calls this with the set of unresolved
-    ids, which may legitimately be empty.
-    """
-
-    def fakeUrlopen(*_a: Any, **_kw: Any) -> Any:
-        raise AssertionError("urlopen called for empty batch")
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    out = exposureTimes.queryIsotBatch([], "TOKEN")
-    assert out == {}
-
-
-def test_lookupCached_returns_None_for_non_string_value(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
-    """A corrupt cache that maps the right key to a non-string (e.g. an
-    int) must surface as a miss, not crash the caller. Recovery path is
-    "fall through to ConsDB and overwrite"."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath()
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
+
+
+def test_storeCachedRecord_then_lookup_round_trip(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(2026051900722, _REC, siteName="summit")
+    got = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert got == _REC
+    assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
+
+
+def test_lookupCachedRecord_reads_legacy_obs_end_string(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cache written by the pre-record format stored a bare obs_end
+    string per dataId. It must still resolve (wrapped as a 1-field
+    record) so an existing cache keeps working across the upgrade."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath("summit")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"2026051900722": "2026-05-20T08:46:16.267000"}))
+    got = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert got == {"obs_end": "2026-05-20T08:46:16.267000"}
+    assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
+
+
+def test_storeCachedRecords_batches_one_write(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecords(
+        {2026051900722: _REC, 2026051900723: {"obs_end": "iso-b"}}, siteName="summit"
+    )
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") == _REC
+    assert exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026051900723, siteName="summit")) == "iso-b"
+
+
+def test_storeCachedRecords_empty_is_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecords({}, siteName="summit")
+    assert not exposureTimes.cachedExposureTimesPath("summit").exists()
+
+
+def test_storeCachedRecord_appends_without_clobbering(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(2026051900722, {"obs_end": "iso-a"}, siteName="summit")
+    exposureTimes.storeCachedRecord(2026051900723, {"obs_end": "iso-b"}, siteName="summit")
+    assert exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")) == "iso-a"
+    assert exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026051900723, siteName="summit")) == "iso-b"
+
+
+def test_storeCachedRecord_isolates_sites_for_the_same_dataId(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Two sites can record different records for the same bare dataId
+    (real-camera vs BTS-simulated). The per-site cache files keep them
+    from crosstalking — a miss for one site must not see the other's."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(2026060200001, {"obs_end": "2026-06-03T00:42:43.632000"}, siteName="bts")
+    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="summit") is None
+    assert (
+        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="bts"))
+        == "2026-06-03T00:42:43.632000"
+    )
+    base = tmp_path / "exposure-times"
+    assert (base / "bts.json").exists()
+    assert not (base / "summit.json").exists()
+
+
+def test_lookupCachedRecord_tolerates_corrupt_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath("summit")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("not-json{")
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
+
+
+def test_lookupCachedRecord_tolerates_unexpected_schema(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath("summit")
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(["not", "a", "dict"]))
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
+
+
+def test_lookupCachedRecord_returns_None_for_unexpected_value_type(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A corrupt cache that maps the right key to neither a dict nor a
+    string (e.g. an int) must surface as a miss, not crash the caller."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    p = exposureTimes.cachedExposureTimesPath("summit")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"2026051900722": 12345}))
-    assert exposureTimes.lookupCached(2026051900722) is None
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
 
 
-def test_sqlFor_format_is_stable(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The SQL we send is part of the contract with ConsDB — pin its
-    shape so a refactor of `_sqlFor` doesn't silently change the wire
-    format (which would be invisible until a query failed in prod)."""
-    sql = exposureTimes._sqlFor(2026051900722, "lsstcam")
-    assert sql == "SELECT obs_end FROM cdb_lsstcam.exposure WHERE exposure_id = 2026051900722"
+def test_storeCachedRecords_recovers_from_corrupt_existing_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """If the existing cache file is corrupt, storing should silently
+    overwrite it with a fresh map rather than refusing to record."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    cachePath = exposureTimes.cachedExposureTimesPath("summit")
+    cachePath.parent.mkdir(parents=True, exist_ok=True)
+    cachePath.write_text("this is not json")
+    exposureTimes.storeCachedRecord(
+        2026051900722, {"obs_end": "2026-05-20T08:46:16.267000"}, siteName="summit"
+    )
+    data = json.loads(cachePath.read_text())
+    assert data == {"2026051900722": {"obs_end": "2026-05-20T08:46:16.267000"}}

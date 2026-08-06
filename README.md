@@ -25,7 +25,8 @@ window. One exposure at a time.
 # Loki password — ask Merlin for the value.
 export LOKI_PASSWORD='...'
 
-# RSP bearer token for the ConsDB shutter-close lookup. Get one at
+# RSP bearer token for the ConsDB exposure lookup (shutter close +
+# the image properties shown in the explore-view info box). Get one at
 # https://usdf-rsp.slac.stanford.edu/auth/tokens/ and drop it in:
 mkdir -p ~/.lsst && cat > ~/.lsst/log-browser-token.txt   # paste, then Ctrl-D
 
@@ -34,7 +35,7 @@ cd ra_log_explorer
 python3 -m ra_log_explorer.cli
 ```
 
-That starts a local server and opens `http://127.0.0.1:8765/` in your
+That starts a local server and opens `http://127.0.0.1:8780/` in your
 browser. Type a 13-digit dataId, click **Fetch & explore**, wait
 ~60–90 s the first time (instant on a repeat). Stop with **Ctrl-C**.
 
@@ -43,40 +44,75 @@ drive it from the CLI, troubleshooting — read on.
 
 ## Required environment + credentials
 
-The tool needs **one env var** and **one token file** to fetch logs
-and resolve dataIds. Put the env var in your shell rc (`~/.zshrc`,
-`~/.bashrc`, …) so it survives across terminals:
+The tool needs **one env var** and **one ConsDB token file per site
+you want to talk to** (see [Sites](#sites) below — today there are
+two: the summit and the Base Test Stand). Put the env var in
+`~/.zshenv` (or your bash equivalent) so it survives across both
+interactive shells and non-interactive ones:
 
 ```sh
 # 1. Loki credentials — used by `logcli` to authenticate against the
-#    summit Loki cluster.
+#    Loki cluster behind every site. Same value works for all sites.
 export LOKI_PASSWORD='<the password>'
 ```
 
 ```sh
-# 2. RSP bearer token — used to query the ConsDB shutter-close
-#    timestamp for each dataId. Get a token at
-#    https://usdf-rsp.slac.stanford.edu/auth/tokens/ and save it as:
+# 2a. Summit RSP bearer token — used to query the ConsDB shutter-close
+#     timestamp when the active site is "summit" (cluster yagan). Get
+#     one at https://usdf-rsp.slac.stanford.edu/auth/tokens/.
 mkdir -p ~/.lsst
-echo '<paste-token-here>' > ~/.lsst/log-browser-token.txt
+echo '<paste-summit-token>' > ~/.lsst/log-browser-token.txt
 chmod 600 ~/.lsst/log-browser-token.txt
+
+# 2b. BTS RSP bearer token — used when the active site is "bts"
+#     (cluster manke). Get one from base-lsp.lsst.codes.
+echo '<paste-bts-token>'    > ~/.lsst/manke-token.txt
+chmod 600 ~/.lsst/manke-token.txt
 ```
 
-Once a dataId has been resolved on this machine it is cached on
-disk (under `~/.cache/ra_log_explorer/exposure-times.json`), so
-subsequent lookups for the same id work without the token. Exposure
-end-times are immutable once recorded, so the cache never goes
-stale.
+Once a dataId has been resolved on this machine it is cached on disk
+per-site (under `~/.cache/ra_log_explorer/exposure-times/<site>.json`),
+so subsequent lookups for the same id work without the token. Exposure
+end-times are immutable once recorded, so the cache never goes stale.
+Sites have separate cache files so a colliding bare dataId between
+scopes (BTS simulated vs. summit real) can't return the wrong obs_end.
 
 | Setting                                   | Required for                                  | What if it's missing                                 |
 |--------------------------------------------|------------------------------------------------|------------------------------------------------------|
 | `LOKI_PASSWORD` (env var)                  | Every Loki fetch                              | `logcli` refuses to run; fetches fail at submit time. |
-| `~/.lsst/log-browser-token.txt` (file)     | dataId → shutter-close auto-resolution        | The home form shows "RSP token file not found"; cached dataIds still resolve. The CLI's `--t-zero` flag is also a manual override. |
-| `RA_LOG_EXPLORER_RSP_TOKEN_FILE` (env var) | *Optional* — overrides the token file path    | Defaults to `~/.lsst/log-browser-token.txt`. Also overridable per-session in the home page Credentials card. |
+| `~/.lsst/log-browser-token.txt` (file)     | dataId → shutter-close auto-resolution for the **summit** site | The home form shows "ConsDB token file for site 'summit' not found"; cached dataIds still resolve. The CLI's `--t-zero` flag is also a manual override. |
+| `~/.lsst/manke-token.txt` (file)           | dataId → shutter-close auto-resolution for the **bts** site    | Same shape of error, scoped to the BTS site. |
+| `RA_LOG_EXPLORER_SITES_FILE` (env var)     | *Optional* — point at a custom site catalog   | Defaults to the checked-in [`ra_log_explorer/sites.toml`](ra_log_explorer/sites.toml). |
 | `RA_LOG_EXPLORER_CACHE` (env var)          | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
 
 The username for `logcli` defaults to `merlin` and is overridable in the
 browser's Credentials card (or via the CLI's `--username` flag).
+
+## Sites
+
+A *site* pairs a Loki cluster (where the logs live) with the ConsDB
+endpoint that owns its shutter-close truth. The site catalog is
+checked in at [`ra_log_explorer/sites.toml`](ra_log_explorer/sites.toml)
+and currently has two entries:
+
+| Site name | Cluster (Loki) | ConsDB endpoint                                    | Token file                       |
+|-----------|----------------|----------------------------------------------------|----------------------------------|
+| `summit`  | `yagan`        | `https://usdf-rsp.slac.stanford.edu/consdb/query` | `~/.lsst/log-browser-token.txt`  |
+| `bts`     | `manke`        | `https://base-lsp.lsst.codes/consdb/query`        | `~/.lsst/manke-token.txt`        |
+
+The summit site sees the real Vera C. Rubin camera; BTS is the Base
+Test Stand replica that runs simulated data through the same pipeline.
+The two ConsDBs are independent databases, so the same 13-digit dataId
+can refer to a real exposure on the summit and a simulated one on BTS
+with completely different `obs_end` values — the catalog keeps them
+from crosstalking.
+
+Pick a site in the browser's top-bar switcher; the selection is
+remembered per browser. From the CLI, pass `--site=summit|bts`
+(default: the catalog's `default_site` — currently `summit`).
+
+(USDF will get its own site once we plumb that path; it'll share the
+summit ConsDB.)
 
 ## Other prerequisites
 
@@ -85,7 +121,7 @@ browser's Credentials card (or via the CLI's `--username` flag).
 | Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only.                                  |
 | `logcli` on your `$PATH`          | `brew install grafana/grafana/logcli` on macOS, or grab a binary from Grafana releases. |
 | `git`                              | There is no PyPI package; you run from a checkout.                                  |
-| A browser                         | The tool opens `http://127.0.0.1:8765/` for you.                                      |
+| A browser                         | The tool opens `http://127.0.0.1:8780/` for you.                                      |
 
 ## Getting started — first run, step by step
 
@@ -111,38 +147,50 @@ python3 -m ra_log_explorer.cli
 ```
 
 That last command starts a local HTTP server and tries to open
-`http://127.0.0.1:8765/` in your default browser. If the browser doesn't
+`http://127.0.0.1:8780/` in your default browser. If the browser doesn't
 open by itself, paste the URL by hand. To stop the server, press
 **Ctrl-C** in the terminal where you launched it.
 
 In the browser:
 
-1. The home page loads with a **right-side App settings sidebar**
-   (cluster, namespace, parallel-fetch workers, Loki URL, RSP token
-   file, max cache space) and a **Credentials** card below it. Fill
-   in your **Loki username + password** if you haven't already —
-   tick "remember in this browser" if you want them kept in
-   `localStorage`. The password field is optional; if you leave it
-   blank the server falls back to `LOKI_PASSWORD` from its
-   environment. Settings persist as you type (and `maxCacheBytes` is
-   pushed to the server immediately so its LRU eviction uses the
+1. The home page loads with a **top-bar site switcher** (summit vs.
+   bts) and a **right-side App settings sidebar** (parallel-fetch
+   workers, max cache space, cache directory) plus a **Credentials**
+   card below it. Pick the site that matches the cluster you want to
+   investigate — `summit` for real-camera data on yagan, `bts` for
+   simulated data on manke. Fill in your **Loki username + password**
+   if you haven't already — tick "remember in this browser" if you
+   want them kept in `localStorage`. The password field is optional;
+   if you leave it blank the server falls back to `LOKI_PASSWORD` from
+   its environment. Settings persist as you type (and `maxCacheBytes`
+   is pushed to the server immediately so its LRU eviction uses the
    latest cap).
 2. Type a **dataId** (e.g. `2026051900722`) in the *Explore exposure
    processing* card. After ~300 ms the tool resolves the shutter
    close time and shows it inline under the input.
+   - **ConsDB down or missing the entry?** If the lookup can't resolve
+     the dataId (ConsDB unreachable, no token, or no row for that id), a
+     **manual shutter close** field appears under the input. Type the
+     timestamp yourself in TAI ISO-8601 — e.g. `2026-06-24T14:38:41.380663`,
+     the same convention as ConsDB's `obs_end` and the CLI's `--t-zero` —
+     and the fetch proceeds with that value. It's remembered for this
+     dataId (cached under the active site) so reopening or refreshing the
+     view doesn't ask again; a real ConsDB value, once reachable, takes
+     precedence. Manual entry is single-dataId only — not range or night.
 3. Optional *per-exposure tuning* (window before / after t₀) lives
-   in a small details fold on the exposure form. The global
-   knobs — cluster, namespace, worker count, Loki URL — are in the
-   sidebar and shared with night-mode fetches.
+   in a small details fold on the exposure form. Cluster, namespace,
+   Loki URL and ConsDB token file all come from the active site, so
+   you don't enter them anywhere — switch sites in the top-bar
+   instead.
 4. Click **Fetch & explore**. A progress bar follows the fetch live
    (Server-Sent Events). When it's done the URL updates to
    `/?dataId=<id>` and the page switches to the timeline view.
 
 The home page also lists every cached window on disk in the *Recent
 runs* table. Each row carries a **key** column showing the dataId(s)
-that triggered fetches landing on that cache (or the `dayObs` for
-night caches); the keys are clickable links that open the cached
-view in a new tab. The ✕ button on each row deletes that one
+that triggered fetches landing on that cache (the `dayObs` for night
+caches, or the seq-number span for range caches); the keys are
+clickable links that open the cached view in a new tab. The ✕ button on each row deletes that one
 window; the "delete all" button under the table wipes the whole
 cache. The server also LRU-evicts the least-recently-viewed windows
 automatically once the on-disk total exceeds the sidebar's *max
@@ -178,20 +226,47 @@ port. Ctrl-C in the terminal stops the server.
 
 ## What the UI shows
 
-The browser app has two views:
+The browser app has three views:
 
-- **Home view** — the landing page when no exposure is loaded.
-  Hosts the fetch form, the credentials panel, the cached-runs table,
+- **Home view** — the landing page when nothing is loaded. Hosts the
+  three fetch forms (single exposure, a range of exposures, an
+  investigate-night), the credentials panel, the cached-runs table,
   and the live progress bar for an in-flight fetch.
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is
-  a navigation, not a reset).
+  a navigation, not a reset). In **range mode** the explore view gains
+  a navigator strip on top: one chip per exposure in the range (red if
+  it raised a traceback), plus ◀/▶ buttons and the ←/→ arrow keys to
+  step between them. Each exposure's timeline is anchored at its own
+  shutter close, so the `Δt₀ = 0` line always sits on the exposure
+  you're looking at.
+- **Night view** — the dayObs-wide failure breakdown and Δshutter
+  histograms, plus data-completeness banners: an incomplete-fetch
+  warning, and a "gather-only" warning listing any dataIds whose
+  step1b (gather) ran with no step1a — physically impossible, so a tell
+  that step1a logs were dropped (and a cause of a biased first-task
+  histogram). It also rolls up **pod restarts & deaths** for the night:
+  a `pod restarts` stat tile and a table of every restart / kill /
+  OOM / failure (from the `k8s/events` stream), each attributed to the
+  dataId the pod was processing at that moment — click it to open that
+  visit. A `restart` is an in-place container restart, usually an OOM,
+  so it's the fastest way to spot "which exposures had a worker die on
+  them tonight".
 
 Inside the explore view:
 
 - **Top bar** — the dataId, the UTC t-zero, where the cache lives, and
   how big the on-disk cache currently is.
+- **Exposure info box** — a strip of ConsDB exposure properties for the
+  loaded dataId: image type, observation reason, science program,
+  filter, exposure time, target, and (for multi-exposure groups) the
+  "N of M" index — enough to tell *what kind of image* you're looking
+  at, e.g. spotting that a dataId is one half of a CWFS donut pair.
+  Hidden if ConsDB never resolved the dataId (no token / unknown id).
+  The same properties show as a hover tooltip on every dataId link —
+  the night view's histogram-bin and failure-table ids, and the range
+  navigator chips — so you can triage without opening each one.
 - **t₀ selector** — pick between the two reference points the tool
   derives: shutter close (caller-supplied) and the head-node's first
   `Defining visit` for this exposure. Whichever you pick becomes the
@@ -207,6 +282,9 @@ Inside the explore view:
   the camera closed" reading.
 - **"collapse all" / "expand all"** — toggle every pod group at once.
 - **Events legend** — head-node / worker event icons.
+- **Pod lifecycle legend** — the full-height markers for pod
+  death/restart pulled from Kubernetes events (see below):
+  `restart`, `killed`, `OOM-killed`, `unhealthy`.
 - **Tasks legend** — one colour swatch per pipeline task seen (`isr`,
   `calibrateImage`, `calcZernikesTask`, …). Quantum bars on the
   timeline are coloured to match.
@@ -233,6 +311,20 @@ Inside the explore view:
     a red `TB N` pill in their row name. The cheapest visual scan
     for "where are things going wrong" is to look down the left
     edge of the timeline for red bars.
+  - **Pod death/restart markers.** Alongside each pod's app-log events
+    the timeline draws tall, full-height ticks for Kubernetes pod
+    lifecycle events — pulled from a second Loki stream (`k8s/events`)
+    fetched next to the logs. An orange `restart` tick is the important
+    one: it means the container died and was restarted **in place**, so
+    if a pod's app log just stops mid-exposure with no traceback, the
+    restart tick a few seconds later is usually *why*. Red `killed` /
+    `OOM-killed` / `failed` and amber `unhealthy` ticks cover the
+    explicit cases. Hover any tick for the k8s reason and message.
+    (Caveat: a container that exceeds its own memory limit is killed by
+    the kernel with **no** Kubernetes event, and the kernel's OOM line
+    isn't shipped to Loki — so that common case shows up only as the
+    `restart` tick, not a definitive `OOM-killed`. To confirm OOM, check
+    `kubectl ... lastState.terminated` (`reason: OOMKilled`, exit 137).)
 - **Detail drawer** — click any pod's row to slide up its full parsed
   log, with Δt₀, level, and a filter / "warn-only" / "only lines
   relevant to this dataId" toggle. The relevance check is smarter than
@@ -278,6 +370,21 @@ The `Δt₀ = 0` reference stays on the same exposure; you just see more
 of the surrounding cluster activity. If a cached run already covers
 the wider window the subset is reused immediately — no re-fetch.
 
+### Explore a contiguous range of exposures
+
+In the home page, use the **Explore a range of exposures** card: type a
+start and a stop dataId. The browser resolves both shutter-close times,
+then a **single** Loki fetch covers the whole span
+(`shutterClose(start) − before → shutterClose(stop) + after`) as one
+cache block — far cheaper than fetching each exposure's overlapping
+window on its own. The server resolves every in-range dataId's shutter
+close from ConsDB (skipped integers in the range are expected and just
+omitted), and you land in the explore view with a navigator strip on
+top. Step through each exposure with the chips, the ◀/▶ buttons, or the
+←/→ arrow keys; every exposure is anchored at its own shutter close.
+This mode is browser-only (there's no CLI flag) and is meant for tens
+of consecutive exposures.
+
 ### Inspect what's cached
 
 ```
@@ -302,6 +409,12 @@ python3 -m ra_log_explorer.cli cache flush
 Or just `rm -rf ~/.cache/ra_log_explorer`. The cache is purely a
 performance accelerator; flushing it costs you nothing but a re-fetch.
 
+You rarely need to do this by hand: when an upgrade changes *how* logs
+are fetched, the tool bumps an internal cache-schema version and flushes
+the whole cache automatically on the next start (printing a one-line
+notice), so a stale snapshot from an older version is never re-served.
+The first loads after such an upgrade re-fetch and so are slower.
+
 ## All CLI options
 
 ```
@@ -311,13 +424,11 @@ performance accelerator; flushing it costs you nothing but a re-fetch.
 --window-before SECONDS  pre-shutter pad (default 5)
 --window-after  SECONDS  post-shutter pad (default 300)
 --workers N              parallel log fetch threads (default 8)
---cluster NAME           Loki cluster label (default yagan)
---namespace NAME         Loki namespace label (default rapid-analysis)
---loki-addr URL          Loki API base URL
+--site NAME              site from sites.toml (default: catalog default_site)
 --username USER          Loki HTTP basic-auth user (default merlin)
 --force-refresh          ignore the cache and re-fetch
 --host HOST              bind address (default 127.0.0.1)
---port PORT              HTTP port (default 8765)
+--port PORT              HTTP port (default 8780)
 --no-serve               with --exposure-id: fetch + parse only, no UI
 --no-browser             launch the UI but don't auto-open a browser tab
 ```
@@ -343,13 +454,63 @@ The cache layout, reuse rules, and `.partial` flag are described in
 (`brew install grafana/grafana/logcli`) and reopen your shell. The tool
 will not auto-install or fall back to a different client.
 
-**"LOKI_PASSWORD is not set in the environment"** — export it. Don't
-pass passwords on the command line.
+**"LOKI_PASSWORD is not set in the environment"** — export it from
+`~/.zshenv` (or your bash equivalent). Don't pass passwords on the
+command line, and don't drop the export in `~/.zshrc` — that's only
+sourced for interactive shells, so non-interactive child processes
+won't see it.
+
+**"ConsDB token file for site '<name>' not found at <path>"** — you
+picked a site whose token file isn't on this machine. Either drop the
+right token at the named path (see [Sites](#sites) for the matrix), or
+switch the top-bar site picker back to one you do have a token for.
+Cached dataIds still resolve without a token. (For a one-off where you
+can't fix the token but know the shutter close, use the **manual
+shutter close** field that appears under the dataId input — see step 2
+of *Getting started*.)
+
+**"No exposure-time record for dataId=N" / ConsDB unreachable** — ConsDB
+either has no row for that id yet or is down. The **manual shutter close**
+field appears under the input; type the timestamp in TAI ISO-8601
+(`2026-06-24T14:38:41.380663`) and fetch with it. The value is cached for
+that dataId under the active site, and a real ConsDB value supersedes it
+once reachable. This is single-dataId only — the range and night forms
+have no manual fallback.
+
+**Shutter close looks off after switching sites** — sanity check that
+you're on the right site. The summit cluster's dataIds resolve against
+the summit ConsDB; BTS dataIds resolve against the BTS ConsDB; same
+13-digit id can mean different exposures in each. The per-site cache
+files at `~/.cache/ra_log_explorer/exposure-times/` keep them
+separate, but the top-bar switcher is what tells the server which to
+use for *new* lookups.
 
 **A few pods show 0 events but the exposure obviously touched them** —
 look at the pod's `.jsonl` directly under the cache directory. If the
 file is empty, that's Loki returning nothing for the window — usually a
 transient series-index gap. Re-run with `--force-refresh` to pull again.
+
+**A pod's log just stops mid-exposure, no traceback, no finish** — look
+for a tall `restart` tick on that pod's lane a few seconds after the last
+line (and an amber `⚠ window` flag on the row). That's a container that
+died and was restarted in place — most often an out-of-memory kill the
+kernel didn't log to us. The `restart` tick comes from the `k8s/events`
+stream the fetch pulls alongside the logs; to *confirm* OOM specifically,
+`kubectl get pod <pod> -n rapid-analysis -o jsonpath='{.status.containerStatuses[*].lastState.terminated}'`
+shows `reason: OOMKilled` and exit code 137 (only until the next restart
+overwrites it).
+
+**Red "Incomplete fetch" banner (or an `INCOMPLETE FETCH` line on the
+CLI)** — one or more pods are missing data, so the window you're looking
+at is incomplete. This matters most in night mode, where missing pods
+silently bias the Δshutter histograms. The banner lists the affected
+pods; re-run with `--force-refresh` to retry. There are two causes, both
+flagged the same way: a hard `logcli` failure (timeout / transient 5xx),
+or a pod whose logs couldn't be verified complete. (The tool fetches
+every line — it works around a Loki bug that silently drops lines on wide
+busy windows by fetching in verified single-batch time-chunks — so it
+either gets the whole window or tells you which pods it couldn't, never a
+silent truncation.)
 
 **Cache hit when you didn't expect one** — the tool reuses any
 *superset* of the requested window. If you specifically want to refetch,
@@ -362,7 +523,7 @@ with `--force-refresh` to write a tighter cache directory and reload.
 
 **Browser opens but the page is blank / JS error** — check the terminal
 for a Python traceback from the server. Re-run with `--port` set to a
-free port if 8765 is in use.
+free port if 8780 is in use.
 
 ## For developers / contributors
 

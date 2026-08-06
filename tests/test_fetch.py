@@ -74,12 +74,13 @@ def _writeCache(
                     "fromIso": fromIso,
                     "toIso": toIso,
                     "workers": 8,
-                    "lineLimit": 50000,
                 },
+                "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
                 "pod_count": 0,
                 "total_bytes": 0,
                 "pod_bytes": {},
                 "errors": {},
+                "fetchComplete": True,
                 "window_in_past": True,
                 "fromCache": False,
                 "cacheReuse": "none",
@@ -236,6 +237,30 @@ def test_getCacheExposureIds_skips_unparseable_lines(tmp_path: Path) -> None:
     assert fetch.getCacheExposureIds(tmp_path) == [2026051900722, 2026051900723]
 
 
+# ----- markCacheRange / getCacheRange -------------------------------------
+
+
+def test_getCacheRange_returns_None_when_no_sidecar(tmp_path: Path) -> None:
+    assert fetch.getCacheRange(tmp_path) is None
+
+
+def test_markCacheRange_then_get_roundtrips(tmp_path: Path) -> None:
+    fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750)
+    assert fetch.getCacheRange(tmp_path) == (2026051900722, 2026051900750)
+
+
+def test_markCacheRange_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
+    fetch.markCacheRange(tmp_path / "does-not-exist", 1, 2)  # no raise
+    assert fetch.getCacheRange(tmp_path / "does-not-exist") is None
+
+
+def test_getCacheRange_returns_None_on_malformed_sidecar(tmp_path: Path) -> None:
+    (tmp_path / fetch.RANGE_NAME).write_text("only-one-line\n")
+    assert fetch.getCacheRange(tmp_path) is None
+    (tmp_path / fetch.RANGE_NAME).write_text("not-a-number\nalso-bad\n")
+    assert fetch.getCacheRange(tmp_path) is None
+
+
 # ----- markCacheViewed / getCacheLastViewed -------------------------------
 
 
@@ -296,12 +321,13 @@ def _plantWindowWithBody(
                     "fromIso": fromIso,
                     "toIso": toIso,
                     "workers": 8,
-                    "lineLimit": 50000,
                 },
+                "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
                 "pod_count": 1,
                 "total_bytes": bodyBytes,
                 "pod_bytes": {},
                 "errors": {},
+                "fetchComplete": True,
                 "window_in_past": True,
                 "fromCache": False,
                 "cacheReuse": "none",
@@ -538,29 +564,301 @@ def test_listPods_handles_malformed_series_lines(monkeypatch: pytest.MonkeyPatch
     assert pods == ["ok-pod"]
 
 
-def test_fetchOnePod_writes_stdout_to_outPath_and_returns_bytes(
+# ----- count_over_time oracle parsing -------------------------------------
+
+
+def test_parseCountOutput_reads_vector_sample() -> None:
+    out = b'{"metric":{},"value":[1748600000,"1717"]}\n'
+    assert fetch._parseCountOutput(out) == 1717
+
+
+def test_parseCountOutput_reads_pretty_printed_array() -> None:
+    # The real shape logcli emits for `instant-query -o jsonl` on a metric
+    # query: a pretty-printed JSON array of vector samples (NOT one per line).
+    out = b"""[
+  {
+    "metric": {},
+    "value": [
+      1780203600,
+      "44597"
+    ]
+  }
+]"""
+    assert fetch._parseCountOutput(out) == 44597
+
+
+def test_parseCountOutput_sums_per_stream_samples() -> None:
+    # A bare count_over_time (no sum) emits one sample per stream; we add them.
+    out = (
+        b'{"metric":{"detected_level":"info"},"value":[1,"100"]}\n'
+        b'{"metric":{"detected_level":"warn"},"value":[1,"7"]}\n'
+    )
+    assert fetch._parseCountOutput(out) == 107
+
+
+def test_parseCountOutput_returns_None_on_garbage() -> None:
+    assert fetch._parseCountOutput(b"not json\n") is None
+    assert fetch._parseCountOutput(b"") is None
+    assert fetch._parseCountOutput(b'{"no":"value"}\n') is None
+
+
+def test_countOverTime_builds_instant_query_and_parses(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        captured["args"] = list(extraArgs)
+        return b'{"metric":{},"value":[1,"42"]}\n'
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    toT = dt.datetime(2026, 5, 20, 8, 0, 5, tzinfo=dt.timezone.utc)
+    n = fetch._countOverTime(_stubSpec(), "pod-x", fromT, toT)
+    assert n == 42
+    args = captured["args"]
+    assert args[0] == "instant-query"
+    assert "sum(count_over_time(" in args[1]
+    assert 'pod="pod-x"' in args[1]
+    # 5s window in ms (LogQL rejects ns/us), plus the 1ms superset pad.
+    assert "[5001ms]" in args[1]
+    assert any(a.startswith("--now=") for a in args)
+
+
+def test_countOverTime_range_is_a_strict_superset_of_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The selector covers ``(to - range, to]`` but the fetch covers
+    ``[from, to)``, and a zero count skips the chunk's fetch entirely — so
+    the range must round *up* and pad, never truncate. A sub-ms fraction
+    that ``round()`` would have discarded is the case that used to lose a
+    line sitting on the window's left edge."""
+    captured: dict[str, Any] = {}
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        captured["args"] = list(extraArgs)
+        return b'{"metric":{},"value":[1,"0"]}\n'
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    # 2000.4 ms: round() gives 2000 (narrower than the window), ceil gives 2001.
+    toT = fromT + dt.timedelta(microseconds=2_000_400)
+    assert fetch._countOverTime(_stubSpec(), "pod-x", fromT, toT) == 0
+    assert "[2002ms]" in captured["args"][1]
+
+
+def test_countOverTime_treats_empty_window_as_zero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A zero-width (or inverted) window is empty by construction — no query,
+    and no ``ceil(0) + 1`` turning it into a live 1ms range selector."""
+
+    def boom(*_a: Any, **_kw: Any) -> bytes:
+        raise AssertionError("should not query Loki for an empty window")
+
+    monkeypatch.setattr(fetch, "_run_logcli", boom)
+    t = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    assert fetch._countOverTime(_stubSpec(), "p", t, t) == 0
+    assert fetch._countOverTime(_stubSpec(), "p", t, t - dt.timedelta(seconds=1)) == 0
+
+
+def test_countOverTime_returns_None_on_fetch_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    def boom(*_a: Any, **_kw: Any) -> bytes:
+        raise fetch.FetchError("loki down")
+
+    monkeypatch.setattr(fetch, "_run_logcli", boom)
+    fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    toT = dt.datetime(2026, 5, 20, 8, 5, 0, tzinfo=dt.timezone.utc)
+    assert fetch._countOverTime(_stubSpec(), "p", fromT, toT) is None
+
+
+# ----- _queryWindowToFile -------------------------------------------------
+
+
+def test_queryWindowToFile_batches_at_cap_and_counts_lines(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured: dict[str, Any] = {}
 
-    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], timeout: float | None = None) -> bytes:
-        captured["extraArgs"] = list(extraArgs)
+    def fakeRunLogcli(
+        _spec: FetchSpec,
+        extraArgs: list[str],
+        timeout: float | None = None,
+        stdoutPath: Path | None = None,
+    ) -> bytes:
+        captured["args"] = list(extraArgs)
         captured["timeout"] = timeout
-        return b'{"timestamp":"...", "line":"hi\\n"}\n'
+        assert stdoutPath is not None
+        stdoutPath.write_bytes(b'{"a":1}\n{"b":2}\n{"c":3}\n')
+        return b""
 
     monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
     out = tmp_path / "pod.jsonl"
-    pod, nbytes = fetch._fetchOnePod(_stubSpec(), "s-lsstcam-run-aos-worker-0", out)
-    assert pod == "s-lsstcam-run-aos-worker-0"
-    assert nbytes == len(out.read_bytes())
-    assert out.read_text().startswith('{"timestamp"')
-    # The query must use forward order + JSONL output (the file format the
-    # parser assumes). Regressing either of those silently breaks the
-    # downstream pipeline, so they're worth pinning here.
-    assert "--forward" in captured["extraArgs"]
-    assert "jsonl" in captured["extraArgs"]
-    # Per-pod fetches get a longer timeout than series queries.
-    assert captured["timeout"] == 600.0
+    fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
+    toT = dt.datetime(2026, 5, 20, 8, 0, 5, tzinfo=dt.timezone.utc)
+    got = fetch._queryWindowToFile(_stubSpec(), "pod-x", fromT, toT, out)
+    assert got == 3
+    args = captured["args"]
+    # The batch size MUST equal the server cap (see SERVER_QUERY_CAP): the
+    # single-batch trust check and the no-early-stop guarantee both hinge on
+    # it. Forward + jsonl preserve order and labels for the parser.
+    assert f"--batch={fetch.SERVER_QUERY_CAP}" in args
+    assert "--limit=0" in args
+    assert "--forward" in args
+    assert "jsonl" in args
+    assert captured["timeout"] == fetch.PER_POD_TIMEOUT_S
+
+
+# ----- _fetchOnePod chunker -----------------------------------------------
+#
+# These drive the recursive count-presized fetch with the two cluster calls
+# (count_over_time + the windowed query) replaced by an in-memory model of a
+# pod's log stream, and SERVER_QUERY_CAP shrunk so the splitting logic runs
+# on tiny line counts. The chunker's correctness rests on a single invariant:
+# a window is trusted only when its single fetch returns < SERVER_QUERY_CAP
+# lines (i.e. logcli didn't paginate, so #17270 couldn't fire).
+
+
+class _FakeLoki:
+    """In-memory pod log stream: a sorted list of event timestamps. Both the
+    count oracle and the windowed query read from it, so they always agree."""
+
+    def __init__(self, events: list[dt.datetime]) -> None:
+        self.events = sorted(events)
+        self.countCalls: list[tuple[dt.datetime, dt.datetime]] = []
+        self.queryCalls: list[tuple[dt.datetime, dt.datetime]] = []
+
+    def _inWindow(self, fromT: dt.datetime, toT: dt.datetime) -> int:
+        return sum(1 for t in self.events if fromT <= t < toT)
+
+    def count(self, _spec: FetchSpec, _pod: str, fromT: dt.datetime, toT: dt.datetime) -> int | None:
+        self.countCalls.append((fromT, toT))
+        return self._inWindow(fromT, toT)
+
+    def query(self, _spec: FetchSpec, _pod: str, fromT: dt.datetime, toT: dt.datetime, outPath: Path) -> int:
+        self.queryCalls.append((fromT, toT))
+        n = self._inWindow(fromT, toT)
+        with open(outPath, "wb") as fh:
+            for i in range(n):
+                fh.write(b'{"i":%d}\n' % i)
+        return n
+
+
+def _evenEvents(fromT: dt.datetime, toT: dt.datetime, n: int) -> list[dt.datetime]:
+    span = (toT - fromT).total_seconds()
+    return [fromT + dt.timedelta(seconds=span * (i + 0.5) / n) for i in range(n)]
+
+
+def _countFileLines(path: Path) -> int:
+    return path.read_bytes().count(b"\n")
+
+
+def _installFakeLoki(monkeypatch: pytest.MonkeyPatch, fl: _FakeLoki, cap: int = 10, target: int = 8) -> None:
+    monkeypatch.setattr(fetch, "_countOverTime", fl.count)
+    monkeypatch.setattr(fetch, "_queryWindowToFile", fl.query)
+    monkeypatch.setattr(fetch, "SERVER_QUERY_CAP", cap)
+    monkeypatch.setattr(fetch, "CHUNK_TARGET_LINES", target)
+
+
+def test_fetchOnePod_single_shot_when_under_cap(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    spec = _stubSpec()
+    fromT, toT = fetch._parseIso(spec.fromIso), fetch._parseIso(spec.toIso)
+    fl = _FakeLoki(_evenEvents(fromT, toT, 6))  # 6 < cap(10)
+    _installFakeLoki(monkeypatch, fl)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is True
+    assert res.lines == 6
+    assert res.expected == 6
+    assert _countFileLines(out) == 6
+    # One window, fetched once — no splitting.
+    assert len(fl.queryCalls) == 1
+
+
+def test_fetchOnePod_splits_when_count_exceeds_cap_and_loses_nothing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    spec = _stubSpec()
+    fromT, toT = fetch._parseIso(spec.fromIso), fetch._parseIso(spec.toIso)
+    fl = _FakeLoki(_evenEvents(fromT, toT, 30))  # 30 >> cap(10)
+    _installFakeLoki(monkeypatch, fl)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is True
+    # Every line preserved across the split — the whole point.
+    assert res.lines == 30
+    assert _countFileLines(out) == 30
+    # The big window was presized away, never fetched whole: every *fetched*
+    # window came back under the cap.
+    for fromW, toW in fl.queryCalls:
+        assert fl._inWindow(fromW, toW) < fetch.SERVER_QUERY_CAP
+
+
+def test_fetchOnePod_blind_bisects_when_count_unavailable(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With the oracle dark (count returns None) correctness must still hold:
+    the got<cap self-check drives the splitting on its own."""
+    spec = _stubSpec()
+    fromT, toT = fetch._parseIso(spec.fromIso), fetch._parseIso(spec.toIso)
+    fl = _FakeLoki(_evenEvents(fromT, toT, 25))
+    _installFakeLoki(monkeypatch, fl)
+    monkeypatch.setattr(fetch, "_countOverTime", lambda *_a, **_k: None)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is True
+    assert res.lines == 25
+    assert _countFileLines(out) == 25
+    assert res.expected is None  # oracle was dark
+
+
+def test_fetchOnePod_empty_window_skips_the_query(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    spec = _stubSpec()
+    fl = _FakeLoki([])  # no events anywhere
+    _installFakeLoki(monkeypatch, fl)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is True
+    assert res.lines == 0
+    assert fl.queryCalls == []  # oracle said 0 — never hit the query path
+    assert out.read_bytes() == b""
+
+
+def test_fetchOnePod_flags_incomplete_at_split_floor(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A burst denser than one batch within MIN_SPLIT_S can't be fetched
+    losslessly; we keep what we got but flag the pod rather than lie."""
+    spec = FetchSpec(
+        lokiAddr="https://loki",
+        username="u",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-05-20T08:00:00.000000Z",
+        toIso="2026-05-20T08:00:01.000000Z",  # exactly MIN_SPLIT_S wide
+    )
+    fromT, toT = fetch._parseIso(spec.fromIso), fetch._parseIso(spec.toIso)
+    fl = _FakeLoki(_evenEvents(fromT, toT, 12))  # 12 >= cap(10) in a 1s span
+    _installFakeLoki(monkeypatch, fl)
+    monkeypatch.setattr(fetch, "MIN_SPLIT_S", 1.0)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is False
+    assert res.reason  # carries a human-readable why
+    # Best-effort: we still keep the lines we did pull rather than dropping all.
+    assert res.lines == 12
+
+
+def test_run_logcli_streams_stdout_to_file_when_stdoutPath_given(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    out = tmp_path / "x.jsonl"
+
+    def fakeRun(cmd: list[str], **kw: Any) -> _FakeCompleted:
+        # Streaming mode passes an open file handle as stdout=; emulate
+        # logcli writing to it.
+        kw["stdout"].write(b"line1\nline2\n")
+        return _FakeCompleted(returncode=0)
+
+    monkeypatch.setenv("LOKI_PASSWORD", "x")
+    monkeypatch.setattr(fetch.subprocess, "run", fakeRun)
+    ret = fetch._run_logcli(_stubSpec(), ["query"], stdoutPath=out)
+    assert ret == b""
+    assert out.read_bytes() == b"line1\nline2\n"
 
 
 def test_fetchAll_happy_path_invokes_listPods_and_fetchOnePod(
@@ -575,11 +873,11 @@ def test_fetchAll_happy_path_invokes_listPods_and_fetchOnePod(
 
     fetched: list[str] = []
 
-    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> fetch._PodFetch:
         body = f'{{"pod":"{pod}"}}\n'.encode()
         outPath.write_bytes(body)
         fetched.append(pod)
-        return pod, len(body)
+        return fetch._PodFetch(pod=pod, nbytes=len(body), lines=1, expected=1, complete=True, reason="")
 
     # Force `windowInPast` false-positive to trigger a fresh fetch
     # (window is well in the past relative to "now").
@@ -608,11 +906,11 @@ def test_fetchAll_collects_per_pod_errors_without_bailing(
     def fakeListPods(_spec: FetchSpec) -> list[str]:
         return ["ok-pod", "bad-pod"]
 
-    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> fetch._PodFetch:
         if pod == "bad-pod":
             raise fetch.FetchError("simulated")
         outPath.write_bytes(b"{}\n")
-        return pod, 3
+        return fetch._PodFetch(pod=pod, nbytes=3, lines=1, expected=1, complete=True, reason="")
 
     monkeypatch.setattr(fetch, "listPods", fakeListPods)
     monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
@@ -629,9 +927,9 @@ def test_fetchAll_progress_callback_fires_per_pod(
     def fakeListPods(_spec: FetchSpec) -> list[str]:
         return ["a", "b", "c"]
 
-    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> fetch._PodFetch:
         outPath.write_bytes(b"x")
-        return pod, 1
+        return fetch._PodFetch(pod=pod, nbytes=1, lines=1, expected=1, complete=True, reason="")
 
     seen: list[tuple[str, int, int]] = []
 
@@ -666,13 +964,14 @@ def test_fetchAll_reuses_superset_when_no_exact_match(
                     "fromIso": "2026-05-20T08:00:00Z",
                     "toIso": "2026-05-20T09:00:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": None,
                 },
+                "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
                 "pod_count": 1,
                 "total_bytes": 0,
                 "pod_bytes": {},
                 "errors": {},
+                "fetchComplete": True,
                 "window_in_past": True,
                 "fromCache": False,
                 "cacheReuse": "none",
@@ -711,7 +1010,13 @@ def test_fetchAll_returns_exact_cache_hit_without_fetching(
     cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
     (cacheDir / "_meta.json").write_text(
         json.dumps(
-            {"spec": dt_asdict(spec), "pod_count": 1, "total_bytes": 0, "errors": {}},
+            {
+                "spec": dt_asdict(spec),
+                "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
+                "pod_count": 1,
+                "total_bytes": 0,
+                "errors": {},
+            },
         )
     )
 
@@ -724,6 +1029,103 @@ def test_fetchAll_returns_exact_cache_hit_without_fetching(
     assert out == cacheDir
     assert meta["cacheReuse"] == "exact"
     assert meta["fromCache"] is True
+
+
+def test_fetchAll_refetches_when_cache_schema_outdated(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """A cache written by an older fetch schema (no ``fetchSchemaVersion``)
+    may be truncated, so it must NOT be re-served — we re-fetch instead.
+    This is what keeps a stale v1 (50k-capped) night out of the UI."""
+    spec = _stubSpec()
+    cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    # v1-style meta: note the absent fetchSchemaVersion field.
+    (cacheDir / "_meta.json").write_text(
+        json.dumps({"spec": dt_asdict(spec), "pod_count": 1, "total_bytes": 0, "errors": {}})
+    )
+
+    refetched: list[bool] = []
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        refetched.append(True)
+        return []
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    _, meta = fetch.fetchAll(spec)
+    assert refetched == [True], "outdated cache must be re-fetched, not re-served"
+    assert meta["cacheReuse"] == "none"
+    assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
+
+
+def test_fetchAll_marks_complete_when_all_pods_succeed(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        return ["a", "b"]
+
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> fetch._PodFetch:
+        outPath.write_bytes(b"x")
+        return fetch._PodFetch(pod=pod, nbytes=1, lines=1, expected=1, complete=True, reason="")
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    _, meta = fetch.fetchAll(_stubSpec())
+    assert meta["fetchComplete"] is True
+    assert meta["errors"] == {}
+    assert meta["incomplete_pods"] == {}
+    assert meta["pod_lines"] == {"a": 1, "b": 1}
+    assert meta["pod_expected"] == {"a": 1, "b": 1}
+    assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
+
+
+def test_fetchAll_marks_incomplete_when_a_pod_cannot_be_reconciled(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """A pod whose chunks couldn't be proven lossless (soft shortfall, not a
+    hard logcli error) lands in ``incomplete_pods`` and makes the whole
+    fetch incomplete — even though no exception was raised."""
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        return ["good", "lossy"]
+
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> fetch._PodFetch:
+        outPath.write_bytes(b"{}\n")
+        if pod == "lossy":
+            return fetch._PodFetch(
+                pod=pod, nbytes=3, lines=1, expected=99, complete=False, reason="burst too dense"
+            )
+        return fetch._PodFetch(pod=pod, nbytes=3, lines=1, expected=1, complete=True, reason="")
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    _, meta = fetch.fetchAll(_stubSpec())
+    assert meta["errors"] == {}  # nothing hard-failed
+    assert meta["incomplete_pods"] == {"lossy": "burst too dense"}
+    assert meta["fetchComplete"] is False
+    assert meta["pod_expected"]["lossy"] == 99
+
+
+def test_fetchAll_marks_incomplete_and_keeps_partial_bytes_on_pod_error(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """A streamed pod query that dies mid-download leaves a partial file.
+    We keep it (and count its bytes) but flag the pod errored and the
+    whole fetch incomplete — the signal the UI/CLI shout about."""
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        return ["bad"]
+
+    def fakeFetchOne(_spec: FetchSpec, pod: str, outPath: Path) -> tuple[str, int]:
+        outPath.write_bytes(b"partial\n")  # streamed some bytes...
+        raise fetch.FetchError("logcli timed out")  # ...then died
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    monkeypatch.setattr(fetch, "_fetchOnePod", fakeFetchOne)
+    cacheDir, meta = fetch.fetchAll(_stubSpec())
+    assert "bad" in meta["errors"]
+    assert meta["fetchComplete"] is False
+    assert meta["pod_bytes"]["bad"] == len(b"partial\n")
+    assert (cacheDir / "pods" / "bad.jsonl").read_bytes() == b"partial\n"
 
 
 def dt_asdict(spec: FetchSpec) -> dict[str, Any]:
@@ -783,13 +1185,14 @@ def test_findSupersetCache_matches_filtered_to_filtered(tmpCacheRoot: Path) -> N
                     "fromIso": fromIso,
                     "toIso": toIso,
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
+                "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
                 "pod_count": 1,
                 "total_bytes": 0,
                 "pod_bytes": {},
                 "errors": {},
+                "fetchComplete": True,
                 "window_in_past": True,
                 "fromCache": False,
                 "cacheReuse": "none",
@@ -879,7 +1282,6 @@ def test_evictToFit_handles_nested_night_caches(tmpCacheRoot: Path) -> None:
                     "fromIso": "2026-05-20T08:00:00Z",
                     "toIso": "2026-05-20T08:05:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
                 "pod_count": 1,
@@ -947,7 +1349,6 @@ def test_evictToFit_prunes_empty_window_parent_for_night_cache(tmpCacheRoot: Pat
                     "fromIso": "2026-05-20T08:00:00Z",
                     "toIso": "2026-05-20T08:05:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
                 "pod_count": 1,
@@ -995,3 +1396,45 @@ def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     removed = fetch.evictToFit(maxBytes=3000)
     assert unviewed in removed
     assert viewed.exists()
+
+
+# ----- ensureCacheSchemaCurrent (whole-cache flush on schema bump) ---------
+
+
+def test_ensureCacheSchemaCurrent_noop_on_empty_cache_and_writes_sentinel(
+    tmpCacheRoot: Path,
+) -> None:
+    removed = fetch.ensureCacheSchemaCurrent()
+    assert removed == 0
+    sentinel = tmpCacheRoot / fetch.CACHE_SCHEMA_SENTINEL
+    assert sentinel.read_text().strip() == str(fetch.CACHE_SCHEMA_VERSION)
+
+
+def test_ensureCacheSchemaCurrent_flushes_when_sentinel_absent(tmpCacheRoot: Path) -> None:
+    """A pre-existing cache from before the sentinel existed (older tool
+    version) is treated as stale: the whole tree is flushed."""
+    d = _writeCache(tmpCacheRoot, "yagan", "rapid-analysis", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z")
+    assert d.exists()
+    removed = fetch.ensureCacheSchemaCurrent()
+    assert removed == 1
+    assert not d.exists()
+    assert not (tmpCacheRoot / "yagan").exists()
+    assert (tmpCacheRoot / fetch.CACHE_SCHEMA_SENTINEL).read_text().strip() == str(fetch.CACHE_SCHEMA_VERSION)
+
+
+def test_ensureCacheSchemaCurrent_flushes_on_version_mismatch(tmpCacheRoot: Path) -> None:
+    (tmpCacheRoot / fetch.CACHE_SCHEMA_SENTINEL).write_text("2\n")
+    _writeCache(tmpCacheRoot, "yagan", "rapid-analysis", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z")
+    _writeCache(tmpCacheRoot, "manke", "rapid-analysis", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z")
+    removed = fetch.ensureCacheSchemaCurrent()
+    assert removed == 2  # both cluster trees gone
+    assert not any(p.is_dir() for p in tmpCacheRoot.iterdir())
+    assert (tmpCacheRoot / fetch.CACHE_SCHEMA_SENTINEL).read_text().strip() == str(fetch.CACHE_SCHEMA_VERSION)
+
+
+def test_ensureCacheSchemaCurrent_noop_when_already_current(tmpCacheRoot: Path) -> None:
+    (tmpCacheRoot / fetch.CACHE_SCHEMA_SENTINEL).write_text(f"{fetch.CACHE_SCHEMA_VERSION}\n")
+    d = _writeCache(tmpCacheRoot, "yagan", "rapid-analysis", "2026-05-20T08:00:00Z", "2026-05-20T08:05:00Z")
+    removed = fetch.ensureCacheSchemaCurrent()
+    assert removed == 0
+    assert d.exists()  # current-schema cache survives untouched

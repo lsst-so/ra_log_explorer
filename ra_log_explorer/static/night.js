@@ -4,6 +4,8 @@
  * a one-page failure dashboard:
  *
  *   - Top stats (visits seen, tracebacks, distinct exception classes …)
+ *   - An incomplete-fetch banner and a gather-only banner (dataIds whose
+ *     step1b ran with no step1a — a dropped-step1a-logs tell)
  *   - Errors-by-type and errors-by-pod tables
  *   - Δshutter histograms for the first task pickup and calcZernikes end
  *   - Per-traceback failure list with click-to-expand drilldown
@@ -15,6 +17,10 @@ let nightListenersWired = false;
 
 function startNight(summary) {
   nightSummary = summary;
+  if (window.renderFetchBanner) {
+    window.renderFetchBanner(document.getElementById('night-fetch-banner'), summary);
+  }
+  renderGatherOnly(summary.gatherOnly || []);
   document.getElementById('night-dayobs-display').textContent = `dayObs=${summary.dayObs}`;
   document.getElementById('night-window-display').textContent =
     `(${summary.startTime} → ${summary.endTime})`;
@@ -40,8 +46,12 @@ function startNight(summary) {
     summary.histograms.calcZernikesEnd,
   );
   renderFailures(summary.failures);
+  renderRestarts(summary.restarts);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
+      // Drop the dayObs key out of the URL bar so a subsequent refresh
+      // lands on home — not back on whatever night we just left.
+      history.replaceState({}, '', window.location.pathname);
       if (window.showHome) window.showHome();
     });
     nightListenersWired = true;
@@ -60,6 +70,11 @@ function renderTopStats(stats) {
     { label: 'dataIds w/ traceback', value: stats.nDataIdsWithTraceback },
     { label: 'pods w/ traceback', value: stats.nPodsWithTraceback },
     { label: 'distinct exception classes', value: stats.nDistinctExceptionClasses },
+    {
+      label: 'pod restarts',
+      value: stats.nPodRestarts || 0,
+      accent: (stats.nPodRestarts || 0) > 0 ? 'warn' : null,
+    },
     { label: 'pods in fetch', value: stats.nPods },
   ];
   if (stats.nMissingShutterClose > 0) {
@@ -123,6 +138,73 @@ function asTd(text, klass) {
   if (klass) td.className = klass;
   td.textContent = text;
   return td;
+}
+
+// Tooltip (filter / exp time / image type / reason / …) for a dataId,
+// built from the night payload's exposureInfo map. '' when the record
+// wasn't resolved (no token, or a skipped id), so a hover just shows
+// nothing extra. Lets a user tell *what kind of image* a flagged dataId
+// is — e.g. spot a CWFS pair — without leaving the night view.
+function nightExposureTooltip(dataId) {
+  const info = (nightSummary && nightSummary.exposureInfo) || {};
+  const fn = window.exposureInfoTooltip;
+  return fn ? fn(info[String(dataId)]) : '';
+}
+
+// ----- gather-only warning --------------------------------------------------
+//
+// A gather (step1b) step aggregates step1a's per-detector output, so it
+// cannot run for a dataId unless step1a ran first. Seeing gather activity
+// with no step1a for the same dataId is physically impossible — it means the
+// fetch dropped the step1a lines (the grafana/loki#17270 symptom). We flag it
+// loudly because it also explains a biased "first task pickup" histogram:
+// with step1a gone, the earliest event left for that dataId is the gather.
+function renderGatherOnly(dataIds) {
+  const el = document.getElementById('night-gather-banner');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!dataIds || dataIds.length === 0) {
+    el.hidden = true;
+    return;
+  }
+  el.hidden = false;
+
+  const title = document.createElement('div');
+  title.className = 'fetch-banner-title';
+  title.textContent =
+    `⚠ ${dataIds.length} dataId${dataIds.length === 1 ? '' : 's'} show gather (step1b) `
+    + 'activity with no step1a — impossible unless the fetch dropped step1a logs';
+  el.appendChild(title);
+
+  const sub = document.createElement('div');
+  sub.className = 'fetch-banner-sub';
+  sub.textContent =
+    'Gather aggregates step1a output, so it cannot run without it. These are '
+    + 'almost certainly missing data (and bias the first-task-pickup histogram). '
+    + 'Re-fetch with force-refresh.';
+  el.appendChild(sub);
+
+  const list = document.createElement('div');
+  list.className = 'night-hist-bin-list';
+  const shown = dataIds.slice(0, 40);
+  for (const id of shown) {
+    const a = document.createElement('a');
+    a.className = 'night-hist-bin-id mono';
+    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.target = '_blank';
+    a.rel = 'noopener';
+    a.textContent = String(id);
+    const tip = nightExposureTooltip(id);
+    if (tip) a.title = tip;
+    list.appendChild(a);
+  }
+  el.appendChild(list);
+  if (dataIds.length > shown.length) {
+    const more = document.createElement('div');
+    more.className = 'fetch-banner-sub muted';
+    more.textContent = `+${dataIds.length - shown.length} more (see the night cache _meta.json / re-fetch)`;
+    el.appendChild(more);
+  }
 }
 
 // ----- histograms (SVG, no D3 — just a few <rect>s) ------------------------
@@ -281,6 +363,8 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
+    const tip = nightExposureTooltip(id);
+    if (tip) a.title = tip;
     list.appendChild(a);
   }
   panel.appendChild(list);
@@ -301,7 +385,12 @@ function renderFailures(rows) {
     const tr = document.createElement('tr');
     tr.className = 'night-failure-row';
     tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));
-    tr.appendChild(asTd(r.dataId == null ? '?' : String(r.dataId), 'mono'));
+    const idTd = asTd(r.dataId == null ? '?' : String(r.dataId), 'mono');
+    if (r.dataId != null) {
+      const tip = nightExposureTooltip(r.dataId);
+      if (tip) idTd.title = tip;
+    }
+    tr.appendChild(idTd);
     tr.appendChild(asTd(r.offsetS == null ? '—' : fmtOffset(r.offsetS), 'mono'));
     tr.appendChild(asTd(r.pod, 'mono night-pod-cell'));
     tr.appendChild(asTd(r.excClass, 'mono'));
@@ -427,4 +516,67 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
     {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]
   ));
+}
+
+// ----- pod restarts / deaths table ------------------------------------------
+//
+// POD_* lifecycle events from the k8s/events stream (see parse.classifyK8sEvent).
+// `[label, cssSuffix]` per kind; the cssSuffix matches the `.life-*` badge
+// colours in style.css and the timeline lifecycle markers.
+const LIFECYCLE_LABELS = {
+  POD_RESTARTED: ['restart', 'restart'],
+  POD_KILLED: ['killed', 'killed'],
+  POD_OOMKILLED: ['OOM-killed', 'oom'],
+  POD_FAILED: ['failed', 'podfail'],
+  POD_UNHEALTHY: ['unhealthy', 'podunhealthy'],
+};
+
+function renderRestarts(rows) {
+  const tbody = document.querySelector('#night-restarts tbody');
+  if (!tbody) return;
+  tbody.innerHTML = '';
+  rows = rows || [];
+  document.getElementById('night-restarts-count').textContent =
+    `(${rows.length} event${rows.length === 1 ? '' : 's'})`;
+  if (rows.length === 0) {
+    tbody.innerHTML =
+      '<tr><td colspan="6" class="muted">No pod restarts or deaths in this window 🎉</td></tr>';
+    return;
+  }
+  for (const r of rows) {
+    const tr = document.createElement('tr');
+    tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));
+    // dataId the pod was processing when it died — clickable into its
+    // per-visit explore view, same as the failures table.
+    const idTd = document.createElement('td');
+    idTd.className = 'mono';
+    if (r.dataId == null) {
+      idTd.textContent = '?';
+    } else {
+      const a = document.createElement('a');
+      a.className = 'mono';
+      a.href = `/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`;
+      a.target = '_blank';
+      a.rel = 'noopener';
+      a.textContent = String(r.dataId);
+      const tip = nightExposureTooltip(r.dataId);
+      if (tip) a.title = tip;
+      idTd.appendChild(a);
+    }
+    tr.appendChild(idTd);
+    tr.appendChild(asTd(r.offsetS == null ? '—' : fmtOffset(r.offsetS), 'mono'));
+    tr.appendChild(asTd(r.pod, 'mono night-pod-cell'));
+    const evTd = document.createElement('td');
+    const [label, cls] = LIFECYCLE_LABELS[r.kind] || [r.kind, 'podfail'];
+    const badge = document.createElement('span');
+    badge.className = `life-badge life-${cls}`;
+    badge.textContent = label;
+    evTd.appendChild(badge);
+    tr.appendChild(evTd);
+    const msgCell = document.createElement('td');
+    msgCell.className = 'night-msg-cell';
+    msgCell.textContent = r.message || r.reason || '';
+    tr.appendChild(msgCell);
+    tbody.appendChild(tr);
+  }
 }

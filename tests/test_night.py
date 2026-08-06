@@ -130,6 +130,7 @@ def _stubSummary(
     tracebacks: list[parse.TracebackRecord] | None = None,
     events: list[parse.Event] | None = None,
     expIdsSeen: set[int] | None = None,
+    expIdFirstLast: dict[int, tuple[dt.datetime, dt.datetime]] | None = None,
 ) -> parse.PodSummary:
     return parse.PodSummary(
         pod=pod,
@@ -145,7 +146,13 @@ def _stubSummary(
         expIdsSeen=expIdsSeen or set(),
         events=events or [],
         tracebacks=tracebacks or [],
+        expIdFirstLast=expIdFirstLast or {},
     )
+
+
+def _lifeEv(pod: str, when: dt.datetime, kind: str, reason: str, message: str = "") -> parse.Event:
+    """A POD_* lifecycle Event, as classifyK8sEvent would emit (no dataId)."""
+    return parse.Event(pod=pod, t=when, kind=kind, level="warn", flavor=reason, message=message)
 
 
 def _tb(pod: str, when: dt.datetime, expId: int | None, cls: str, msg: str = "") -> parse.TracebackRecord:
@@ -446,3 +453,110 @@ def test_buildHistogram_single_value_no_dataIds_yields_empty_dataIdsByBin() -> N
     h = night.buildHistogram("only", "s", [5.0], dataIds=None)
     assert h.counts == [1]
     assert h.dataIdsByBin == []
+
+
+# ----- gatherOnlyDataIds (impossible gather-with-no-step1a) -----------------
+
+
+def test_gatherOnlyDataIds_flags_step1b_without_step1a() -> None:
+    # dataId 100: aos (step1a) AND step1b-aos (gather) — fine.
+    # dataId 200: step1b-aos only — impossible, gather can't precede step1a.
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100})
+    gather = _stubSummary("step1b-aos-0", "step1b-aos", expIdsSeen={100, 200})
+    assert night.gatherOnlyDataIds([aos, gather]) == [200]
+
+
+def test_gatherOnlyDataIds_empty_when_every_gather_has_step1a() -> None:
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100, 200})
+    gather = _stubSummary("step1b-aos-0", "step1b-aos", expIdsSeen={100, 200})
+    assert night.gatherOnlyDataIds([aos, gather]) == []
+
+
+def test_gatherOnlyDataIds_pairs_by_pipeline() -> None:
+    # Science gather (step1b) needs sfm; AOS gather (step1b-aos) needs aos.
+    # An aos for 300 does NOT satisfy a science step1b for 300.
+    sfmGather = _stubSummary("step1b-0", "step1b", expIdsSeen={300})
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={300})
+    assert night.gatherOnlyDataIds([sfmGather, aos]) == [300]
+
+
+def test_gatherOnlyDataIds_ignores_dataids_with_no_gather() -> None:
+    # A step1a-only dataId is normal (gather may simply not have run yet).
+    aos = _stubSummary("aos-0", "aos", expIdsSeen={100})
+    assert night.gatherOnlyDataIds([aos]) == []
+
+
+# ----- pod lifecycle (restarts / deaths) -----------------------------------
+
+
+def test_computeTopStats_counts_pod_restarts() -> None:
+    t = dt.datetime(2026, 6, 5, 2, 19, 9, tzinfo=dt.timezone.utc)
+    s1 = _stubSummary(
+        "aos-2",
+        "aos",
+        events=[
+            _lifeEv("aos-2", t, "POD_RESTARTED", "Started"),
+            _lifeEv("aos-2", t, "POD_KILLED", "Killing"),  # not a restart — excluded from the count
+        ],
+    )
+    s2 = _stubSummary("aos-3", "aos", events=[_lifeEv("aos-3", t, "POD_RESTARTED", "Started")])
+    stats = night.computeTopStats([s1, s2])
+    assert stats.nPodRestarts == 2
+
+
+def test_lifecycleRows_attributes_dataid_and_offset() -> None:
+    close = dt.datetime(2026, 6, 5, 2, 17, 30, tzinfo=dt.timezone.utc)
+    pickup = dt.datetime(2026, 6, 5, 2, 18, 0, tzinfo=dt.timezone.utc)
+    restart = dt.datetime(2026, 6, 5, 2, 19, 9, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "aos-2",
+        "aos",
+        events=[_lifeEv("aos-2", restart, "POD_RESTARTED", "Started", "Started container (restart #2)")],
+        expIdFirstLast={2026060400222: (pickup, restart)},
+    )
+    rows = night.lifecycleRows([s], shutterCloseByExpId={2026060400222: close})
+    assert len(rows) == 1
+    r = rows[0]
+    assert r.kind == "POD_RESTARTED"
+    assert r.reason == "Started"
+    assert r.dataId == 2026060400222  # attributed to the visit it was processing
+    assert r.offsetS == pytest.approx((restart - close).total_seconds())  # 99.0 s
+
+
+def test_lifecycleRows_picks_most_recent_pickup_for_attribution() -> None:
+    t0 = dt.datetime(2026, 6, 5, 2, 0, 0, tzinfo=dt.timezone.utc)
+    earlier = (t0, t0 + dt.timedelta(seconds=10))
+    later = (t0 + dt.timedelta(seconds=20), t0 + dt.timedelta(seconds=30))
+    restart = t0 + dt.timedelta(seconds=25)  # inside `later`'s span
+    s = _stubSummary(
+        "aos-2",
+        "aos",
+        events=[_lifeEv("aos-2", restart, "POD_RESTARTED", "Started")],
+        expIdFirstLast={111: earlier, 222: later},
+    )
+    rows = night.lifecycleRows([s])
+    assert rows[0].dataId == 222
+    assert rows[0].offsetS is None  # no shutter close supplied
+
+
+def test_lifecycleRows_excludes_pod_started_and_sorts_by_time() -> None:
+    t1 = dt.datetime(2026, 6, 5, 2, 10, 0, tzinfo=dt.timezone.utc)
+    t2 = dt.datetime(2026, 6, 5, 2, 19, 9, tzinfo=dt.timezone.utc)
+    s = _stubSummary(
+        "aos-2",
+        "aos",
+        events=[
+            _lifeEv("aos-2", t2, "POD_RESTARTED", "Started"),
+            _lifeEv("aos-2", t1, "POD_STARTED", "Started"),  # first start — must be dropped
+            _lifeEv("aos-2", t1, "POD_KILLED", "Killing"),
+        ],
+    )
+    rows = night.lifecycleRows([s])
+    assert [r.kind for r in rows] == ["POD_KILLED", "POD_RESTARTED"]  # POD_STARTED gone, time-sorted
+
+
+def test_lifecycleRows_empty_when_no_lifecycle_events() -> None:
+    s = _stubSummary(
+        "aos-2", "aos", events=[_ev(dt.datetime(2026, 6, 5, 2, 0, tzinfo=dt.timezone.utc), 1, "QUANTUM_DONE")]
+    )
+    assert night.lifecycleRows([s]) == []

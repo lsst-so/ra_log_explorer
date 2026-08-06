@@ -25,9 +25,12 @@ import pytest
 from ra_log_explorer import exposureTimes
 from ra_log_explorer import jobs as jobsModule
 from ra_log_explorer import server as serverModule
+from ra_log_explorer import sites as sitesModule
 from ra_log_explorer.config import FetchSpec
 from ra_log_explorer.jobs import JobManager
 from ra_log_explorer.server import ServerContext, _makeHandler
+
+from .conftest import FakeSiteCatalog  # for fixture typing
 
 RunningServer = tuple[str, int, ServerContext]
 
@@ -39,16 +42,22 @@ def _freePort() -> int:
 
 
 @pytest.fixture
-def runningServer(tmpCacheRoot: Path) -> Iterator[RunningServer]:
+def runningServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterator[RunningServer]:
     """Yield (host, port, ctx) for a server bound to an ephemeral port.
 
     Closes the socket and joins the serve_forever thread at teardown.
     Each test gets a clean cache root via the ``tmpCacheRoot`` fixture
-    so cache-listing tests don't see each other's leftovers.
+    so cache-listing tests don't see each other's leftovers, and the
+    in-test ``siteCatalog`` fixture so ConsDB calls land on a sandboxed
+    URL with a sandboxed token-file path.
     """
     from http.server import ThreadingHTTPServer
 
-    ctx = ServerContext(jobs=JobManager())
+    ctx = ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        defaultSiteName=siteCatalog.defaultName,
+    )
     handler = _makeHandler(ctx)
     port = _freePort()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
@@ -132,7 +141,6 @@ def test_cache_lists_completed_window(runningServer: RunningServer, tmpCacheRoot
                     "fromIso": "2026-05-20T08:45:34.267000Z",
                     "toIso": "2026-05-20T08:50:39.267000Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                 },
                 "fetched_at": "2026-05-21T15:00:00+00:00",
                 "pod_count": 42,
@@ -324,14 +332,331 @@ def test_summary_mode_field_distinguishes_exposure_from_night(
                 endTime=serverModule.dayObsEndUtc(20260521),
             )
         )
-    # Block the token lookup so the histogram code falls back to empty.
-    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
+    # Token file deliberately absent — the histogram code falls back
+    # to empty when there's no token to call ConsDB with.
     status, body = _get(host, port, "/api/summary?dayObs=20260521")
     assert status == 200
     assert body["loaded"] is True
     assert body["mode"] == "night"
     assert body["dayObs"] == 20260521
     assert body["stats"]["nTracebacks"] == 0
+
+
+# ----- /api/fetch-range + range summary -----------------------------------
+
+
+def test_range_fetch_validates_reversed_range(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900750,
+            "rangeStop": 2026051900722,  # < start
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:51:09.512",
+        },
+    )
+    assert status == 400
+    assert "greater than" in body["error"]
+
+
+def test_range_fetch_starts_job_and_populates_RangeState(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        # A range fetch is an all-pods window (no AOS pod-regex).
+        assert spec.podRegex is None
+        cacheDir = tmpCacheRoot / "fake-range"
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900722,
+            "rangeStop": 2026051900724,
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:46:36.267",
+        },
+    )
+    assert status == 202, body
+    jobId = body["jobId"]
+
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    assert body["kind"] == "range"
+    assert body["startId"] == 2026051900722
+    assert body["stopId"] == 2026051900724
+
+    with ctx.jobs.stateLock:
+        loaded = ctx.getRangeState(serverModule.rangeKey(2026051900722, 2026051900724))
+    assert loaded is not None
+    # No ConsDB token was configured, so only the client-resolved start
+    # and stop anchors got seeded (the middle id stays unresolved).
+    assert set(loaded.shutterCloseByExpId) == {2026051900722, 2026051900724}
+    # _range.txt was written so the cache lists as a range + rehydrates.
+    from ra_log_explorer.fetch import getCacheRange
+
+    assert getCacheRange(loaded.cacheDir) == (2026051900722, 2026051900724)
+
+
+def test_range_summary_index_and_per_dataId(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A loaded range serves a lightweight index payload, and the
+    per-dataId timeline when ``dataId`` is added."""
+    import datetime as _dt
+
+    from ra_log_explorer.server import RangeState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "range-1"
+    (cacheDir / "pods").mkdir(parents=True)
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026051900722,
+        stopId=2026051900724,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+    )
+    state.shutterCloseByExpId = {
+        2026051900722: base,
+        2026051900724: base + _dt.timedelta(seconds=20),  # 723 is a skipped integer
+    }
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+
+    # Index payload.
+    status, body = _get(host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["mode"] == "range"
+    assert body["nMissing"] == 1
+    assert [d["expId"] for d in body["dataIds"]] == [2026051900722, 2026051900724]
+
+    # Per-dataId timeline.
+    status, body = _get(
+        host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724&dataId=2026051900722"
+    )
+    assert status == 200, body
+    assert body["mode"] == "range-exposure"
+    assert body["expId"] == 2026051900722
+    assert "dataId=2026051900722" in body["podDetailQuery"]
+
+    # A skipped integer 404s.
+    status, body = _get(
+        host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724&dataId=2026051900723"
+    )
+    assert status == 404
+
+
+def test_range_summary_unloaded_when_unknown(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/api/summary?rangeStart=1&rangeStop=2")
+    assert status == 200
+    assert body["loaded"] is False
+
+
+def test_range_pod_endpoint_routes_through_range_state(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """/api/pod/<pod>?rangeStart=&rangeStop=&dataId= reads from the range's
+    shared cache, anchored at that dataId's shutter close."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+    from ra_log_explorer.server import RangeState
+
+    host, port, ctx = runningServer
+    cacheDir = tmpCacheRoot / "range-pod"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-sfm-runner-sfmworkerset-0"
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "some range log line\n",
+            }
+        )
+        + "\n"
+    )
+    summaries = _parse.summarizeAll(cacheDir)
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=summaries,
+        startId=2026051900722,
+        stopId=2026051900722,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+    )
+    state.shutterCloseByExpId = {2026051900722: base}
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+    status, body = _get(
+        host,
+        port,
+        f"/api/pod/{podName}?rangeStart=2026051900722&rangeStop=2026051900722&dataId=2026051900722",
+    )
+    assert status == 200, body
+    assert body["pod"] == podName
+    assert len(body["lines"]) == 1
+
+
+def test_cache_list_includes_range_kind(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A cache dir carrying a `_range.txt` sidecar lists as kind 'range'
+    with its [start, stop] bounds, so the UI can deep-link it back to the
+    range view."""
+    from ra_log_explorer.fetch import markCacheRange
+
+    host, port, _ctx = runningServer
+    d = tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085532_512000Z"
+    (d / "pods").mkdir(parents=True)
+    (d / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:45:34.267000Z",
+                    "toIso": "2026-05-20T08:55:32.512000Z",
+                    "workers": 8,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 5,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    markCacheRange(d, 2026051900722, 2026051900750)
+    status, body = _get(host, port, "/api/cache")
+    assert status == 200
+    rows = [w for w in body["windows"] if w["kind"] == "range"]
+    assert len(rows) == 1
+    assert rows[0]["rangeStart"] == 2026051900722
+    assert rows[0]["rangeStop"] == 2026051900750
+
+
+def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
+    """A range that isn't in memory is rebuilt from its on-disk cache.
+
+    Exercises the deep-link / post-eviction path end to end:
+    ``_findRangeCacheDir`` (matches the ``_range.txt`` bounds),
+    ``_siteForCacheDir`` (derives the site from the ``yagan`` cluster
+    path component), and ``_loadRangeFromCache`` (reads each in-range
+    shutter close from the per-site exposure-time cache only — no
+    ConsDB call on a sync request). None of this is touched by the
+    in-memory range tests above.
+    """
+    from ra_log_explorer.fetch import markCacheRange
+
+    host, port, ctx = runningServer
+    startId, stopId = 2026051900722, 2026051900724  # 723 is a skipped integer
+    window = (
+        tmpCacheRoot / "yagan" / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z"
+    )
+    (window / "pods").mkdir(parents=True)
+    (window / "pods" / "s-lsstcam-run-sfm-runner-sfmworkerset-0.jsonl").write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "a line in the range window\n",
+            }
+        )
+        + "\n"
+    )
+    (window / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-20T08:45:34.267000Z",
+                    "toIso": "2026-05-20T08:50:39.267000Z",
+                    "workers": 8,
+                },
+                "fetched_at": "2026-05-21T15:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "pod_bytes": {},
+                "errors": {},
+                "window_in_past": True,
+                "fromCache": False,
+                "cacheReuse": "none",
+            }
+        )
+    )
+    markCacheRange(window, startId, stopId)
+    # Only start + stop were ever resolved into the per-site cache (the
+    # original fetch had no token for the middle id, say).
+    exposureTimes.storeCachedRecord(
+        startId, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+    )
+    exposureTimes.storeCachedRecord(
+        stopId, {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science"}, siteName="summit"
+    )
+
+    # Fresh server: nothing loaded in memory, so this must rebuild from disk.
+    assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is None
+    status, body = _get(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
+    assert status == 200, body
+    assert body["loaded"] is True
+    assert body["mode"] == "range"
+    assert body["site"] == "summit"  # derived from the yagan cluster path component
+    assert body["nMissing"] == 1  # 723 had no cached shutter close
+    assert [d["expId"] for d in body["dataIds"]] == [startId, stopId]
+    # The curated record stored in the per-site cache rode through the
+    # rehydration into the navigator-chip payload (cache → record → JSON).
+    assert {d["expId"]: d["exposure"]["img_type"] for d in body["dataIds"]} == {
+        startId: "science",
+        stopId: "science",
+    }
+
+    # The rebuilt state is now resident for follow-up pod-detail requests.
+    with ctx.jobs.stateLock:
+        assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is not None
 
 
 def test_fetch_status_404_for_unknown_job(runningServer: RunningServer) -> None:
@@ -360,99 +685,143 @@ def test_pod_endpoint_404_when_dataId_not_loaded(runningServer: RunningServer) -
 # ----- _buildSpecFromRequest unit-level coverage --------------------------
 
 
-def test_buildSpecFromRequest_TAI_default() -> None:
-    spec, expId, tZero, password = serverModule._buildSpecFromRequest(
-        {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267"}
+def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> ServerContext:
+    return ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        defaultSiteName=siteCatalog.defaultName,
+    )
+
+
+def test_buildSpecFromRequest_TAI_default(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, expId, tZero, password = serverModule._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267"}
     )
     assert expId == 1
     # 37s TAI->UTC adjustment applied by default
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
+    # `site` defaults to the catalog's default_site (summit).
+    assert site.name == "summit"
     assert spec.cluster == "yagan"
     assert spec.namespace == "rapid-analysis"
     assert password is None
 
 
-def test_buildSpecFromRequest_UTC_opt_out() -> None:
-    _, _, tZero, _ = serverModule._buildSpecFromRequest(
-        {"exposureId": 1, "tZero": "2026-05-20T08:45:39.267", "tZeroUtc": True}
+def test_buildSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+    """An explicit ``site`` field overrides the catalog default. This is
+    the only knob clients have for picking the cluster now — we don't
+    accept cluster/namespace/lokiAddr in the body any more."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, _, _, _ = serverModule._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "bts"}
+    )
+    assert site.name == "bts"
+    assert spec.cluster == "manke"
+
+
+def test_buildSpecFromRequest_rejects_unknown_site(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    with pytest.raises(ValueError, match="No site"):
+        serverModule._buildSpecFromRequest(
+            ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "ghost"}
+        )
+
+
+def test_buildSpecFromRequest_UTC_opt_out(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, tZero, _ = serverModule._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:45:39.267", "tZeroUtc": True}
     )
     # No 37s offset applied
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
 
 
-def test_buildSpecFromRequest_password_passthrough() -> None:
-    _, _, _, password = serverModule._buildSpecFromRequest(
-        {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "password": "hunter2"}
+def test_buildSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, _, password = serverModule._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "password": "hunter2"}
     )
     assert password == "hunter2"
 
 
-def test_buildSpecFromRequest_rejects_missing_expId() -> None:
+def test_buildSpecFromRequest_rejects_missing_expId(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="exposureId"):
-        serverModule._buildSpecFromRequest({"tZero": "2026-05-20T08:46:16.267"})
+        serverModule._buildSpecFromRequest(ctx, {"tZero": "2026-05-20T08:46:16.267"})
 
 
-def test_buildSpecFromRequest_rejects_missing_tZero() -> None:
+def test_buildSpecFromRequest_rejects_missing_tZero(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="tZero"):
-        serverModule._buildSpecFromRequest({"exposureId": 1})
+        serverModule._buildSpecFromRequest(ctx, {"exposureId": 1})
 
 
-def test_buildSpecFromRequest_rejects_bad_tZero() -> None:
+def test_buildSpecFromRequest_rejects_bad_tZero(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="ISO"):
-        serverModule._buildSpecFromRequest({"exposureId": 1, "tZero": "not a date"})
+        serverModule._buildSpecFromRequest(ctx, {"exposureId": 1, "tZero": "not a date"})
 
 
 # ----- /api/exposure-time/<dataId> ----------------------------------------
 
 
-def _plantExposureTime(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-    obsEnd: str | None,
-) -> Path:
-    """Drop a fake token file in `tmp_path`, point the env at it, and stub
-    `urlopen` so queryIsot returns ``obsEnd`` (or ``None`` if no row).
-    """
-    tokFile = tmp_path / "tok"
-    tokFile.write_text("fake-token")
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tokFile))
-
+def _stubConsdb(monkeypatch: pytest.MonkeyPatch, obsEnd: str | None) -> None:
+    """Stub `urlopen` so a query returns a full-ish exposure row carrying
+    ``obs_end`` (or no row at all when ``obsEnd`` is None). The columns
+    mirror the curated record so tests can assert the richer fields the
+    endpoint now echoes back, not just the t-zero."""
     import io as _io
 
+    cols = ["exposure_id", "obs_end", "physical_filter", "img_type", "observation_reason", "exp_time"]
+
     def fakeUrlopen(req: object, **_kw: Any) -> object:
+        sql = json.loads(req.data.decode("utf-8"))["query"]  # type: ignore[attr-defined]
+        # Pull the queried id straight out of the SQL so single + IN()
+        # forms both echo a matching exposure_id.
+        digits = "".join(ch for ch in sql.split("exposure_id")[-1] if ch.isdigit())
+        eid = int(digits) if digits else 0
         payload = (
-            {"columns": ["obs_end"], "data": [[obsEnd]]}
+            {"columns": cols, "data": [[eid, obsEnd, "z_20", "science", "template_blob", 30.0]]}
             if obsEnd is not None
-            else {"columns": ["obs_end"], "data": []}
+            else {"columns": cols, "data": []}
         )
         return _io.BytesIO(json.dumps(payload).encode("utf-8"))
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
-    return tokFile
 
 
-def test_exposure_time_returns_isot(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_exposure_time_returns_record(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
-    # Steer the cache file into a tmp path so this run doesn't pollute
-    # (or accidentally read from) the developer's real cache.
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path / "cache"))
-    _plantExposureTime(monkeypatch, tmp_path, "2026-05-20T08:46:16.267000")
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, "2026-05-20T08:46:16.267000")
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 200
-    assert body == {
-        "dataId": 2026051900722,
-        "tZero": "2026-05-20T08:46:16.267000",
-        "scale": "TAI",
-        "fromCache": False,
-    }
+    assert body["dataId"] == 2026051900722
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"
+    assert body["scale"] == "TAI"
+    assert body["fromCache"] is False
+    assert body["site"] == "summit"
+    # The curated exposure record rides along so the home form can show
+    # the image properties before the fetch even starts.
+    assert body["exposure"]["physical_filter"] == "z_20"
+    assert body["exposure"]["img_type"] == "science"
+    assert body["exposure"]["obs_end"] == "2026-05-20T08:46:16.267000"
 
 
 def test_exposure_time_404_when_no_row_anywhere(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
-    _plantExposureTime(monkeypatch, tmp_path, None)
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, None)
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 404
@@ -460,21 +829,22 @@ def test_exposure_time_404_when_no_row_anywhere(
 
 
 def test_exposure_time_503_when_token_file_missing(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    runningServer: RunningServer,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tmp_path / "nope"))
+    # Token file never written.
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 503
-    assert "RSP token file not found" in body["error"]
+    assert "token file" in body["error"]
+    assert "summit" in body["error"]
 
 
 def test_exposure_time_503_when_token_file_empty(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    runningServer: RunningServer,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
-    tokFile = tmp_path / "tok"
-    tokFile.write_text("   \n")
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tokFile))
+    siteCatalog.writeSummitToken("   \n")
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 503
@@ -482,66 +852,234 @@ def test_exposure_time_503_when_token_file_empty(
 
 
 def test_exposure_time_returns_cached_without_calling_consdb(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
     """If the dataId is already in the on-disk cache, the endpoint must
     short-circuit: no token needed, no ConsDB call. The cache is
     immutable (exposure end-times never change once recorded)."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    exposureTimes.storeCached(2026051900722, "2026-05-20T08:46:16.267000")
+    exposureTimes.storeCachedRecord(
+        2026051900722, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+    )
 
     def blowUp(*_args: object, **_kw: object) -> object:
         raise AssertionError("urlopen should not be reached on a cache hit")
 
     monkeypatch.setattr(exposureTimes, "urlopen", blowUp)
-    # No RSP_TOKEN_FILE_ENV either — the cache hit should remove the need.
-    monkeypatch.delenv(exposureTimes.RSP_TOKEN_FILE_ENV, raising=False)
-
+    # Token file deliberately absent — the cache hit must skip token lookup entirely.
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026051900722")
     assert status == 200
     assert body["tZero"] == "2026-05-20T08:46:16.267000"
     assert body["fromCache"] is True
+    assert body["exposure"]["img_type"] == "science"
 
 
 def test_exposure_time_writes_to_cache_on_consdb_hit(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
     """A successful ConsDB lookup persists the result so the next call
     is instant. The original `fromCache` is False to surface that the
     network was hit; subsequent calls report True."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    _plantExposureTime(monkeypatch, tmp_path, "2026-05-20T08:46:16.267000")
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, "2026-05-20T08:46:16.267000")
     host, port, _ = runningServer
     status1, body1 = _get(host, port, "/api/exposure-time/2026051900722")
     assert status1 == 200
     assert body1["fromCache"] is False
-    # Cache file now exists with the entry persisted.
-    assert exposureTimes.lookupCached(2026051900722) == "2026-05-20T08:46:16.267000"
+    # Cache file now exists with the record persisted under the summit site.
+    cached = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert cached is not None
+    assert exposureTimes.obsEnd(cached) == "2026-05-20T08:46:16.267000"
+    assert cached["img_type"] == "science"  # the richer columns landed too
 
 
-def test_exposure_time_accepts_tokenFile_query_param_override(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+def test_exposure_time_picks_site_from_query_param(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
 ) -> None:
-    """The env var points at a missing file but the UI sends a working
-    path via ?tokenFile=... — the override must win."""
-    monkeypatch.setenv(exposureTimes.RSP_TOKEN_FILE_ENV, str(tmp_path / "nope"))
-    overFile = tmp_path / "real-tok"
-    overFile.write_text("fake-token")
-
-    import io as _io
-
-    def fakeUrlopen(req: object, **_kw: Any) -> object:
-        return _io.BytesIO(
-            json.dumps({"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]}).encode("utf-8")
-        )
-
-    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    """``?site=bts`` redirects the lookup at the BTS ConsDB + token file
+    AND writes the resolved value into the bts cache. Without the
+    explicit site, the server would fall back to ``default_site`` (summit)
+    and the BTS lookup would have no path to succeed."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    siteCatalog.writeBtsToken()
+    _stubConsdb(monkeypatch, "2026-06-03T00:42:43.632000")
     host, port, _ = runningServer
-    qs = f"?tokenFile={overFile}"
-    status, body = _get(host, port, f"/api/exposure-time/2026051900722{qs}")
+    status, body = _get(host, port, "/api/exposure-time/2026060200001?site=bts")
     assert status == 200
-    assert body["tZero"] == "2026-05-20T08:46:16.267000"
+    assert body["site"] == "bts"
+    assert body["tZero"] == "2026-06-03T00:42:43.632000"
+    assert (
+        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="bts"))
+        == "2026-06-03T00:42:43.632000"
+    )
+    # And NOT under the summit cache — the per-site isolation is the
+    # whole point of this scoping.
+    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="summit") is None
+
+
+def test_exposure_time_400_for_unknown_site(runningServer: RunningServer) -> None:
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722?site=ghost")
+    assert status == 400
+    assert "No site" in body["error"]
+
+
+# ----- manual shutter-close stand-ins --------------------------------------
+
+
+def test_exposure_time_manual_standin_does_not_block_consdb(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """A manual stand-in is a fallback, not immutable truth — unlike a real
+    ConsDB cache hit it must NOT short-circuit the lookup. ConsDB is still
+    queried and its (authoritative) value wins, overwriting the stand-in."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-05-20T00:00:00.000000"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, "2026-05-20T08:46:16.267000")  # a different, real value
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is False
+    assert body["tZero"] == "2026-05-20T08:46:16.267000"  # ConsDB, not the stand-in
+    # And the real value has superseded the stand-in in the cache.
+    rec = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(rec) is False
+
+
+def test_exposure_time_falls_back_to_manual_when_token_missing(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """With no token (ConsDB unreachable for this user) a previously-stored
+    manual stand-in is surfaced rather than the 503 — so a one-off manual
+    fetch survives a browser refresh."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    # Token deliberately absent.
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is True
+    assert body["fromCache"] is True
+    assert body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
+def test_exposure_time_falls_back_to_manual_on_consdb_404(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """ConsDB has a token but no row for the id → the manual stand-in is
+    returned instead of the 404."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    _stubConsdb(monkeypatch, None)  # no row anywhere
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert status == 200
+    assert body["manual"] is True
+    assert body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
+def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch flagged ``tZeroManual`` persists a ``_manual`` exposure
+    record (so the explore view reopens without re-typing) and the loaded
+    state's reference point is labelled ``shutter close (manual)``."""
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        cacheDir = tmpCacheRoot / "fake-manual"
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch",
+        {
+            "exposureId": 2026051900722,
+            "tZero": "2026-06-24T14:38:41.380663",
+            "tZeroManual": True,
+        },
+    )
+    assert status == 202, body
+
+    # The stand-in lands in the cache immediately (at request time), tagged.
+    rec = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
+    assert exposureTimes.isManual(rec) is True
+    assert exposureTimes.obsEnd(rec) == "2026-06-24T14:38:41.380663"
+
+    jobId = body["jobId"]
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    with ctx.jobs.stateLock:
+        loaded = ctx.getExposureState(2026051900722)
+    assert loaded is not None
+    assert loaded.referencePoints[0]["label"] == "shutter close (manual)"
+
+
+def test_sites_endpoint_returns_catalog(runningServer: RunningServer) -> None:
+    """``/api/sites`` exposes the catalog so the UI can render the
+    switcher; token-file paths are stripped because they're server-side
+    only."""
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/sites")
+    assert status == 200
+    assert body["default_site"] == "summit"
+    names = sorted(s["name"] for s in body["sites"])
+    assert names == ["bts", "summit"]
+    for s in body["sites"]:
+        # No token file in the wire payload.
+        assert "consdbTokenFile" not in s
+        assert "tokenFile" not in s
+        assert s["consdbUrl"]
 
 
 # ----- DELETE /api/cache (single + all) -----------------------------------
@@ -561,7 +1099,6 @@ def _plantCacheDir(root: Path, cluster: str, namespace: str, slug: str) -> Path:
                     "fromIso": "2026-05-20T08:45:00Z",
                     "toIso": "2026-05-20T08:50:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                 },
                 "fetched_at": "2026-05-21T15:00:00+00:00",
                 "pod_count": 0,
@@ -586,6 +1123,28 @@ def test_delete_single_cache_window(runningServer: RunningServer, tmpCacheRoot: 
     assert status == 200
     assert body["windows"] == []
     assert not d.exists()
+
+
+def test_delete_night_cache_window_with_encoded_pods_segment(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Night caches nest under `pods=<slug>`; the client percent-encodes
+    each path segment, so the `=` arrives as `%3D`. The server must decode
+    it before resolving — otherwise the DELETE 404s and the row never goes
+    away (the bug this pins)."""
+    host, port, _ = runningServer
+    slug = "2026-05-30T120000Z__2026-05-31T120000Z"
+    nightDir = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug) / "pods=__aos__"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "_meta.json").write_text(
+        (tmpCacheRoot / "yagan" / "rapid-analysis" / slug / "_meta.json").read_text()
+    )
+    assert nightDir.exists()
+    # Exactly what the browser sends: encodeURIComponent per segment, so the
+    # pods= segment is `pods%3D__aos__`.
+    status, _ = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}/pods%3D__aos__")
+    assert status == 200
+    assert not nightDir.exists()
 
 
 def test_delete_unknown_cache_window(runningServer: RunningServer) -> None:
@@ -1005,7 +1564,6 @@ def test_cache_list_includes_lastViewedAt_and_dayObs(
                     "fromIso": "2026-05-21T12:00:00Z",
                     "toIso": "2026-05-22T12:00:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
                 "fetched_at": "2026-05-22T13:00:00+00:00",
@@ -1054,7 +1612,6 @@ def test_cache_list_includes_exposureIds_for_exposure_caches(
                     "fromIso": "2026-05-20T08:45:34.267000Z",
                     "toIso": "2026-05-20T08:50:39.267000Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                 },
                 "fetched_at": "2026-05-21T15:00:00+00:00",
                 "pod_count": 1,
@@ -1392,25 +1949,13 @@ def test_settings_put_rejects_bad_json_body(runningServer: RunningServer) -> Non
 # ----- _prefetchNightShutterCloses signalling ----------------------------
 
 
-def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
-    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
-) -> None:
-    """If the RSP token file doesn't exist, the prefetch pass must emit
-    a ``no-token`` event rather than raising into the job thread (which
-    would surface as an opaque "error" event)."""
+def _aosPodSummary(expId: int) -> Any:
+    """Test helper: a minimal AOS-group PodSummary with one expId event."""
     import datetime as _dt
 
-    from ra_log_explorer import exposureTimes as _et
     from ra_log_explorer import parse as _parse
-    from ra_log_explorer.config import FetchSpec
-    from ra_log_explorer.jobs import JobManager
-    from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
 
-    monkeypatch.delenv(_et.RSP_TOKEN_FILE_ENV, raising=False)
-    monkeypatch.setattr(_et, "DEFAULT_RSP_TOKEN_FILE", tmpCacheRoot / "no-such-token-file")
-    # A summary with one dataId that needs shutter close — without a
-    # token, the lookup can't proceed.
-    summary = _parse.PodSummary(
+    return _parse.PodSummary(
         pod="s-lsstcam-run-aos-worker-0",
         group="aos",
         instrument=None,
@@ -1427,10 +1972,25 @@ def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
                 t=_dt.datetime(2026, 5, 21, 13, 0, tzinfo=_dt.timezone.utc),
                 kind="WORKER_PICKUP",
                 level="info",
-                expId=2026052100050,
+                expId=expId,
             )
         ],
     )
+
+
+def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """If the site's ConsDB token file doesn't exist, the prefetch pass
+    must emit a ``no-token`` event rather than raising into the job
+    thread (which would surface as an opaque "error" event)."""
+    import datetime as _dt
+
+    from ra_log_explorer.config import FetchSpec
+    from ra_log_explorer.jobs import JobManager
+    from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
+
+    summary = _aosPodSummary(2026052100050)
     state = NightState(
         cacheDir=tmpCacheRoot,
         cacheBytes=0,
@@ -1439,6 +1999,7 @@ def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
         dayObs=20260521,
         startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
         endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+        siteName="summit",
     )
     jobs = JobManager()
     job = jobs.createNightJob(
@@ -1452,8 +2013,11 @@ def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
             podRegex=".*aos.*",
         ),
         20260521,
+        siteName="summit",
     )
-    _prefetchNightShutterCloses(state, [summary], job)
+    summit = sitesModule.siteByName(siteCatalog.catalog, "summit")
+    # Token file deliberately absent.
+    _prefetchNightShutterCloses(state, [summary], job, summit)
     phases = [ev["phase"] for ev in job.events if ev.get("type") == "shutter-close"]
     # The "starting" + "cache-checked" phases always fire; the final
     # phase must be "no-token" given there's no file.
@@ -1462,48 +2026,24 @@ def test_prefetchNightShutterCloses_no_token_emits_no_token_event(
 
 
 def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
-    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
 ) -> None:
     """An exception from the ConsDB batch query must surface as a
     ``consdb-error`` event, not propagate out of the worker."""
     import datetime as _dt
 
     from ra_log_explorer import exposureTimes as _et
-    from ra_log_explorer import parse as _parse
     from ra_log_explorer.config import FetchSpec
     from ra_log_explorer.jobs import JobManager
     from ra_log_explorer.server import NightState, _prefetchNightShutterCloses
 
-    # Plant a real token file so the no-token branch doesn't short-circuit.
-    tok = tmpCacheRoot / "tok"
-    tok.write_text("BEARER")
-    monkeypatch.setenv(_et.RSP_TOKEN_FILE_ENV, str(tok))
+    siteCatalog.writeSummitToken("BEARER")
 
-    def boom(*_a: Any, **_kw: Any) -> dict[int, str]:
+    def boom(*_a: Any, **_kw: Any) -> dict[int, dict]:
         raise _et.ConsDbError("synthetic 503")
 
-    monkeypatch.setattr(_et, "queryIsotBatch", boom)
-    summary = _parse.PodSummary(
-        pod="s-lsstcam-run-aos-worker-0",
-        group="aos",
-        instrument=None,
-        ordinal=None,
-        nLines=1,
-        nWarn=0,
-        nError=0,
-        nTraceback=0,
-        firstTs=None,
-        lastTs=None,
-        events=[
-            _parse.Event(
-                pod="p",
-                t=_dt.datetime(2026, 5, 21, 13, 0, tzinfo=_dt.timezone.utc),
-                kind="WORKER_PICKUP",
-                level="info",
-                expId=2026052100051,
-            )
-        ],
-    )
+    monkeypatch.setattr(_et, "queryExposureRecordBatch", boom)
+    summary = _aosPodSummary(2026052100051)
     state = NightState(
         cacheDir=tmpCacheRoot,
         cacheBytes=0,
@@ -1512,6 +2052,7 @@ def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
         dayObs=20260521,
         startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
         endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+        siteName="summit",
     )
     jobs = JobManager()
     job = jobs.createNightJob(
@@ -1525,8 +2066,10 @@ def test_prefetchNightShutterCloses_consdb_error_emits_error_event(
             podRegex=".*aos.*",
         ),
         20260521,
+        siteName="summit",
     )
-    _prefetchNightShutterCloses(state, [summary], job)
+    summit = sitesModule.siteByName(siteCatalog.catalog, "summit")
+    _prefetchNightShutterCloses(state, [summary], job, summit)
     phases = [ev["phase"] for ev in job.events if ev.get("type") == "shutter-close"]
     assert "consdb-error" in phases
 
@@ -1653,7 +2196,7 @@ def test_progress_sse_404_for_unknown_job(runningServer: RunningServer) -> None:
 
 
 def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
-    tmpCacheRoot: Path,
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
 ) -> None:
     """With no events that mention dataIds, there's nothing to look up
     — the function must exit early without emitting any progress
@@ -1686,6 +2229,7 @@ def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
         dayObs=20260521,
         startTime=_dt.datetime(2026, 5, 21, 12, 0, tzinfo=_dt.timezone.utc),
         endTime=_dt.datetime(2026, 5, 22, 12, 0, tzinfo=_dt.timezone.utc),
+        siteName="summit",
     )
     jobs = JobManager()
     job = jobs.createNightJob(
@@ -1699,7 +2243,9 @@ def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
             podRegex=".*aos.*",
         ),
         20260521,
+        siteName="summit",
     )
-    _prefetchNightShutterCloses(state, [summary], job)
+    summit = sitesModule.siteByName(siteCatalog.catalog, "summit")
+    _prefetchNightShutterCloses(state, [summary], job, summit)
     shutterEvents = [ev for ev in job.events if ev.get("type") == "shutter-close"]
     assert shutterEvents == []

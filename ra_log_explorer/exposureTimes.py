@@ -1,46 +1,82 @@
-"""Resolve a dataId to its shutter-close ISOT (TAI) via the RSP ConsDB.
+"""Resolve a dataId to its ConsDB exposure record via a ConsDB endpoint.
 
-The RSP exposes a SQL-style query endpoint at
-``https://usdf-rsp.slac.stanford.edu/consdb/query``. We POST a single
-``SELECT obs_end FROM cdb_<instrument>.exposure WHERE exposure_id = N``
-and get back a JSON envelope::
+The ConsDB exposes a SQL-style query endpoint at the site's
+``consdbUrl`` (USDF / summit RSP for summit data, ``base-lsp.lsst.codes``
+for the Base Test Stand sandbox). We POST a single ::
 
-    {"columns": ["obs_end"], "data": [["2026-05-20T08:46:16.267000"]]}
+    SELECT * FROM cdb_<instrument>.exposure WHERE exposure_id = N
 
-``obs_end`` is the shutter-close moment in **TAI**, matching the Butler
-`DimensionRecord.timespan.end.isot` convention — i.e. the same scale
-the previous JSON-file lookup returned, so the rest of the codebase
-needs no other change.
+and get back a JSON envelope of ``{"columns": [...], "data": [[...]]}``,
+which we project down to the curated :data:`EXPOSURE_RECORD_COLUMNS`
+(dropping huge geometry blobs like ``s_region``). The record carries
+``obs_end`` — the shutter-close moment in **TAI**, matching the Butler
+``DimensionRecord.timespan.end.isot`` convention — plus the human-facing
+properties the UI surfaces (filter, exposure time, image type, science
+program, observation reason, group/index, pointing, seeing, …) so a
+user can tell *what kind of image* a dataId is at a glance.
 
-A bearer token is required. By default we read it from
-``~/.lsst/log-browser-token.txt`` (the path the RSP team's own docs
-use), but the path is overridable both via the
-``RA_LOG_EXPLORER_RSP_TOKEN_FILE`` environment variable and via a
-per-request override the home-page UI sends. The token itself never
-appears in env-vars, URLs, or response bodies — only its file path.
+We ``SELECT *`` rather than an explicit column list so a column that's
+absent from a given instrument's schema can't break the query (the row
+is projected to whatever curated columns are present). ``obs_end`` is
+the only column every instrument's ``exposure`` table is assumed to
+carry, exactly as before.
+
+ConsDB URL and bearer-token file are **per site** (see :mod:`.sites`):
+the same dataId can refer to a real-camera exposure on the summit and a
+simulated exposure on BTS, with different records. Every helper here
+takes either a ``Site`` directly or its ``consdbUrl`` and the resolved
+bearer token explicitly, so callers can never accidentally mix sources.
 """
 
 from __future__ import annotations
 
 import json
-import os
 from collections.abc import Iterable
 from pathlib import Path
+from typing import Any
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from .config import cache_root
+from .sites import Site
 
 TAI_MINUS_UTC_S = 37.0
-RSP_TOKEN_FILE_ENV = "RA_LOG_EXPLORER_RSP_TOKEN_FILE"
-DEFAULT_RSP_TOKEN_FILE = Path.home() / ".lsst" / "log-browser-token.txt"
-CONSDB_URL = "https://usdf-rsp.slac.stanford.edu/consdb/query"
 
-# On-disk cache: `dataId (as string) -> obs_end ISO (TAI)`. Exposure
-# end-times are immutable once a record exists, so caching is free of
-# staleness concerns. The cache file lives next to the Loki window
-# cache so a `rm -rf ~/.cache/ra_log_explorer` still resets everything.
-EXPOSURE_TIME_CACHE_NAME = "exposure-times.json"
+# On-disk cache: per-site JSON file mapping ``dataId (as string) ->
+# exposure record (a JSON object of the columns below, including
+# ``obs_end``)``. Exposure properties are immutable once a row exists,
+# so caching is free of staleness concerns. The cache files live next
+# to the Loki window cache so a ``rm -rf ~/.cache/ra_log_explorer``
+# still resets everything.
+EXPOSURE_TIME_CACHE_DIR = "exposure-times"
+
+# Columns we keep from ``cdb_<instrument>.exposure``. Curated from the
+# 51-column table to the properties worth showing a user — what kind of
+# image this is and the context to make sense of its processing — while
+# dropping the megabyte-scale geometry blobs (``s_region``,
+# ``pgs_region``). ``obs_end`` is the shutter-close (TAI) t-zero; the
+# rest drive the explore-view info box and the dataId-link tooltips.
+EXPOSURE_RECORD_COLUMNS: tuple[str, ...] = (
+    "exposure_id",
+    "exposure_name",
+    "obs_start",
+    "obs_end",
+    "exp_time",
+    "physical_filter",
+    "band",
+    "img_type",
+    "science_program",
+    "observation_reason",
+    "target_name",
+    "group_id",
+    "cur_index",
+    "max_index",
+    "s_ra",
+    "s_dec",
+    "sky_rotation",
+    "airmass",
+    "dimm_seeing",
+)
 
 # Instruments to probe in order — first match wins. LSSTCam first because
 # that's where ~all current rapid-analysis traffic comes from; the rest
@@ -52,29 +88,16 @@ INSTRUMENTS_BY_PROBE_ORDER: tuple[str, ...] = (
     "lsstcomcamsim",
 )
 
+# One exposure's curated ConsDB columns: ``{column -> value}``. ``obs_end``
+# is a TAI ISO string; numeric columns are int/float; others may be None.
+ExposureRecord = dict[str, Any]
+
 
 class ConsDbError(RuntimeError):
     """The ConsDB query failed for a reason we can't recover from."""
 
 
-def rspTokenFilePath(override: str | None = None) -> Path:
-    """Resolve the path to read the RSP bearer token from.
-
-    Resolution order: explicit ``override`` (typically from the home
-    page UI), then ``RA_LOG_EXPLORER_RSP_TOKEN_FILE``, then the
-    default ``~/.lsst/log-browser-token.txt``. ``~`` is expanded
-    against the *server's* HOME — which is the user that started the
-    process, the only sensible interpretation.
-    """
-    if override:
-        return Path(override).expanduser()
-    fromEnv = os.environ.get(RSP_TOKEN_FILE_ENV)
-    if fromEnv:
-        return Path(fromEnv).expanduser()
-    return DEFAULT_RSP_TOKEN_FILE
-
-
-def readRspToken(path: Path) -> str:
+def readToken(path: Path) -> str:
     """Read and whitespace-strip the bearer token from ``path``.
 
     Raises :exc:`OSError` if the file can't be read; returns the empty
@@ -83,8 +106,42 @@ def readRspToken(path: Path) -> str:
     return path.read_text().strip()
 
 
-def queryIsot(dataId: int, token: str, instrument: str | None = None) -> str | None:
-    """Return the shutter-close ISO (TAI) for ``dataId``, or ``None``.
+def obsEnd(record: ExposureRecord | None) -> str | None:
+    """Extract the shutter-close ISO (TAI) from a record, or ``None``.
+
+    ``obs_end`` is the one column every code path that needs a t-zero
+    reads; pulling it through this helper keeps the "is it a usable
+    string" check in one place.
+    """
+    if not record:
+        return None
+    v = record.get("obs_end")
+    return v if isinstance(v, str) else None
+
+
+# A hand-entered shutter close: the user typed a timestamp because ConsDB
+# was down/unreachable or had no row for the dataId. We persist it to the
+# same per-site cache as a real record (so the explore view can be
+# reopened/refreshed without re-typing), but tag it so the live lookup
+# still prefers a real ConsDB answer once one becomes available — a manual
+# value is a stand-in, not the immutable truth a ConsDB row is.
+MANUAL_RECORD_KEY = "_manual"
+
+
+def manualRecord(obsEndTai: str) -> ExposureRecord:
+    """Build a minimal manual exposure record carrying just ``obs_end``."""
+    return {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+
+
+def isManual(record: ExposureRecord | None) -> bool:
+    """True if ``record`` is a hand-entered stand-in (see :func:`manualRecord`)."""
+    return bool(record and record.get(MANUAL_RECORD_KEY))
+
+
+def queryExposureRecord(
+    dataId: int, token: str, *, consdbUrl: str, instrument: str | None = None
+) -> ExposureRecord | None:
+    """Return the curated ConsDB exposure record for ``dataId``, or ``None``.
 
     If ``instrument`` is omitted we probe each of
     :data:`INSTRUMENTS_BY_PROBE_ORDER` in turn and return the first
@@ -93,22 +150,24 @@ def queryIsot(dataId: int, token: str, instrument: str | None = None) -> str | N
     """
     instruments = (instrument,) if instrument else INSTRUMENTS_BY_PROBE_ORDER
     for inst in instruments:
-        iso = _queryOne(dataId, token, inst)
-        if iso is not None:
-            return iso
+        rec = _queryOneRecord(dataId, token, inst, consdbUrl=consdbUrl)
+        if rec is not None:
+            return rec
     return None
 
 
-def queryIsotBatch(
+def queryExposureRecordBatch(
     dataIds: Iterable[int],
     token: str,
+    *,
+    consdbUrl: str,
     chunkSize: int = 500,
-) -> dict[int, str]:
+) -> dict[int, ExposureRecord]:
     """Resolve many dataIds in one round trip per instrument.
 
     For each instrument in :data:`INSTRUMENTS_BY_PROBE_ORDER` we send
-    a single SELECT ... WHERE exposure_id IN (...) covering whatever
-    dataIds are still unresolved. Returns ``{dataId: iso}`` for the
+    a single ``SELECT * … WHERE exposure_id IN (…)`` covering whatever
+    dataIds are still unresolved. Returns ``{dataId: record}`` for the
     matches found; dataIds with no row in any instrument's table
     simply don't appear in the output.
 
@@ -118,44 +177,63 @@ def queryIsotBatch(
     instrument, and the instrument loop short-circuits as soon as
     all dataIds have been resolved.
     """
-    out: dict[int, str] = {}
+    out: dict[int, ExposureRecord] = {}
     remaining = [int(x) for x in dataIds]
     for instrument in INSTRUMENTS_BY_PROBE_ORDER:
         if not remaining:
             break
-        found = _queryBatch(remaining, token, instrument, chunkSize)
+        found = _queryBatch(remaining, token, instrument, chunkSize, consdbUrl=consdbUrl)
         out.update(found)
         remaining = [d for d in remaining if d not in out]
     return out
 
 
-def _queryBatch(dataIds: list[int], token: str, instrument: str, chunkSize: int) -> dict[int, str]:
-    """Send one or more ``IN (...)`` queries against one instrument's table."""
-    out: dict[int, str] = {}
+def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
+    """Project one ConsDB result row to the curated record.
+
+    Only columns in :data:`EXPOSURE_RECORD_COLUMNS` that the table
+    actually returned are kept — so an instrument missing a column just
+    omits that key rather than failing.
+    """
+    idx = {c: i for i, c in enumerate(cols)}
+    out: ExposureRecord = {}
+    for c in EXPOSURE_RECORD_COLUMNS:
+        i = idx.get(c)
+        if i is not None and i < len(row):
+            out[c] = row[i]
+    return out
+
+
+def _queryBatch(
+    dataIds: list[int],
+    token: str,
+    instrument: str,
+    chunkSize: int,
+    *,
+    consdbUrl: str,
+) -> dict[int, ExposureRecord]:
+    """Send one or more ``IN (…)`` queries against one instrument's table."""
+    out: dict[int, ExposureRecord] = {}
     for i in range(0, len(dataIds), chunkSize):
         chunk = dataIds[i : i + chunkSize]
         idsSql = ",".join(str(d) for d in chunk)
-        sql = f"SELECT exposure_id, obs_end FROM cdb_{instrument}.exposure WHERE exposure_id IN ({idsSql})"
+        sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id IN ({idsSql})"
         try:
-            payload = _postQuery(sql, token)
+            payload = _postQuery(sql, token, consdbUrl=consdbUrl)
         except _UndefinedTableError:
             # This instrument has no schema — try the next one.
             return out
         cols = payload.get("columns") or []
         rows = payload.get("data") or []
-        try:
-            iIdCol = cols.index("exposure_id")
-            iIsoCol = cols.index("obs_end")
-        except ValueError:
+        if "exposure_id" not in cols:
             continue
         for row in rows:
+            rec = _recordFromRow(cols, row)
             try:
-                eid = int(row[iIdCol])
-                iso = row[iIsoCol]
-            except (IndexError, TypeError, ValueError):
+                eid = int(rec.get("exposure_id"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
                 continue
-            if isinstance(iso, str):
-                out[eid] = iso
+            out[eid] = rec
     return out
 
 
@@ -164,11 +242,11 @@ class _UndefinedTableError(Exception):
     should try the next instrument rather than surface this."""
 
 
-def _postQuery(sql: str, token: str) -> dict:
+def _postQuery(sql: str, token: str, *, consdbUrl: str) -> dict:
     """POST one SQL query, return the parsed JSON payload."""
     body = json.dumps({"query": sql}).encode("utf-8")
     req = Request(
-        CONSDB_URL,
+        consdbUrl,
         data=body,
         headers={
             "accept": "application/json",
@@ -194,73 +272,66 @@ def _postQuery(sql: str, token: str) -> dict:
         raise ConsDbError(f"ConsDB HTTP {e.code}: {e.reason}") from e
 
 
-def _queryOne(dataId: int, token: str, instrument: str) -> str | None:
-    """POST one SELECT against ``cdb_<instrument>.exposure`` for this id.
+def _queryOneRecord(dataId: int, token: str, instrument: str, *, consdbUrl: str) -> ExposureRecord | None:
+    """POST one ``SELECT *`` against ``cdb_<instrument>.exposure`` for this id.
 
     Returns ``None`` when this instrument's table doesn't have the row
     (or doesn't exist) so the caller can fall through to the next
-    instrument. Raises :exc:`ConsDbError` for anything else — bad
-    token, network failure, etc.
+    instrument. Shares :func:`_postQuery`'s error handling: a missing
+    row/table (400/404 or a 500 UndefinedTable) becomes an empty result;
+    anything else raises :exc:`ConsDbError`.
     """
-    body = json.dumps({"query": _sqlFor(dataId, instrument)}).encode("utf-8")
-    req = Request(
-        CONSDB_URL,
-        data=body,
-        headers={
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
+    sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id = {dataId}"
     try:
-        with urlopen(req, timeout=15.0) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except HTTPError as e:
-        errBody = ""
-        try:
-            errBody = e.read().decode("utf-8", "replace")
-        except Exception:  # noqa: BLE001 — body is best-effort
-            pass
-        # 400 / 404: row or table missing — try next instrument.
-        if e.code in (400, 404):
-            return None
-        # 500 with an "UndefinedTable" SQL error means we asked for an
-        # instrument table that doesn't exist (e.g. ConsDB dropped or
-        # renamed a schema). Treat as "no row here, try next" rather
-        # than failing the whole lookup — exactly how a stale entry in
-        # our instrument probe list should behave.
-        if e.code == 500 and ("UndefinedTable" in errBody or "does not exist" in errBody):
-            return None
-        raise ConsDbError(f"ConsDB HTTP {e.code}: {e.reason}") from e
+        payload = _postQuery(sql, token, consdbUrl=consdbUrl)
+    except _UndefinedTableError:
+        return None
     rows = payload.get("data") or []
     if not rows:
         return None
     cols = payload.get("columns") or []
-    try:
-        idx = cols.index("obs_end")
-    except ValueError:
-        return None
-    val = rows[0][idx]
-    return val if isinstance(val, str) else None
+    return _recordFromRow(cols, rows[0])
+
+
+# ----- site-aware convenience wrappers -------------------------------------
+
+
+def loadTokenForSite(site: Site) -> str:
+    """Read and return the bearer token for ``site.consdbTokenFile``.
+
+    Raises :exc:`OSError` if the file can't be read; returns the empty
+    string only if the file exists but is whitespace-only. Callers
+    check both conditions explicitly so they can report a clear UI
+    message ("token file missing" vs "token file empty") to the user.
+    """
+    return readToken(site.consdbTokenFile)
 
 
 # ----- on-disk cache --------------------------------------------------------
 
 
-def cachedExposureTimesPath() -> Path:
-    """Where we persist the dataId → obs_end map across runs."""
-    return cache_root() / EXPOSURE_TIME_CACHE_NAME
+def cachedExposureTimesPath(siteName: str) -> Path:
+    """Where we persist the per-site dataId → exposure-record map across runs.
+
+    Sites have separate files so a colliding bare dataId can't return
+    the wrong site's record (real-camera vs BTS-simulated values can
+    share a 13-digit id and *do not* share an immutable truth).
+    """
+    return cache_root() / EXPOSURE_TIME_CACHE_DIR / f"{siteName}.json"
 
 
-def lookupCached(dataId: int) -> str | None:
-    """Return a previously-cached ``obs_end`` for ``dataId``, or ``None``.
+def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
+    """Return a previously-cached exposure record for ``dataId`` under
+    this site, or ``None``.
 
     The cache is best-effort: any read error (missing file, invalid
     JSON, unexpected schema) is swallowed and we return ``None`` so the
-    caller falls through to a fresh ConsDB query.
+    caller falls through to a fresh ConsDB query. A legacy entry stored
+    as a bare ``obs_end`` string (the pre-record cache format) is read
+    back as ``{"obs_end": <str>}`` so the t-zero still resolves; the
+    richer columns simply fill in on the next fetch.
     """
-    p = cachedExposureTimesPath()
+    p = cachedExposureTimesPath(siteName)
     if not p.exists():
         return None
     try:
@@ -270,17 +341,32 @@ def lookupCached(dataId: int) -> str | None:
     if not isinstance(d, dict):
         return None
     val = d.get(str(dataId))
-    return val if isinstance(val, str) else None
+    if isinstance(val, dict):
+        return val
+    if isinstance(val, str):
+        return {"obs_end": val}
+    return None
 
 
-def storeCached(dataId: int, iso: str) -> None:
-    """Persist ``(dataId, iso)`` in the on-disk cache.
+def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str) -> None:
+    """Persist one ``(dataId, record)`` in the on-disk cache for this site."""
+    storeCachedRecords({int(dataId): record}, siteName=siteName)
+
+
+def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> None:
+    """Persist many ``(dataId, record)`` pairs in one read-modify-write.
 
     Best-effort: any I/O error is swallowed (the cache is purely an
-    optimisation). Records here never need to be invalidated — once a
-    `cdb_*.exposure.obs_end` row exists in ConsDB, it's immutable.
+    optimisation). Records never need to be invalidated — once a
+    ``cdb_*.exposure`` row exists in ConsDB, it's immutable. They are
+    plainly overwritten, though, which is how a real record supersedes a
+    ``_manual`` stand-in (see :func:`manualRecord`). Taking the whole
+    batch in one rewrite keeps a night-prefetch of hundreds of dataIds
+    from re-serialising the file once per id.
     """
-    p = cachedExposureTimesPath()
+    if not records:
+        return
+    p = cachedExposureTimesPath(siteName)
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         existing: dict = {}
@@ -291,17 +377,8 @@ def storeCached(dataId: int, iso: str) -> None:
                     existing = raw
             except (OSError, json.JSONDecodeError):
                 existing = {}
-        existing[str(dataId)] = iso
+        for eid, rec in records.items():
+            existing[str(eid)] = rec
         p.write_text(json.dumps(existing, sort_keys=True, indent=2))
     except OSError:
         pass
-
-
-def _sqlFor(dataId: int, instrument: str) -> str:
-    """SQL we'll send to ConsDB.
-
-    ``dataId`` is server-validated as ``int`` upstream and ``instrument``
-    comes from :data:`INSTRUMENTS_BY_PROBE_ORDER`, so neither needs
-    further escaping.
-    """
-    return f"SELECT obs_end FROM cdb_{instrument}.exposure WHERE exposure_id = {dataId}"

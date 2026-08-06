@@ -18,7 +18,9 @@ debugging a misbehaving fetch.
 |----------------------------------------|--------------------------------------------------------------|
 | Run any logcli command                | `fetch._run_logcli(spec, [...])`                            |
 | List pods in a window                  | `fetch.listPods(spec)`                                       |
-| Fetch one pod's JSONL                  | `fetch._fetchOnePod(spec, pod, outPath)`                     |
+| Fetch one pod's JSONL (chunked, safe)  | `fetch._fetchOnePod(spec, pod, outPath)`                     |
+| Count lines in a window (exact oracle) | `fetch._countOverTime(spec, pod, fromT, toT)`               |
+| Fetch one time-chunk single-batch      | `fetch._queryWindowToFile(spec, pod, fromT, toT, outPath)`  |
 | Whole-window fetch with caching        | `fetch.fetchAll(spec)`                                       |
 | Find a reusable wider cache            | `fetch.findSupersetCache(cluster, ns, fromIso, toIso)`       |
 | Parse Loki's timestamp string          | `parse._parseTimestamp(s)` (in `parse.py`, not `fetch.py`)   |
@@ -62,34 +64,84 @@ both, even when only one cluster is in scope today.
 Issuing a single broad `query` against the whole namespace and
 post-splitting the lines by pod would be simpler, but it has two
 problems:
-1. The per-stream `--limit` cap (50 000 by default in our `FetchSpec`)
-   is per-query, not per-stream; a broad query truncates noisy pods
-   first and silently drops events from the ones we care about.
+1. We fetch *every* line per pod (see *The #17270 line-loss bug* below).
+   A single broad query over the whole namespace would be far larger,
+   slower, and harder to bound; per-pod queries keep each download
+   independently sized and isolate one pod's failure (recorded in
+   `_meta.json`'s `errors`) instead of letting it take down the window.
 2. The on-disk cache is naturally indexed by pod (one `.jsonl` per pod);
    per-pod queries map straight onto that layout with no post-processing.
 
 If you ever change this, document the trade-off in
 [architecture/caching.md](../../../architecture/caching.md).
 
-### Required logcli flags for `query`
+### The #17270 line-loss bug (read before touching the fetch path)
+
+`logcli query --limit=0` does **not** reliably fetch every line. On wide,
+busy windows it silently drops entries (grafana/loki#17270): when a query
+response spans multiple Loki streams, logcli advances the next batch's
+cursor by the *global* max timestamp across streams, so a busier stream's
+tail falls into a 1 ns dedup gap and vanishes. A single `{pod=…}` is
+already ≥2 streams (by `detected_level`: info/unknown/warn), so a 24 h AOS
+night came back ~9 % short while still reporting itself complete. A finite
+`--limit` cap is *also* lossy (it tail-drops the busiest pods). So neither
+"limit=0" nor "limit=N" is safe on its own.
+
+The loss only happens when a query **paginates** — when some batch comes
+back full and logcli asks for another. `_fetchOnePod` exploits that:
+
+- **`_countOverTime`** uses `sum(count_over_time({pod}[range]))` as an
+  exact oracle. It's a *server-side aggregation* (no entry pagination), so
+  it's immune to the bug — `1717 == 1717` on a complete window. Use it to
+  presize chunks (target `CHUNK_TARGET_LINES`, below the batch size).
+  Mind the interval mismatch: a `[range]` selector at `--now=to` covers
+  `(to - range, to]`, but the fetch covers `[from, to)`. Round the range
+  **up** and pad it (we add 1 ms) so the count is a strict superset —
+  a zero count short-circuits the chunk's fetch entirely, so an
+  under-count there is a silent dropped line.
+- **`_queryWindowToFile`** fetches one chunk with
+  `--batch=SERVER_QUERY_CAP`. A chunk is trusted **only** when
+  `got < SERVER_QUERY_CAP` — proof it completed in one un-paginated
+  request, so the bug couldn't fire. The count is just an accelerator;
+  this structural check is what guarantees correctness (if the oracle is
+  unavailable the chunker blind-bisects and is still correct).
+- A chunk that fills a batch is discarded and re-fetched as two half-open
+  time halves, recursing until each fits. At the `MIN_SPLIT_S` floor an
+  unsplittable burst is flagged in `_meta.json`'s `incomplete_pods`.
+
+`SERVER_QUERY_CAP` **must equal** the cluster's `max_entries_limit_per_query`
+(≈5000). Setting `--batch` *above* the real cap breaks the trust check —
+a full server response would look non-full and logcli would stop early,
+silently truncating. Lowering it only costs extra (still-correct) chunking.
+
+### Required logcli flags for the per-pod `query`
 
 ```
 --quiet                  drop the API URL + common-labels preamble
 -o jsonl                 one JSON object per line, with labels preserved
 --forward                ascending time order; otherwise we'd need to
                          reverse the file before parsing
---limit=<N>              FetchSpec.lineLimit; default 50_000
+--limit=0                no client-side line cap…
+--batch=SERVER_QUERY_CAP …but bounded per request to the server cap, so a
+                         trusted (got < cap) chunk is provably un-paginated
 --from --to              RFC3339Nano UTC strings ending in 'Z'
 ```
 
 Drop any of these at your peril; tests assume the file is in `--forward`
-order and that `labels.detected_level` is present.
+order, that `labels.detected_level` is present, and that the batch size
+equals the cap. Each chunk is streamed straight to a temp file
+(`_run_logcli(spec, [...], stdoutPath=…)`) so a chatty pod can't blow up
+memory, then appended to the pod's `.jsonl` once trusted. The whole
+per-pod tree runs under `PER_POD_TIMEOUT_S` (1800 s); the oracle gets the
+shorter `COUNT_TIMEOUT_S`.
 
 ### Timestamps
 
-- `--from` / `--to` want RFC3339-ish strings; we format them via
-  `cli._isoForLogcli` as `YYYY-MM-DDTHH:MM:SS.uuuuuuZ`. Always pass UTC
-  with a trailing `Z`; don't supply a `+HH:MM` offset.
+- `--from` / `--to` / `--now` want RFC3339-ish strings; we format them as
+  `YYYY-MM-DDTHH:MM:SS.uuuuuuZ` via `cli._isoForLogcli` (window edges) and
+  `fetch._fmtLogcliTime` (split-chunk boundaries — same format, so chunk
+  edges stay consistent with the requested window). Always pass UTC with a
+  trailing `Z`; don't supply a `+HH:MM` offset.
 - Loki's response timestamps look like
   `"2026-05-20T09:45:46.216887282+01:00"` — i.e. **nanosecond**
   precision and **local-cluster offset** (the cluster runs in
@@ -104,8 +156,13 @@ the useful range; beyond that you start hitting Loki ingestion-side
 backpressure that manifests as occasional logcli timeouts (`_run_logcli`
 catches and reports those per-pod, so other pods keep going).
 
-If you raise `lineLimit` significantly above 50 000, raise the per-query
-timeout in `_run_logcli` proportionally — 600 s is the current cap.
+A chatty pod over a full night fans out into many count-presized chunks
+(plus the re-splits when a chunk overflows), each its own logcli process.
+That's why the per-pod budget is the generous `PER_POD_TIMEOUT_S` (1800 s)
+covering the whole tree, not the series default — bump it further if real
+nights start hitting it. The chunk count is more logcli invocations than
+the old one-query-per-pod, but each is bounded and the result is correct;
+the cache makes the cost a one-time hit per window.
 
 ## Error modes you should expect
 
@@ -115,7 +172,17 @@ timeout in `_run_logcli` proportionally — 600 s is the current cap.
   stderr; the most common non-fatal reason is a transient 502/504
   through nginx, retryable by re-running.
 - **`logcli timed out`** — happens when a pod's `.jsonl` is huge or the
-  cluster is busy. Drop `--workers` or narrow the window.
+  cluster is busy. Drop `--workers` or narrow the window. Any per-pod
+  failure (timeout / 5xx) lands in `_meta.json`'s `errors` map and flips
+  `fetchComplete` to `false`; that's surfaced loudly (red banner in the
+  UI, `INCOMPLETE FETCH` on the CLI) because a short window otherwise
+  passes for the whole night. Don't swallow these.
+- **Unreconcilable chunk (soft data-loss)** — a pod whose lines couldn't
+  be proven complete (a >cap burst inside `MIN_SPLIT_S` that can't be
+  split finer) lands in `_meta.json`'s **`incomplete_pods`** map (distinct
+  from `errors`: no exception was raised) and *also* flips `fetchComplete`
+  to `false`. Same loud surfacing. Implausible in practice, but it means
+  "missing data" not "fetch failed" — keep the two maps distinct.
 - **Empty per-pod output but the pod is in `listPods`** — Loki has a
   silent disagreement between the `series` index and the underlying
   blocks (rare but real). Treat as fetched and let the parser see an
@@ -125,12 +192,21 @@ timeout in `_run_logcli` proportionally — 600 s is the current cap.
 
 - **Streaming / `--tail`** support. The whole tool is snapshot-based;
   see "Non-goals" in [architecture/architecture.md](../../../architecture/architecture.md).
-- **A LogQL pipeline filter** like `|~ "..."` baked into the listPods
-  or per-pod fetch. We deliberately fetch every pod's lines and filter
-  *after* parsing — pre-filtering would bind the cache to a specific
-  search and prevent superset reuse. If you really want a server-side
-  filter, build a *second* code path that uses uncacheable streaming
-  queries, and document the divergence.
+- **A content LogQL pipeline filter** like `|~ "..."` baked into the
+  listPods or per-pod fetch. We deliberately fetch every pod's lines and
+  filter *after* parsing — pre-filtering would bind the cache to a
+  specific search and prevent superset reuse. (Note: `count_over_time`
+  in `_countOverTime` is a *metric* aggregation, not a content filter —
+  it doesn't fetch lines, so it doesn't bind the cache.) If you really
+  want a content filter, build a *second* code path that uses uncacheable
+  streaming queries, and document the divergence.
+- **Per-stream splitting** via `{pod} | detected_level="X"` to dodge
+  #17270 (each single response-stream paginates correctly). It's a valid
+  *alternative* complete fix and uses fewer queries for huge pods, but it
+  needs structured-metadata filtering plus a merge-sort across levels, so
+  it was deferred in favour of the assumption-free time-chunker. Mentioned
+  so you don't think it was overlooked — revisit only if chunk fan-out
+  becomes a real performance problem.
 - **`--retries`** on logcli. We rely on the user re-running on transient
   failures; the per-pod error map in `_meta.json` is enough signal.
 

@@ -650,6 +650,147 @@ def classify(line: LogLine) -> Event | None:
     return None
 
 
+# ----- k8s/events (pod lifecycle) parsing -----------------------------------
+#
+# The ``k8s/events`` Loki stream is a different shape from app logs: each
+# line is a flat ``key=value`` record with a quoted ``msg="…"`` tail, e.g.
+#
+#   name=… kind=Pod … reason=Started type=Normal count=2 msg="Started container run-aos-worker"
+#
+# so it gets its own parse + classify path (``classifyK8sEvent``), wholly
+# separate from the LSST-log-format ``classify`` above. We surface only the
+# lifecycle reasons that explain a pod dropping off the timeline — a
+# restart, kill, OOM, or probe failure — and drop the bulk of the chatter
+# (image pulls, sandbox setup, scheduling, container create). The specific
+# k8s ``reason`` rides along in ``flavor`` for the hover tooltip.
+#
+# These events carry no dataId: they're pod-global lifecycle facts, not
+# per-exposure ones, so ``expId`` is always None. The server includes them
+# on any pod already in a timeline, windowed by time (see ``server.
+# _summaryToDict``). All kinds share the ``POD_`` prefix so the UI can
+# style them as one family.
+
+# key=value, where the value is either a "double-quoted string" (the msg,
+# which can contain escaped quotes) or a bare non-space token.
+_K8S_KV_RE = re.compile(r'(\w+)=(?:"((?:[^"\\]|\\.)*)"|(\S+))')
+
+# k8s event reasons that mean "this container went down hard" (as opposed
+# to the graceful ``Killing`` of a rollout). Mapped to one POD_FAILED kind;
+# the precise reason is preserved in the event's ``flavor``.
+_POD_DOWN_REASONS: frozenset[str] = frozenset(
+    {"Failed", "BackOff", "Evicted", "Preempted", "NodeNotReady", "FailedKillPod"}
+)
+
+# The lifecycle event kinds, for consumers that want to recognise the
+# family without string-prefix sniffing. Kept in sync with the kinds
+# emitted by :func:`classifyK8sEvent`.
+LIFECYCLE_EVENT_KINDS: frozenset[str] = frozenset(
+    {"POD_OOMKILLED", "POD_KILLED", "POD_FAILED", "POD_UNHEALTHY", "POD_RESTARTED", "POD_STARTED"}
+)
+
+
+def _parseK8sEventFields(raw: str) -> dict[str, str]:
+    """Split a ``key=value`` k8s-event line into a dict.
+
+    Quoted values (the ``msg``) keep their interior spaces and have their
+    backslash escapes unwound; bare values are taken verbatim. Later keys
+    win on the (not-expected) chance of a duplicate.
+    """
+    fields: dict[str, str] = {}
+    for m in _K8S_KV_RE.finditer(raw):
+        quoted, bare = m.group(2), m.group(3)
+        if quoted is not None:
+            value = quoted.replace('\\"', '"').replace("\\\\", "\\")
+        else:
+            value = bare
+        fields[m.group(1)] = value
+    return fields
+
+
+def classifyK8sEvent(pod: str, jsonObj: dict) -> Event | None:
+    """Classify one ``k8s/events`` JSONL line into a pod-lifecycle Event.
+
+    Returns ``None`` for the bulk of lifecycle chatter (image pulls,
+    scheduling, container *create*) and for events whose involved object
+    isn't the Pod itself (a StatefulSet ``SuccessfulCreate`` names the set,
+    not the pod, and would mislabel the lane). The ``count`` field — k8s's
+    occurrence counter for the reason — is what distinguishes an in-place
+    container *restart* (``Started`` with ``count ≥ 2``) from the pod's
+    first start.
+    """
+    raw = jsonObj.get("line", "").rstrip("\n")
+    tsStr = jsonObj.get("timestamp", "")
+    if not tsStr:
+        return None
+    try:
+        t = _parseTimestamp(tsStr)
+    except ValueError:
+        return None
+    fields = _parseK8sEventFields(raw)
+    # Only Pod-object events describe a single pod's lifecycle. ``kind`` is
+    # absent on the odd malformed line; treat that as "could be a pod".
+    if fields.get("kind", "Pod") != "Pod":
+        return None
+    reason = fields.get("reason", "")
+    if not reason:
+        return None
+    try:
+        count = int(fields.get("count", "1"))
+    except ValueError:
+        count = 1
+
+    kind: str | None = None
+    level = "info"
+    if "OOM" in reason:  # OOMKilling (node-pressure) — rare but unambiguous
+        kind, level = "POD_OOMKILLED", "error"
+    elif reason in _POD_DOWN_REASONS:
+        kind, level = "POD_FAILED", "error"
+    elif reason == "Unhealthy":  # liveness/readiness probe failed
+        kind, level = "POD_UNHEALTHY", "warn"
+    elif reason == "Killing":  # container stopping (graceful rollout, or pre-restart)
+        kind, level = "POD_KILLED", "warn"
+    elif reason == "Started":
+        # count ≥ 2 ⇒ the container has started before in this pod, i.e. it
+        # died and was restarted in place — the signal that explains an
+        # abrupt mid-work gap in the app log (e.g. an OOM the kernel didn't
+        # ship us a message for).
+        kind, level = ("POD_RESTARTED", "warn") if count >= 2 else ("POD_STARTED", "info")
+    if kind is None:
+        return None
+
+    msg = fields.get("msg", "").strip()
+    node = fields.get("sourcehost") or fields.get("reportinginstance") or ""
+    if count >= 2 and kind == "POD_RESTARTED":
+        msg = f"{msg} (restart #{count})" if msg else f"restart #{count}"
+    detail = f"{msg}  ·  on {node}" if (msg and node) else (msg or (f"on {node}" if node else reason))
+    return Event(pod, t, kind, level, flavor=reason, message=detail, raw=raw)
+
+
+def iterPodEvents(eventsLogPath: Path) -> Iterator[Event]:
+    """Yield classified lifecycle Events from a pod's ``pods_events`` file.
+
+    Mirrors :func:`iterPodLines` but for the k8s/events stream: skips
+    unparseable lines and events that classify to nothing. Returns nothing
+    if the file is absent (the common case for a pod with no lifecycle
+    events in the window).
+    """
+    pod = eventsLogPath.stem
+    if not eventsLogPath.exists():
+        return
+    with eventsLogPath.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev = classifyK8sEvent(pod, obj)
+            if ev is not None:
+                yield ev
+
+
 # ----- per-pod summary ------------------------------------------------------
 
 
@@ -696,9 +837,27 @@ class TracebackRecord:
     pod: str
     t: dt.datetime  # time of the "Traceback (most recent…)" leader line
     expId: int | None  # carryover-attributed dataId, if any
-    excClass: str  # e.g. "RuntimeError" or "<unknown>" if no class line
+    # e.g. "RuntimeError". Three sentinel values surface a non-classified
+    # traceback, kept distinct so the UI can tell them apart:
+    #   "<unclassified>" — the traceback reached its terminating
+    #     exception line (a column-0 ``Foo: …`` shape) but that class
+    #     didn't match our classifier (e.g. ``StopIteration``, or a
+    #     custom class with no canonical Error/Exception/… suffix). The
+    #     record is *complete*; we just couldn't name the type.
+    #   "<truncated>"    — the traceback was genuinely cut short before
+    #     any terminating exception line: the log forwarder lost the
+    #     tail, another logger interleaved a line mid-stack, or the pod
+    #     log simply ended inside the frames.
+    #   "<unknown>"      — transient default while the body is still
+    #     being collected; always resolved to one of the two above at
+    #     finalisation. Never appears on a finished record.
+    excClass: str
     excMessage: str  # the rest of the exception line, capped
     body: str  # full traceback text, capped
+    # Set once we observe the traceback's terminating exception line
+    # (classified or not). Drives the <unclassified> vs <truncated>
+    # split in :func:`_finaliseTraceback`.
+    reachedTerminator: bool = False
 
 
 # How many lines / characters to capture for each traceback body. Bodies
@@ -733,6 +892,14 @@ _EXC_CLASS_RE = re.compile(
     r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
     r"(?:\s*:\s*(?P<msg>.*))?$"
 )
+# Broader "this is the terminating exception line of a traceback" shape:
+# a column-0 dotted identifier, optionally followed by ``: message``,
+# WITHOUT requiring the canonical class suffix. A superset of
+# _EXC_CLASS_RE. We use it only to decide whether a traceback *ended*
+# (reached its exception line) versus was cut short — not to name the
+# class. That keeps "complete but unclassifiable" (e.g. ``StopIteration``,
+# a custom ``Halt: …``) labelled <unclassified> rather than <truncated>.
+_EXC_TERMINATOR_RE = re.compile(r"^(?:[A-Za-z_]\w*\.)*[A-Za-z_]\w*(?:\s*:\s*.*)?$")
 
 
 def _isTracebackBodyLine(raw: str) -> bool:
@@ -758,7 +925,7 @@ def _isTracebackBodyLine(raw: str) -> bool:
 _TRACEBACK_LEAD = "Traceback (most recent call last):"
 
 
-def summarizePod(podLogPath: Path) -> PodSummary:
+def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSummary:
     pod = podLogPath.stem
     group = podGroup(pod)
     summary = PodSummary(
@@ -812,7 +979,19 @@ def summarizePod(podLogPath: Path) -> PodSummary:
                 if m and activeTb.excClass == "<unknown>":
                     activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]
                     activeTb.excMessage = (m.group("msg") or "").strip()[:200]
+                    activeTb.reachedTerminator = True
             else:
+                # A non-body line ends the traceback. If it's itself a
+                # column-0 exception-terminator shape we couldn't strictly
+                # classify (StopIteration, a custom Foo: …), the traceback
+                # is *complete* — capture the line and mark it so it lands
+                # as <unclassified>, not <truncated>. A genuinely foreign
+                # interrupt (an INFO line mid-stack) won't match, so it
+                # stays <truncated>.
+                if activeTb.excClass == "<unknown>" and _EXC_TERMINATOR_RE.match(ln.raw):
+                    if len(tbLines) < _TRACEBACK_MAX_LINES:
+                        tbLines.append(ln.raw)
+                    activeTb.reachedTerminator = True
                 _finaliseTraceback(activeTb, tbLines, summary)
                 activeTb = None
                 tbLines = []
@@ -838,27 +1017,50 @@ def summarizePod(podLogPath: Path) -> PodSummary:
     # we've collected so it isn't lost.
     if activeTb is not None:
         _finaliseTraceback(activeTb, tbLines, summary)
+    # Merge in the pod's k8s lifecycle events (restart/kill/OOM markers)
+    # from the parallel events stream, if it was fetched. They carry their
+    # own timestamps, so re-sort the combined list to keep the per-pod
+    # event stream time-ascending for the timeline.
+    if eventsLogPath is not None:
+        lifecycle = list(iterPodEvents(eventsLogPath))
+        if lifecycle:
+            summary.events.extend(lifecycle)
+            summary.events.sort(key=lambda e: e.t)
     return summary
 
 
 def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:
-    """Pack `lines` into `record.body` (capped) and attach to `summary`."""
+    """Pack `lines` into `record.body` (capped) and attach to `summary`.
+
+    Resolve the transient ``"<unknown>"`` excClass sentinel: a traceback
+    that reached its terminating exception line but didn't classify is
+    ``"<unclassified>"`` (complete, type unknown); one that ended before
+    any terminator is ``"<truncated>"`` (genuinely cut short). See the
+    ``excClass`` field doc on :class:`TracebackRecord` for why these are
+    kept distinct.
+    """
     body = "\n".join(lines)
     if len(body) > _TRACEBACK_MAX_CHARS:
         body = body[:_TRACEBACK_MAX_CHARS] + "\n…(traceback body truncated)"
     record.body = body
+    if record.excClass == "<unknown>":
+        record.excClass = "<unclassified>" if record.reachedTerminator else "<truncated>"
     summary.tracebacks.append(record)
 
 
 def summarizeAll(cacheDir: Path) -> list[PodSummary]:
     podsDir = cacheDir / "pods"
+    eventsDir = cacheDir / "pods_events"
     summaries: list[PodSummary] = []
     if not podsDir.exists():
         return summaries
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
             continue
-        summaries.append(summarizePod(podFile))
+        # The sibling pods_events/<pod>.jsonl is optional: absent for v3
+        # caches (pre-events) and for pods that had no lifecycle events.
+        eventsFile = eventsDir / podFile.name
+        summaries.append(summarizePod(podFile, eventsFile if eventsFile.exists() else None))
     return summaries
 
 

@@ -1,0 +1,31 @@
+# Per-deployment site catalog for ra_log_explorer.
+#
+# Each [[site]] entry pairs a Loki cluster with the ConsDB endpoint that
+# owns the "truth" about shutter-close times for that cluster's logs.
+# Cluster-vs-ConsDB pairing matters: the same dataId can resolve to a
+# different obs_end depending on whether the source is the summit
+# (real camera) or BTS (simulated, base test stand).
+#
+# `consdbTokenFile` is the absolute or `~`-relative path on the machine
+# running the server. Get tokens from the relevant RSP token page
+# (USDF / summit RSP for summit, base-lsp.lsst.codes for BTS).
+#
+# Override the path to this file at runtime with the
+# `RA_LOG_EXPLORER_SITES_FILE` env var.
+default_site = "summit"
+
+[[site]]
+name = "summit"
+cluster = "yagan"
+namespace = "rapid-analysis"
+lokiAddr = "https://loki-query.ls.lsst.org"
+consdbUrl = "https://usdf-rsp.slac.stanford.edu/consdb/query"
+consdbTokenFile = "~/.lsst/log-browser-token.txt"
+
+[[site]]
+name = "bts"
+cluster = "manke"
+namespace = "rapid-analysis"
+lokiAddr = "https://loki-query.ls.lsst.org"
+consdbUrl = "https://base-lsp.lsst.codes/consdb/query"
+consdbTokenFile = "~/.lsst/manke-token.txt"

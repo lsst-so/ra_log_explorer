@@ -97,6 +97,44 @@ def test_build_parser_cache_flush_with_yes() -> None:
     assert ns.yes is True
 
 
+def test_warnIfIncompleteFetch_silent_when_complete(capsys: pytest.CaptureFixture[str]) -> None:
+    cli._warnIfIncompleteFetch({"errors": {}, "incomplete_pods": {}}, "/tmp/cache")
+    assert capsys.readouterr().err == ""
+
+
+def test_warnIfIncompleteFetch_shouts_and_lists_failed_pods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    meta = {"errors": {"aos-worker-7": "logcli timed out", "sfm-runner-1": "rc=1: 502"}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "INCOMPLETE FETCH" in err
+    assert "2 pod(s) are missing data" in err
+    assert "aos-worker-7" in err and "sfm-runner-1" in err
+    assert "--force-refresh" in err
+
+
+def test_warnIfIncompleteFetch_surfaces_soft_incomplete_pods(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A pod flagged incomplete by the chunker (no hard error) must still
+    trigger the warning — that's the silent-data-loss case."""
+    meta = {"errors": {}, "incomplete_pods": {"aos-worker-0": "burst too dense to split"}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "INCOMPLETE FETCH" in err
+    assert "1 pod(s) are missing data" in err
+    assert "aos-worker-0" in err and "burst too dense" in err
+
+
+def test_warnIfIncompleteFetch_caps_the_pod_list(capsys: pytest.CaptureFixture[str]) -> None:
+    meta = {"errors": {f"pod-{i}": "boom" for i in range(20)}}
+    cli._warnIfIncompleteFetch(meta, "/tmp/cache")
+    err = capsys.readouterr().err
+    assert "20 pod(s) are missing data" in err
+    assert "and 8 more" in err  # 20 - 12 shown
+
+
 def test_cmdRun_rejects_partial_args(capsys: pytest.CaptureFixture[str]) -> None:
     """Supplying --exposure-id without --t-zero (or vice-versa) is an error."""
     # We test cmdRun directly rather than main(): main([]) would start the
@@ -176,7 +214,6 @@ def test_cmdCacheInfo_lists_night_caches_under_pods_subdir(
                     "fromIso": "2026-05-21T12:00:00Z",
                     "toIso": "2026-05-22T12:00:00Z",
                     "workers": 8,
-                    "lineLimit": 50000,
                     "podRegex": ".*aos.*",
                 },
                 "pod_count": 1,
@@ -284,10 +321,12 @@ def test_cmdCacheFlush_without_yes_respects_no_input(
 
 
 def test_main_no_args_dispatches_to_cmdRun(
+    tmpCacheRoot: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Passing no subcommand should land in cmdRun (the default).
-    We stub ``serve`` so we don't actually open a socket."""
+    We stub ``serve`` so we don't actually open a socket. ``tmpCacheRoot``
+    keeps main()'s startup schema-flush off the real user cache."""
     serveCalls: list[tuple] = []
 
     def fakeServe(host: str, port: int, ctx: cli.ServerContext) -> None:
@@ -334,7 +373,7 @@ def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args)
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
     # 08:46:16.267 TAI - 37s = 08:45:39.267 UTC.
     assert state.tZero.hour == 8 and state.tZero.minute == 45 and state.tZero.second == 39
     assert state.expId == 2026051900722
@@ -375,7 +414,7 @@ def test_eagerFetch_utc_flag_skips_tai_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args)
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
     # Same numeric value: no conversion applied.
     assert state.tZero.second == 39
 
@@ -432,7 +471,7 @@ def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: py
             "--no-browser",
         ]
     )
-    cli._eagerFetchAndBuildState(args)
+    cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
     assert captured["forceRefresh"] is True
 
 

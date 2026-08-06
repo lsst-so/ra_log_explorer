@@ -38,10 +38,7 @@ import webbrowser
 
 from . import parse as parser
 from .config import (
-    DEFAULT_CLUSTER,
     DEFAULT_HTTP_PORT,
-    DEFAULT_LOKI_ADDR,
-    DEFAULT_NAMESPACE,
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
@@ -59,12 +56,14 @@ from .config import (
 from .exposureTimes import TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    ensureCacheSchemaCurrent,
     fetchAll,
     humanBytes,
     stderrProgress,
 )
 from .jobs import JobManager
 from .server import ServerContext, ServerState, serve
+from .sites import Site, loadSites, siteByName
 
 
 def _parseIsoUtc(s: str) -> dt.datetime:
@@ -90,10 +89,14 @@ def _isoForLogcli(t: dt.datetime) -> str:
 
 
 def _addCommonArgs(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--loki-addr", default=DEFAULT_LOKI_ADDR)
+    p.add_argument(
+        "--site",
+        default=None,
+        help="Named site to fetch from (see ra_log_explorer/sites.toml). "
+        "Defaults to the catalog's `default_site`. Each site bundles a "
+        "Loki cluster/namespace/URL and the matching ConsDB endpoint.",
+    )
     p.add_argument("--username", default=DEFAULT_USERNAME)
-    p.add_argument("--cluster", default=DEFAULT_CLUSTER)
-    p.add_argument("--namespace", default=DEFAULT_NAMESPACE)
     p.add_argument(
         "--workers",
         type=int,
@@ -115,7 +118,43 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
     p.add_argument("--force-refresh", action="store_true", help="Re-fetch even if cached results exist")
 
 
-def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
+def _resolveSite(args: argparse.Namespace) -> Site:
+    """Look up the site named by --site (or the catalog default)."""
+    sites, defaultName = loadSites()
+    name = args.site or defaultName
+    return siteByName(sites, name)
+
+
+def _warnIfIncompleteFetch(meta: dict, cacheDir: object) -> None:
+    """Print a loud stderr warning if the fetch missed any pod's logs.
+
+    A window comes back short in two ways, both flagged here: a hard
+    per-pod logcli failure (``meta['errors']``) or a pod whose chunks
+    couldn't be reconciled to a lossless single-batch fetch
+    (``meta['incomplete_pods']`` — i.e. data the Loki #17270 bug may have
+    eaten). Either way the logs are missing data and easy to mistake for
+    complete, so we make it obvious.
+    """
+    errors = meta.get("errors") or {}
+    incomplete = meta.get("incomplete_pods") or {}
+    # Merge both failure modes for a single, ordered report. A pod that hard-
+    # failed takes precedence over a soft reconciliation shortfall.
+    problems = {**incomplete, **errors}
+    if not problems:
+        return
+    nFailed = len(problems)
+    print(
+        f"\n  *** INCOMPLETE FETCH: {nFailed} pod(s) are missing data — " "the logs may be misleading. ***",
+        file=sys.stderr,
+    )
+    for pod, why in list(problems.items())[:12]:
+        print(f"      - {pod}: {why}", file=sys.stderr)
+    if nFailed > 12:
+        print(f"      ... and {nFailed - 12} more (see {cacheDir}/_meta.json)", file=sys.stderr)
+    print("  Re-run with --force-refresh to retry.\n", file=sys.stderr)
+
+
+def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerState:
     """Do the CLI-side fetch + parse and return a populated `ServerState`."""
     tZeroInput = _parseIsoUtc(args.t_zero)
     if args.t_zero_utc:
@@ -125,6 +164,7 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
         tZero = tZeroInput - dt.timedelta(seconds=TAI_MINUS_UTC_S)
         tZeroScale = "TAI"
     print(
+        f"site:                   {site.name} (cluster={site.cluster})\n"
         f"t-zero (input, {tZeroScale}): {tZeroInput.isoformat()}\n"
         f"t-zero (used, UTC):     {tZero.isoformat()}",
         file=sys.stderr,
@@ -132,10 +172,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
     fromT = tZero - dt.timedelta(seconds=args.window_before)
     toT = tZero + dt.timedelta(seconds=args.window_after)
     spec = FetchSpec(
-        lokiAddr=args.loki_addr,
+        lokiAddr=site.lokiAddr,
         username=args.username,
-        cluster=args.cluster,
-        namespace=args.namespace,
+        cluster=site.cluster,
+        namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
         workers=args.workers,
@@ -161,11 +201,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace) -> ServerState:
             f"{humanBytes(meta['total_bytes'])} in {meta['elapsed_s']:.1f}s.",
             file=sys.stderr,
         )
-        if meta.get("errors"):
-            print(
-                f"  WARNING: {len(meta['errors'])} pods failed; see {cacheDir}/_meta.json",
-                file=sys.stderr,
-            )
+    # Loud, unmissable warning whenever the window came back short — in any
+    # branch, cache hit included. An incomplete fetch silently misleads
+    # (e.g. it biases the night Δshutter histograms), so we shout.
+    _warnIfIncompleteFetch(meta, cacheDir)
     cacheBytes = cacheDuSizeBytes(cache_root())
     print(f"Total cache: {humanBytes(cacheBytes)} at {cache_root()}", file=sys.stderr)
 
@@ -206,15 +245,23 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
         return 2
 
+    site = _resolveSite(args)
+    sites, defaultName = loadSites()
     state: ServerState | None = None
     if eager:
-        state = _eagerFetchAndBuildState(args)
+        state = _eagerFetchAndBuildState(args, site)
+        # Eager state belongs to the site we just fetched against.
+        state.siteName = site.name
         if args.no_serve:
             return 0
     else:
-        print("Starting in home mode — pick an exposure in the browser.", file=sys.stderr)
+        print(
+            f"Starting in home mode (site={site.name}, cluster={site.cluster}) — "
+            "pick an exposure in the browser.",
+            file=sys.stderr,
+        )
 
-    ctx = ServerContext(jobs=JobManager())
+    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName)
     if state is not None:
         ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}/"
@@ -341,6 +388,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     p = build_parser()
     args = p.parse_args(argv)
+    # Reconcile the on-disk cache to the current schema before doing anything.
+    # If CACHE_SCHEMA_VERSION was bumped, this flushes the whole tree once, up
+    # front, so no stale (possibly line-dropping) data is read and the user
+    # sees the re-fetch cost explicitly rather than one slow load at a time.
+    ensureCacheSchemaCurrent()
     if getattr(args, "fn", None) is None:
         # No subcommand: default to run (home mode if exposure args missing).
         args.fn = cmdRun

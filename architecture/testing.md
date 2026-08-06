@@ -47,14 +47,16 @@ The unit tests target the deterministic pieces of the codebase:
 | Log line parsing   | `parseLogLine` against the rapid-analysis Python log format and fallbacks (Z suffix, naive UTC, explicit offset, nano-precision trim, label-level priority, malformed JSON); `_normalizeLevel` warn/error alias buckets | `tests/test_parse.py`             |
 | Event classification | `classify` for every kind in [parsing.md](parsing.md), including `HEAD_INCOMING`, the `WORKER_REPORT_FAILED` variant, and the calibrate-quantum visit→expId fallback | `tests/test_parse.py`             |
 | Pod classification | `podGroup` (longest-prefix-match, order-independence regression, full real-pod fixture parametrisation), `podOrdinal`, `podInstrument`, `groupLabels` (defensive-copy contract) | `tests/test_parse.py`             |
-| Per-pod summary    | `summarizePod` against JSONL fixtures, including carryover (worker vs head), traceback capture (single, multi, chained, back-to-back, truncated body, no-class-line, blank-line termination), per-dataId first/last/wait stats; `tagLinesWithExpId` empty-input edge case; `podsTouchingExp` no-match base case | `tests/test_parse.py`             |
+| Per-pod summary    | `summarizePod` against JSONL fixtures, including carryover (worker vs head), traceback capture (single, multi, chained, back-to-back, truncated body, no-class-line split into `<unclassified>` vs `<truncated>`, blank-line termination), per-dataId first/last/wait stats; `tagLinesWithExpId` empty-input edge case; `podsTouchingExp` no-match base case | `tests/test_parse.py`             |
 | Cache paths        | `windowCachePath` determinism + slug-cleaning + per-`podRegex` nesting; `ensureWindowCacheDir` is the only I/O side; `NIGHT_AOS_POD_REGEX` constant pin; `dayObsStartUtc`/`dayObsEndUtc` (UTC-12 rollover + 24 h invariant + year-boundary alignment) | `tests/test_config.py`            |
 | Cache reuse        | `findSupersetCache` exact / superset / no-meta / partial-flag / smallest-wins / cross-mode isolation / filtered-to-filtered nesting | `tests/test_fetch.py`             |
 | Cache eviction     | `evictToFit` over flat exposure caches, nested night caches, exempt-set respect, unviewed-as-oldest, empty-parent-dir pruning (both layouts) | `tests/test_fetch.py`             |
 | Cache sidecars     | `addExposureToCache` / `getCacheExposureIds`, `markCacheViewed` / `getCacheLastViewed` round-trips and best-effort no-ops | `tests/test_fetch.py`             |
 | Misc helpers       | `humanBytes`, `fetch._parseIso` (timezone handling)                        | `tests/test_fetch.py`             |
 | `logcli` wrapping  | `_run_logcli` cmd construction, missing-binary / failed-RC / timeout error paths, `LOKI_PASSWORD` requirement, `_matcher` (default vs pod-pinned vs podRegex) | `tests/test_fetch.py`             |
-| fetchAll happy path | listPods + per-pod fetch with subprocess mocked; per-pod error capture; progress-callback firing; exact + superset cache hits; refetch when window is in the future; .partial flag while running | `tests/test_fetch.py`             |
+| fetchAll happy path | listPods + per-pod fetch with `_fetchOnePod` mocked; per-pod hard-error capture; soft `incomplete_pods` capture (unreconciled chunk, no exception); `pod_lines` / `pod_expected` in meta; `fetchComplete` iff both fall-short maps empty; progress-callback firing; exact + superset cache hits; refetch when window is in the future / schema outdated; .partial flag while running | `tests/test_fetch.py`             |
+| Chunked fetch (#17270) | `_countOverTime` instant-query construction (ms range, `--now`) + None-on-error; `_parseCountOutput` for the pretty-printed JSON array, line-by-line fallback, per-stream sum, garbage→None; `_queryWindowToFile` `--batch`==cap + line count; `_fetchOnePod` single-shot-under-cap, split-loses-nothing (presized), blind-bisect when oracle dark, empty-window-skips-query, floor→`incomplete` flag. Cluster calls modelled by an in-memory `_FakeLoki` stream with `SERVER_QUERY_CAP` shrunk | `tests/test_fetch.py`             |
+| Schema-version flush | `ensureCacheSchemaCurrent` no-op on empty/current cache (+ sentinel write), flush on sentinel mismatch, flush when sentinel absent (legacy cache), current-schema cache survives | `tests/test_fetch.py`             |
 | Task palette       | `_assignTaskColors` collision-freeness up to palette size + on real pipeline labels, stable across input reorders, pinned tasks honoured | `tests/test_server.py`            |
 | JSON serialisation | `_toJsonable` for `datetime`, `set`, dataclass, `Path`, nested containers | `tests/test_server.py`            |
 | `_summaryToDict`   | Target-expId filter, untagged-WARN windowing, per-pod summary stats (start/duration/QG-build/wait/looksTruncatedEnd), truncation flag scoped to worker groups | `tests/test_server.py`            |
@@ -62,11 +64,11 @@ The unit tests target the deterministic pieces of the codebase:
 | ServerContext      | Keyed `put`/`get`/LRU eviction for both exposure and night states; `evictByCacheDir` drops only matching entries (and is a no-op when nothing matches); two states coexist | `tests/test_server.py`            |
 | Night helpers      | `_taiIsoToUtc`, `_buildNightPayload` (histograms + stats + failures), `_podDetailForNight` (offset from night-start), `_tracebackContextForNight` None on unknown key | `tests/test_server.py`            |
 | Server-side helpers | `_resolveCacheWindow` path-component allowlist + `pods=`-prefix gate; `_buildNightSpecFromRequest` happy path + every validation error + password passthrough; `_maybeSetLokiPassword` sets / doesn't clobber an existing env var; `_parseClientIso` + `_isoForLogcli` parsing / UTC conversion | `tests/test_server.py`            |
-| `night.py` rollups | `computeTopStats`, `errorsByType` (sort + sample-message), `errorsByPod`, `firstTaskStartByDataId` (cross-pod min, None-expId skip), `calcZernikesEndByDataId` (substring match, ignores non-DONE), `buildHistogram` (binning, drops, dataId attribution, single-value, parallel-list validation), `computeDeltaShutterOffsets`, `failureRows` (offsetS / sort / unique bodyKey), `tracebackBody` round-trip; all rollups exercise their empty-input degenerate paths | `tests/test_night.py`             |
+| `night.py` rollups | `computeTopStats`, `errorsByType` (sort + sample-message), `errorsByPod`, `firstTaskStartByDataId` (cross-pod min, None-expId skip), `calcZernikesEndByDataId` (substring match, ignores non-DONE), `buildHistogram` (binning, drops, dataId attribution, single-value, parallel-list validation), `computeDeltaShutterOffsets`, `failureRows` (offsetS / sort / unique bodyKey), `tracebackBody` round-trip, `gatherOnlyDataIds` (step1b-without-step1a flag, pipeline pairing, no-gather and all-paired empty cases); all rollups exercise their empty-input degenerate paths | `tests/test_night.py`             |
 | Exposure-time lookup | `queryIsot` happy path, instrument fallthrough, no-row 404, 500 propagation, 500-UndefinedTable fallthrough, missing obs_end column. `queryIsotBatch` single-instrument-hit, multi-instrument fallthrough, chunking, UndefinedTable, malformed rows, missing-column-skip, empty-input short-circuit. `rspTokenFilePath` env-var + explicit-override + tilde-expand. `readRspToken` strip + missing file. `lookupCached` / `storeCached` round-trip + corrupt-recovery + non-string-value. `_sqlFor` wire format. `_postQuery` 400-as-empty + 503-as-error. | `tests/test_exposure_times.py` |
 | Job manager        | `FetchJob` event ordering, status transitions (pending→running→parsing→done), error path captures terminal `error` event, `onComplete` fires before `done` (verified by snapshotting `len(events)` from inside the callback), `startJob` runs in background, condvar wake. `createNightJob` distinct shape. `runJob` populates `cacheDir`/`meta`. `stateLock` is a real Lock (not RLock). | `tests/test_jobs.py`              |
 | HTTP endpoints     | Spins up the real server on an ephemeral port and hits it with `http.client`. Covers: `/api/summary` (empty / by-dataId / by-dayObs / 400-on-bad-int / mode-discriminator / LRU touch on hit), `/api/cache` (lists exposure + night, partial skipping, sidecar fields surfaced), `/api/fetch` + `/api/fetch-night` (body validation, 202 + status polling to done, NightState populated, podRegex on night spec), `/api/pod` (400 no key, 404 not loaded, valid-name allowlist), `/api/exposure-time/<>` (200 / 404 / 503-no-token / 503-empty-token / cache short-circuit / cache write / `?tokenFile=` override), `/api/night/traceback/<key>` (dataId-block context, time-window fallback, 404 unknown bodyKey, 400 bad-int dayObs), `DELETE /api/cache` (all + single + path-traversal-rejection + state-cleared-when-matching), `/api/settings` (GET + PUT round-trip + validation), SSE `/api/fetch/<id>/progress` (history replay + terminal close + 404), `_buildSpecFromRequest` (TAI/UTC, password passthrough, validation errors), `_prefetchNightShutterCloses` (no-token, consdb-error, short-circuit-when-empty) | `tests/test_server_endpoints.py` |
-| CLI parsing        | `_parseIsoUtc` for Z / no-offset / explicit-offset (positive and negative) / microseconds; `_isoForLogcli` Z suffix + UTC conversion; TAI constant pin; subparser arg parsing + `--t-zero-utc` flag; partial-args rejection; eager-fetch TAI→UTC conversion and `--t-zero-utc` opt-out; `--force-refresh` reaches fetchAll; `cache info` / `cache flush` behaviour (with-yes / decline-prompt / empty-cache-root / night-mode `pods=<slug>` row surfacing) | `tests/test_cli.py`               |
+| CLI parsing        | `_parseIsoUtc` for Z / no-offset / explicit-offset (positive and negative) / microseconds; `_isoForLogcli` Z suffix + UTC conversion; TAI constant pin; subparser arg parsing + `--t-zero-utc` flag; partial-args rejection; eager-fetch TAI→UTC conversion and `--t-zero-utc` opt-out; `--force-refresh` reaches fetchAll; `_warnIfIncompleteFetch` silent-when-clean / shouts on hard `errors` / shouts on soft `incomplete_pods` / caps the list; `cache info` / `cache flush` behaviour (with-yes / decline-prompt / empty-cache-root / night-mode `pods=<slug>` row surfacing) | `tests/test_cli.py`               |
 
 ### What we don't unit-test
 
@@ -129,7 +131,7 @@ python3 -m ra_log_explorer.cli \
     --no-browser
 ```
 
-Then `curl http://127.0.0.1:8765/api/summary?dataId=2026051900722`
+Then `curl http://127.0.0.1:8780/api/summary?dataId=2026051900722`
 and sanity-check:
 
 - `referencePoints` includes both stable refs (shutter close,
@@ -151,6 +153,30 @@ For night mode, point a browser at the home page and click
 - Clicking a failure row's drilldown returns the dataId's full
   processing block (or a fallback time window when carryover
   couldn't attribute it).
+- No red banners: the incomplete-fetch banner (`meta.errors` /
+  `meta.incomplete_pods` both empty) and the gather-only banner
+  (`gatherOnly` empty) — a populated gather-only banner means step1a
+  logs were dropped for those dataIds.
+
+**Verifying fetch completeness** (the #17270 fix). The fetch is lossless
+by construction (each chunk trusted only when `got < --batch`), but to
+confirm against the cluster, compare a busy pod's cached line count to the
+`count_over_time` oracle, which is server-side and immune to the bug:
+
+```bash
+# Lines we actually cached for one pod over the night window:
+wc -l <cache>/.../pods=__aos__/pods/<busy-aos-pod>.jsonl
+# What Loki says was there (ms range; -o jsonl is a pretty-printed array):
+logcli --username=… --addr=… --quiet instant-query \
+  'sum(count_over_time({cluster="yagan",namespace="rapid-analysis",pod="<busy-aos-pod>"}[86400000ms]))' \
+  --now=<toIso> -o jsonl
+```
+
+They should agree to within a handful of lines (the count covers
+`(from,to]`, the fetch `[from,to)`, so they differ only at the window
+edges). A gap of percent-scale means a regression — that's exactly the
+symptom #17270 produced before the chunker. (Live 2026-06-05, a 2 h busy
+window: chunker 56212 vs oracle 56227; the old `--limit=0` got 54091.)
 
 The first run for a given window takes 60–90 s (exposure) to
 several minutes (night). A second run for the same — or any

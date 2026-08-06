@@ -17,6 +17,11 @@
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
+      <div class="site-switcher" id="site-switcher" hidden>
+        <label for="site-select">site</label>
+        <select id="site-select"></select>
+        <span class="muted" id="site-info"></span>
+      </div>
     </header>
 
     <div id="home-layout">
@@ -29,6 +34,14 @@
                 <span class="lbl">dataId / exposure id</span>
                 <input type="number" name="exposureId" required placeholder="e.g. 2026051900722" />
                 <span id="tzero-status" class="hint">enter a 13-digit dataId to resolve its shutter close time</span>
+              </label>
+            </div>
+            <div class="row manual-tzero" id="manual-tzero" hidden>
+              <label>
+                <span class="lbl">manual shutter close (TAI)</span>
+                <input type="text" name="manualTZero" autocomplete="off" spellcheck="false"
+                       placeholder="e.g. 2026-06-24T14:38:41.380663" />
+                <span id="manual-tzero-status" class="hint">enter the shutter close as TAI ISO-8601, e.g. 2026-06-24T14:38:41.380663</span>
               </label>
             </div>
             <details>
@@ -49,6 +62,54 @@
               <span id="fetch-message" class="hint"></span>
             </div>
             <div id="fetch-progress" class="inline-progress" hidden>
+              <div class="progress-bar"><div class="progress-fill"></div></div>
+              <div class="progress-text hint"></div>
+            </div>
+          </form>
+        </section>
+
+        <section class="home-card">
+          <h2>Explore a range of exposures</h2>
+          <p class="hint">
+            Give a start and stop dataId. One Loki fetch covers the whole
+            span (shutter close of the start, through shutter close of the
+            stop plus the after-buffer) as a single cache block — far
+            cheaper than fetching each exposure's overlapping window
+            separately. Step through each exposure's timeline in the
+            explore view, anchored at its own shutter close. Skipped
+            integers in the range are expected and simply omitted.
+          </p>
+          <form id="range-form">
+            <div class="row">
+              <label>
+                <span class="lbl">start dataId</span>
+                <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
+                <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
+              </label>
+              <label>
+                <span class="lbl">stop dataId</span>
+                <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
+                <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
+              </label>
+            </div>
+            <details>
+              <summary>per-exposure tuning</summary>
+              <div class="row">
+                <label>
+                  <span class="lbl">window before start t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                </label>
+                <label>
+                  <span class="lbl">window after stop t<sub>0</sub> (s)</span>
+                  <input type="number" name="windowAfter" value="300" step="1" />
+                </label>
+              </div>
+            </details>
+            <div class="row submit-row">
+              <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
+              <span id="range-message" class="hint"></span>
+            </div>
+            <div id="range-progress" class="inline-progress" hidden>
               <div class="progress-bar"><div class="progress-fill"></div></div>
               <div class="progress-text hint"></div>
             </div>
@@ -117,34 +178,9 @@
           <form id="settings-form">
             <div class="row">
               <label>
-                <span class="lbl">cluster</span>
-                <input type="text" name="cluster" value="yagan" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">namespace</span>
-                <input type="text" name="namespace" value="rapid-analysis" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
                 <span class="lbl">parallel fetch workers</span>
                 <input type="number" name="workers" value="8" min="1" max="64" />
                 <span class="hint">used by both exposure &amp; night fetches</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">Loki URL</span>
-                <input type="text" name="lokiAddr" value="https://loki-query.ls.lsst.org" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">RSP token file</span>
-                <input type="text" name="rspTokenFile" placeholder="~/.lsst/log-browser-token.txt" autocomplete="off" />
-                <span class="hint">ConsDB shutter-close lookup; falls back to <code>RA_LOG_EXPLORER_RSP_TOKEN_FILE</code></span>
               </label>
             </div>
             <div class="row">
@@ -209,6 +245,30 @@
       </div>
     </header>
 
+    <!-- Loud warning shown only when the underlying fetch did not get
+         every pod's logs in full (a pod errored / timed out). Hidden on
+         a complete fetch. Populated by window.renderFetchBanner. -->
+    <div id="explore-fetch-banner" class="fetch-banner" hidden></div>
+
+    <!-- ConsDB exposure properties (filter, exp time, image type,
+         program, reason, …) for the loaded dataId. Populated by
+         explore.renderExposureInfoBox from summary.exposure; hidden when
+         ConsDB never resolved the record. -->
+    <div id="exposure-info" class="exposure-info" hidden></div>
+
+    <!-- Range navigator: only shown in range mode (range.js populates it
+         and app.js toggles its visibility). Lets you step between the
+         exposures in the fetched range; each loads its own timeline. -->
+    <section id="range-nav" hidden>
+      <div class="range-nav-head">
+        <span id="range-nav-label" class="muted"></span>
+        <span class="spacer"></span>
+        <button type="button" id="range-prev" class="mini" title="previous exposure (←)">◀ prev</button>
+        <button type="button" id="range-next" class="mini" title="next exposure (→)">next ▶</button>
+      </div>
+      <div id="range-chips" class="range-chips"></div>
+    </section>
+
     <section id="refs">
       <label for="ref-select">t<sub>0</sub>:</label>
       <select id="ref-select"></select>
@@ -233,6 +293,13 @@
         <span class="lg lg-mosaic">mosaic dispatch</span>
         <span class="lg lg-warn">WARN</span>
         <span class="lg lg-error">ERROR</span>
+      </div>
+      <div class="lg-block">
+        <strong>pod lifecycle:</strong>
+        <span class="lg lg-lifecycle lg-restart">restart</span>
+        <span class="lg lg-lifecycle lg-killed">killed</span>
+        <span class="lg lg-lifecycle lg-oom">OOM-killed</span>
+        <span class="lg lg-lifecycle lg-podunhealthy">unhealthy</span>
       </div>
       <div class="lg-block">
         <strong>tasks:</strong>
@@ -271,6 +338,12 @@
         <span id="night-cache-info"></span>
       </div>
     </header>
+
+    <!-- Loud warning when the night fetch did not get every pod's logs in
+         full. Critical here: a truncated/incomplete night silently biases
+         the Δshutter histograms. Populated by window.renderFetchBanner. -->
+    <div id="night-fetch-banner" class="fetch-banner" hidden></div>
+    <div id="night-gather-banner" class="fetch-banner" hidden></div>
 
     <main id="night-main">
       <section class="home-card" id="night-stats-card">
@@ -342,12 +415,39 @@
           <tbody></tbody>
         </table>
       </section>
+
+      <section class="home-card">
+        <h2>Pod restarts &amp; deaths <span class="muted" id="night-restarts-count"></span></h2>
+        <p class="hint">
+          Pod lifecycle events from Kubernetes (the <code>k8s/events</code>
+          stream). A <strong>restart</strong> is an in-place container
+          restart — most often an out-of-memory kill the kernel didn't log
+          to us — so a pod whose work stops mid-visit with no traceback
+          usually has a restart here. Each row is attributed to the dataId
+          the pod was processing at that moment; click it to open that
+          visit.
+        </p>
+        <table id="night-restarts">
+          <thead>
+            <tr>
+              <th>time</th>
+              <th>dataId</th>
+              <th>Δshutter</th>
+              <th>pod</th>
+              <th>event</th>
+              <th>detail</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
     </main>
   </section>
 
   <script src="/static/explore.js"></script>
   <script src="/static/home.js"></script>
   <script src="/static/night.js"></script>
+  <script src="/static/range.js"></script>
   <script src="/static/app.js"></script>
 </body>
 </html>

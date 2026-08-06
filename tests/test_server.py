@@ -3,12 +3,30 @@
 from __future__ import annotations
 
 import datetime as dt
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
 
-from ra_log_explorer import parse, server
+from ra_log_explorer import config, exposureTimes, parse, server, sites
+from ra_log_explorer.jobs import FetchJob, JobManager
+
+from .conftest import FakeSiteCatalog
+
+
+def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> server.ServerContext:
+    """Build a ServerContext seeded with the test catalog. Match what
+    `cli.cmdRun` does at startup so the unit-level tests of the request
+    builders exercise the same plumbing.
+    """
+    return server.ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        defaultSiteName=siteCatalog.defaultName,
+    )
+
 
 # ----- task palette -------------------------------------------------------
 
@@ -169,16 +187,22 @@ def test_summaryToDict_keeps_untagged_warn_only_in_work_window() -> None:
     assert kinds == ["WORKER_PICKUP", "WARN", "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE"]
 
 
-def test_summaryToDict_keeps_all_untagged_when_no_targeted_events() -> None:
-    # A pod with no explicitly-tagged events still gets its untagged
-    # warnings shown (e.g. head-node lines that don't mention an expId).
+def test_summaryToDict_anchors_untagged_window_on_tZero_when_no_targeted_events() -> None:
+    # A pod with no explicitly-tagged events for this dataId still surfaces
+    # its untagged warnings, but scoped to a t₀-anchored window rather than
+    # the whole (possibly very wide) fetch. This matters for range mode and
+    # superset-reuse exposure views, where "keep all untagged" would pull
+    # the entire span's warnings into a single dataId's timeline. The
+    # fallback window is (t₀ - DEFAULT_WINDOW_BEFORE_S, t₀ +
+    # DEFAULT_WINDOW_AFTER_S) = (t₀ - 5 s, t₀ + 300 s).
     tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
     events = [
-        _ev(tZero - dt.timedelta(seconds=60), "WARN", level="warn"),
-        _ev(tZero + dt.timedelta(seconds=60), "WARN", level="warn"),
+        _ev(tZero - dt.timedelta(seconds=60), "WARN", level="warn"),  # before window -> dropped
+        _ev(tZero + dt.timedelta(seconds=60), "WARN", level="warn"),  # inside window -> kept
+        _ev(tZero + dt.timedelta(seconds=3600), "WARN", level="warn"),  # far after -> dropped
     ]
     out = server._summaryToDict(_stubSummary(events), tZero, 2026051900722)
-    assert len(out["events"]) == 2
+    assert len(out["events"]) == 1
 
 
 # ----- _buildSummaryPayload reference points ------------------------------
@@ -465,6 +489,19 @@ def _makeNightState(dayObs: int, *, cacheDir: Path | None = None) -> server.Nigh
     )
 
 
+def _makeRangeState(startId: int, stopId: int, *, cacheDir: Path | None = None) -> server.RangeState:
+    return server.RangeState(
+        cacheDir=cacheDir or Path(f"/tmp/range-{startId}-{stopId}"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=startId,
+        stopId=stopId,
+        fromTime=dt.datetime(2026, 5, 20, 8, 45, tzinfo=dt.timezone.utc),
+        toTime=dt.datetime(2026, 5, 20, 8, 51, tzinfo=dt.timezone.utc),
+    )
+
+
 def _emptyCtx() -> server.ServerContext:
     from ra_log_explorer.jobs import JobManager
 
@@ -488,6 +525,26 @@ def test_put_then_get_night_state_roundtrips() -> None:
     n = _makeNightState(20260521)
     ctx.putNightState(n)
     assert ctx.getNightState(20260521) is n
+
+
+def test_put_then_get_range_state_roundtrips() -> None:
+    ctx = _emptyCtx()
+    r = _makeRangeState(2026051900722, 2026051900750)
+    ctx.putRangeState(r)
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is r
+
+
+def test_get_range_state_returns_None_when_unknown() -> None:
+    ctx = _emptyCtx()
+    assert ctx.getRangeState(server.rangeKey(1, 2)) is None
+
+
+def test_evictByCacheDir_drops_matching_range_state(tmp_path: Path) -> None:
+    ctx = _emptyCtx()
+    r = _makeRangeState(2026051900722, 2026051900750, cacheDir=tmp_path)
+    ctx.putRangeState(r)
+    ctx.evictByCacheDir(tmp_path)
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is None
 
 
 def test_two_exposures_coexist_independently() -> None:
@@ -544,6 +601,16 @@ def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
     out = server._taiIsoToUtc("2026-05-20T08:46:16.267000")
     expected = dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
     assert out == expected
+
+
+def test_utcToTaiIso_inverts_taiIsoToUtc() -> None:
+    """Persisting a hand-entered shutter close depends on this inverse: a
+    UTC tZero must serialise back to the exact TAI ``obs_end`` string it
+    came from, so the manual value round-trips through the per-site cache.
+    """
+    taiIso = "2026-06-24T14:38:41.380663"
+    utc = server._taiIsoToUtc(taiIso)
+    assert server._utcToTaiIso(utc) == taiIso
 
 
 # ----- _buildNightPayload --------------------------------------------------
@@ -611,6 +678,56 @@ def test_buildNightPayload_carries_histograms_and_stats() -> None:
     # Failures table carries our one record.
     assert len(payload["failures"]) == 1
     assert payload["failures"][0]["excClass"] == "RuntimeError"
+
+
+def test_buildNightPayload_carries_pod_restarts() -> None:
+    """A POD_RESTARTED lifecycle event lands in the night payload's
+    ``restarts`` list and ``stats.nPodRestarts``, attributed to the dataId
+    the pod was processing at the time."""
+    tShutter = dt.datetime(2026, 6, 5, 2, 17, 30, tzinfo=dt.timezone.utc)
+    tPickup = tShutter + dt.timedelta(seconds=30)
+    tRestart = tShutter + dt.timedelta(seconds=99)
+    pickupEv = parse.Event(pod="p", t=tPickup, kind="WORKER_PICKUP", level="info", expId=2026060400222)
+    restartEv = parse.Event(
+        pod="p",
+        t=tRestart,
+        kind="POD_RESTARTED",
+        level="warn",
+        flavor="Started",
+        message="Started container run-aos-worker (restart #2)  ·  on yagan01",
+    )
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=10,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=tPickup,
+        lastTs=tRestart,
+        expIdsSeen={2026060400222},
+        events=[pickupEv, restartEv],
+        expIdFirstLast={2026060400222: (tPickup, tRestart)},
+    )
+    state = server.NightState(
+        cacheDir=Path("/tmp/dummy"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        dayObs=20260604,
+        startTime=dt.datetime(2026, 6, 4, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 6, 5, 12, 0, tzinfo=dt.timezone.utc),
+        shutterCloseByExpId={2026060400222: tShutter},
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["stats"]["nPodRestarts"] == 1
+    assert len(payload["restarts"]) == 1
+    row = payload["restarts"][0]
+    assert row["kind"] == "POD_RESTARTED"
+    assert row["dataId"] == 2026060400222
+    assert row["offsetS"] == pytest.approx(99.0)
 
 
 def test_buildNightPayload_counts_missing_shutter_closes() -> None:
@@ -765,39 +882,300 @@ def test_evictByCacheDir_no_match_is_noop(tmp_path: Path) -> None:
 # ----- _buildNightSpecFromRequest -----------------------------------------
 
 
-def test_buildNightSpecFromRequest_happy_path() -> None:
+def test_buildNightSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> None:
     """A minimal valid body produces a FetchSpec with the AOS pod-regex
     pinned and the window set to the dayObs's noon-UTC bounds."""
-    spec, dayObs, password = server._buildNightSpecFromRequest({"dayObs": 20260521})
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, dayObs, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
     assert dayObs == 20260521
     assert password is None
+    assert site.name == "summit"  # falls back to default
     assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
     # Window: noon UTC dayObs → noon UTC dayObs+1.
     assert spec.fromIso.startswith("2026-05-21T12:00:00")
     assert spec.toIso.startswith("2026-05-22T12:00:00")
 
 
-def test_buildNightSpecFromRequest_rejects_missing_dayObs() -> None:
+def test_buildNightSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+    """The night-fetch endpoint accepts the same ``site`` field as the
+    exposure-fetch endpoint — picking BTS swaps both the Loki target
+    and the ConsDB endpoint used for the prefetch pass."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, _, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
+    assert site.name == "bts"
+    assert spec.cluster == "manke"
+
+
+def test_buildNightSpecFromRequest_rejects_missing_dayObs(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="dayObs"):
-        server._buildNightSpecFromRequest({})
+        server._buildNightSpecFromRequest(ctx, {})
 
 
-def test_buildNightSpecFromRequest_rejects_non_integer_dayObs() -> None:
+def test_buildNightSpecFromRequest_rejects_non_integer_dayObs(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="YYYYMMDD"):
-        server._buildNightSpecFromRequest({"dayObs": "tomorrow"})
+        server._buildNightSpecFromRequest(ctx, {"dayObs": "tomorrow"})
 
 
-def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs() -> None:
+def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs(siteCatalog: FakeSiteCatalog) -> None:
     """A YYYYMMDD outside the [1900, 3000] year band almost certainly
     means the caller passed something that isn't a dayObs — surface
     that as a 400 rather than letting a nonsense window go to Loki."""
+    ctx = _ctxWithSites(siteCatalog)
     with pytest.raises(ValueError, match="YYYYMMDD"):
-        server._buildNightSpecFromRequest({"dayObs": 12345})
+        server._buildNightSpecFromRequest(ctx, {"dayObs": 12345})
 
 
-def test_buildNightSpecFromRequest_password_passthrough() -> None:
-    _, _, password = server._buildNightSpecFromRequest({"dayObs": 20260521, "password": "hunter2"})
+def test_buildNightSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "password": "hunter2"})
     assert password == "hunter2"
+
+
+# ----- _buildRangeSpecFromRequest -----------------------------------------
+
+
+def _rangeBody(**overrides: object) -> dict:
+    body: dict = {
+        "rangeStart": 2026051900722,
+        "rangeStop": 2026051900750,
+        "tZeroStart": "2026-05-20T08:46:16.267",
+        "tZeroStop": "2026-05-20T08:51:09.512",
+    }
+    body.update(overrides)
+    return body
+
+
+def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> None:
+    """A valid body produces an all-pods spec whose window spans from the
+    start anchor (minus the before-buffer) to the stop anchor (plus the
+    after-buffer), with the TAI→UTC conversion applied to both anchors."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, site, startId, stopId, tZeroStart, tZeroStop, password = server._buildRangeSpecFromRequest(
+        ctx, _rangeBody()
+    )
+    assert (startId, stopId) == (2026051900722, 2026051900750)
+    assert password is None
+    assert site.name == "summit"  # default
+    assert spec.podRegex is None  # range is an all-pods fetch
+    # TAI inputs minus 37 s; default windowBefore=5, windowAfter=300.
+    # start 08:46:16.267 TAI -> 08:45:39.267 UTC -> minus 5 s = 08:45:34.267.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+    # stop 08:51:09.512 TAI -> 08:50:32.512 UTC -> plus 300 s = 08:55:32.512.
+    assert spec.toIso.startswith("2026-05-20T08:55:32.512")
+    # The returned anchors are the UTC shutter closes (window-defining).
+    assert tZeroStart == dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
+    assert tZeroStop == dt.datetime(2026, 5, 20, 8, 50, 32, 512000, tzinfo=dt.timezone.utc)
+
+
+def test_buildRangeSpecFromRequest_tZeroUtc_skips_conversion(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, _, _, _, tZeroStart, _, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
+    assert tZeroStart == dt.datetime(2026, 5, 20, 8, 46, 16, 267000, tzinfo=dt.timezone.utc)
+
+
+def test_buildRangeSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    _, site, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
+    assert site.name == "bts"
+
+
+def test_buildRangeSpecFromRequest_rejects_reversed_range(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    with pytest.raises(ValueError, match="greater than"):
+        server._buildRangeSpecFromRequest(ctx, _rangeBody(rangeStart=2026051900750, rangeStop=2026051900722))
+
+
+def test_buildRangeSpecFromRequest_rejects_oversize_span(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    start = 2026051900722
+    with pytest.raises(ValueError, match="exceeds"):
+        server._buildRangeSpecFromRequest(
+            ctx, _rangeBody(rangeStart=start, rangeStop=start + config.MAX_RANGE_SPAN + 1)
+        )
+
+
+def test_buildRangeSpecFromRequest_rejects_missing_anchor(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    body = _rangeBody()
+    del body["tZeroStart"]
+    with pytest.raises(ValueError, match="tZeroStart"):
+        server._buildRangeSpecFromRequest(ctx, body)
+
+
+def test_buildRangeSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    *_, password = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2"))
+    assert password == "hunter2"
+
+
+def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
+    """An empty browser number input serializes to JSON null; it must fall
+    back to the default window, not crash on ``float(None)`` (which the
+    handler doesn't catch — it would drop the connection with no
+    response)."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
+    # Defaults: start 08:45:39.267 − 5 s, stop 08:50:32.512 + 300 s.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+    assert spec.toIso.startswith("2026-05-20T08:55:32.512")
+
+
+def test_buildRangeSpecFromRequest_zero_window_is_preserved(siteCatalog: FakeSiteCatalog) -> None:
+    """``0`` is a legitimate window (start exactly at the shutter close)
+    and must not be coerced to the default."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
+    assert spec.fromIso.startswith("2026-05-20T08:45:39.267")
+
+
+def test_buildSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
+    """Same null-window robustness for the single-exposure endpoint, which
+    shares the window-parsing helper."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, *_ = server._buildSpecFromRequest(
+        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "windowBefore": None}
+    )
+    # 08:46:16.267 TAI − 37 s − default 5 s = 08:45:34.267.
+    assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
+
+
+# ----- range payloads -----------------------------------------------------
+
+
+def _rangeStateForPayload() -> server.RangeState:
+    """A RangeState over [722, 725] where 724 is a skipped integer, 725
+    resolved a shutter close but produced no logs, and 723 has a traceback."""
+    tb = parse.TracebackRecord(
+        pod="p",
+        t=dt.datetime(2026, 5, 20, 8, 46, tzinfo=dt.timezone.utc),
+        expId=2026051900723,
+        excClass="RuntimeError",
+        excMessage="boom",
+        body="Traceback ...",
+    )
+    summary = parse.PodSummary(
+        pod="p",
+        group="aos",
+        instrument=None,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=1,
+        nTraceback=1,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen={2026051900722, 2026051900723},
+        events=[],
+        tracebacks=[tb],
+    )
+    state = server.RangeState(
+        cacheDir=Path("/tmp/range"),
+        cacheBytes=0,
+        meta={},
+        summaries=[summary],
+        startId=2026051900722,
+        stopId=2026051900725,
+        fromTime=dt.datetime(2026, 5, 20, 8, 45, tzinfo=dt.timezone.utc),
+        toTime=dt.datetime(2026, 5, 20, 8, 51, tzinfo=dt.timezone.utc),
+    )
+    base = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    state.shutterCloseByExpId = {
+        2026051900722: base,
+        2026051900723: base + dt.timedelta(seconds=30),
+        2026051900725: base + dt.timedelta(seconds=90),  # resolved but no logs
+    }
+    state.exposureInfoByExpId = {
+        2026051900722: {"obs_end": base.isoformat(), "img_type": "science", "physical_filter": "z_20"},
+    }
+    return state
+
+
+def test_buildRangePayload_lists_resolved_dataIds_with_overview() -> None:
+    payload = server._buildRangePayload(_rangeStateForPayload())
+    assert payload["mode"] == "range"
+    assert payload["startId"] == 2026051900722 and payload["stopId"] == 2026051900725
+    # 4 candidate ids (722..725); 724 has no resolved shutter close.
+    assert payload["nMissing"] == 1
+    ids = payload["dataIds"]
+    assert [d["expId"] for d in ids] == [2026051900722, 2026051900723, 2026051900725]
+    byId = {d["expId"]: d for d in ids}
+    assert byId[2026051900723]["nTraceback"] == 1
+    assert byId[2026051900722]["hasLogs"] is True
+    assert byId[2026051900725]["hasLogs"] is False  # resolved but produced no logs
+    # The curated ConsDB record rides along per dataId for the chip tooltip
+    # (only 722 was resolved here; the others carry None).
+    assert byId[2026051900722]["exposure"]["img_type"] == "science"
+    assert byId[2026051900723]["exposure"] is None
+
+
+def test_buildRangeExposurePayload_carries_exposure_record() -> None:
+    state = _rangeStateForPayload()
+    payload = server._buildRangeExposurePayload(state, 2026051900722)
+    assert payload is not None
+    assert payload["exposure"]["physical_filter"] == "z_20"
+
+
+def test_buildRangeExposurePayload_reuses_exposure_shape_with_query() -> None:
+    state = _rangeStateForPayload()
+    payload = server._buildRangeExposurePayload(state, 2026051900722)
+    assert payload is not None
+    assert payload["mode"] == "range-exposure"
+    assert payload["expId"] == 2026051900722
+    assert payload["podDetailQuery"] == (
+        "rangeStart=2026051900722&rangeStop=2026051900725&dataId=2026051900722"
+    )
+    assert "pods" in payload  # the reused exposure-payload body
+
+
+def test_buildRangeExposurePayload_returns_None_for_skipped_id() -> None:
+    state = _rangeStateForPayload()
+    assert server._buildRangeExposurePayload(state, 2026051900724) is None
+
+
+def test_buildSummaryPayload_carries_exposure_record() -> None:
+    rec = {"obs_end": "2026-05-20T08:45:39.000", "img_type": "science", "physical_filter": "z_20"}
+    state = server.ServerState(
+        cacheDir=Path("/tmp/x"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc),
+        exposureInfo=rec,
+    )
+    payload = server._buildSummaryPayload(state)
+    assert payload["exposure"] == rec
+
+
+def test_buildSummaryPayload_exposure_is_None_when_unresolved() -> None:
+    state = server.ServerState(
+        cacheDir=Path("/tmp/x"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026051900722,
+        tZero=dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc),
+    )
+    assert server._buildSummaryPayload(state)["exposure"] is None
+
+
+def test_buildNightPayload_exposes_exposureInfo_map_keyed_by_string() -> None:
+    rec = {"obs_end": "2026-05-21T13:00:00.000", "img_type": "science"}
+    state = server.NightState(
+        cacheDir=Path("/tmp/n"),
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260521,
+        startTime=dt.datetime(2026, 5, 21, 12, 0, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
+    )
+    state.exposureInfoByExpId = {2026052100051: rec}
+    payload = server._buildNightPayload(state)
+    # JSON object keys must be strings, so the map is keyed by str(expId).
+    assert payload["exposureInfo"] == {"2026052100051": rec}
 
 
 # ----- _maybeSetLokiPassword ----------------------------------------------
@@ -863,3 +1241,136 @@ def test_isoForLogcli_emits_Z_suffix_and_utc() -> None:
     s = server._isoForLogcli(t)
     assert s.endswith("Z")
     assert "08:45:39" in s  # the +01:00 input projected to UTC
+
+
+# ----- _resolveShutterClosesInto (night / range prefetch) -----------------
+
+
+def _prefetchJob(siteCatalog: FakeSiteCatalog) -> tuple[FetchJob, sites.Site]:
+    """A night FetchJob + the summit Site, for driving the prefetch path."""
+    spec = config.FetchSpec(
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-05-20T08:00:00Z",
+        toIso="2026-05-20T09:00:00Z",
+        username="u",
+        lokiAddr="https://loki.example",
+    )
+    job = JobManager().createNightJob(spec, 20260520, siteName="summit")
+    site = next(s for s in siteCatalog.catalog if s.name == "summit")
+    return job, site
+
+
+def _phase(job: FetchJob, name: str) -> dict[str, Any]:
+    """The single progress event with ``phase == name``."""
+    return next(e for e in job.events if e.get("phase") == name)
+
+
+def test_resolveShutterCloses_requeries_manual_standins(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A `_manual` stand-in anchors its id *and* still joins the ConsDB
+    batch, so a real row supersedes it. Treating it as an ordinary cache
+    hit would freeze one hand-typed value into every future night/range
+    view of that dataId — silently biasing every Δshutter derived from it.
+    """
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-05-20T00:00:00.000000"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+    queried: list[list[int]] = []
+
+    def fakeBatch(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        queried.append(sorted(dataIds))
+        return {2026052000001: {"obs_end": "2026-05-20T08:46:16.267000", "physical_filter": "r"}}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert queried == [[2026052000001]]  # the stand-in was re-queried
+    # ConsDB's value won, in memory and on disk.
+    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert info[2026052000001]["physical_filter"] == "r"
+    stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
+    assert exposureTimes.isManual(stored) is False
+    checked = _phase(job, "cache-checked")
+    assert checked["cacheHits"] == 0 and checked["manualStandins"] == 1
+    assert checked["remaining"] == 0  # anchored provisionally, so not "missing"
+    assert _phase(job, "done")["stillMissing"] == 0
+
+
+def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The stand-in is a *fallback*: when the re-query comes back empty it
+    stays put, and the id is reported anchored rather than missing."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+
+    def emptyBatch(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", emptyBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
+    assert exposureTimes.isManual(stored) is True
+    assert _phase(job, "done")["stillMissing"] == 0
+
+
+def test_resolveShutterCloses_manual_survives_a_missing_token(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """No token means no re-query at all — the stand-in still anchors the
+    id, and `remaining` counts only the genuinely unresolvable one."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    # Token deliberately absent.
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert 2026052000002 not in target
+    assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
+
+
+def test_resolveShutterCloses_real_cache_hit_skips_consdb(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flip side: a genuine ConsDB-sourced record *is* immutable truth,
+    so it must still short-circuit the batch query entirely."""
+    exposureTimes.storeCachedRecord(
+        2026052000001, {"obs_end": "2026-05-20T08:46:16.267000"}, siteName="summit"
+    )
+    siteCatalog.writeSummitToken()
+
+    def boom(
+        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        raise AssertionError("a real cache hit must not hit ConsDB")
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", boom)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
+
+    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    checked = _phase(job, "cache-checked")
+    assert checked["cacheHits"] == 1 and checked["manualStandins"] == 0

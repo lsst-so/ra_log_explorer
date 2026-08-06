@@ -147,6 +147,60 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   gap: 6px;
 }
 #topbar button.ghost:hover { background: var(--nav-bg-2); }
+/* Site switcher: deliberately loud — which site you're talking to is
+   the most important thing on the page; everything else is secondary.
+   The accent colour comes from `body[data-site=…]` below so it shifts
+   with the selection and is impossible to lose track of. */
+#topbar .site-switcher {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 14px 5px 12px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--site-accent, #4a8cdf) 18%, transparent);
+  border: 1px solid var(--site-accent, #4a8cdf);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--site-accent, #4a8cdf) 20%, transparent);
+}
+#topbar .site-switcher label {
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--site-accent, #4a8cdf);
+}
+#topbar .site-switcher select {
+  font: inherit;
+  font-family: var(--font-mono);
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #fff;
+  background: transparent;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  /* Custom caret in the accent colour so the native one doesn't clash. */
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: 18px;
+  background-image: linear-gradient(45deg, transparent 50%, var(--site-accent, #4a8cdf) 50%),
+                    linear-gradient(-45deg, transparent 50%, var(--site-accent, #4a8cdf) 50%);
+  background-position: calc(100% - 8px) 50%, calc(100% - 3px) 50%;
+  background-size: 5px 5px;
+  background-repeat: no-repeat;
+}
+#topbar .site-switcher select:focus { outline: none; }
+#topbar .site-switcher #site-info {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: color-mix(in srgb, var(--site-accent, #4a8cdf) 80%, #fff 20%);
+}
+
+/* Page-wide accent strip + per-site colour mapping. The strip is the
+   "you can't miss which cluster you're on" signal that survives
+   across views. */
+body[data-site] { border-top: 3px solid var(--site-accent); }
+body[data-site="summit"] { --site-accent: #4a8cdf; }
+body[data-site="bts"]    { --site-accent: #ff8a3a; }
 
 /* ============================================================
    Home view
@@ -360,7 +414,8 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
 .home-card #fetch-message.error { color: var(--err); }
 
 /* dataId -> shutter close inline lookup feedback */
-#tzero-status {
+#tzero-status,
+#manual-tzero-status {
   font-size: 12.5px;
   color: var(--text-muted);
   margin-top: 4px;
@@ -368,7 +423,8 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   align-items: center;
   gap: 6px;
 }
-#tzero-status.ok {
+#tzero-status.ok,
+#manual-tzero-status.ok {
   color: var(--ok);
   font-family: var(--font-mono);
   background: var(--ok-soft);
@@ -376,7 +432,24 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   border-radius: var(--radius-sm);
   font-size: 12px;
 }
-#tzero-status.error { color: var(--err); }
+#tzero-status.error,
+#manual-tzero-status.error { color: var(--err); }
+
+/* Manual shutter-close fallback row: revealed only when the ConsDB lookup
+   can't resolve the dataId. The left accent marks it as a deliberate
+   override rather than the normal auto-resolved path. */
+#manual-tzero {
+  margin-top: 8px;
+  padding-left: 10px;
+  border-left: 2px solid var(--warn);
+}
+/* `.home-card .row { display: flex }` (specificity 0,2,0) outranks the UA
+   `[hidden] { display: none }` (0,1,0), so the bare `hidden` attribute
+   wouldn't hide a `.row`. This id+attr rule (1,1,0) wins it back, keeping
+   the block hidden until a lookup actually fails. */
+#manual-tzero[hidden] {
+  display: none;
+}
 
 /* Destructive variants */
 .home-card button.ghost.delete,
@@ -599,6 +672,13 @@ button.ghost.mini.delete:disabled {
 .lg-mosaic { color: #b9710b; }
 .lg-warn   { color: #b15a00; }
 .lg-error  { color: var(--err); }
+/* Pod-lifecycle legend chips — taller/wider swatch to echo the full-height
+   markers on the track. Colours track the .kind-* marker backgrounds. */
+.lg-lifecycle::before { width: 4px; height: 15px; }
+.lg-restart      { color: #d9600f; }
+.lg-killed       { color: #c0392b; }
+.lg-oom          { color: #b00020; }
+.lg-podunhealthy { color: #b15a00; }
 
 /* Task chips (rendered by populateTaskLegend). The chips are appended as
    direct children of #task-legend with no separator, so make the
@@ -975,6 +1055,41 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .tl-event.kind-loopslow   { background: #d36100; }
 .tl-event.kind-info       { background: #94a3b8; opacity: .55; }
 
+/* Pod-lifecycle markers (k8s/events: restart / kill / OOM / unhealthy).
+   Full-height, slightly wider, with a white halo so they read as a
+   whole-pod event standing above the inset work ticks. */
+.tl-event.lifecycle {
+  top: 0;
+  bottom: 0;
+  width: 4px;
+  border-radius: 0;
+  z-index: 2;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .7);
+}
+.tl-event.kind-restart       { background: #ff7a18; }
+.tl-event.kind-killed        { background: #d05a5a; }
+.tl-event.kind-oom           { background: #b00020; }
+.tl-event.kind-podfail       { background: #b00020; }
+.tl-event.kind-podunhealthy  { background: #e7a200; }
+.tl-event.kind-podstart      { background: #2f9e44; opacity: .5; }
+
+/* Pod-lifecycle pill badges in the night-view "Pod restarts & deaths"
+   table. Colours track the .kind-* timeline markers / .lg-* legend. */
+.life-badge {
+  display: inline-block;
+  padding: 1px 7px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  white-space: nowrap;
+}
+.life-restart      { background: #d9600f; }
+.life-killed       { background: #c0392b; }
+.life-oom          { background: #b00020; }
+.life-podfail      { background: #b00020; }
+.life-podunhealthy { background: #b15a00; }
+
 .tl-t0-marker {
   position: absolute;
   top: 0;
@@ -1350,6 +1465,15 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
   background: #ede4fb;
   color: #6b3df0;
 }
+.cache-kind-range {
+  background: #d7f0e6;
+  color: #137a55;
+}
+/* Range cache key: full start/stop dataIds stacked on two lines. */
+.cache-key-range {
+  display: inline-block;
+  line-height: 1.35;
+}
 
 .night-tb-context { padding: 0; }
 .night-tb-header {
@@ -1384,3 +1508,125 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 }
 .night-tb-body .tb-lvl.tb-warn  { color: var(--warn); }
 .night-tb-body .tb-lvl.tb-error { color: var(--err); }
+
+/* ============================================================
+   ConsDB exposure info box (#exposure-info) — the curated
+   exposure properties for the loaded dataId, shown under the
+   explore-view topbar as a row of labelled chips.
+   ============================================================ */
+#exposure-info {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  align-items: baseline;
+  padding: 7px 18px 8px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12.5px;
+}
+#exposure-info .exp-item {
+  font-family: var(--font-mono);
+  color: var(--text);
+  white-space: nowrap;
+}
+#exposure-info .exp-label {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--text-2);
+  margin-right: 5px;
+}
+
+/* ============================================================
+   Range navigator (#range-nav) — shown above the explore
+   timeline in range mode. Chip per resolved dataId + prev/next.
+   ============================================================ */
+#range-nav {
+  padding: 8px 18px 10px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--border);
+}
+.range-nav-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 6px;
+}
+.range-nav-head .spacer { flex: 1; }
+#range-nav-label { font-size: 12.5px; }
+.range-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  max-height: 84px;
+  overflow-y: auto;
+}
+.range-chip {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  padding: 2px 7px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-2);
+  cursor: pointer;
+  line-height: 1.5;
+}
+.range-chip:hover { border-color: var(--accent); color: var(--accent); }
+/* An exposure with no logs in the fetched window — still navigable but
+   visually de-emphasised so the eye lands on the ones that did run. */
+.range-chip.no-logs { opacity: 0.5; }
+/* An exposure that raised at least one traceback — the thing you most
+   often opened the range to find. */
+.range-chip.has-traceback {
+  border-color: var(--err);
+  background: var(--err-soft);
+  color: var(--err);
+}
+.range-chip.selected {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+  font-weight: 600;
+}
+.range-chip.selected.has-traceback {
+  border-color: var(--err);
+  background: var(--err);
+  color: #fff;
+}
+.range-empty { padding: 40px 18px; font-size: 13px; }
+
+/* ----- incomplete-fetch banner (explore + night views) -------------------
+ *
+ * Loud, hard-to-miss strip shown only when a fetch did not retrieve every
+ * pod's logs in full. Deliberately high-contrast (err palette, left rule)
+ * so a partial night can't be mistaken for the whole night. */
+.fetch-banner {
+  margin: 10px 14px 0;
+  padding: 12px 14px;
+  border: 1px solid var(--err);
+  border-left-width: 5px;
+  border-radius: var(--radius);
+  background: var(--err-soft);
+  color: var(--text);
+}
+.fetch-banner-title {
+  font-weight: 700;
+  color: var(--err);
+  font-size: 14px;
+}
+.fetch-banner-sub {
+  margin-top: 3px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+.fetch-banner-pods {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  font-size: 12px;
+  color: var(--text-2);
+  max-height: 160px;
+  overflow-y: auto;
+}
+.fetch-banner-pods li { margin: 1px 0; }

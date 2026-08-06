@@ -16,28 +16,38 @@ const LS = {
   remember: 'ra_log_explorer.remember',
   // App settings shared across both fetchers. Lives in localStorage
   // because they're per-user-browser; maxCacheGiB is also POSTed
-  // server-side so the cache eviction can act on it.
-  settings: 'ra_log_explorer.settings',  // JSON {cluster, namespace, workers, lokiAddr, rspTokenFile, maxCacheGiB}
+  // server-side so the cache eviction can act on it. Cluster /
+  // namespace / Loki URL / ConsDB token file all moved into the
+  // server-side site catalog (sites.toml) and are picked via the
+  // top-bar site switcher.
+  settings: 'ra_log_explorer.settings',  // JSON {workers, maxCacheGiB, cacheDir}
+  // Which site the user last picked in the top-bar switcher.
+  site: 'ra_log_explorer.site',  // bare site name string
   // Last per-exposure tuning (windowBefore/After) keyed off the
   // exposure form alone.
   lastExpTuning: 'ra_log_explorer.lastExpTuning',  // {windowBefore, windowAfter}
 };
 
-// Application defaults. Mirror the backend's DEFAULT_MAX_CACHE_BYTES /
-// config.DEFAULT_* — kept in sync by hand since the values are stable.
+// Application defaults for the user-tunable knobs (everything left
+// after cluster/namespace/Loki URL/ConsDB token moved into the site
+// catalog). Kept in sync with config.DEFAULT_* and DEFAULT_MAX_CACHE_BYTES.
 const SETTINGS_DEFAULTS = {
-  cluster: 'yagan',
-  namespace: 'rapid-analysis',
   workers: 8,
-  lokiAddr: 'https://loki-query.ls.lsst.org',
-  rspTokenFile: '',
   maxCacheGiB: 5,
   cacheDir: '',
 };
 
+// Site catalog as returned by /api/sites: {default_site, sites: [...]}.
+// Loaded once at startup; the switcher renders from it and the rest of
+// the home view reads ``activeSite`` for `site` request fields.
+let siteCatalog = null;
+let activeSite = null;
+let siteSwitcherWired = false;  // guard: startHome() re-runs on every back-home
+
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
 let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
+let tZeroIsManual = false;      // true when resolvedTZero was hand-entered (ConsDB couldn't resolve it)
 let lookupTimer = null;         // debounce timer for the dataId input
 let lookupSeq = 0;              // sequence number to ignore stale lookup responses
 
@@ -46,6 +56,7 @@ function startHome() {
   prefillSettings();
   prefillForm();
   prefillCreds();
+  loadSiteCatalog();
   refreshCache();
   // URL-driven entry. We land here either via a deep-link
   // (/?dataId=…&autoFetch=1) or because the URL points at a key the
@@ -54,6 +65,8 @@ function startHome() {
   const params = new URLSearchParams(window.location.search);
   const urlDataId = params.get('dataId');
   const urlDayObs = params.get('dayObs');
+  const urlRangeStart = params.get('rangeStart');
+  const urlRangeStop = params.get('rangeStop');
   const urlAutoFetch = params.get('autoFetch') === '1';
   if (urlDataId) {
     document.getElementById('fetch-form').elements.exposureId.value = urlDataId;
@@ -61,12 +74,84 @@ function startHome() {
   if (urlDayObs) {
     document.getElementById('night-form').elements.dayObs.value = urlDayObs;
   }
-  // If the form already has a dataId pre-filled from localStorage, kick
-  // a lookup so the submit button is ready to fire immediately.
+  if (urlRangeStart) {
+    document.getElementById('range-form').elements.rangeStart.value = urlRangeStart;
+  }
+  if (urlRangeStop) {
+    document.getElementById('range-form').elements.rangeStop.value = urlRangeStop;
+  }
+  // If the forms already have ids pre-filled (URL or localStorage), kick
+  // the lookups so the submit buttons are ready to fire immediately.
   triggerLookupIfReady();
+  triggerRangeLookupsIfReady();
   if (urlAutoFetch && urlDataId) waitAndAutoFetch(parseInt(urlDataId, 10));
 }
 window.startHome = startHome;
+
+async function loadSiteCatalog() {
+  // The site catalog is the same for every user of this deployment
+  // (it's checked into sites.toml on the server). Pull it once: the
+  // switcher's <option>s, the active-site state, and the change listener
+  // all live in the persistent DOM / module scope, so re-running on a
+  // later back-home would only leak a duplicate listener — guard it.
+  if (siteSwitcherWired) return;
+  try {
+    const r = await fetch('/api/sites');
+    if (!r.ok) return;
+    siteCatalog = await r.json();
+  } catch (_) {
+    return;
+  }
+  if (!siteCatalog || !Array.isArray(siteCatalog.sites) || !siteCatalog.sites.length) return;
+  const sel = document.getElementById('site-select');
+  sel.innerHTML = '';
+  for (const s of siteCatalog.sites) {
+    const opt = document.createElement('option');
+    opt.value = s.name;
+    opt.textContent = `${s.name} (${s.cluster})`;
+    sel.appendChild(opt);
+  }
+  const stored = localStorage.getItem(LS.site);
+  const startName = siteCatalog.sites.find(s => s.name === stored)
+    ? stored
+    : siteCatalog.default_site;
+  sel.value = startName;
+  setActiveSite(startName);
+  document.getElementById('site-switcher').hidden = false;
+  sel.addEventListener('change', () => {
+    setActiveSite(sel.value);
+    localStorage.setItem(LS.site, sel.value);
+    // A site switch changes which ConsDB the lookup hits AND which
+    // per-site exposure-time cache we read, so any pending dataId
+    // resolution must re-run (and any manual entry belonged to the old
+    // site's missing record).
+    clearResolvedTZero();
+    hideManualEntry();
+    clearRangeSlot(rangeStartSlot);
+    clearRangeSlot(rangeStopSlot);
+    triggerLookupIfReady();
+    triggerRangeLookupsIfReady();
+    refreshCache();
+  });
+  siteSwitcherWired = true;
+}
+
+function setActiveSite(name) {
+  if (!siteCatalog) return;
+  activeSite = siteCatalog.sites.find(s => s.name === name) || null;
+  // Drive the per-site CSS accent (border-top strip, switcher chip).
+  // Persists across home/explore/night views — the strip is visible
+  // even when the switcher itself isn't on screen.
+  if (activeSite) {
+    document.body.dataset.site = activeSite.name;
+  } else {
+    delete document.body.dataset.site;
+  }
+  const info = document.getElementById('site-info');
+  if (info && activeSite) {
+    info.textContent = `consdb=${activeSite.consdbUrl.replace(/^https?:\/\//, '')}`;
+  }
+}
 
 function waitAndAutoFetch(expId) {
   // Wait for the shutter-close lookup to resolve, then submit the
@@ -252,13 +337,12 @@ function readFormValues() {
   const fd = new FormData(form);
   const out = {};
   for (const [k, v] of fd.entries()) out[k] = v;
-  // Merge in the app-wide settings (cluster, namespace, workers,
-  // lokiAddr). These no longer live on the per-fetch form.
+  // Merge in the app-wide knobs that no longer live on the per-fetch
+  // form. cluster / namespace / Loki URL are derived from the
+  // currently-selected site on the server side (we just pass `site`).
   const s = readSettings();
-  out.cluster = s.cluster;
-  out.namespace = s.namespace;
+  out.site = activeSite ? activeSite.name : undefined;
   out.workers = parseInt(s.workers, 10);
-  out.lokiAddr = s.lokiAddr;
   out.exposureId = parseInt(out.exposureId, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
@@ -268,8 +352,13 @@ function readFormValues() {
   if (password) out.password = password;
   // Always TAI; the server applies the -37 s conversion. We deliberately
   // never expose a UTC opt-out in the UI now that timings come from a
-  // service that's TAI by construction.
+  // service that's TAI by construction (and a manual entry is, by the
+  // label next to the field, a TAI shutter close too).
   out.tZero = resolvedTZero;
+  // Tell the server this t-zero was hand-entered (ConsDB couldn't resolve
+  // the dataId) so it persists it to the exposure-time cache and the
+  // explore view can be reopened/refreshed without re-typing.
+  if (tZeroIsManual) out.tZeroManual = true;
   return out;
 }
 
@@ -287,12 +376,90 @@ function setTZeroStatus(text, kind /* 'info' | 'ok' | 'error' */) {
 function clearResolvedTZero() {
   resolvedTZero = null;
   resolvedForExpId = null;
+  tZeroIsManual = false;
 }
 
 function updateSubmitButton() {
   const submit = document.getElementById('fetch-submit');
   // Allow re-submitting an already-typed dataId without forcing a refetch.
   submit.disabled = !resolvedTZero;
+}
+
+// ----- manual shutter-close fallback --------------------------------------
+//
+// When ConsDB is down/unreachable or has no row for the dataId, the
+// automatic lookup can't produce a t-zero. Rather than dead-end, we reveal
+// a text field so the user can type the shutter close themselves (TAI,
+// ISO-8601 — the same convention ConsDB's obs_end and the CLI's --t-zero
+// use). A valid entry drives the same resolvedTZero the submit path reads.
+
+// ISO-8601 local time, no timezone: YYYY-MM-DD(T| )HH:MM:SS with optional
+// fractional seconds — matches the obs_end / Butler `.isot` form and the
+// example placeholder. A trailing Z / offset is rejected on purpose: the
+// value is interpreted as TAI wall-clock, so a UTC marker would mislead.
+const MANUAL_TZERO_RE = /^\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(\.\d{1,6})?$/;
+
+function setManualStatus(text, kind /* 'info' | 'ok' | 'error' */) {
+  const el = document.getElementById('manual-tzero-status');
+  el.textContent = text;
+  el.classList.remove('ok', 'error');
+  if (kind === 'ok') el.classList.add('ok');
+  if (kind === 'error') el.classList.add('error');
+}
+
+function hideManualEntry() {
+  // Hide and reset — a fresh dataId (or a successful lookup) starts clean.
+  // The block's own line stays purely instructional; the main #tzero-status
+  // line above owns the "why ConsDB couldn't resolve this" message.
+  const row = document.getElementById('manual-tzero');
+  row.hidden = true;
+  document.getElementById('fetch-form').elements.manualTZero.value = '';
+  setManualStatus('enter the shutter close as TAI ISO-8601, e.g. 2026-06-24T14:38:41.380663', 'info');
+}
+
+function revealManualEntry() {
+  // Show the field (keeping whatever the user already typed) and evaluate
+  // it, so a re-fired lookup failure leaves a valid entry still applied.
+  document.getElementById('manual-tzero').hidden = false;
+  applyManualTZero();
+}
+
+function applyManualTZero() {
+  const raw = document.getElementById('fetch-form').elements.manualTZero.value.trim();
+  const expId = currentExposureId();
+  if (expId === null) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('enter a valid 13-digit dataId first', 'error');
+    updateSubmitButton();
+    return;
+  }
+  if (!raw) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('type the shutter-close timestamp, e.g. 2026-06-24T14:38:41.380663 (TAI)', 'info');
+    updateSubmitButton();
+    return;
+  }
+  if (!MANUAL_TZERO_RE.test(raw)) {
+    if (tZeroIsManual) clearResolvedTZero();
+    setManualStatus('expected ISO-8601 TAI like 2026-06-24T14:38:41.380663 (no timezone)', 'error');
+    updateSubmitButton();
+    return;
+  }
+  resolvedTZero = raw;
+  resolvedForExpId = expId;
+  tZeroIsManual = true;
+  setManualStatus('this manual shutter close overrides ConsDB for this dataId', 'ok');
+  // Flip the main status green too — it's the affordance the user already
+  // associates with "resolved, ready to fetch".
+  setTZeroStatus(`manual shutter close (TAI): ${raw}`, 'ok');
+}
+
+// The exposureId field as a finite 13-digit int, or null if it isn't one.
+function currentExposureId() {
+  const raw = document.getElementById('fetch-form').elements.exposureId.value.trim();
+  if (raw.length !== DATAID_LENGTH) return null;
+  const expId = parseInt(raw, 10);
+  return Number.isFinite(expId) ? expId : null;
 }
 
 // dataIds are 13 digits: YYYYMMDDSSSSS. Anything shorter is still
@@ -327,44 +494,160 @@ function triggerLookupIfReady() {
   }
   // If we already resolved this exact dataId, don't re-request.
   if (resolvedForExpId === expId && resolvedTZero) {
-    setTZeroStatus(`shutter close (TAI): ${resolvedTZero}`, 'ok');
+    const prefix = tZeroIsManual ? 'manual shutter close (TAI)' : 'shutter close (TAI)';
+    setTZeroStatus(`${prefix}: ${resolvedTZero}`, 'ok');
     return;
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  const tokenFile = readSettings().rspTokenFile;
-  const qs = tokenFile ? `?tokenFile=${encodeURIComponent(tokenFile)}` : '';
+  // The site picks which ConsDB to ask AND which per-site cache file
+  // the resolved obs_end lands in. Falls through to the server's
+  // default_site if we haven't loaded the catalog yet (rare race on
+  // first paint).
+  const siteName = activeSite ? activeSite.name : '';
+  const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
   fetch(`/api/exposure-time/${expId}${qs}`)
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer
-      if (r.ok && body.tZero) {
+      if (r.ok && body.manual && body.tZero) {
+        // ConsDB couldn't answer, but a manual stand-in was cached earlier
+        // (this machine, or another tab). Pre-fill it into the editable
+        // field and let revealManualEntry() validate + apply it, so the
+        // user sees their prior value and can re-fetch or amend it.
+        document.getElementById('fetch-form').elements.manualTZero.value = body.tZero;
+        revealManualEntry();
+      } else if (r.ok && body.tZero) {
         resolvedTZero = body.tZero;
         resolvedForExpId = expId;
+        tZeroIsManual = false;
         setTZeroStatus(`shutter close (TAI): ${body.tZero}`, 'ok');
+        hideManualEntry();
       } else if (r.status === 404) {
         clearResolvedTZero();
-        setTZeroStatus(`no exposure-time record for ${expId}`, 'error');
+        setTZeroStatus(`no exposure-time record for ${expId} — enter the shutter close manually below`, 'error');
+        revealManualEntry();
       } else if (r.status === 503) {
         clearResolvedTZero();
         setTZeroStatus(body.error || 'RSP token / ConsDB lookup not configured', 'error');
+        revealManualEntry();
       } else {
         clearResolvedTZero();
-        setTZeroStatus(`lookup failed: ${body.error || r.status}`, 'error');
+        setTZeroStatus(`lookup failed: ${body.error || r.status} — enter the shutter close manually below`, 'error');
+        revealManualEntry();
       }
     })
     .catch((e) => {
       if (mySeq !== lookupSeq) return;
       clearResolvedTZero();
-      setTZeroStatus(`lookup failed: ${e}`, 'error');
+      setTZeroStatus(`lookup failed: ${e} — enter the shutter close manually below`, 'error');
+      revealManualEntry();
     });
 }
 
 function scheduleLookup() {
   clearResolvedTZero();
+  // A new/edited dataId starts fresh — drop any manual entry from the
+  // previous one; the impending lookup re-reveals it only if it fails.
+  hideManualEntry();
   setTZeroStatus('typing...', 'info');
   if (lookupTimer) clearTimeout(lookupTimer);
   lookupTimer = setTimeout(triggerLookupIfReady, 300);
+}
+
+// ----- range exposure-time lookups ----------------------------------------
+
+// One slot per range endpoint. Each resolves its own dataId -> shutter
+// close (TAI) independently, mirroring the single-exposure lookup but
+// driving the two range inputs. `seq` guards against stale responses;
+// `timer` is the per-field debounce.
+const rangeStartSlot = { tZero: null, forId: null, seq: 0, timer: null, input: 'rangeStart', status: 'range-start-status' };
+const rangeStopSlot = { tZero: null, forId: null, seq: 0, timer: null, input: 'rangeStop', status: 'range-stop-status' };
+
+function setRangeStatus(statusId, text, kind) {
+  const el = document.getElementById(statusId);
+  el.textContent = text;
+  el.classList.remove('ok', 'error');
+  if (kind === 'ok') el.classList.add('ok');
+  if (kind === 'error') el.classList.add('error');
+  updateRangeSubmit();
+}
+
+function clearRangeSlot(slot) {
+  slot.tZero = null;
+  slot.forId = null;
+}
+
+function updateRangeSubmit() {
+  const submit = document.getElementById('range-submit');
+  submit.disabled = !(rangeStartSlot.tZero && rangeStopSlot.tZero);
+}
+
+function triggerRangeLookup(slot) {
+  const raw = document.getElementById('range-form').elements[slot.input].value.trim();
+  if (!raw) {
+    clearRangeSlot(slot);
+    setRangeStatus(slot.status, `enter a ${DATAID_LENGTH}-digit dataId`, 'info');
+    return;
+  }
+  if (raw.length !== DATAID_LENGTH) {
+    clearRangeSlot(slot);
+    const over = raw.length > DATAID_LENGTH;
+    setRangeStatus(slot.status, `dataIds are ${DATAID_LENGTH} digits (have ${raw.length})`, over ? 'error' : 'info');
+    return;
+  }
+  const expId = parseInt(raw, 10);
+  if (!Number.isFinite(expId)) {
+    clearRangeSlot(slot);
+    setRangeStatus(slot.status, 'dataId must be an integer', 'error');
+    return;
+  }
+  if (slot.forId === expId && slot.tZero) {
+    setRangeStatus(slot.status, `t₀ (TAI): ${slot.tZero}`, 'ok');
+    return;
+  }
+  setRangeStatus(slot.status, `looking up ${expId}…`, 'info');
+  const mySeq = ++slot.seq;
+  const siteName = activeSite ? activeSite.name : '';
+  const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
+  fetch(`/api/exposure-time/${expId}${qs}`)
+    .then(async (r) => {
+      const body = await r.json().catch(() => ({}));
+      if (mySeq !== slot.seq) return;  // stale; user typed something newer
+      if (r.ok && body.tZero) {
+        slot.tZero = body.tZero;
+        slot.forId = expId;
+        setRangeStatus(slot.status, `t₀ (TAI): ${body.tZero}`, 'ok');
+      } else if (r.status === 404) {
+        clearRangeSlot(slot);
+        setRangeStatus(slot.status, `no exposure-time record for ${expId}`, 'error');
+      } else if (r.status === 503) {
+        clearRangeSlot(slot);
+        setRangeStatus(slot.status, body.error || 'RSP token / ConsDB lookup not configured', 'error');
+      } else {
+        clearRangeSlot(slot);
+        setRangeStatus(slot.status, `lookup failed: ${body.error || r.status}`, 'error');
+      }
+    })
+    .catch((e) => {
+      if (mySeq !== slot.seq) return;
+      clearRangeSlot(slot);
+      setRangeStatus(slot.status, `lookup failed: ${e}`, 'error');
+    });
+}
+
+function scheduleRangeLookup(slot) {
+  clearRangeSlot(slot);
+  setRangeStatus(slot.status, 'typing...', 'info');
+  if (slot.timer) clearTimeout(slot.timer);
+  slot.timer = setTimeout(() => triggerRangeLookup(slot), 300);
+}
+
+function triggerRangeLookupsIfReady() {
+  // Fire both lookups for whatever's currently in the inputs (used on
+  // first paint when the form is prefilled and after a site switch).
+  triggerRangeLookup(rangeStartSlot);
+  triggerRangeLookup(rangeStopSlot);
 }
 
 // ----- cache list ----------------------------------------------------------
@@ -393,6 +676,7 @@ function renderCache(data) {
   for (const w of data.windows) {
     const tr = document.createElement('tr');
     const isNight = w.kind === 'night';
+    const isRange = w.kind === 'range';
     const url = cacheRowUrl(w);
     tr.title = url
       ? 'click to open this cached run in a new tab'
@@ -401,18 +685,29 @@ function renderCache(data) {
     const toS = (w.toIso || '').replace('T', ' ').replace(/\..*Z$/, '');
     const fetchedS = (w.fetchedAt || '').replace('T', ' ').replace(/\..*$/, '');
     const lastViewedS = (w.lastViewedAt || '').replace('T', ' ').replace(/\..*$/, '');
-    const kindBadge = isNight
-      ? `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night</span>`
-      : `<span class="cache-kind cache-kind-exposure">exposure</span>`;
+    let kindBadge;
+    if (isNight) {
+      kindBadge = `<span class="cache-kind cache-kind-night" title="night-mode AOS-only fetch">night</span>`;
+    } else if (isRange) {
+      kindBadge = `<span class="cache-kind cache-kind-range" title="range fetch — one wide window over [start, stop]">range</span>`;
+    } else {
+      kindBadge = `<span class="cache-kind cache-kind-exposure">exposure</span>`;
+    }
     // The "key" column shows the most useful identifier for the row's
     // kind. Night caches have a single dayObs (computed by the server
-    // from the noon-UTC start). Exposure caches carry one *or more*
-    // dataIds — superset reuse means consecutive fetches often land
-    // on the same cache, so we render every dataId that's known to
+    // from the noon-UTC start). Range caches show their seq-number span
+    // (linking back to the range view). Exposure caches carry one *or
+    // more* dataIds — superset reuse means consecutive fetches often
+    // land on the same cache, so we render every dataId that's known to
     // have triggered this cache as a clickable link.
     let keyCell;
     if (isNight) {
       keyCell = `<a class="mono cache-key-link" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener">${w.dayObs}</a>`;
+    } else if (isRange) {
+      // Full start/stop dataIds on two lines — the seq-only form hid the
+      // dayObs (the leading 8 digits of the id), which made the row
+      // ambiguous about which night it covers.
+      keyCell = `<a class="mono cache-key-link cache-key-range" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener" title="range ${w.rangeStart} → ${w.rangeStop}">${w.rangeStart}<br>→ ${w.rangeStop}</a>`;
     } else if (w.exposureIds && w.exposureIds.length > 0) {
       keyCell = w.exposureIds
         .map((id) => `<a class="mono cache-key-link" href="/?dataId=${encodeURIComponent(id)}" target="_blank" rel="noopener">${id}</a>`)
@@ -462,13 +757,22 @@ async function deleteCacheWindow(w) {
   if (!window.confirm(
     `Delete cached window?\n\n${w.cluster}/${w.namespace}/${subPath}\n(${humanBytes(w.sizeOnDisk)})`,
   )) return;
-  // For night-mode caches relPath is `<window>/<pods=…>` — we need two
-  // URL segments rather than one. encodeURIComponent each segment so
-  // the `=` in `pods=__aos__` survives intact.
+  // For night-mode caches relPath is `<window>/<pods=…>` — two URL
+  // segments, not one. Split on `/` and encodeURIComponent each segment
+  // (so the `=` in `pods=__aos__` is percent-encoded, not treated as a
+  // query delimiter); the server percent-decodes them back before
+  // resolving the directory.
   const segments = subPath.split('/').map(encodeURIComponent).join('/');
   const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`;
   try {
     const r = await fetch(url, { method: 'DELETE' });
+    if (r.status === 404) {
+      // Dir is already gone (deleted out of band, or from another tab).
+      // Re-fetch the listing so the stale row disappears instead of
+      // leaving the user clicking ✕ on a phantom.
+      await refreshCache();
+      return;
+    }
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       alert(`Delete failed: ${body.error || r.status}`);
@@ -522,6 +826,9 @@ function cacheRowUrl(w) {
   // submits manually. Returns null for that case.
   if (w.kind === 'night' && w.dayObs != null) {
     return `/?dayObs=${encodeURIComponent(w.dayObs)}`;
+  }
+  if (w.kind === 'range' && w.rangeStart != null && w.rangeStop != null) {
+    return `/?rangeStart=${encodeURIComponent(w.rangeStart)}&rangeStop=${encodeURIComponent(w.rangeStop)}`;
   }
   return null;
 }
@@ -614,10 +921,11 @@ function showMessage(text, isError) {
 }
 
 function progressEls(kind) {
-  // Both forms host an identically-shaped inline progress region. Look
+  // Each form hosts an identically-shaped inline progress region. Look
   // up the wrapper and its children by kind so the SSE consumer can
   // route updates to whichever card launched the active job.
-  const wrap = document.getElementById(kind === 'night' ? 'night-progress' : 'fetch-progress');
+  const id = kind === 'night' ? 'night-progress' : kind === 'range' ? 'range-progress' : 'fetch-progress';
+  const wrap = document.getElementById(id);
   return {
     wrap,
     fill: wrap.querySelector('.progress-fill'),
@@ -687,23 +995,29 @@ function openProgressStream(jobId) {
       if (phaseMsg) setProgressText(`${windowStr}  ·  ${phaseMsg}`);
     } else if (ev.type === 'done') {
       setProgressFill('100%');
-      const target = ev.kind === 'night' ? 'night view' : 'explore view';
+      const target = ev.kind === 'night' ? 'night view' : ev.kind === 'range' ? 'range view' : 'explore view';
       setProgressText(`done in ${ev.elapsedS.toFixed(1)}s — opening ${target} …`);
       es.close();
       activeEventSource = null;
       activeJobId = null;
       updateSubmitButton();
       document.getElementById('night-submit').disabled = false;
-      transitionToExplore({ kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs });
+      document.getElementById('range-submit').disabled = false;
+      transitionToExplore({
+        kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs, startId: ev.startId, stopId: ev.stopId,
+      });
     } else if (ev.type === 'error') {
       setProgressText(`ERROR: ${ev.error.split('\n')[0]}`);
       showMessage(`Fetch failed: ${ev.error.split('\n')[0]}`, true);
-      const nightMsg = document.getElementById('night-message');
-      if (nightMsg) {
-        nightMsg.textContent = `Fetch failed: ${ev.error.split('\n')[0]}`;
-        nightMsg.classList.add('error');
+      for (const msgId of ['night-message', 'range-message']) {
+        const m = document.getElementById(msgId);
+        if (m) {
+          m.textContent = `Fetch failed: ${ev.error.split('\n')[0]}`;
+          m.classList.add('error');
+        }
       }
       document.getElementById('night-submit').disabled = false;
+      document.getElementById('range-submit').disabled = false;
       es.close();
       activeEventSource = null;
       activeJobId = null;
@@ -719,9 +1033,15 @@ async function transitionToExplore(activeJob) {
   // /api/summary so we route to the right loaded state on the server.
   // Without this the request would be context-less and the server
   // couldn't tell us which exposure / night to summarise.
-  const params = activeJob && activeJob.kind === 'night'
-    ? `dayObs=${encodeURIComponent(activeJob.dayObs)}`
-    : `dataId=${encodeURIComponent(activeJob.expId)}`;
+  let params;
+  if (activeJob && activeJob.kind === 'night') {
+    params = `dayObs=${encodeURIComponent(activeJob.dayObs)}`;
+  } else if (activeJob && activeJob.kind === 'range') {
+    params = `rangeStart=${encodeURIComponent(activeJob.startId)}`
+      + `&rangeStop=${encodeURIComponent(activeJob.stopId)}`;
+  } else {
+    params = `dataId=${encodeURIComponent(activeJob.expId)}`;
+  }
   try {
     const r = await fetch(`/api/summary?${params}`);
     const summary = await r.json();
@@ -736,6 +1056,8 @@ async function transitionToExplore(activeJob) {
     window.history.replaceState({}, '', newUrl);
     if (summary.mode === 'night' && window.showNight) {
       window.showNight(summary);
+    } else if (summary.mode === 'range' && window.showRange) {
+      window.showRange(summary);
     } else if (window.showExplore) {
       window.showExplore(summary);
     }
@@ -761,8 +1083,7 @@ async function startNightFetch(ev) {
   const s = readSettings();
   const body = {
     dayObs,
-    cluster: s.cluster || undefined,
-    namespace: s.namespace || undefined,
+    site: activeSite ? activeSite.name : undefined,
     workers: parseInt(s.workers, 10) || undefined,
     username: credsForm.elements.username.value.trim() || undefined,
     password: credsForm.elements.password.value || undefined,
@@ -796,28 +1117,92 @@ async function startNightFetch(ev) {
   openProgressStream(jobId);
 }
 
+async function startRangeFetch(ev) {
+  ev.preventDefault();
+  if (activeJobId) return;
+  const msgEl = document.getElementById('range-message');
+  if (!(rangeStartSlot.tZero && rangeStopSlot.tZero)) {
+    msgEl.textContent = 'Resolve both start and stop shutter-close times first.';
+    msgEl.classList.add('error');
+    return;
+  }
+  if (rangeStopSlot.forId <= rangeStartSlot.forId) {
+    msgEl.textContent = 'Stop dataId must be greater than start dataId.';
+    msgEl.classList.add('error');
+    return;
+  }
+  saveCreds();
+  const form = document.getElementById('range-form');
+  const credsForm = document.getElementById('creds-form');
+  const s = readSettings();
+  const body = {
+    rangeStart: rangeStartSlot.forId,
+    rangeStop: rangeStopSlot.forId,
+    // Always TAI; the server applies the -37 s conversion (same contract
+    // as the single-exposure form).
+    tZeroStart: rangeStartSlot.tZero,
+    tZeroStop: rangeStopSlot.tZero,
+    site: activeSite ? activeSite.name : undefined,
+    workers: parseInt(s.workers, 10) || undefined,
+    windowBefore: parseFloat(form.elements.windowBefore.value),
+    windowAfter: parseFloat(form.elements.windowAfter.value),
+    username: credsForm.elements.username.value.trim() || undefined,
+    password: credsForm.elements.password.value || undefined,
+  };
+
+  const submit = document.getElementById('range-submit');
+  submit.disabled = true;
+  msgEl.textContent = 'Starting range fetch...';
+  msgEl.classList.remove('error');
+  activeProgressKind = 'range';
+  showInlineProgress('range', true);
+  resetInlineProgress('range');
+
+  let jobId;
+  try {
+    const r = await fetch('/api/fetch-range', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const data = await r.json();
+    if (!r.ok) throw new Error(data.error || `HTTP ${r.status}`);
+    jobId = data.jobId;
+  } catch (e) {
+    msgEl.textContent = `Failed to start range fetch: ${e.message || e}`;
+    msgEl.classList.add('error');
+    submit.disabled = false;
+    activeProgressKind = null;
+    return;
+  }
+  activeJobId = jobId;
+  openProgressStream(jobId);
+}
+
 // ----- wiring -------------------------------------------------------------
 
 function wireHomeListeners() {
   document.getElementById('fetch-form').addEventListener('submit', startFetch);
   document.getElementById('night-form').addEventListener('submit', startNightFetch);
+  document.getElementById('range-form').addEventListener('submit', startRangeFetch);
   const expIdInput = document.getElementById('fetch-form').elements.exposureId;
   expIdInput.addEventListener('input', scheduleLookup);
+  // Manual shutter-close fallback (shown only when the ConsDB lookup fails).
+  document.getElementById('fetch-form').elements.manualTZero.addEventListener('input', applyManualTZero);
+  const rangeForm = document.getElementById('range-form');
+  rangeForm.elements.rangeStart.addEventListener('input', () => scheduleRangeLookup(rangeStartSlot));
+  rangeForm.elements.rangeStop.addEventListener('input', () => scheduleRangeLookup(rangeStopSlot));
   document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
   document.getElementById('creds-forget').addEventListener('click', forgetCreds);
   // Save settings on every input — they're tiny, latency-free, and the
-  // user expects "I changed it" to mean "it's saved". The RSP token
-  // input also retriggers the dataId lookup, since changing the token
-  // path may unlock a previously-failed lookup.
+  // user expects "I changed it" to mean "it's saved".
   const settingsForm = document.getElementById('settings-form');
   for (const el of settingsForm.querySelectorAll('input')) {
-    el.addEventListener('input', () => {
-      saveSettings();
-      if (el.name === 'rspTokenFile') triggerLookupIfReady();
-    });
+    el.addEventListener('input', saveSettings);
   }
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
   document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
   homeListenersWired = true;
   updateSubmitButton();  // start with submit disabled until lookup resolves
+  updateRangeSubmit();   // same for the range card
 }
