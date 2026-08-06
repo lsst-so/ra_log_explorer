@@ -11,6 +11,7 @@ from urllib.error import HTTPError
 import pytest
 
 from ra_log_explorer import exposureTimes
+from ra_log_explorer import sites as sitesModule
 
 # A throwaway URL used for every call below. The point of these tests is the
 # helper's behaviour around the response shape, not its URL routing — the URL
@@ -593,3 +594,34 @@ def test_storeCachedRecords_recovers_from_corrupt_existing_file(
     )
     data = json.loads(cachePath.read_text())
     assert data == {"2026051900722": {"obs_end": "2026-05-20T08:46:16.267000"}}
+
+
+def test_postQuery_omits_auth_header_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An in-cluster ConsDB takes no token. Sending a bare ``Bearer`` with
+    nothing after it would be rejected, so the header must be absent
+    entirely rather than empty."""
+    seen: list[dict[str, str]] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        seen.append(dict(req.header_items()))
+        return _stubResponse(
+            {"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")]}
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    rec = exposureTimes.queryExposureRecord(2026051900722, "", consdbUrl=URL)
+    assert rec is not None
+    # urllib title-cases header names, so check case-insensitively.
+    assert not [k for k in seen[0] if k.lower() == "authorization"]
+
+
+def test_loadTokenForSite_returns_empty_for_a_token_less_site(tmp_path: Path) -> None:
+    site = sitesModule.Site(
+        name="incluster",
+        cluster="manke",
+        namespace="ns",
+        lokiAddr="https://l",
+        consdbUrl="http://consdb-pq.consdb:8080/consdb/query",
+        consdbTokenFile=None,
+    )
+    assert exposureTimes.loadTokenForSite(site) == ""

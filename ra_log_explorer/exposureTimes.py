@@ -245,16 +245,13 @@ class _UndefinedTableError(Exception):
 def _postQuery(sql: str, token: str, *, consdbUrl: str) -> dict:
     """POST one SQL query, return the parsed JSON payload."""
     body = json.dumps({"query": sql}).encode("utf-8")
-    req = Request(
-        consdbUrl,
-        data=body,
-        headers={
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
+    headers = {"accept": "application/json", "Content-Type": "application/json"}
+    # An empty token means the endpoint needs no auth (an in-cluster ConsDB
+    # Service, reached without going through Gafaelfawr). Sending
+    # ``Bearer`` with nothing after it would be rejected outright.
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(consdbUrl, data=body, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=30.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -299,11 +296,15 @@ def _queryOneRecord(dataId: int, token: str, instrument: str, *, consdbUrl: str)
 def loadTokenForSite(site: Site) -> str:
     """Read and return the bearer token for ``site.consdbTokenFile``.
 
-    Raises :exc:`OSError` if the file can't be read; returns the empty
-    string only if the file exists but is whitespace-only. Callers
-    check both conditions explicitly so they can report a clear UI
-    message ("token file missing" vs "token file empty") to the user.
+    Returns the empty string — meaning "send no Authorization header" —
+    for a site that declares no token file at all. Otherwise raises
+    :exc:`OSError` if the file can't be read, and returns the empty
+    string if the file exists but is whitespace-only. Callers check
+    both conditions explicitly so they can report a clear UI message
+    ("token file missing" vs "token file empty") to the user.
     """
+    if site.consdbTokenFile is None:
+        return ""
     return readToken(site.consdbTokenFile)
 
 

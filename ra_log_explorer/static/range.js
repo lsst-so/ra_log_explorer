@@ -89,7 +89,7 @@ async function loadRangeExposure(expId) {
     + `&dataId=${encodeURIComponent(expId)}`;
   let payload;
   try {
-    const r = await fetch(`/api/summary?${qs}`);
+    const r = await fetch(apiUrl(`/api/summary?${qs}`));
     payload = await r.json();
   } catch (e) {
     return;

@@ -97,6 +97,19 @@ def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     return resp.status, parsed
 
 
+def _put(host: str, port: int, path: str, rawBody: str) -> tuple[int, dict]:
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request("PUT", path, body=rawBody, headers={"Content-Type": "application/json"})
+    resp = conn.getresponse()
+    text = resp.read().decode("utf-8")
+    conn.close()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = {"_raw": text}
+    return resp.status, parsed
+
+
 def _delete(host: str, port: int, path: str) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("DELETE", path)
@@ -2249,3 +2262,112 @@ def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
     _prefetchNightShutterCloses(state, [summary], job, summit)
     shutterEvents = [ev for ev in job.events if ev.get("type") == "shutter-close"]
     assert shutterEvents == []
+
+
+# ----- base path ----------------------------------------------------------
+
+
+@pytest.fixture
+def mountedServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterator[RunningServer]:
+    """Same server, mounted under ``/log-explorer`` — how it is deployed
+    behind a Gafaelfawr ingress that shares a hostname with the rest of
+    the RSP."""
+    from http.server import ThreadingHTTPServer
+
+    ctx = ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        defaultSiteName=siteCatalog.defaultName,
+        basePath="/log-explorer",
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield "127.0.0.1", httpd.server_address[1], ctx
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=2.0)
+
+
+def test_healthz_answers_at_the_root(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/healthz")
+    assert status == 200
+    assert body["status"] == "ok"
+
+
+def test_healthz_answers_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The readiness probe hits the prefixed path; if this 404s the pod
+    never becomes Ready and the deployment wedges."""
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/healthz")
+    assert status == 200
+    assert body["status"] == "ok"
+
+
+def test_api_routes_under_the_base_path(mountedServer: RunningServer) -> None:
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/api/summary")
+    assert status == 200
+    assert body["loaded"] is False
+
+
+def test_unprefixed_paths_404_when_mounted(mountedServer: RunningServer) -> None:
+    """Requests outside the base path belong to some other app on the same
+    hostname; answering them would be wrong even though we can."""
+    host, port, _ctx = mountedServer
+    assert _get(host, port, "/api/summary")[0] == 404
+    assert _get(host, port, "/healthz")[0] == 404
+    assert _get(host, port, "/log-explorer-other/api/summary")[0] == 404
+
+
+def test_index_is_served_with_and_without_a_trailing_slash(mountedServer: RunningServer) -> None:
+    """Ingress passes ``/log-explorer`` through verbatim, so the bare
+    prefix has to render the app rather than 404."""
+    host, port, _ctx = mountedServer
+    for path in ("/log-explorer", "/log-explorer/"):
+        status, body = _get(host, port, path)
+        assert status == 200, path
+        assert "<title>Rapid Analysis Log Explorer</title>" in body["_raw"], path
+
+
+def test_index_substitutes_the_base_path_into_asset_urls(mountedServer: RunningServer) -> None:
+    """Every URL the page asks for must carry the prefix; a leftover
+    ``__BASE_PATH__`` or a bare ``/static/`` means a blank page in the
+    browser."""
+    host, port, _ctx = mountedServer
+    _status, body = _get(host, port, "/log-explorer/")
+    html = body["_raw"]
+    assert "__BASE_PATH__" not in html
+    assert 'src="/log-explorer/static/app.js"' in html
+    assert 'href="/log-explorer/static/style.css"' in html
+    assert 'window.BASE_PATH = "/log-explorer";' in html
+    assert 'src="/static/' not in html
+
+
+def test_index_at_the_root_has_no_prefix(runningServer: RunningServer) -> None:
+    """The local, unprefixed run is the common case; the substitution must
+    collapse to plain absolute paths rather than leaving a stray slash."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert "__BASE_PATH__" not in html
+    assert 'src="/static/app.js"' in html
+    assert 'window.BASE_PATH = "";' in html
+
+
+def test_post_and_delete_also_honour_the_base_path(mountedServer: RunningServer) -> None:
+    """Routing is per-method, so a prefix stripped in do_GET but not in
+    do_POST would leave the fetch button dead in the deployed app."""
+    host, port, _ctx = mountedServer
+    # A bad body proves the route was reached (400), not that it 404'd.
+    assert _post(host, port, "/log-explorer/api/fetch", {})[0] == 400
+    assert _post(host, port, "/api/fetch", {})[0] == 404
+    assert _delete(host, port, "/log-explorer/api/cache")[0] == 200
+    assert _delete(host, port, "/api/cache")[0] == 404
+    # PUT too. A malformed body is enough to prove the route was reached
+    # without letting the handler persist anything.
+    assert _put(host, port, "/log-explorer/api/settings", "not json")[0] == 400
+    assert _put(host, port, "/api/settings", "not json")[0] == 404

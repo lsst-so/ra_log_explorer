@@ -31,7 +31,7 @@ async function bootstrap() {
     let summary;
     try {
       const qs = `rangeStart=${encodeURIComponent(urlRangeStart)}&rangeStop=${encodeURIComponent(urlRangeStop)}`;
-      const r = await fetch(`/api/summary?${qs}`);
+      const r = await fetch(apiUrl(`/api/summary?${qs}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {
@@ -50,7 +50,7 @@ async function bootstrap() {
   if (urlDataId) {
     let summary;
     try {
-      const r = await fetch(`/api/summary?dataId=${encodeURIComponent(urlDataId)}`);
+      const r = await fetch(apiUrl(`/api/summary?dataId=${encodeURIComponent(urlDataId)}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {
@@ -63,7 +63,7 @@ async function bootstrap() {
   if (urlDayObs) {
     let summary;
     try {
-      const r = await fetch(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`);
+      const r = await fetch(apiUrl(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {

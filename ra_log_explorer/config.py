@@ -7,7 +7,10 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-DEFAULT_USERNAME = "merlin"
+# Loki basic-auth user. A deployed instance authenticates as a service
+# account rather than a person, so the default is environment-overridable:
+# the container sets LOKI_USERNAME and nobody has to type it into the UI.
+DEFAULT_USERNAME = os.environ.get("LOKI_USERNAME") or "merlin"
 DEFAULT_WORKERS = 8
 # Window padding around the user's t-zero. The CLI applies the TAI→UTC
 # conversion internally so t-zero is the actual shutter-close UTC moment;
@@ -17,11 +20,37 @@ DEFAULT_WORKERS = 8
 DEFAULT_WINDOW_BEFORE_S = 5.0
 DEFAULT_WINDOW_AFTER_S = 5 * 60.0
 DEFAULT_HTTP_PORT = 8780
+# Env var naming the URL prefix the app is served under. Empty (the local
+# default) means "served at the root"; a deployment sharing a hostname with
+# the rest of the RSP sets it to e.g. ``/log-explorer``.
+BASE_PATH_ENV = "RA_LOG_EXPLORER_BASE_PATH"
 # Range mode fetches one wide window covering [startId, stopId]. The tool is
 # meant for tens of consecutive exposures; this is a fat-finger backstop so a
 # transposed/typo'd pair can't generate a multi-thousand-id ConsDB sweep or a
 # pathologically wide Loki window.
 MAX_RANGE_SPAN = 500
+
+
+def normalizeBasePath(raw: str | None) -> str:
+    """Normalize a URL prefix to the one form the router and template agree on.
+
+    Accepts anything a human or a Helm value might supply — ``log-explorer``,
+    ``/log-explorer/``, ``/``, ``None`` — and returns either the empty string
+    ("served at the root") or ``/segment`` with no trailing slash. Having a
+    single canonical form matters because the prefix is both string-matched
+    off incoming request paths and concatenated into the HTML the browser
+    gets back; the two would disagree about ``//static/...`` otherwise.
+    """
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    s = "/" + s.strip("/")
+    return "" if s == "/" else s
+
+
+def defaultBasePath() -> str:
+    """Base path from :data:`BASE_PATH_ENV`, for callers with no explicit flag."""
+    return normalizeBasePath(os.environ.get(BASE_PATH_ENV))
 
 
 def settingsFilePath() -> Path:

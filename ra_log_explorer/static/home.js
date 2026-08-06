@@ -96,7 +96,7 @@ async function loadSiteCatalog() {
   // later back-home would only leak a duplicate listener — guard it.
   if (siteSwitcherWired) return;
   try {
-    const r = await fetch('/api/sites');
+    const r = await fetch(apiUrl('/api/sites'));
     if (!r.ok) return;
     siteCatalog = await r.json();
   } catch (_) {
@@ -196,7 +196,7 @@ function prefillSettings() {
   // default) — render it as a hint so the user can see where their
   // typed input resolves to, including the case where it's overridden
   // by RA_LOG_EXPLORER_CACHE.
-  fetch('/api/settings').then(async (r) => {
+  fetch(apiUrl('/api/settings')).then(async (r) => {
     if (!r.ok) return;
     const data = await r.json();
     const gib = Math.round((data.maxCacheBytes / (1024 ** 3)) * 100) / 100;
@@ -233,7 +233,7 @@ function saveSettings() {
   // #settings-state but don't block anything else.
   const stateEl = document.getElementById('settings-state');
   const bytes = Math.round((s.maxCacheGiB || 0) * (1024 ** 3));
-  fetch('/api/settings', {
+  fetch(apiUrl('/api/settings'), {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ maxCacheBytes: bytes, cacheDir: s.cacheDir || null }),
@@ -506,7 +506,7 @@ function triggerLookupIfReady() {
   // first paint).
   const siteName = activeSite ? activeSite.name : '';
   const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
-  fetch(`/api/exposure-time/${expId}${qs}`)
+  fetch(apiUrl(`/api/exposure-time/${expId}${qs}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer
@@ -610,7 +610,7 @@ function triggerRangeLookup(slot) {
   const mySeq = ++slot.seq;
   const siteName = activeSite ? activeSite.name : '';
   const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
-  fetch(`/api/exposure-time/${expId}${qs}`)
+  fetch(apiUrl(`/api/exposure-time/${expId}${qs}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== slot.seq) return;  // stale; user typed something newer
@@ -654,7 +654,7 @@ function triggerRangeLookupsIfReady() {
 
 async function refreshCache() {
   try {
-    const r = await fetch('/api/cache');
+    const r = await fetch(apiUrl('/api/cache'));
     const data = await r.json();
     renderCache(data);
   } catch (e) {
@@ -710,7 +710,7 @@ function renderCache(data) {
       keyCell = `<a class="mono cache-key-link cache-key-range" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener" title="range ${w.rangeStart} → ${w.rangeStop}">${w.rangeStart}<br>→ ${w.rangeStop}</a>`;
     } else if (w.exposureIds && w.exposureIds.length > 0) {
       keyCell = w.exposureIds
-        .map((id) => `<a class="mono cache-key-link" href="/?dataId=${encodeURIComponent(id)}" target="_blank" rel="noopener">${id}</a>`)
+        .map((id) => `<a class="mono cache-key-link" href="${apiUrl(`/?dataId=${encodeURIComponent(id)}`)}" target="_blank" rel="noopener">${id}</a>`)
         .join(' ');
     } else {
       keyCell = `<span class="muted">—</span>`;
@@ -763,7 +763,7 @@ async function deleteCacheWindow(w) {
   // query delimiter); the server percent-decodes them back before
   // resolving the directory.
   const segments = subPath.split('/').map(encodeURIComponent).join('/');
-  const url = `/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`;
+  const url = apiUrl(`/api/cache/${encodeURIComponent(w.cluster)}/${encodeURIComponent(w.namespace)}/${segments}`);
   try {
     const r = await fetch(url, { method: 'DELETE' });
     if (r.status === 404) {
@@ -791,7 +791,7 @@ async function deleteAllCache() {
   const info = document.getElementById('cache-summary').textContent;
   if (!window.confirm(`Delete EVERY cached window?\n\n${info}\n\nThis cannot be undone.`)) return;
   try {
-    const r = await fetch('/api/cache', { method: 'DELETE' });
+    const r = await fetch(apiUrl('/api/cache'), { method: 'DELETE' });
     if (!r.ok) {
       const body = await r.json().catch(() => ({}));
       alert(`Delete failed: ${body.error || r.status}`);
@@ -825,10 +825,10 @@ function cacheRowUrl(w) {
   // the windowBefore/After + cluster/ns into the form and the user
   // submits manually. Returns null for that case.
   if (w.kind === 'night' && w.dayObs != null) {
-    return `/?dayObs=${encodeURIComponent(w.dayObs)}`;
+    return apiUrl(`/?dayObs=${encodeURIComponent(w.dayObs)}`);
   }
   if (w.kind === 'range' && w.rangeStart != null && w.rangeStop != null) {
-    return `/?rangeStart=${encodeURIComponent(w.rangeStart)}&rangeStop=${encodeURIComponent(w.rangeStop)}`;
+    return apiUrl(`/?rangeStart=${encodeURIComponent(w.rangeStart)}&rangeStop=${encodeURIComponent(w.rangeStop)}`);
   }
   return null;
 }
@@ -896,7 +896,7 @@ async function startFetch(ev) {
 
   let jobId;
   try {
-    const r = await fetch('/api/fetch', {
+    const r = await fetch(apiUrl('/api/fetch'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(values),
@@ -955,7 +955,7 @@ function setProgressFill(pct) {
 
 function openProgressStream(jobId) {
   if (activeEventSource) activeEventSource.close();
-  const es = new EventSource(`/api/fetch/${jobId}/progress`);
+  const es = new EventSource(apiUrl(`/api/fetch/${jobId}/progress`));
   activeEventSource = es;
   let total = 0, done = 0;
   let windowStr = '';  // remembered between events so each pod-count update can re-include the window
@@ -1043,7 +1043,7 @@ async function transitionToExplore(activeJob) {
     params = `dataId=${encodeURIComponent(activeJob.expId)}`;
   }
   try {
-    const r = await fetch(`/api/summary?${params}`);
+    const r = await fetch(apiUrl(`/api/summary?${params}`));
     const summary = await r.json();
     if (!summary.loaded) {
       showMessage('Fetch finished but the server reports no loaded data?', true);
@@ -1099,7 +1099,7 @@ async function startNightFetch(ev) {
 
   let jobId;
   try {
-    const r = await fetch('/api/fetch-night', {
+    const r = await fetch(apiUrl('/api/fetch-night'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -1160,7 +1160,7 @@ async function startRangeFetch(ev) {
 
   let jobId;
   try {
-    const r = await fetch('/api/fetch-range', {
+    const r = await fetch(apiUrl('/api/fetch-range'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),

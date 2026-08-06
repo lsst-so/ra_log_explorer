@@ -38,6 +38,7 @@ import webbrowser
 
 from . import parse as parser
 from .config import (
+    BASE_PATH_ENV,
     DEFAULT_HTTP_PORT,
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
@@ -45,6 +46,8 @@ from .config import (
     DEFAULT_WORKERS,
     FetchSpec,
     cache_root,
+    defaultBasePath,
+    normalizeBasePath,
 )
 
 # Imported here so `cli.TAI_MINUS_UTC_S` keeps resolving and so that the
@@ -261,10 +264,11 @@ def cmdRun(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName)
+    basePath = normalizeBasePath(args.base_path)
+    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName, basePath=basePath)
     if state is not None:
         ctx.putExposureState(state)
-    url = f"http://{args.host}:{args.port}/"
+    url = f"http://{args.host}:{args.port}{basePath}/"
     if not args.no_browser:
         try:
             webbrowser.open(url)
@@ -356,6 +360,12 @@ def build_parser() -> argparse.ArgumentParser:
     runP.add_argument("--host", default="127.0.0.1")
     runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     runP.add_argument(
+        "--base-path",
+        default=defaultBasePath(),
+        help="URL prefix to serve under, e.g. /log-explorer, for deployments sharing a "
+        f"hostname with other apps. Defaults to ${BASE_PATH_ENV}, or the root.",
+    )
+    runP.add_argument(
         "--no-serve",
         action="store_true",
         help="With --exposure-id/--t-zero: fetch + parse only, do not start the web UI. "
@@ -379,6 +389,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--t-zero-utc", action="store_true")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    p.add_argument("--base-path", default=defaultBasePath())
     p.add_argument("--no-serve", action="store_true")
     p.add_argument("--no-browser", action="store_true")
     _addCommonArgs(p)

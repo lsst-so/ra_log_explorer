@@ -31,7 +31,10 @@ class Site:
 
     ``consdbTokenFile`` is the on-disk path the server reads the bearer
     token from when calling ``consdbUrl``. It's resolved with ``~``
-    expansion against the *server's* HOME at load time.
+    expansion against the *server's* HOME at load time. ``None`` means
+    the endpoint takes no token at all — which is the case when
+    ``consdbUrl`` is a cluster-internal Service address, reached inside
+    the same cluster and so never passing through Gafaelfawr.
     """
 
     name: str  # short slug — "summit", "bts" — also used as the cache-key
@@ -39,7 +42,7 @@ class Site:
     namespace: str  # Loki `namespace` label
     lokiAddr: str  # Loki HTTP base URL
     consdbUrl: str  # ConsDB POST endpoint (full URL, includes /query)
-    consdbTokenFile: Path  # absolute, ~ already expanded
+    consdbTokenFile: Path | None  # absolute, ~ already expanded; None = no auth
 
 
 class SitesConfigError(RuntimeError):
@@ -110,19 +113,24 @@ def loadSites(path: Path | None = None) -> tuple[list[Site], str]:
 
 def _siteFromDict(entry: dict, path: Path, idx: int) -> Site:
     """Validate one ``[[site]]`` table and construct a :class:`Site`."""
-    fields = ("name", "cluster", "namespace", "lokiAddr", "consdbUrl", "consdbTokenFile")
+    fields = ("name", "cluster", "namespace", "lokiAddr", "consdbUrl")
     missing = [f for f in fields if not isinstance(entry.get(f), str) or not entry[f]]
     if missing:
         raise SitesConfigError(
             f"Sites catalog entry #{idx} in {path} is missing required string field(s): {missing}."
         )
+    # Optional: omit it (or leave it blank) for a ConsDB that needs no
+    # bearer token, e.g. an in-cluster Service address.
+    rawToken = entry.get("consdbTokenFile")
+    if rawToken is not None and not isinstance(rawToken, str):
+        raise SitesConfigError(f"Sites catalog entry #{idx} in {path} has a non-string consdbTokenFile.")
     return Site(
         name=entry["name"],
         cluster=entry["cluster"],
         namespace=entry["namespace"],
         lokiAddr=entry["lokiAddr"],
         consdbUrl=entry["consdbUrl"],
-        consdbTokenFile=Path(entry["consdbTokenFile"]).expanduser(),
+        consdbTokenFile=Path(rawToken).expanduser() if rawToken else None,
     )
 
 

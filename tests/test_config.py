@@ -163,3 +163,34 @@ def test_dayObsStartUtc_alignment_at_year_boundary() -> None:
     # The end therefore lands on Jan 1.
     end = config.dayObsEndUtc(20251231)
     assert end == _dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+
+# ----- base path -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, ""),
+        ("", ""),
+        ("   ", ""),
+        ("/", ""),
+        ("///", ""),
+        ("/log-explorer", "/log-explorer"),
+        ("log-explorer", "/log-explorer"),
+        ("/log-explorer/", "/log-explorer"),
+        ("  /log-explorer/  ", "/log-explorer"),
+        ("/a/b", "/a/b"),
+    ],
+)
+def test_normalizeBasePath(raw: str | None, expected: str) -> None:
+    """Anything a human or a Helm value might supply collapses to the one
+    canonical form the router and the HTML template both assume."""
+    assert config.normalizeBasePath(raw) == expected
+
+
+def test_defaultBasePath_reads_and_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(config.BASE_PATH_ENV, "log-explorer/")
+    assert config.defaultBasePath() == "/log-explorer"
+    monkeypatch.delenv(config.BASE_PATH_ENV)
+    assert config.defaultBasePath() == ""

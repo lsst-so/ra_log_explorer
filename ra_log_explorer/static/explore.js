@@ -627,7 +627,7 @@ async function selectPod(pod) {
     // at this dataId's shutter close); single-exposure mode just keys
     // off the loaded dataId.
     const q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
-    const r = await fetch(`/api/pod/${pod}?${q}`);
+    const r = await fetch(apiUrl(`/api/pod/${pod}?${q}`));
     podDetailCache[pod] = await r.json();
   }
   renderDetail();

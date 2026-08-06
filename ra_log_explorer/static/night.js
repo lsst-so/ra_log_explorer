@@ -190,7 +190,7 @@ function renderGatherOnly(dataIds) {
   for (const id of shown) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.href = apiUrl(`/?dataId=${encodeURIComponent(id)}&autoFetch=1`);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -359,7 +359,7 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
   for (const id of dataIds) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.href = apiUrl(`/?dataId=${encodeURIComponent(id)}&autoFetch=1`);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -430,8 +430,8 @@ async function toggleFailureExpansion(tr, row) {
   tr.parentNode.insertBefore(detail, tr.nextSibling);
   try {
     const r = await fetch(
-      `/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
-      + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`,
+      apiUrl(`/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
+        + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`),
     );
     if (!r.ok) {
       td.firstChild.textContent = `(failed to load: HTTP ${r.status})`;
@@ -555,7 +555,7 @@ function renderRestarts(rows) {
     } else {
       const a = document.createElement('a');
       a.className = 'mono';
-      a.href = `/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`;
+      a.href = apiUrl(`/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`);
       a.target = '_blank';
       a.rel = 'noopener';
       a.textContent = String(r.dataId);

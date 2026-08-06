@@ -190,3 +190,40 @@ def test_siteByCluster_raises_for_unknown(tmp_path: Path) -> None:
     catalog, _ = sites.loadSites(p)
     with pytest.raises(sites.SitesConfigError):
         sites.siteByCluster(catalog, "ghost")
+
+
+def test_loadSites_allows_a_site_with_no_token_file(tmp_path: Path) -> None:
+    """A ConsDB reached in-cluster needs no bearer token, so the field is
+    optional and its absence must load as ``None`` rather than raising."""
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "incluster"\n'
+        '[[site]]\nname = "incluster"\ncluster = "manke"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "http://consdb-pq.consdb:8080/consdb/query"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].consdbTokenFile is None
+
+
+def test_loadSites_treats_blank_token_file_as_absent(tmp_path: Path) -> None:
+    """An empty string is what a Helm template renders for "no token"; it
+    must mean the same thing as omitting the key, not a path of ``''``."""
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "a"\n'
+        '[[site]]\nname = "a"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\nconsdbTokenFile = ""\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].consdbTokenFile is None
+
+
+def test_loadSites_rejects_non_string_token_file(tmp_path: Path) -> None:
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "a"\n'
+        '[[site]]\nname = "a"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\nconsdbTokenFile = 7\n',
+    )
+    with pytest.raises(sites.SitesConfigError):
+        sites.loadSites(p)

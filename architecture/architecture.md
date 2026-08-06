@@ -57,6 +57,7 @@ Sibling docs:
                   ▼
     ┌────────────────────────────┐         GET    /                          (home/explore/night SPA)
     │   server.py                │ ◄────── GET    /static/*
+    │                            │ ◄────── GET    /healthz                   (readiness probe)
     │   (stdlib HTTP + SSE)      │ ◄────── GET    /api/summary?dataId=…
     │                            │ ◄────── GET    /api/summary?dayObs=…
     │                            │ ◄────── GET    /api/summary?rangeStart=&rangeStop=[&dataId=]
@@ -75,6 +76,8 @@ Sibling docs:
     │                            │ ◄────── GET    /api/fetch/<id>/status
     │                            │ ◄────── GET    /api/fetch/<id>/progress    (SSE)
     └────────────────────────────┘
+       every route above is mounted under ServerContext.basePath — "" for a
+       local run, e.g. /log-explorer when deployed behind a shared hostname
                   ▲
                   │ HTML / CSS / JS (vanilla; no build step)
                   │
@@ -123,22 +126,41 @@ Sibling docs:
 
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
-| `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant. |
+| `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, and base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`). `DEFAULT_USERNAME` reads `$LOKI_USERNAME` so a deployment can authenticate as a service account without anyone typing it. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
-| `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile`). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
+| `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `appSettings.py`   | Reads / writes `<cache_root>/settings.json`. Schema is open-ended; today the only field is `maxCacheBytes`. Used by the LRU cache eviction in `fetch.evictToFit`. |
-| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
+| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
 | `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, credentials, cache list, progress), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
 
 ## Key Concepts
 
-- **Site** — a (Loki cluster, ConsDB endpoint, bearer-token file)
-  bundle that pairs the *log source* with the *truth source* for
+- **Base path** — the URL prefix the app is served under. Empty for a
+  local run (`http://127.0.0.1:8780/`); `/log-explorer` when deployed
+  behind a Gafaelfawr ingress that shares a hostname with the rest of
+  the RSP. Set with `--base-path` or `RA_LOG_EXPLORER_BASE_PATH`,
+  canonicalised by `config.normalizeBasePath`, and carried on
+  `ServerContext.basePath`.
+
+  It acts in two places, which have to agree. Inbound, every `do_*`
+  method runs the request path through `Handler._routePath`, which
+  strips the prefix and 404s anything outside it (rather than serving
+  the home page to a URL belonging to another app on the same host).
+  Outbound, `templates/timeline.html` carries a literal `__BASE_PATH__`
+  at each URL back to us; `Handler._send_index` substitutes it at
+  request time, which is also what defines `window.BASE_PATH` and the
+  `window.apiUrl()` helper that every `fetch` / `EventSource` / deep
+  link in `static/*.js` goes through. Substituting per-request rather
+  than at build time keeps the container image environment-agnostic
+  and keeps the no-build-step edit-and-reload loop working locally.
+
+- **Site** — a (Loki cluster, ConsDB endpoint, optional bearer-token
+  file) bundle that pairs the *log source* with the *truth source* for
   shutter-close times. Catalogued in the checked-in
   [`ra_log_explorer/sites.toml`](../ra_log_explorer/sites.toml);
   loaded once at startup into `ServerContext.sites`. Today there are
@@ -146,6 +168,13 @@ Sibling docs:
   `usdf-rsp.slac.stanford.edu`, token `~/.lsst/log-browser-token.txt`)
   and **bts** (cluster `manke`, ConsDB at `base-lsp.lsst.codes`, token
   `~/.lsst/manke-token.txt`).
+
+  `consdbTokenFile` is optional. Omitting it (or leaving it blank)
+  means the endpoint takes no bearer token — the case for a
+  cluster-internal ConsDB Service address, which is reached without
+  passing through Gafaelfawr. A deployed instance ships a generated
+  one-site catalog of exactly this shape via
+  `RA_LOG_EXPLORER_SITES_FILE`.
 
   Sites matter because the same bare dataId can refer to a real-camera
   exposure on the summit and a *different*, simulated exposure on BTS
@@ -230,6 +259,18 @@ Sibling docs:
   the same exposure. Surfaced on head-node events.
 
 ## JSON API
+
+Every path below is relative to the deployment's **base path** (see Key
+Concepts): served verbatim for a local run, and under e.g.
+`/log-explorer` when deployed. The browser never hard-codes them — they
+all go through `window.apiUrl()`.
+
+### `GET /healthz`
+
+`{"status": "ok"}`, always 200. Deliberately touches no state: it is what
+the deployment's readiness probe polls, and a probe that a slow fetch
+could make fail would pull the only pod out of the Service mid-
+investigation.
 
 ### `GET /api/summary`
 

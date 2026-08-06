@@ -242,6 +242,10 @@ class ServerContext:
     jobs: JobManager
     sites: list[Site] = field(default_factory=list)
     defaultSiteName: str = ""
+    # URL prefix the app is served under (``""`` at the root). Stripped off
+    # every incoming request path before routing, and substituted into the
+    # HTML so the browser asks for the prefixed URLs back.
+    basePath: str = ""
     exposureStates: "OrderedDict[int, ServerState]" = field(default_factory=OrderedDict)
     nightStates: "OrderedDict[int, NightState]" = field(default_factory=OrderedDict)
     # Keyed by ``rangeKey(startId, stopId)``.
@@ -732,26 +736,30 @@ def _resolveShutterClosesInto(
     if not misses:
         return
 
-    # 2) Batch ConsDB queries (one per instrument, chunked) — needs a token.
+    # 2) Batch ConsDB queries (one per instrument, chunked). A site that
+    #    declares no token file talks to a ConsDB that needs no auth, so we
+    #    only insist on a readable token when the catalog names one.
     tokenPath = site.consdbTokenFile
-    if not tokenPath.exists():
-        job.push(
-            {
-                "type": "shutter-close",
-                "phase": "no-token",
-                "remaining": unanchored(),
-                "tokenPath": str(tokenPath),
-                "site": site.name,
-            }
-        )
-        return
-    try:
-        token = exposureTimes.readToken(tokenPath)
-    except OSError:
-        token = ""
-    if not token:
-        job.push({"type": "shutter-close", "phase": "empty-token", "remaining": unanchored()})
-        return
+    token = ""
+    if tokenPath is not None:
+        if not tokenPath.exists():
+            job.push(
+                {
+                    "type": "shutter-close",
+                    "phase": "no-token",
+                    "remaining": unanchored(),
+                    "tokenPath": str(tokenPath),
+                    "site": site.name,
+                }
+            )
+            return
+        try:
+            token = exposureTimes.readToken(tokenPath)
+        except OSError:
+            token = ""
+        if not token:
+            job.push({"type": "shutter-close", "phase": "empty-token", "remaining": unanchored()})
+            return
     try:
         resolved = exposureTimes.queryExposureRecordBatch(misses, token, consdbUrl=site.consdbUrl)
     except (exposureTimes.ConsDbError, OSError) as e:
@@ -1687,6 +1695,44 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             self.end_headers()
             self.wfile.write(body)
 
+        def _send_index(self) -> None:
+            """Serve the single-page shell with the base path substituted in.
+
+            ``timeline.html`` carries a literal ``__BASE_PATH__`` everywhere a
+            URL back to us appears. Substituting at request time (rather than
+            baking it in at build time, as a bundler would) keeps the image
+            environment-agnostic and keeps the no-build-step edit-and-reload
+            loop working locally, where the base path is empty.
+            """
+            path = TEMPLATES_DIR / "timeline.html"
+            if not path.exists():
+                self.send_error(404, f"Not found: {path.name}")
+                return
+            body = path.read_text().replace("__BASE_PATH__", ctx.basePath).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _routePath(self, path: str) -> str | None:
+            """Strip the deployment's base path off an incoming request path.
+
+            Returns the app-relative path (always ``/``-prefixed), or ``None``
+            when the request falls outside the base path — which the caller
+            turns into a 404 rather than quietly serving the home page to a
+            URL that doesn't belong to us.
+            """
+            base = ctx.basePath
+            if not base:
+                return path
+            if path == base:
+                return "/"
+            if path.startswith(base + "/"):
+                return path[len(base) :]
+            return None
+
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             return  # silence default access logs
 
@@ -1734,9 +1780,20 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib API)
             url = urlparse(self.path)
-            path = url.path
+            routed = self._routePath(url.path)
+            if routed is None:
+                self.send_error(404)
+                return
+            path = routed
+            if path == "/healthz":
+                # Deliberately touches no state: it is polled by the
+                # deployment's readiness probe, and a probe that can be made
+                # to fail by a slow fetch would pull the only pod out of the
+                # Service mid-investigation.
+                self._send_json({"status": "ok"})
+                return
             if path in ("/", "/index.html"):
-                self._send_file(TEMPLATES_DIR / "timeline.html")
+                self._send_index()
                 return
             if path.startswith("/static/"):
                 rel = path[len("/static/") :]
@@ -2058,22 +2115,27 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 else:
                     self._send_error_json(status, msg)
 
-            path = site.consdbTokenFile
-            if not path.exists():
-                fallbackOrError(
-                    503,
-                    f"ConsDB token file for site {site.name!r} not found at {path}. "
-                    "Get a token from the relevant RSP and drop it there.",
-                )
-                return
-            try:
-                token = exposureTimes.readToken(path)
-            except OSError as e:
-                fallbackOrError(503, f"Could not read ConsDB token file: {e}")
-                return
-            if not token:
-                fallbackOrError(503, f"ConsDB token file is empty: {path}")
-                return
+            tokenPath = site.consdbTokenFile
+            token = ""
+            if tokenPath is not None:
+                # A site with no token file declared talks to a ConsDB that
+                # needs no auth (an in-cluster Service); only validate the
+                # file when the catalog says there should be one.
+                if not tokenPath.exists():
+                    fallbackOrError(
+                        503,
+                        f"ConsDB token file for site {site.name!r} not found at {tokenPath}. "
+                        "Get a token from the relevant RSP and drop it there.",
+                    )
+                    return
+                try:
+                    token = exposureTimes.readToken(tokenPath)
+                except OSError as e:
+                    fallbackOrError(503, f"Could not read ConsDB token file: {e}")
+                    return
+                if not token:
+                    fallbackOrError(503, f"ConsDB token file is empty: {tokenPath}")
+                    return
             try:
                 record = exposureTimes.queryExposureRecord(dataId, token, consdbUrl=site.consdbUrl)
             except exposureTimes.ConsDbError as e:
@@ -2102,7 +2164,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         def do_DELETE(self) -> None:  # noqa: N802
             url = urlparse(self.path)
-            path = url.path
+            routed = self._routePath(url.path)
+            if routed is None:
+                self.send_error(404)
+                return
+            path = routed
             if path == "/api/cache":
                 _deleteCacheRoot(ctx)
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
@@ -2127,7 +2193,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         def do_POST(self) -> None:  # noqa: N802
             url = urlparse(self.path)
-            if url.path == "/api/fetch":
+            path = self._routePath(url.path)
+            if path is None:
+                self.send_error(404)
+                return
+            if path == "/api/fetch":
                 try:
                     body = _readJsonBody(self)
                 except json.JSONDecodeError as e:
@@ -2157,7 +2227,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
-            if url.path == "/api/fetch-night":
+            if path == "/api/fetch-night":
                 try:
                     body = _readJsonBody(self)
                 except json.JSONDecodeError as e:
@@ -2173,7 +2243,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
-            if url.path == "/api/fetch-range":
+            if path == "/api/fetch-range":
                 try:
                     body = _readJsonBody(self)
                 except json.JSONDecodeError as e:
@@ -2197,7 +2267,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         def do_PUT(self) -> None:  # noqa: N802
             url = urlparse(self.path)
-            if url.path == "/api/settings":
+            path = self._routePath(url.path)
+            if path is None:
+                self.send_error(404)
+                return
+            if path == "/api/settings":
                 try:
                     body = _readJsonBody(self)
                 except json.JSONDecodeError as e:
@@ -2477,7 +2551,7 @@ def _maybeSetLokiPassword(password: str | None) -> None:
 def serve(host: str, port: int, ctx: ServerContext) -> None:
     handler = _makeHandler(ctx)
     httpd = ThreadingHTTPServer((host, port), handler)
-    print(f"Serving on http://{host}:{port} (Ctrl-C to stop)")
+    print(f"Serving on http://{host}:{port}{ctx.basePath}/ (Ctrl-C to stop)")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

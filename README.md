@@ -111,6 +111,15 @@ Pick a site in the browser's top-bar switcher; the selection is
 remembered per browser. From the CLI, pass `--site=summit|bts`
 (default: the catalog's `default_site` — currently `summit`).
 
+`consdbTokenFile` is optional. Omit it (or leave it blank) when the
+ConsDB endpoint takes no bearer token — which is the case for a
+cluster-internal Service address, reached without passing through
+Gafaelfawr. That's how the deployed instances are configured; a
+laptop talking to a public RSP endpoint still needs a token.
+
+Point `$RA_LOG_EXPLORER_SITES_FILE` at a different TOML file to
+override the catalog without touching the package.
+
 (USDF will get its own site once we plumb that path; it'll share the
 summit ConsDB.)
 
@@ -425,13 +434,20 @@ The first loads after such an upgrade re-fetch and so are slower.
 --window-after  SECONDS  post-shutter pad (default 300)
 --workers N              parallel log fetch threads (default 8)
 --site NAME              site from sites.toml (default: catalog default_site)
---username USER          Loki HTTP basic-auth user (default merlin)
+--username USER          Loki HTTP basic-auth user (default $LOKI_USERNAME, else merlin)
 --force-refresh          ignore the cache and re-fetch
 --host HOST              bind address (default 127.0.0.1)
 --port PORT              HTTP port (default 8780)
+--base-path PREFIX       serve under a URL prefix, e.g. /log-explorer
+                         (default $RA_LOG_EXPLORER_BASE_PATH, else the root)
 --no-serve               with --exposure-id: fetch + parse only, no UI
 --no-browser             launch the UI but don't auto-open a browser tab
 ```
+
+`--base-path` exists for deployments that share a hostname with other
+apps; a local run never needs it. With it set, every URL the app serves
+and every request the browser makes back carries the prefix, and paths
+outside it are 404ed rather than answered.
 
 Omit `--exposure-id` / `--t-zero` for **home mode** (server starts at the
 landing page; pick your exposure in the browser).

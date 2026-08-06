@@ -6,7 +6,15 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <link rel="stylesheet" href="__BASE_PATH__/static/style.css" />
+  <script>
+    /* The server substitutes __BASE_PATH__ for the URL prefix it is served
+     * under ("" locally, e.g. "/log-explorer" on the RSP). Every request the
+     * app makes back to itself goes through apiUrl() so one deployment-time
+     * value moves them all. */
+    window.BASE_PATH = "__BASE_PATH__";
+    window.apiUrl = (p) => window.BASE_PATH + p;
+  </script>
 </head>
 <body>
   <!-- ===================== HOME VIEW ===================== -->
@@ -444,10 +452,10 @@
     </main>
   </section>
 
-  <script src="/static/explore.js"></script>
-  <script src="/static/home.js"></script>
-  <script src="/static/night.js"></script>
-  <script src="/static/range.js"></script>
-  <script src="/static/app.js"></script>
+  <script src="__BASE_PATH__/static/explore.js"></script>
+  <script src="__BASE_PATH__/static/home.js"></script>
+  <script src="__BASE_PATH__/static/night.js"></script>
+  <script src="__BASE_PATH__/static/range.js"></script>
+  <script src="__BASE_PATH__/static/app.js"></script>
 </body>
 </html>
