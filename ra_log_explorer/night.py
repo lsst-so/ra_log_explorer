@@ -249,7 +249,10 @@ def lifecycleRows(
     close the row also carries its Δshutter offset. Sorted by time.
     """
     shutterCloseByExpId = shutterCloseByExpId or {}
-    rows: list[LifecycleRow] = []
+    # Sort on the datetime, not the rendered ``tIso`` string: string order
+    # only happens to match chronological order while every event carries the
+    # same tz suffix and isoformat's variable-width fractional part lines up.
+    dated: list[tuple[dt.datetime, LifecycleRow]] = []
     for s in summaries:
         for ev in s.events:
             if ev.kind not in _NIGHT_LIFECYCLE_KINDS:
@@ -258,20 +261,23 @@ def lifecycleRows(
             offsetS: float | None = None
             if dataId is not None and dataId in shutterCloseByExpId:
                 offsetS = (ev.t - shutterCloseByExpId[dataId]).total_seconds()
-            rows.append(
-                LifecycleRow(
-                    kind=ev.kind,
-                    reason=ev.flavor or "",
-                    pod=s.pod,
-                    group=s.group,
-                    dataId=dataId,
-                    offsetS=offsetS,
-                    tIso=ev.t.isoformat(),
-                    message=ev.message,
+            dated.append(
+                (
+                    ev.t,
+                    LifecycleRow(
+                        kind=ev.kind,
+                        reason=ev.flavor or "",
+                        pod=s.pod,
+                        group=s.group,
+                        dataId=dataId,
+                        offsetS=offsetS,
+                        tIso=ev.t.isoformat(),
+                        message=ev.message,
+                    ),
                 )
             )
-    rows.sort(key=lambda r: r.tIso)
-    return rows
+    dated.sort(key=lambda pair: pair[0])
+    return [row for _t, row in dated]
 
 
 def tracebackBody(summaries: Iterable[parse.PodSummary], bodyKey: str) -> str | None:

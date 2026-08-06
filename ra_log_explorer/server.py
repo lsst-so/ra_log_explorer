@@ -400,7 +400,7 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
 
     relevant: list[parser.Event] = []
     for ev in s.events:
-        if ev.kind.startswith("POD_"):
+        if ev.kind in parser.LIFECYCLE_EVENT_KINDS:
             if lifecycleWindow[0] <= ev.t <= lifecycleWindow[1]:
                 relevant.append(ev)
             continue

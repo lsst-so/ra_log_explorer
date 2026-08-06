@@ -862,10 +862,6 @@ def loadPodLogPath(cacheDir: Path, pod: str) -> Path:
     return cacheDir / PODS_DIR_NAME / f"{pod}.jsonl"
 
 
-def loadPodEventsLogPath(cacheDir: Path, pod: str) -> Path:
-    return cacheDir / PODS_EVENTS_DIR_NAME / f"{pod}.jsonl"
-
-
 def loadCacheMeta(cacheDir: Path) -> dict:
     metaPath = cacheDir / META_NAME
     if not metaPath.exists():
