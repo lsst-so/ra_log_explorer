@@ -24,7 +24,7 @@ def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> server.ServerContext:
     return server.ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
 
 
@@ -886,24 +886,24 @@ def test_buildNightSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     """A minimal valid body produces a FetchSpec with the AOS pod-regex
     pinned and the window set to the dayObs's noon-UTC bounds."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, dayObs, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
+    spec, site, dayObs = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
     assert dayObs == 20260521
-    assert password is None
-    assert site.name == "summit"  # falls back to default
+    assert site.name == "summit"  # the site this server serves
     assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
     # Window: noon UTC dayObs → noon UTC dayObs+1.
     assert spec.fromIso.startswith("2026-05-21T12:00:00")
     assert spec.toIso.startswith("2026-05-22T12:00:00")
 
 
-def test_buildNightSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
-    """The night-fetch endpoint accepts the same ``site`` field as the
-    exposure-fetch endpoint — picking BTS swaps both the Loki target
-    and the ConsDB endpoint used for the prefetch pass."""
+def test_buildNightSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """Which cluster gets queried is the server's, decided by where it
+    runs. A body naming another site must not redirect the fetch — a
+    summit deployment answering with BTS logs would be worse than an
+    error, because it would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, _, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
-    assert site.name == "bts"
-    assert spec.cluster == "manke"
+    spec, site, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
+    assert site.name == "summit"
+    assert spec.cluster == "yagan"
 
 
 def test_buildNightSpecFromRequest_rejects_missing_dayObs(siteCatalog: FakeSiteCatalog) -> None:
@@ -927,10 +927,17 @@ def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs(siteCatalog: Fake
         server._buildNightSpecFromRequest(ctx, {"dayObs": 12345})
 
 
-def test_buildNightSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildNightSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """Credentials are the service's, from its environment. A body that
+    supplies its own must be ignored rather than honoured: the process
+    env is shared, so one browser's wrong password would otherwise break
+    fetches for everyone using the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "password": "hunter2"})
-    assert password == "hunter2"
+    spec, _, _ = server._buildNightSpecFromRequest(
+        ctx, {"dayObs": 20260521, "password": "hunter2", "username": "someone-else", "workers": 999}
+    )
+    assert spec.username == server.DEFAULT_USERNAME
+    assert spec.workers == server.DEFAULT_WORKERS
 
 
 # ----- _buildRangeSpecFromRequest -----------------------------------------
@@ -952,12 +959,9 @@ def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     start anchor (minus the before-buffer) to the stop anchor (plus the
     after-buffer), with the TAI→UTC conversion applied to both anchors."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, startId, stopId, tZeroStart, tZeroStop, password = server._buildRangeSpecFromRequest(
-        ctx, _rangeBody()
-    )
+    spec, site, startId, stopId, tZeroStart, tZeroStop = server._buildRangeSpecFromRequest(ctx, _rangeBody())
     assert (startId, stopId) == (2026051900722, 2026051900750)
-    assert password is None
-    assert site.name == "summit"  # default
+    assert site.name == "summit"
     assert spec.podRegex is None  # range is an all-pods fetch
     # TAI inputs minus 37 s; default windowBefore=5, windowAfter=300.
     # start 08:46:16.267 TAI -> 08:45:39.267 UTC -> minus 5 s = 08:45:34.267.
@@ -971,14 +975,14 @@ def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
 
 def test_buildRangeSpecFromRequest_tZeroUtc_skips_conversion(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, _, tZeroStart, _, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
+    _, _, _, _, tZeroStart, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
     assert tZeroStart == dt.datetime(2026, 5, 20, 8, 46, 16, 267000, tzinfo=dt.timezone.utc)
 
 
-def test_buildRangeSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildRangeSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
     _, site, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
-    assert site.name == "bts"
+    assert site.name == "summit"
 
 
 def test_buildRangeSpecFromRequest_rejects_reversed_range(siteCatalog: FakeSiteCatalog) -> None:
@@ -1004,10 +1008,11 @@ def test_buildRangeSpecFromRequest_rejects_missing_anchor(siteCatalog: FakeSiteC
         server._buildRangeSpecFromRequest(ctx, body)
 
 
-def test_buildRangeSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildRangeSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    *_, password = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2"))
-    assert password == "hunter2"
+    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2", workers=999))
+    assert spec.username == server.DEFAULT_USERNAME
+    assert spec.workers == server.DEFAULT_WORKERS
 
 
 def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
@@ -1176,33 +1181,6 @@ def test_buildNightPayload_exposes_exposureInfo_map_keyed_by_string() -> None:
     payload = server._buildNightPayload(state)
     # JSON object keys must be strings, so the map is keyed by str(expId).
     assert payload["exposureInfo"] == {"2026052100051": rec}
-
-
-# ----- _maybeSetLokiPassword ----------------------------------------------
-
-
-def test_maybeSetLokiPassword_sets_env_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-empty password lands in ``LOKI_PASSWORD`` so the next
-    subprocess.run inherits it."""
-    monkeypatch.delenv("LOKI_PASSWORD", raising=False)
-    server._maybeSetLokiPassword("hunter2")
-    import os as _os
-
-    assert _os.environ["LOKI_PASSWORD"] == "hunter2"
-
-
-def test_maybeSetLokiPassword_noop_when_empty_or_None(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty/None password must NOT clobber an existing ``LOKI_PASSWORD``
-    — otherwise the home page's optional credentials card would silently
-    blow away a working env var on every fetch.
-    """
-    import os as _os
-
-    monkeypatch.setenv("LOKI_PASSWORD", "preserve-me")
-    server._maybeSetLokiPassword(None)
-    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
-    server._maybeSetLokiPassword("")
-    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
 
 
 # ----- _parseClientIso ----------------------------------------------------

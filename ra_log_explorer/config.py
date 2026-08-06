@@ -1,4 +1,10 @@
-"""Shared configuration and path helpers."""
+"""Shared configuration and path helpers.
+
+Everything a deployment needs to vary between the summit and the Base Test
+Stand is an environment variable read here, once, at import. Nothing is
+configurable from the browser: the UI is for asking questions about
+exposures, not for reconfiguring the service that answers them.
+"""
 
 from __future__ import annotations
 
@@ -7,18 +13,64 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+
+class ConfigError(RuntimeError):
+    """An environment variable holds something we can't make sense of."""
+
+
+def _envInt(name: str, default: int) -> int:
+    """Read an int from the environment, or return ``default``.
+
+    A malformed value raises rather than quietly falling back. These come
+    from Helm values in a deployment, and a typo that silently reverted to
+    the built-in default would stay invisible until someone eventually
+    wondered why the setting never took effect — whereas a container that
+    refuses to start says so immediately.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name} must be an integer; got {raw!r}") from e
+
+
+def _envFloat(name: str, default: float) -> float:
+    """Read a float from the environment, or return ``default``.
+
+    Fails loudly on a malformed value, for the reasons in :func:`_envInt`.
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ConfigError(f"{name} must be a number; got {raw!r}") from e
+
+
 # Loki basic-auth user. A deployed instance authenticates as a service
 # account rather than a person, so the default is environment-overridable:
 # the container sets LOKI_USERNAME and nobody has to type it into the UI.
 DEFAULT_USERNAME = os.environ.get("LOKI_USERNAME") or "merlin"
-DEFAULT_WORKERS = 8
+DEFAULT_WORKERS = _envInt("RA_LOG_EXPLORER_WORKERS", 8)
 # Window padding around the user's t-zero. The CLI applies the TAI→UTC
 # conversion internally so t-zero is the actual shutter-close UTC moment;
 # we shouldn't ever need to look at logs from before then for a given
 # dataId (if we do, that's a real anomaly, not a window-size problem).
 # A small pre-shutter buffer just covers clock skew between camera / cluster.
-DEFAULT_WINDOW_BEFORE_S = 5.0
-DEFAULT_WINDOW_AFTER_S = 5 * 60.0
+# These are the *starting* values of the per-fetch window fields, so a
+# deployment can tune them to its own pipeline's timings without taking the
+# widen-the-window workflow away from whoever is investigating.
+DEFAULT_WINDOW_BEFORE_S = _envFloat("RA_LOG_EXPLORER_WINDOW_BEFORE_S", 5.0)
+DEFAULT_WINDOW_AFTER_S = _envFloat("RA_LOG_EXPLORER_WINDOW_AFTER_S", 5 * 60.0)
+# Ceiling the LRU eviction in `fetch.evictToFit` keeps the cache under.
+# Deployed, this is derived from the size of the volume provisioned for the
+# cache; locally it's a figure generous enough that an ordinary session
+# never trips it but small enough that a forgotten browser tab can't fill
+# the disk over weeks.
+MAX_CACHE_BYTES = _envInt("RA_LOG_EXPLORER_MAX_CACHE_BYTES", 5 * 1024 * 1024 * 1024)
 DEFAULT_HTTP_PORT = 8780
 # Env var naming the URL prefix the app is served under. Empty (the local
 # default) means "served at the root"; a deployment sharing a hostname with
@@ -53,69 +105,18 @@ def defaultBasePath() -> str:
     return normalizeBasePath(os.environ.get(BASE_PATH_ENV))
 
 
-def settingsFilePath() -> Path:
-    """Return the location of the persisted app-settings JSON.
-
-    Defaults to ``~/.config/ra_log_explorer/settings.json``. Tests and
-    scripted runs can redirect it with ``RA_LOG_EXPLORER_CONFIG_DIR`` so
-    they don't share state with the real user. Kept as a public helper
-    so :mod:`.appSettings` (which writes the file) and :func:`cache_root`
-    (which reads it directly to avoid an import cycle) agree on the
-    one true path.
-    """
-    override = os.environ.get("RA_LOG_EXPLORER_CONFIG_DIR")
-    base = Path(override).expanduser() if override else Path.home() / ".config" / "ra_log_explorer"
-    return base / "settings.json"
-
-
 def cache_root() -> Path:
     """Return the on-disk cache root, creating it if needed.
 
-    Resolution order:
-
-    1. The ``RA_LOG_EXPLORER_CACHE`` env var, if set — useful for tests
-       and for scripted runs where the user wants a one-off override
-       that ignores persisted settings entirely.
-    2. The ``cacheDir`` field of the persisted app settings, if set.
-       This is what the settings panel in the home view writes.
-    3. The XDG-style default at ``~/.cache/ra_log_explorer``.
-
-    The settings JSON is read here by hand (instead of via
-    :mod:`.appSettings`) so this module stays an import leaf — making
-    it safe for the settings module to depend on config rather than
-    the other way around.
+    ``RA_LOG_EXPLORER_CACHE`` if set, otherwise the XDG-style default at
+    ``~/.cache/ra_log_explorer``. A deployment always sets the env var: it
+    points at the volume provisioned for the cache, whose size is also what
+    :data:`MAX_CACHE_BYTES` is derived from.
     """
     override = os.environ.get("RA_LOG_EXPLORER_CACHE")
-    if override:
-        root = Path(override).expanduser()
-    else:
-        settingsDir = _readPersistedCacheDir()
-        if settingsDir:
-            root = Path(settingsDir).expanduser()
-        else:
-            root = Path.home() / ".cache" / "ra_log_explorer"
+    root = Path(override).expanduser() if override else Path.home() / ".cache" / "ra_log_explorer"
     root.mkdir(parents=True, exist_ok=True)
     return root
-
-
-def _readPersistedCacheDir() -> str | None:
-    """Best-effort read of the ``cacheDir`` setting from the appSettings
-    JSON, returning ``None`` on any failure (file missing, malformed,
-    field absent). Kept private to this module so :func:`cache_root`
-    can call it without needing to import :mod:`.appSettings` and
-    risking an import cycle.
-    """
-    import json
-
-    path = settingsFilePath()
-    if not path.exists():
-        return None
-    try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    val = raw.get("cacheDir") if isinstance(raw, dict) else None
-    return val if isinstance(val, str) and val else None
 
 
 def windowCachePath(

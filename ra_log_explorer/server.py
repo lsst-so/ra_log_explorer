@@ -32,7 +32,6 @@ from __future__ import annotations
 import datetime as dt
 import json
 import mimetypes
-import os
 import re
 import shutil
 from collections import OrderedDict
@@ -43,12 +42,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import appSettings, exposureTimes, night
+from . import exposureTimes, night
 from . import parse as parser
 from .config import (
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
+    DEFAULT_WORKERS,
+    MAX_CACHE_BYTES,
     NIGHT_AOS_POD_REGEX,
     FetchSpec,
     cache_root,
@@ -235,14 +236,13 @@ class ServerContext:
     Access is LRU-ordered so the least-recently-used entries are first
     to be evicted when we go over :data:`_MAX_LOADED_STATES`.
 
-    ``sites`` is the per-deployment catalog (see :mod:`.sites`), loaded
-    once at process start; ``defaultSiteName`` is the catalog's named
-    fallback when a request body / query string omits ``site``.
+    ``sites`` is the catalog (see :mod:`.sites`), loaded once at process
+    start; ``siteName`` picks the one entry this process serves.
     """
 
     jobs: JobManager
     sites: list[Site] = field(default_factory=list)
-    defaultSiteName: str = ""
+    siteName: str = ""
     # URL prefix the app is served under (``""`` at the root). Stripped off
     # every incoming request path before routing, and substituted into the
     # HTML so the browser asks for the prefixed URLs back.
@@ -252,13 +252,17 @@ class ServerContext:
     # Keyed by ``rangeKey(startId, stopId)``.
     rangeStates: "OrderedDict[str, RangeState]" = field(default_factory=OrderedDict)
 
-    def siteForRequest(self, name: str | None) -> Site:
-        """Return the named site, falling back to the catalog default
-        when ``name`` is missing or blank. Raises
-        :class:`SitesConfigError` for an unknown name so the handler
-        surfaces a 400.
+    def site(self) -> Site:
+        """Return the one site this server serves.
+
+        Which observatory's logs are on offer is a property of where the
+        server runs, not something a request gets to choose: a deployment
+        on manke means BTS and one on yagan means the summit. The catalog
+        may still list several — that's what lets a laptop point at either
+        — but ``--site`` picks among them once, at startup, and nothing
+        afterwards can change it.
         """
-        return siteByName(self.sites, name or self.defaultSiteName)
+        return siteByName(self.sites, self.siteName)
 
     def getExposureState(self, expId: int) -> ServerState | None:
         s = self.exposureStates.get(expId)
@@ -1579,8 +1583,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         # configured cap. The just-fetched cache is exempted; we
         # accept a brief over-cap state during the fetch itself and
         # only sweep at the end.
-        settings = appSettings.loadAppSettings()
-        evictToFit(settings.maxCacheBytes, exempt=[job.cacheDir])
+        evictToFit(MAX_CACHE_BYTES, exempt=[job.cacheDir])
         summaries = parser.summarizeAll(job.cacheDir)
         # Sites are validated when the request comes in, so this should
         # always succeed for a job we actually started. Bail out on the
@@ -1666,6 +1669,15 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
     return cb
 
 
+def _trimFloat(v: float) -> str:
+    """Render a float for an HTML number field without a pointless ``.0``.
+
+    ``5.0`` in a spinner reads as a setting someone fiddled with; ``5``
+    reads as the default it is.
+    """
+    return str(int(v)) if v == int(v) else str(v)
+
+
 def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
     class Handler(BaseHTTPRequestHandler):
         # HTTP/1.0 is the default; that's fine for SSE because the spec
@@ -1699,12 +1711,13 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
         def _send_index(self) -> None:
             """Serve the single-page shell with the base path substituted in.
 
-            ``timeline.html`` carries a literal ``__BASE_PATH__`` everywhere a
-            URL back to us appears, and a ``__LOKI_USERNAME__`` in the
-            credentials form. Substituting at request time (rather than
-            baking it in at build time, as a bundler would) keeps the image
-            environment-agnostic and keeps the no-build-step edit-and-reload
-            loop working locally, where the base path is empty.
+            ``timeline.html`` carries literal placeholders for the handful of
+            values that differ between deployments: ``__BASE_PATH__``
+            everywhere a URL back to us appears, and the starting values of
+            the fetch window fields. Substituting at request time (rather
+            than baking it in at build time, as a bundler would) keeps the
+            container image environment-agnostic and keeps the no-build-step
+            edit-and-reload loop working locally.
             """
             path = TEMPLATES_DIR / "timeline.html"
             if not path.exists():
@@ -1713,12 +1726,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             text = path.read_text()
             for placeholder, value in (
                 ("__BASE_PATH__", ctx.basePath),
-                # The Loki user the server authenticates as unless the
-                # browser overrides it. Rendered in rather than written into
-                # the HTML so a deployment's service account is what the
-                # field offers, instead of whoever the template was written
-                # for.
-                ("__LOKI_USERNAME__", DEFAULT_USERNAME),
+                # Only the *starting* values: the fields stay editable, so
+                # widening a window mid-investigation still works. The
+                # deployment just decides where they start.
+                ("__WINDOW_BEFORE__", _trimFloat(DEFAULT_WINDOW_BEFORE_S)),
+                ("__WINDOW_AFTER__", _trimFloat(DEFAULT_WINDOW_AFTER_S)),
             ):
                 text = text.replace(placeholder, value)
             body = text.encode("utf-8")
@@ -1939,44 +1951,24 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if path == "/api/cache":
                 self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
                 return
-            if path == "/api/settings":
-                s = appSettings.loadAppSettings()
-                # ``effectiveCacheRoot`` resolves through the same
-                # priority order as a live fetch (env var → persisted
-                # cacheDir → default) so the UI can show the user what
-                # the server will *actually* use, not just what they
-                # typed.
+            if path == "/api/site":
+                # Which observatory's logs these are. Read-only: the UI
+                # labels the page with it so nobody misreads summit data as
+                # BTS data, but it is chosen by where this server runs.
+                site = ctx.site()
                 self._send_json(
                     {
-                        "maxCacheBytes": s.maxCacheBytes,
-                        "cacheDir": s.cacheDir,
-                        "effectiveCacheRoot": str(cache_root()),
-                    }
-                )
-                return
-            if path == "/api/sites":
-                self._send_json(
-                    {
-                        "default_site": ctx.defaultSiteName,
-                        "sites": [
-                            {
-                                "name": s.name,
-                                "cluster": s.cluster,
-                                "namespace": s.namespace,
-                                "lokiAddr": s.lokiAddr,
-                                "consdbUrl": s.consdbUrl,
-                            }
-                            for s in ctx.sites
-                        ],
+                        "name": site.name,
+                        "cluster": site.cluster,
+                        "namespace": site.namespace,
+                        "lokiAddr": site.lokiAddr,
+                        "consdbUrl": site.consdbUrl,
                     }
                 )
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
-                qs = parse_qs(url.query)
-                siteValues = qs.get("site")
-                siteName: str | None = siteValues[0] if siteValues else None
-                self._handle_exposure_time(int(m.group(1)), siteName)
+                self._handle_exposure_time(int(m.group(1)))
                 return
             m = re.match(r"^/api/fetch/([A-Za-z0-9]+)/status$", path)
             if m:
@@ -2068,17 +2060,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             self._send_json(_podDetail(transient, pod))
 
-        def _handle_exposure_time(self, dataId: int, siteName: str | None) -> None:
-            # Site picks the (consdbUrl, tokenFile) pair AND which
+        def _handle_exposure_time(self, dataId: int) -> None:
+            # The site picks the (consdbUrl, tokenFile) pair AND which
             # per-site cache file the resolved iso lands in. The same
             # dataId means different things at different sites — BTS
-            # simulated values can collide with summit real-camera ids
-            # — so we never mix them.
-            try:
-                site = ctx.siteForRequest(siteName)
-            except SitesConfigError as e:
-                self._send_error_json(400, str(e))
-                return
+            # simulated values can collide with summit real-camera ids —
+            # so the two are never mixed, and the site is the server's,
+            # not the caller's.
+            site = ctx.site()
             # Cache check first: exposure properties are immutable once
             # they exist, so a hit lets us skip the token + network call
             # entirely. This also means a user with no ConsDB token can
@@ -2216,11 +2205,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 except json.JSONDecodeError as e:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
-                # Build the spec from the request, applying server-side defaults
-                # where the client didn't supply a value. We never trust the
-                # client to set arbitrary host/proto values for logcli.
+                # Build the spec from the request. Only the question being
+                # asked comes from the browser — which exposure, which
+                # window. Everything about *how* we talk to Loki is server
+                # configuration and is never taken from a request body.
                 try:
-                    spec, site, expId, tZero, password = _buildSpecFromRequest(ctx, body)
+                    spec, site, expId, tZero = _buildSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
@@ -2232,10 +2222,6 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     exposureTimes.storeCachedRecord(
                         expId, exposureTimes.manualRecord(_utcToTaiIso(tZero)), siteName=site.name
                     )
-                # The password — if any — is consumed by the fetch worker
-                # thread (it sets LOKI_PASSWORD in the subprocess env) and
-                # never persisted, returned, or logged.
-                _maybeSetLokiPassword(password)
                 job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
@@ -2247,11 +2233,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
                 try:
-                    spec, site, dayObs, password = _buildNightSpecFromRequest(ctx, body)
+                    spec, site, dayObs = _buildNightSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
-                _maybeSetLokiPassword(password)
                 job = ctx.jobs.createNightJob(spec, dayObs, siteName=site.name)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
@@ -2263,74 +2248,15 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
                 try:
-                    spec, site, startId, stopId, tZeroStart, tZeroStop, password = _buildRangeSpecFromRequest(
-                        ctx, body
-                    )
+                    spec, site, startId, stopId, tZeroStart, tZeroStop = _buildRangeSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
-                _maybeSetLokiPassword(password)
                 job = ctx.jobs.createRangeJob(
                     spec, startId, stopId, tZeroStart, tZeroStop, siteName=site.name
                 )
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
-                return
-            self.send_error(404)
-
-        def do_PUT(self) -> None:  # noqa: N802
-            url = urlparse(self.path)
-            path = self._routePath(url.path)
-            if path is None:
-                self.send_error(404)
-                return
-            if path == "/api/settings":
-                try:
-                    body = _readJsonBody(self)
-                except json.JSONDecodeError as e:
-                    self._send_error_json(400, f"Bad JSON body: {e}")
-                    return
-                # Start from whatever's currently persisted so a PUT
-                # that touches only one field doesn't accidentally
-                # blank out the other.
-                current = appSettings.loadAppSettings()
-                maxCacheBytes = current.maxCacheBytes
-                if "maxCacheBytes" in body:
-                    raw = body["maxCacheBytes"]
-                    try:
-                        maxCacheBytes = int(raw)
-                    except (TypeError, ValueError):
-                        self._send_error_json(400, "maxCacheBytes must be an integer")
-                        return
-                    if maxCacheBytes < 0:
-                        self._send_error_json(400, "maxCacheBytes must be non-negative")
-                        return
-                cacheDir: str | None = current.cacheDir
-                if "cacheDir" in body:
-                    raw = body["cacheDir"]
-                    if raw is None or (isinstance(raw, str) and not raw.strip()):
-                        cacheDir = None
-                    elif isinstance(raw, str):
-                        candidate = Path(raw).expanduser()
-                        try:
-                            candidate.mkdir(parents=True, exist_ok=True)
-                        except OSError as e:
-                            self._send_error_json(400, f"Could not create cacheDir {candidate}: {e}")
-                            return
-                        cacheDir = str(candidate)
-                    else:
-                        self._send_error_json(400, "cacheDir must be a string or null")
-                        return
-                appSettings.saveAppSettings(
-                    appSettings.AppSettings(maxCacheBytes=maxCacheBytes, cacheDir=cacheDir)
-                )
-                self._send_json(
-                    {
-                        "maxCacheBytes": maxCacheBytes,
-                        "cacheDir": cacheDir,
-                        "effectiveCacheRoot": str(cache_root()),
-                    }
-                )
                 return
             self.send_error(404)
 
@@ -2340,19 +2266,17 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 # ----- request body helpers -------------------------------------------------
 
 
-def _buildSpecFromRequest(
-    ctx: ServerContext, body: dict
-) -> tuple[FetchSpec, Site, int, dt.datetime, str | None]:
-    """Translate a JSON fetch request body into (FetchSpec, Site, expId, tZero, password).
+def _buildSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, dt.datetime]:
+    """Translate a JSON fetch request body into (FetchSpec, Site, expId, tZero).
 
-    The body's ``site`` field selects which site catalog entry to pull
-    ``lokiAddr`` / ``cluster`` / ``namespace`` from; the client no
-    longer sets those individually. Raises ``ValueError`` for
-    client-fixable mistakes (missing fields, unparseable timestamp,
-    unknown site); the handler converts those into a 400 response.
+    The body says *what* to fetch — which exposure, which window. Which
+    cluster, which Loki, and which credentials are all deployment
+    configuration read from the environment, never from the request:
+    a browser cannot point this server at a different Loki or make it
+    authenticate as somebody else. Raises ``ValueError`` for
+    client-fixable mistakes (missing fields, unparseable timestamp); the
+    handler converts those into a 400 response.
     """
-    from .config import DEFAULT_USERNAME, DEFAULT_WINDOW_AFTER_S, DEFAULT_WINDOW_BEFORE_S, DEFAULT_WORKERS
-
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
 
@@ -2378,29 +2302,21 @@ def _buildSpecFromRequest(
     fromT = tZero - dt.timedelta(seconds=windowBefore)
     toT = tZero + dt.timedelta(seconds=windowAfter)
 
-    try:
-        site = ctx.siteForRequest(body.get("site"))
-    except SitesConfigError as e:
-        raise ValueError(str(e)) from e
+    site = ctx.site()
     spec = FetchSpec(
         lokiAddr=site.lokiAddr,
-        username=str(body.get("username") or DEFAULT_USERNAME),
+        username=DEFAULT_USERNAME,
         cluster=site.cluster,
         namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
-        workers=int(body.get("workers") or DEFAULT_WORKERS),
+        workers=DEFAULT_WORKERS,
     )
-    password = body.get("password")
-    if password is not None:
-        password = str(password)
-    return spec, site, expId, tZero, password
+    return spec, site, expId, tZero
 
 
-def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, str | None]:
-    """Translate a JSON night-fetch request body into (FetchSpec, Site, dayObs, password)."""
-    from .config import DEFAULT_USERNAME, DEFAULT_WORKERS
-
+def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int]:
+    """Translate a JSON night-fetch request body into (FetchSpec, Site, dayObs)."""
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
     dayObsRaw = body.get("dayObs")
@@ -2416,31 +2332,25 @@ def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpe
     fromT = dayObsStartUtc(dayObs)
     toT = dayObsEndUtc(dayObs)
 
-    try:
-        site = ctx.siteForRequest(body.get("site"))
-    except SitesConfigError as e:
-        raise ValueError(str(e)) from e
+    site = ctx.site()
     spec = FetchSpec(
         lokiAddr=site.lokiAddr,
-        username=str(body.get("username") or DEFAULT_USERNAME),
+        username=DEFAULT_USERNAME,
         cluster=site.cluster,
         namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
-        workers=int(body.get("workers") or DEFAULT_WORKERS),
+        workers=DEFAULT_WORKERS,
         podRegex=NIGHT_AOS_POD_REGEX,
     )
-    password = body.get("password")
-    if password is not None:
-        password = str(password)
-    return spec, site, dayObs, password
+    return spec, site, dayObs
 
 
 def _buildRangeSpecFromRequest(
     ctx: ServerContext, body: dict
-) -> tuple[FetchSpec, Site, int, int, dt.datetime, dt.datetime, str | None]:
+) -> tuple[FetchSpec, Site, int, int, dt.datetime, dt.datetime]:
     """Translate a JSON range-fetch body into (FetchSpec, Site, startId,
-    stopId, tZeroStartUtc, tZeroStopUtc, password).
+    stopId, tZeroStartUtc, tZeroStopUtc).
 
     The window is one wide span: ``[tZeroStart - windowBefore,
     tZeroStop + windowAfter]`` with no pod filter (all pods, like a single
@@ -2479,23 +2389,17 @@ def _buildRangeSpecFromRequest(
     fromT = tZeroStart - dt.timedelta(seconds=windowBefore)
     toT = tZeroStop + dt.timedelta(seconds=windowAfter)
 
-    try:
-        site = ctx.siteForRequest(body.get("site"))
-    except SitesConfigError as e:
-        raise ValueError(str(e)) from e
+    site = ctx.site()
     spec = FetchSpec(
         lokiAddr=site.lokiAddr,
-        username=str(body.get("username") or DEFAULT_USERNAME),
+        username=DEFAULT_USERNAME,
         cluster=site.cluster,
         namespace=site.namespace,
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
-        workers=int(body.get("workers") or DEFAULT_WORKERS),
+        workers=DEFAULT_WORKERS,
     )
-    password = body.get("password")
-    if password is not None:
-        password = str(password)
-    return spec, site, startId, stopId, tZeroStart, tZeroStop, password
+    return spec, site, startId, stopId, tZeroStart, tZeroStop
 
 
 def _requireRangeInt(body: dict, field: str) -> int:
@@ -2543,19 +2447,6 @@ def _parseClientIso(s: str) -> dt.datetime:
 
 def _isoForLogcli(t: dt.datetime) -> str:
     return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
-
-
-def _maybeSetLokiPassword(password: str | None) -> None:
-    """If the client provided a password, set LOKI_PASSWORD in our process env.
-
-    `fetch._run_logcli` reads LOKI_PASSWORD from `os.environ` when spawning
-    logcli. Setting it here is *process-global*; we accept that risk because
-    the tool is a single-user local UI. The password is never echoed back
-    in any response, logged, or written to disk.
-    """
-    if not password:
-        return
-    os.environ["LOKI_PASSWORD"] = password
 
 
 # ----- public entry point ---------------------------------------------------

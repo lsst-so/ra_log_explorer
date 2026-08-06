@@ -85,8 +85,10 @@ scopes (BTS simulated vs. summit real) can't return the wrong obs_end.
 | `RA_LOG_EXPLORER_SITES_FILE` (env var)     | *Optional* — point at a custom site catalog   | Defaults to the checked-in [`ra_log_explorer/sites.toml`](ra_log_explorer/sites.toml). |
 | `RA_LOG_EXPLORER_CACHE` (env var)          | *Optional* — overrides the cache root         | Defaults to `~/.cache/ra_log_explorer/`.             |
 
-The username for `logcli` defaults to `merlin` and is overridable in the
-browser's Credentials card (or via the CLI's `--username` flag).
+The username for `logcli` defaults to `merlin`; set `$LOKI_USERNAME` (or
+pass `--username`) to authenticate as something else. Neither the
+username nor the password can be set from the browser — see
+[Configuration](#configuration).
 
 ## Sites
 
@@ -107,9 +109,15 @@ can refer to a real exposure on the summit and a simulated one on BTS
 with completely different `obs_end` values — the catalog keeps them
 from crosstalking.
 
-Pick a site in the browser's top-bar switcher; the selection is
-remembered per browser. From the CLI, pass `--site=summit|bts`
-(default: the catalog's `default_site` — currently `summit`).
+**One running server serves exactly one site.** Pick it with
+`--site=summit|bts` (default: the catalog's `default_site`, currently
+`summit`); it is fixed for the life of the process and shown as a badge
+in the browser's top bar. There is no switcher: a deployment on manke
+*is* BTS and one on yagan *is* the summit, and since the same 13-digit
+dataId exists at both with different `obs_end` values, a server that
+could be talked into answering for the other one would produce results
+that looked plausible rather than obviously wrong. To look at the other
+site locally, start a second server with `--site` set to it.
 
 `consdbTokenFile` is optional. Omit it (or leave it blank) when the
 ConsDB endpoint takes no bearer token — which is the case for a
@@ -162,18 +170,12 @@ open by itself, paste the URL by hand. To stop the server, press
 
 In the browser:
 
-1. The home page loads with a **top-bar site switcher** (summit vs.
-   bts) and a **right-side App settings sidebar** (parallel-fetch
-   workers, max cache space, cache directory) plus a **Credentials**
-   card below it. Pick the site that matches the cluster you want to
-   investigate — `summit` for real-camera data on yagan, `bts` for
-   simulated data on manke. Fill in your **Loki username + password**
-   if you haven't already — tick "remember in this browser" if you
-   want them kept in `localStorage`. The password field is optional;
-   if you leave it blank the server falls back to `LOKI_PASSWORD` from
-   its environment. Settings persist as you type (and `maxCacheBytes`
-   is pushed to the server immediately so its LRU eviction uses the
-   latest cap).
+1. The home page loads with a **site badge** in the top bar naming the
+   cluster this server queries — `summit`/yagan for real-camera data,
+   `bts`/manke for simulated. It's a label, not a control: the site,
+   your Loki credentials, the fetch width and the cache size all come
+   from the server's environment, so there is nothing to fill in before
+   you start. See [Configuration](#configuration) for how to change them.
 2. Type a **dataId** (e.g. `2026051900722`) in the *Explore exposure
    processing* card. After ~300 ms the tool resolves the shutter
    close time and shows it inline under the input.
@@ -187,10 +189,11 @@ In the browser:
      view doesn't ask again; a real ConsDB value, once reachable, takes
      precedence. Manual entry is single-dataId only — not range or night.
 3. Optional *per-exposure tuning* (window before / after t₀) lives
-   in a small details fold on the exposure form. Cluster, namespace,
-   Loki URL and ConsDB token file all come from the active site, so
-   you don't enter them anywhere — switch sites in the top-bar
-   instead.
+   in a small details fold on the exposure form. These are the one
+   thing you can vary per fetch — widening the window to catch a
+   neighbouring exposure is a normal move. They start at whatever the
+   server is configured with. Cluster, namespace, Loki URL and ConsDB
+   endpoint all come from the site the server serves.
 4. Click **Fetch & explore**. A progress bar follows the fetch live
    (Server-Sent Events). When it's done the URL updates to
    `/?dataId=<id>` and the page switches to the timeline view.
@@ -239,8 +242,8 @@ The browser app has three views:
 
 - **Home view** — the landing page when nothing is loaded. Hosts the
   three fetch forms (single exposure, a range of exposures, an
-  investigate-night), the credentials panel, the cached-runs table,
-  and the live progress bar for an in-flight fetch.
+  investigate-night), the cached-runs table, and the live progress bar
+  for an in-flight fetch.
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is
@@ -454,6 +457,40 @@ landing page; pick your exposure in the browser).
 
 Run `python3 -m ra_log_explorer.cli --help` for the same list.
 
+## Configuration
+
+Everything that varies between deployments is an environment variable,
+read once when the server starts. **Nothing is configurable from the
+browser.** The UI asks questions about exposures; it does not
+reconfigure the service that answers them — a shared deployment has many
+users and one process, so a settings field would let whoever touched it
+last change how everyone else's fetches behave.
+
+| Variable | What it sets | Default |
+|----------|--------------|---------|
+| `LOKI_PASSWORD` | Loki basic-auth password, used by `logcli` | *(required)* |
+| `LOKI_USERNAME` | Loki basic-auth user | `merlin` |
+| `RA_LOG_EXPLORER_CACHE` | cache root | `~/.cache/ra_log_explorer` |
+| `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling | 5 GiB |
+| `RA_LOG_EXPLORER_WORKERS` | parallel fetch workers | `8` |
+| `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
+| `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
+| `RA_LOG_EXPLORER_SITES_FILE` | which site catalog to load | the packaged `sites.toml` |
+| `RA_LOG_EXPLORER_BASE_PATH` | URL prefix to serve under | `""` (the root) |
+
+Most have a matching CLI flag (`--workers`, `--window-after`, `--site`,
+`--base-path`, …) that wins over the environment for a one-off run.
+
+A malformed numeric value stops the server with a clear error rather
+than falling back to the default — a setting that quietly never took
+effect is much harder to notice than one that refuses to start.
+
+The two window values are the *starting* values of editable form fields,
+not fixed limits: widening a window to catch a neighbouring exposure is
+a normal investigative move, so the deployment picks where the fields
+start and you can still change them per fetch. Everything else in the
+table the browser cannot influence at all.
+
 ## Cache
 
 The tool caches per-pod Loki output under `~/.cache/ra_log_explorer/`
@@ -476,11 +513,11 @@ command line, and don't drop the export in `~/.zshrc` — that's only
 sourced for interactive shells, so non-interactive child processes
 won't see it.
 
-**"ConsDB token file for site '<name>' not found at <path>"** — you
-picked a site whose token file isn't on this machine. Either drop the
+**"ConsDB token file for site '<name>' not found at <path>"** — this
+server's site needs a token that isn't on this machine. Either drop the
 right token at the named path (see [Sites](#sites) for the matrix), or
-switch the top-bar site picker back to one you do have a token for.
-Cached dataIds still resolve without a token. (For a one-off where you
+restart with `--site` set to one you do have a token for. Cached dataIds
+still resolve without a token. (For a one-off where you
 can't fix the token but know the shutter close, use the **manual
 shutter close** field that appears under the dataId input — see step 2
 of *Getting started*.)
@@ -493,13 +530,13 @@ that dataId under the active site, and a real ConsDB value supersedes it
 once reachable. This is single-dataId only — the range and night forms
 have no manual fallback.
 
-**Shutter close looks off after switching sites** — sanity check that
-you're on the right site. The summit cluster's dataIds resolve against
-the summit ConsDB; BTS dataIds resolve against the BTS ConsDB; same
-13-digit id can mean different exposures in each. The per-site cache
-files at `~/.cache/ra_log_explorer/exposure-times/` keep them
-separate, but the top-bar switcher is what tells the server which to
-use for *new* lookups.
+**Shutter close looks off** — check the site badge in the top bar. The
+summit cluster's dataIds resolve against the summit ConsDB; BTS dataIds
+against the BTS ConsDB; the same 13-digit id can mean different
+exposures in each. The per-site cache files at
+`~/.cache/ra_log_explorer/exposure-times/` keep them separate. If the
+badge says the wrong thing, you are pointed at the wrong server (or
+started this one with the wrong `--site`).
 
 **A few pods show 0 events but the exposure obviously touched them** —
 look at the pod's `.jsonl` directly under the cache directory. If the
@@ -553,22 +590,19 @@ behind Gafaelfawr. The chart lives in Phalanx under
 `.github/workflows/build.yaml` builds and pushes
 `ghcr.io/lsst-so/ra_log_explorer` on every push to `main`, every
 `tickets/**` branch (tagged `tickets-DM-xxxxx`), and every `v*` tag.
-The image bakes in no environment — one tag serves both deployments —
-so everything site-specific arrives at runtime:
+The image bakes in no environment — one tag serves both deployments — so
+everything site-specific arrives at runtime through the variables in
+[Configuration](#configuration). Each deployment ships a one-site
+`sites.toml` naming its own cluster's in-cluster ConsDB, gets
+`LOKI_PASSWORD` from its environment's Vault secret, and has
+`RA_LOG_EXPLORER_MAX_CACHE_BYTES` derived from the size of the volume
+provisioned for the cache — so "how much disk may this use" is answered
+once, in the Helm values.
 
-| Variable                      | What it does                                                     |
-|-------------------------------|------------------------------------------------------------------|
-| `RA_LOG_EXPLORER_BASE_PATH`   | URL prefix to serve under, e.g. `/log-explorer`.                 |
-| `RA_LOG_EXPLORER_CACHE`       | Cache root. Points at the deployment's persistent volume.        |
-| `RA_LOG_EXPLORER_CONFIG_DIR`  | Where `settings.json` lives; must be writable.                   |
-| `RA_LOG_EXPLORER_SITES_FILE`  | Site catalog. Each deployment ships a one-site catalog naming its own cluster's ConsDB. |
-| `LOKI_USERNAME`               | Loki basic-auth user, so nobody has to type it into the UI.      |
-| `LOKI_PASSWORD`               | Loki basic-auth password, from the environment's Vault secret.   |
-
-The image runs as UID 1000 with a read-only root filesystem: the cache,
-the config dir and `/tmp` all arrive as mounted volumes. `/healthz`
-answers `{"status": "ok"}` under the base path and is what the readiness
-probe polls.
+The image runs as UID 1000 with a read-only root filesystem: the cache
+and `/tmp` arrive as mounted volumes. `/healthz` answers
+`{"status": "ok"}` under the base path and is what the readiness probe
+polls.
 
 Build and smoke-test it locally with:
 

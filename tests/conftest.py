@@ -57,14 +57,11 @@ def tmpCacheRoot(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Pa
     """Redirect `cache_root()` to a per-test scratch directory.
 
     Reset the cache between tests so superset-cache lookups can't leak
-    fixtures from one test into another. Also redirects the app-settings
-    JSON to a scratch location so tests don't inherit (or stomp on) the
-    real user's persisted settings in ``~/.config/ra_log_explorer``.
+    fixtures from one test into another.
     """
     root = tmp_path / "cache_root"
     root.mkdir()
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(root))
-    monkeypatch.setenv("RA_LOG_EXPLORER_CONFIG_DIR", str(tmp_path / "config"))
     yield root
     # Cleanup is automatic via tmp_path, but be paranoid in case the
     # test under examination clobbers our env var.

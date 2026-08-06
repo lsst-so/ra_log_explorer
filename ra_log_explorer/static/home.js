@@ -1,5 +1,5 @@
-/* ra-log-explorer — home view: pick an exposure, configure credentials,
- * inspect the cache, watch a fetch happen.
+/* ra-log-explorer — home view: pick an exposure, inspect the cache, watch
+ * a fetch happen.
  *
  * The user types a dataId; the browser resolves it to its TAI shutter-
  * close timestamp via /api/exposure-time/<dataId> and keeps that value
@@ -10,39 +10,18 @@
 'use strict';
 
 const LS = {
-  // Loki creds (still per-user-browser).
-  username: 'ra_log_explorer.username',
-  password: 'ra_log_explorer.password',
-  remember: 'ra_log_explorer.remember',
-  // App settings shared across both fetchers. Lives in localStorage
-  // because they're per-user-browser; maxCacheGiB is also POSTed
-  // server-side so the cache eviction can act on it. Cluster /
-  // namespace / Loki URL / ConsDB token file all moved into the
-  // server-side site catalog (sites.toml) and are picked via the
-  // top-bar site switcher.
-  settings: 'ra_log_explorer.settings',  // JSON {workers, maxCacheGiB, cacheDir}
-  // Which site the user last picked in the top-bar switcher.
-  site: 'ra_log_explorer.site',  // bare site name string
-  // Last per-exposure tuning (windowBefore/After) keyed off the
-  // exposure form alone.
+  // Last per-exposure tuning (windowBefore/After). The only thing the home
+  // view still remembers per browser: everything else that used to live
+  // here — credentials, worker count, cache size and location, which site
+  // to query — is deployment configuration the server reads from its
+  // environment, not something a visitor gets to set.
   lastExpTuning: 'ra_log_explorer.lastExpTuning',  // {windowBefore, windowAfter}
 };
 
-// Application defaults for the user-tunable knobs (everything left
-// after cluster/namespace/Loki URL/ConsDB token moved into the site
-// catalog). Kept in sync with config.DEFAULT_* and DEFAULT_MAX_CACHE_BYTES.
-const SETTINGS_DEFAULTS = {
-  workers: 8,
-  maxCacheGiB: 5,
-  cacheDir: '',
-};
-
-// Site catalog as returned by /api/sites: {default_site, sites: [...]}.
-// Loaded once at startup; the switcher renders from it and the rest of
-// the home view reads ``activeSite`` for `site` request fields.
-let siteCatalog = null;
-let activeSite = null;
-let siteSwitcherWired = false;  // guard: startHome() re-runs on every back-home
+// This deployment's site, from /api/site. Read-only: it labels the page so
+// nobody mistakes summit data for BTS data, and it is decided by where the
+// server runs.
+let site = null;
 
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
@@ -53,10 +32,8 @@ let lookupSeq = 0;              // sequence number to ignore stale lookup respon
 
 function startHome() {
   if (!homeListenersWired) wireHomeListeners();
-  prefillSettings();
   prefillForm();
-  prefillCreds();
-  loadSiteCatalog();
+  loadSite();
   refreshCache();
   // URL-driven entry. We land here either via a deep-link
   // (/?dataId=…&autoFetch=1) or because the URL points at a key the
@@ -88,69 +65,25 @@ function startHome() {
 }
 window.startHome = startHome;
 
-async function loadSiteCatalog() {
-  // The site catalog is the same for every user of this deployment
-  // (it's checked into sites.toml on the server). Pull it once: the
-  // switcher's <option>s, the active-site state, and the change listener
-  // all live in the persistent DOM / module scope, so re-running on a
-  // later back-home would only leak a duplicate listener — guard it.
-  if (siteSwitcherWired) return;
+async function loadSite() {
+  // One request, once: which observatory's logs this server serves. There
+  // is nothing to choose, so there is no listener to wire and no state to
+  // guard against startHome() re-running on every back-home.
   try {
-    const r = await fetch(apiUrl('/api/sites'));
+    const r = await fetch(apiUrl('/api/site'));
     if (!r.ok) return;
-    siteCatalog = await r.json();
+    site = await r.json();
   } catch (_) {
     return;
   }
-  if (!siteCatalog || !Array.isArray(siteCatalog.sites) || !siteCatalog.sites.length) return;
-  const sel = document.getElementById('site-select');
-  sel.innerHTML = '';
-  for (const s of siteCatalog.sites) {
-    const opt = document.createElement('option');
-    opt.value = s.name;
-    opt.textContent = `${s.name} (${s.cluster})`;
-    sel.appendChild(opt);
-  }
-  const stored = localStorage.getItem(LS.site);
-  const startName = siteCatalog.sites.find(s => s.name === stored)
-    ? stored
-    : siteCatalog.default_site;
-  sel.value = startName;
-  setActiveSite(startName);
-  document.getElementById('site-switcher').hidden = false;
-  sel.addEventListener('change', () => {
-    setActiveSite(sel.value);
-    localStorage.setItem(LS.site, sel.value);
-    // A site switch changes which ConsDB the lookup hits AND which
-    // per-site exposure-time cache we read, so any pending dataId
-    // resolution must re-run (and any manual entry belonged to the old
-    // site's missing record).
-    clearResolvedTZero();
-    hideManualEntry();
-    clearRangeSlot(rangeStartSlot);
-    clearRangeSlot(rangeStopSlot);
-    triggerLookupIfReady();
-    triggerRangeLookupsIfReady();
-    refreshCache();
-  });
-  siteSwitcherWired = true;
-}
-
-function setActiveSite(name) {
-  if (!siteCatalog) return;
-  activeSite = siteCatalog.sites.find(s => s.name === name) || null;
-  // Drive the per-site CSS accent (border-top strip, switcher chip).
-  // Persists across home/explore/night views — the strip is visible
-  // even when the switcher itself isn't on screen.
-  if (activeSite) {
-    document.body.dataset.site = activeSite.name;
-  } else {
-    delete document.body.dataset.site;
-  }
+  if (!site || !site.name) return;
+  // Drives the per-site CSS accent (border-top strip, badge), which stays
+  // visible across the home / explore / night views.
+  document.body.dataset.site = site.name;
+  document.getElementById('site-name').textContent = `${site.name} · ${site.cluster}`;
   const info = document.getElementById('site-info');
-  if (info && activeSite) {
-    info.textContent = `consdb=${activeSite.consdbUrl.replace(/^https?:\/\//, '')}`;
-  }
+  if (info) info.textContent = `consdb=${site.consdbUrl.replace(/^https?:\/\//, '')}`;
+  document.getElementById('site-badge').hidden = false;
 }
 
 function waitAndAutoFetch(expId) {
@@ -175,86 +108,6 @@ function waitAndAutoFetch(expId) {
   }, 200);
 }
 
-function readSettings() {
-  return { ...SETTINGS_DEFAULTS, ...(readJson(LS.settings) || {}) };
-}
-
-function prefillSettings() {
-  // Settings panel: app-wide knobs that both fetchers (and the cache
-  // eviction layer) read from. Persisted in localStorage; the
-  // maxCacheGiB value is also pushed to the server so its eviction
-  // pass uses the latest limit.
-  const s = readSettings();
-  const form = document.getElementById('settings-form');
-  for (const k of Object.keys(SETTINGS_DEFAULTS)) {
-    const el = form.elements.namedItem(k);
-    if (el) el.value = s[k] != null ? s[k] : SETTINGS_DEFAULTS[k];
-  }
-  // Reflect what the server currently believes the cache limit + the
-  // persisted cacheDir override are. ``effectiveCacheRoot`` is the
-  // path the server will *actually* use next time (env-var > setting >
-  // default) — render it as a hint so the user can see where their
-  // typed input resolves to, including the case where it's overridden
-  // by RA_LOG_EXPLORER_CACHE.
-  fetch(apiUrl('/api/settings')).then(async (r) => {
-    if (!r.ok) return;
-    const data = await r.json();
-    const gib = Math.round((data.maxCacheBytes / (1024 ** 3)) * 100) / 100;
-    if (gib !== parseFloat(form.elements.maxCacheGiB.value)) {
-      form.elements.maxCacheGiB.value = gib;
-      saveSettings();  // sync localStorage to the server's value
-    }
-    if (data.cacheDir !== form.elements.cacheDir.value) {
-      form.elements.cacheDir.value = data.cacheDir || '';
-      saveSettings();
-    }
-    updateCacheDirHint(data.effectiveCacheRoot);
-  }).catch(() => { /* offline — leave the form alone */ });
-}
-
-function updateCacheDirHint(effective) {
-  const el = document.getElementById('cache-dir-effective');
-  if (!el) return;
-  if (!effective) { el.textContent = ''; return; }
-  el.textContent = `currently using: ${effective}`;
-}
-
-function saveSettings() {
-  const form = document.getElementById('settings-form');
-  const s = {};
-  for (const k of Object.keys(SETTINGS_DEFAULTS)) {
-    const el = form.elements.namedItem(k);
-    if (!el) continue;
-    s[k] = el.type === 'number' ? parseFloat(el.value) : el.value.trim();
-  }
-  localStorage.setItem(LS.settings, JSON.stringify(s));
-  // Push the server-side fields (cache size + cache root override).
-  // Other fields are client-side only. Errors are surfaced via
-  // #settings-state but don't block anything else.
-  const stateEl = document.getElementById('settings-state');
-  const bytes = Math.round((s.maxCacheGiB || 0) * (1024 ** 3));
-  fetch(apiUrl('/api/settings'), {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ maxCacheBytes: bytes, cacheDir: s.cacheDir || null }),
-  }).then(async (r) => {
-    if (!r.ok) {
-      const body = await r.json().catch(() => ({}));
-      stateEl.textContent = `(server: ${body.error || `HTTP ${r.status}`})`;
-      stateEl.classList.add('error');
-      return;
-    }
-    const data = await r.json().catch(() => ({}));
-    if (data.effectiveCacheRoot) updateCacheDirHint(data.effectiveCacheRoot);
-    refreshCache();  // the cache listing comes from the new root
-    stateEl.textContent = '(saved)';
-    stateEl.classList.remove('error');
-    setTimeout(() => { stateEl.textContent = ''; }, 1500);
-  }).catch((e) => {
-    stateEl.textContent = `(server unreachable: ${e})`;
-  });
-}
-
 function prefillForm() {
   // Per-exposure tuning (windowBefore/After) only — cluster/namespace/
   // workers are in the settings panel.
@@ -265,52 +118,6 @@ function prefillForm() {
     const el = form.elements.namedItem(k);
     if (el) el.value = v;
   }
-}
-
-function prefillCreds() {
-  const form = document.getElementById('creds-form');
-  const remember = localStorage.getItem(LS.remember) === '1';
-  const u = localStorage.getItem(LS.username);
-  const p = localStorage.getItem(LS.password);
-  if (u != null) form.elements.username.value = u;
-  if (p != null) form.elements.password.value = p;
-  form.elements.remember.checked = remember;
-  updateCredsState();
-}
-
-function updateCredsState() {
-  const remember = document.getElementById('creds-form').elements.remember.checked;
-  const has = !!localStorage.getItem(LS.password);
-  const el = document.getElementById('creds-state');
-  if (has && remember) el.textContent = '(remembered in this browser)';
-  else if (has && !remember) el.textContent = '(stored but "remember" off — will clear after this fetch)';
-  else el.textContent = '';
-}
-
-function saveCreds() {
-  const form = document.getElementById('creds-form');
-  const u = form.elements.username.value.trim();
-  const p = form.elements.password.value;
-  const remember = form.elements.remember.checked;
-  if (remember) {
-    if (u) localStorage.setItem(LS.username, u);
-    if (p) localStorage.setItem(LS.password, p);
-    localStorage.setItem(LS.remember, '1');
-  } else {
-    localStorage.removeItem(LS.remember);
-  }
-  updateCredsState();
-}
-
-function forgetCreds() {
-  localStorage.removeItem(LS.username);
-  localStorage.removeItem(LS.password);
-  localStorage.removeItem(LS.remember);
-  const form = document.getElementById('creds-form');
-  form.elements.username.value = 'merlin';
-  form.elements.password.value = '';
-  form.elements.remember.checked = false;
-  updateCredsState();
 }
 
 function saveExpTuning() {
@@ -337,19 +144,12 @@ function readFormValues() {
   const fd = new FormData(form);
   const out = {};
   for (const [k, v] of fd.entries()) out[k] = v;
-  // Merge in the app-wide knobs that no longer live on the per-fetch
-  // form. cluster / namespace / Loki URL are derived from the
-  // currently-selected site on the server side (we just pass `site`).
-  const s = readSettings();
-  out.site = activeSite ? activeSite.name : undefined;
-  out.workers = parseInt(s.workers, 10);
+  // Only what the user actually asked for. Site, credentials and worker
+  // count are the server's own configuration; sending them from here would
+  // let one browser change how every other user's fetch behaves.
   out.exposureId = parseInt(out.exposureId, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
-  const creds = document.getElementById('creds-form');
-  out.username = creds.elements.username.value.trim();
-  const password = creds.elements.password.value;
-  if (password) out.password = password;
   // Always TAI; the server applies the -37 s conversion. We deliberately
   // never expose a UTC opt-out in the UI now that timings come from a
   // service that's TAI by construction (and a manual entry is, by the
@@ -500,13 +300,7 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  // The site picks which ConsDB to ask AND which per-site cache file
-  // the resolved obs_end lands in. Falls through to the server's
-  // default_site if we haven't loaded the catalog yet (rare race on
-  // first paint).
-  const siteName = activeSite ? activeSite.name : '';
-  const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
-  fetch(apiUrl(`/api/exposure-time/${expId}${qs}`))
+  fetch(apiUrl(`/api/exposure-time/${expId}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer
@@ -608,9 +402,7 @@ function triggerRangeLookup(slot) {
   }
   setRangeStatus(slot.status, `looking up ${expId}…`, 'info');
   const mySeq = ++slot.seq;
-  const siteName = activeSite ? activeSite.name : '';
-  const qs = siteName ? `?site=${encodeURIComponent(siteName)}` : '';
-  fetch(apiUrl(`/api/exposure-time/${expId}${qs}`))
+  fetch(apiUrl(`/api/exposure-time/${expId}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== slot.seq) return;  // stale; user typed something newer
@@ -884,7 +676,6 @@ async function startFetch(ev) {
     showMessage('Shutter close time has not been resolved yet.', true);
     return;
   }
-  saveCreds();
   saveExpTuning();
 
   const submit = document.getElementById('fetch-submit');
@@ -1070,7 +861,6 @@ async function startNightFetch(ev) {
   ev.preventDefault();
   if (activeJobId) return;
   const form = document.getElementById('night-form');
-  const credsForm = document.getElementById('creds-form');
   const dayObsRaw = form.elements.dayObs.value.trim();
   const dayObs = parseInt(dayObsRaw, 10);
   if (!Number.isFinite(dayObs) || dayObs < 19000000 || dayObs > 30000000) {
@@ -1079,15 +869,7 @@ async function startNightFetch(ev) {
     el.classList.add('error');
     return;
   }
-  saveCreds();
-  const s = readSettings();
-  const body = {
-    dayObs,
-    site: activeSite ? activeSite.name : undefined,
-    workers: parseInt(s.workers, 10) || undefined,
-    username: credsForm.elements.username.value.trim() || undefined,
-    password: credsForm.elements.password.value || undefined,
-  };
+  const body = { dayObs };
   const submit = document.getElementById('night-submit');
   submit.disabled = true;
   const msgEl = document.getElementById('night-message');
@@ -1131,10 +913,7 @@ async function startRangeFetch(ev) {
     msgEl.classList.add('error');
     return;
   }
-  saveCreds();
   const form = document.getElementById('range-form');
-  const credsForm = document.getElementById('creds-form');
-  const s = readSettings();
   const body = {
     rangeStart: rangeStartSlot.forId,
     rangeStop: rangeStopSlot.forId,
@@ -1142,12 +921,8 @@ async function startRangeFetch(ev) {
     // as the single-exposure form).
     tZeroStart: rangeStartSlot.tZero,
     tZeroStop: rangeStopSlot.tZero,
-    site: activeSite ? activeSite.name : undefined,
-    workers: parseInt(s.workers, 10) || undefined,
     windowBefore: parseFloat(form.elements.windowBefore.value),
     windowAfter: parseFloat(form.elements.windowAfter.value),
-    username: credsForm.elements.username.value.trim() || undefined,
-    password: credsForm.elements.password.value || undefined,
   };
 
   const submit = document.getElementById('range-submit');
@@ -1192,14 +967,6 @@ function wireHomeListeners() {
   const rangeForm = document.getElementById('range-form');
   rangeForm.elements.rangeStart.addEventListener('input', () => scheduleRangeLookup(rangeStartSlot));
   rangeForm.elements.rangeStop.addEventListener('input', () => scheduleRangeLookup(rangeStopSlot));
-  document.getElementById('creds-form').elements.remember.addEventListener('change', saveCreds);
-  document.getElementById('creds-forget').addEventListener('click', forgetCreds);
-  // Save settings on every input — they're tiny, latency-free, and the
-  // user expects "I changed it" to mean "it's saved".
-  const settingsForm = document.getElementById('settings-form');
-  for (const el of settingsForm.querySelectorAll('input')) {
-    el.addEventListener('input', saveSettings);
-  }
   document.getElementById('cache-refresh').addEventListener('click', refreshCache);
   document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
   homeListenersWired = true;

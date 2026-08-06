@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import http.client
 import json
-import os
 import socket
 import threading
 import time
@@ -56,7 +55,7 @@ def runningServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterato
     ctx = ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
     handler = _makeHandler(ctx)
     port = _freePort()
@@ -87,19 +86,6 @@ def _get(host: str, port: int, path: str) -> tuple[int, dict]:
 def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
-        parsed = {"_raw": text}
-    return resp.status, parsed
-
-
-def _put(host: str, port: int, path: str, rawBody: str) -> tuple[int, dict]:
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request("PUT", path, body=rawBody, headers={"Content-Type": "application/json"})
     resp = conn.getresponse()
     text = resp.read().decode("utf-8")
     conn.close()
@@ -702,60 +688,63 @@ def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> ServerContext:
     return ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
 
 
 def test_buildSpecFromRequest_TAI_default(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, expId, tZero, password = serverModule._buildSpecFromRequest(
+    spec, site, expId, tZero = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267"}
     )
     assert expId == 1
     # 37s TAI->UTC adjustment applied by default
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
-    # `site` defaults to the catalog's default_site (summit).
     assert site.name == "summit"
     assert spec.cluster == "yagan"
     assert spec.namespace == "rapid-analysis"
-    assert password is None
 
 
-def test_buildSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
-    """An explicit ``site`` field overrides the catalog default. This is
-    the only knob clients have for picking the cluster now — we don't
-    accept cluster/namespace/lokiAddr in the body any more."""
+def test_buildSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """The cluster is decided by where this server runs, not by the
+    request. Honouring a body-supplied site would let a summit deployment
+    hand back BTS logs — worse than an error, because the same dataId
+    exists on both and the answer would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, _, _, _ = serverModule._buildSpecFromRequest(
+    spec, site, _, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "bts"}
     )
-    assert site.name == "bts"
-    assert spec.cluster == "manke"
-
-
-def test_buildSpecFromRequest_rejects_unknown_site(siteCatalog: FakeSiteCatalog) -> None:
-    ctx = _ctxWithSites(siteCatalog)
-    with pytest.raises(ValueError, match="No site"):
-        serverModule._buildSpecFromRequest(
-            ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "ghost"}
-        )
+    assert site.name == "summit"
+    assert spec.cluster == "yagan"
 
 
 def test_buildSpecFromRequest_UTC_opt_out(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, tZero, _ = serverModule._buildSpecFromRequest(
+    _, _, _, tZero = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:45:39.267", "tZeroUtc": True}
     )
     # No 37s offset applied
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
 
 
-def test_buildSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildSpecFromRequest_ignores_credentials_and_workers(siteCatalog: FakeSiteCatalog) -> None:
+    """Credentials and the worker count are the service's configuration.
+    A body supplying its own must be ignored: LOKI_PASSWORD is
+    process-global, so one browser's wrong password would otherwise break
+    fetches for every other user of the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, _, password = serverModule._buildSpecFromRequest(
-        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "password": "hunter2"}
+    spec, _, _, _ = serverModule._buildSpecFromRequest(
+        ctx,
+        {
+            "exposureId": 1,
+            "tZero": "2026-05-20T08:46:16.267",
+            "password": "hunter2",
+            "username": "someone-else",
+            "workers": 999,
+        },
     )
-    assert password == "hunter2"
+    assert spec.username == serverModule.DEFAULT_USERNAME
+    assert spec.workers == serverModule.DEFAULT_WORKERS
 
 
 def test_buildSpecFromRequest_rejects_missing_expId(siteCatalog: FakeSiteCatalog) -> None:
@@ -914,38 +903,29 @@ def test_exposure_time_writes_to_cache_on_consdb_hit(
     assert cached["img_type"] == "science"  # the richer columns landed too
 
 
-def test_exposure_time_picks_site_from_query_param(
+def test_exposure_time_ignores_a_site_query_param(
     runningServer: RunningServer,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     siteCatalog: FakeSiteCatalog,
 ) -> None:
-    """``?site=bts`` redirects the lookup at the BTS ConsDB + token file
-    AND writes the resolved value into the bts cache. Without the
-    explicit site, the server would fall back to ``default_site`` (summit)
-    and the BTS lookup would have no path to succeed."""
+    """The lookup goes to the server's own ConsDB whatever the query string
+    says, and the resolved value lands in that site's cache. The same
+    13-digit dataId exists on both BTS and the summit with different
+    obs_end values, so honouring a caller-supplied site would silently
+    cache one observatory's answer under the other's name."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    siteCatalog.writeBtsToken()
+    siteCatalog.writeSummitToken()
     _stubConsdb(monkeypatch, "2026-06-03T00:42:43.632000")
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026060200001?site=bts")
     assert status == 200
-    assert body["site"] == "bts"
-    assert body["tZero"] == "2026-06-03T00:42:43.632000"
+    assert body["site"] == "summit"
     assert (
-        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="bts"))
+        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="summit"))
         == "2026-06-03T00:42:43.632000"
     )
-    # And NOT under the summit cache — the per-site isolation is the
-    # whole point of this scoping.
-    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="summit") is None
-
-
-def test_exposure_time_400_for_unknown_site(runningServer: RunningServer) -> None:
-    host, port, _ = runningServer
-    status, body = _get(host, port, "/api/exposure-time/2026051900722?site=ghost")
-    assert status == 400
-    assert "No site" in body["error"]
+    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="bts") is None
 
 
 # ----- manual shutter-close stand-ins --------------------------------------
@@ -1078,24 +1058,26 @@ def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     assert loaded.referencePoints[0]["label"] == "shutter close (manual)"
 
 
-def test_sites_endpoint_returns_catalog(runningServer: RunningServer) -> None:
-    """``/api/sites`` exposes the catalog so the UI can render the
-    switcher; token-file paths are stripped because they're server-side
-    only."""
+def test_site_endpoint_returns_the_served_site(runningServer: RunningServer) -> None:
+    """``/api/site`` names the one site this server serves, so the UI can
+    label the page with it. The token-file path is server-side only and
+    must not appear in the payload."""
     host, port, _ = runningServer
-    status, body = _get(host, port, "/api/sites")
+    status, body = _get(host, port, "/api/site")
     assert status == 200
-    assert body["default_site"] == "summit"
-    names = sorted(s["name"] for s in body["sites"])
-    assert names == ["bts", "summit"]
-    for s in body["sites"]:
-        # No token file in the wire payload.
-        assert "consdbTokenFile" not in s
-        assert "tokenFile" not in s
-        assert s["consdbUrl"]
+    assert body["name"] == "summit"
+    assert body["cluster"] == "yagan"
+    assert body["consdbUrl"]
+    assert "consdbTokenFile" not in body
+    assert "tokenFile" not in body
 
 
-# ----- DELETE /api/cache (single + all) -----------------------------------
+def test_sites_endpoint_is_gone(runningServer: RunningServer) -> None:
+    """The plural catalog endpoint existed to populate a site switcher. The
+    switcher is gone — the deployment decides — so nothing should still be
+    serving a list of sites to choose from."""
+    host, port, _ = runningServer
+    assert _get(host, port, "/api/sites")[0] == 404
 
 
 def _plantCacheDir(root: Path, cluster: str, namespace: str, slug: str) -> Path:
@@ -1428,128 +1410,6 @@ def test_two_nights_coexist_via_endpoint(runningServer: RunningServer, tmpCacheR
     sB, bB = _get(host, port, "/api/summary?dayObs=20260522")
     assert bA["dayObs"] == 20260521
     assert bB["dayObs"] == 20260522
-
-
-def test_settings_get_returns_defaults_then_put_persists(
-    runningServer: RunningServer, tmpCacheRoot: Path
-) -> None:
-    """GET /api/settings returns the current settings; PUT persists changes.
-
-    The cache root is per-test (via tmpCacheRoot), so the first GET sees
-    the default value.
-    """
-    from ra_log_explorer.appSettings import DEFAULT_MAX_CACHE_BYTES
-
-    host, port, _ctx = runningServer
-    status, body = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body["maxCacheBytes"] == DEFAULT_MAX_CACHE_BYTES
-
-    # PUT a new value.
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": 2 * 1024 * 1024 * 1024}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    assert json.loads(text)["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
-
-    # GET reflects the persisted value.
-    status, body = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
-
-
-def test_settings_put_persists_cacheDir_and_resolves_effective_root(
-    runningServer: RunningServer, tmp_path: Path
-) -> None:
-    """``cacheDir`` round-trips through PUT/GET and the server reports
-    the *effective* cache root it'll actually use next — which honours
-    the env-var override over the persisted value.
-    """
-    host, port, _ctx = runningServer
-    target = tmp_path / "my-custom-cache"
-
-    # PUT a custom cacheDir.
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"cacheDir": str(target)}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    body = json.loads(text)
-    assert body["cacheDir"] == str(target)
-    # The env-var override (RA_LOG_EXPLORER_CACHE, set by the fixture)
-    # still wins over the persisted cacheDir, so effectiveCacheRoot
-    # reports the env-var value rather than `target`.
-    assert body["effectiveCacheRoot"] == os.environ["RA_LOG_EXPLORER_CACHE"]
-    # The directory was created on the server's side.
-    assert target.is_dir()
-
-    # GET still reports the persisted value.
-    status, body2 = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body2["cacheDir"] == str(target)
-
-
-def test_settings_put_clears_cacheDir_when_set_to_empty(runningServer: RunningServer, tmp_path: Path) -> None:
-    """Setting ``cacheDir`` to an empty string or null reverts to the
-    default resolution chain — the user can undo a custom override
-    without hand-editing the settings JSON."""
-    host, port, _ctx = runningServer
-
-    # Plant a value, then clear it.
-    for clearer in ("", None):
-        conn = http.client.HTTPConnection(host, port, timeout=2.0)
-        conn.request(
-            "PUT",
-            "/api/settings",
-            body=json.dumps({"cacheDir": str(tmp_path / "first")}),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        resp.read()
-        conn.close()
-        assert resp.status == 200
-
-        conn = http.client.HTTPConnection(host, port, timeout=2.0)
-        conn.request(
-            "PUT",
-            "/api/settings",
-            body=json.dumps({"cacheDir": clearer}),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        text = resp.read().decode("utf-8")
-        conn.close()
-        assert resp.status == 200, text
-        assert json.loads(text)["cacheDir"] is None
-
-
-def test_settings_put_rejects_non_integer(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": "five gigs"}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "maxCacheBytes" in text
 
 
 def test_cache_list_includes_lastViewedAt_and_dayObs(
@@ -1901,67 +1761,6 @@ def test_cache_delete_404_for_unknown_window(runningServer: RunningServer, tmpCa
     assert status == 404
 
 
-# ----- /api/settings PUT validation ---------------------------------------
-
-
-def test_settings_put_with_empty_body_is_a_no_op(runningServer: RunningServer) -> None:
-    """PUT /api/settings now accepts partial updates — touching maxCacheBytes
-    alone must not clobber a previously-set cacheDir, and vice versa. The
-    degenerate case of an empty body is therefore a successful no-op that
-    returns whatever's currently persisted."""
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    body = json.loads(text)
-    assert "maxCacheBytes" in body
-    assert "cacheDir" in body
-    assert "effectiveCacheRoot" in body
-
-
-def test_settings_put_rejects_negative_value(runningServer: RunningServer) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": -1}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "non-negative" in text or "negative" in text
-
-
-def test_settings_put_rejects_bad_json_body(runningServer: RunningServer) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=b"{this is not json",
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "JSON" in text or "json" in text
-
-
-# ----- _prefetchNightShutterCloses signalling ----------------------------
-
-
 def _aosPodSummary(expId: int) -> Any:
     """Test helper: a minimal AOS-group PodSummary with one expId event."""
     import datetime as _dt
@@ -2277,7 +2076,7 @@ def mountedServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterato
     ctx = ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
         basePath="/log-explorer",
     )
     httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
@@ -2367,21 +2166,29 @@ def test_post_and_delete_also_honour_the_base_path(mountedServer: RunningServer)
     assert _post(host, port, "/api/fetch", {})[0] == 404
     assert _delete(host, port, "/log-explorer/api/cache")[0] == 200
     assert _delete(host, port, "/api/cache")[0] == 404
-    # PUT too. A malformed body is enough to prove the route was reached
-    # without letting the handler persist anything.
-    assert _put(host, port, "/log-explorer/api/settings", "not json")[0] == 400
-    assert _put(host, port, "/api/settings", "not json")[0] == 404
 
 
-def test_index_offers_the_servers_loki_username(
-    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """The credentials form must offer whatever user the server will
-    actually authenticate as. Writing a name into the HTML instead would
-    make a deployment send its template author's username to Loki and fail
-    every fetch."""
+def test_index_has_no_configuration_fields(runningServer: RunningServer) -> None:
+    """Credentials, worker count, cache size and cache location are all
+    deployment configuration read from the environment. A field for any of
+    them in a shared deployment would let one visitor change how the
+    service behaves for everyone else."""
     host, port, _ctx = runningServer
     _status, body = _get(host, port, "/")
     html = body["_raw"]
-    assert "__LOKI_USERNAME__" not in html
-    assert f'name="username" value="{serverModule.DEFAULT_USERNAME}"' in html
+    for name in ('name="username"', 'name="password"', 'name="workers"', 'name="cacheDir"'):
+        assert name not in html, name
+    assert "creds-form" not in html
+    assert "settings-form" not in html
+
+
+def test_index_seeds_the_window_fields_from_the_server(runningServer: RunningServer) -> None:
+    """The window fields stay editable — widening a window mid-investigation
+    is a real workflow — but where they start is the deployment's call."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert "__WINDOW_BEFORE__" not in html
+    assert "__WINDOW_AFTER__" not in html
+    assert 'name="windowBefore" value="5"' in html
+    assert 'name="windowAfter" value="300"' in html

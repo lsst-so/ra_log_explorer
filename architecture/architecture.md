@@ -68,8 +68,7 @@ Sibling docs:
     │                            │ ◄────── DELETE /api/cache                  (wipe all)
     │                            │ ◄────── DELETE /api/cache/.../<slug>[/<pods=…>]
     │                            │ ◄────── GET    /api/exposure-time/<id>
-    │                            │ ◄────── GET    /api/settings
-    │                            │ ◄────── PUT    /api/settings
+    │                            │ ◄────── GET    /api/site                   (read-only label)
     │                            │ ◄────── POST   /api/fetch                  (exposure)
     │                            │ ◄────── POST   /api/fetch-night            (dayObs)
     │                            │ ◄────── POST   /api/fetch-range            (start/stop)
@@ -107,36 +106,30 @@ Sibling docs:
                           at <cache_root>/exposure-times/<site>.json so
                           once-resolved dataIds work offline.
 
-       sites.py           Per-deployment site catalog. A *site* pairs a
-                          Loki cluster with the ConsDB endpoint that
-                          owns its shutter-close truth. yagan→summit
-                          (USDF/summit RSP) and manke→bts (base-lsp);
-                          the table lives in the checked-in
-                          ra_log_explorer/sites.toml. The home page
-                          shows a top-bar switcher; every fetch and
-                          shutter-close lookup carries a `site` field
-                          that the server resolves via the catalog.
-
-       appSettings.py     Server-side settings persisted at
-                          <cache_root>/settings.json. Currently just
-                          `maxCacheBytes` (the LRU eviction threshold).
+       sites.py           Site catalog. A *site* pairs a Loki cluster
+                          with the ConsDB endpoint that owns its
+                          shutter-close truth. yagan→summit and
+                          manke→bts; the table lives in sites.toml,
+                          which a deployment replaces via
+                          RA_LOG_EXPLORER_SITES_FILE. `--site` picks
+                          one entry at startup and that is the site
+                          for the life of the process.
 ```
 
 ## Module Responsibilities
 
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
-| `config.py`        | Defaults, `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, and base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`). `DEFAULT_USERNAME` reads `$LOKI_USERNAME` so a deployment can authenticate as a service account without anyone typing it. |
+| `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
-| `appSettings.py`   | Reads / writes `<cache_root>/settings.json`. Schema is open-ended; today the only field is `maxCacheBytes`. Used by the LRU cache eviction in `fetch.evictToFit`. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
-| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, credentials, cache list, progress), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, cache list, progress, site badge), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
 
 ## Key Concepts
 
@@ -180,11 +173,17 @@ Sibling docs:
   exposure on the summit and a *different*, simulated exposure on BTS
   — different `obs_end` values, separate sources of truth. Every
   shutter-close lookup and every exposure-time cache file is scoped by
-  site to keep them from crosstalking. The home page exposes the
-  current site as a top-bar switcher; every fetch + exposure-time
-  request body carries a `site` field that the server resolves via the
-  catalog (falls back to `default_site` if omitted). USDF will get its
-  own site once we plumb that path; it'll share the summit ConsDB.
+  site to keep them from crosstalking.
+
+  **One process serves exactly one site.** `--site` (or the catalog's
+  `default_site`) picks it at startup; `ServerContext.site()` is the only
+  way to reach it, and no request can name a different one. A deployment
+  on manke means BTS and one on yagan means the summit, so a `site` field
+  in a request body is ignored rather than honoured — the same dataId
+  exists at both observatories with different `obs_end` values, and a
+  summit deployment answering with BTS data would look plausible rather
+  than wrong. The catalog can still list several entries, which is what
+  lets a laptop point at either.
 
 - **dataId / expId** — 13-digit `YYYYMMDDSSSSS` integer (e.g. `2026051900722`).
   Exposure mode targets a single one of these at a time.
@@ -257,6 +256,44 @@ Sibling docs:
 - **`who`** — pipeline tag (`SFM`, `AOS`, `AOS_DANISH`, `ISR`, …) that
   the rapid analysis system uses to distinguish concurrent pipelines on
   the same exposure. Surfaced on head-node events.
+
+## Configuration
+
+Everything that varies between deployments is an environment variable,
+read once at import in `config.py`. Nothing is configurable from the
+browser: the UI asks questions about exposures, it does not reconfigure
+the service that answers them. That is not tidiness — a shared deployment
+has many users and one process, so a settings field would let whoever
+touched it last change how everyone else's fetches behave.
+
+| Variable | Drives | Default |
+|----------|--------|---------|
+| `RA_LOG_EXPLORER_BASE_PATH` | URL prefix the app is served under | `""` (the root) |
+| `RA_LOG_EXPLORER_CACHE` | `cache_root()` | `~/.cache/ra_log_explorer` |
+| `RA_LOG_EXPLORER_SITES_FILE` | which `sites.toml` to load | the packaged one |
+| `RA_LOG_EXPLORER_WORKERS` | `DEFAULT_WORKERS`, the parallel fetch width | `8` |
+| `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
+| `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
+| `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
+| `LOKI_USERNAME` | `DEFAULT_USERNAME`, the Loki basic-auth user | `merlin` |
+| `LOKI_PASSWORD` | the Loki basic-auth password, read by `logcli` | *(required)* |
+
+A malformed numeric value raises `ConfigError` at import rather than
+falling back to the default: a container that refuses to start is much
+easier to notice than a setting that quietly never took effect.
+
+The two window values are the *starting* values of editable form fields,
+not fixed limits — widening a window to catch a neighbouring exposure is
+a real investigative move, so the deployment chooses where the fields
+start and the user can still change them for a given fetch. Everything
+else in this table the browser cannot influence at all: a `site`,
+`username`, `password` or `workers` field in a request body is ignored,
+not honoured.
+
+Deployed, `RA_LOG_EXPLORER_MAX_CACHE_BYTES` is derived from the size of
+the volume provisioned for the cache, so "how much disk may this use" is
+answered once, in the Helm values, rather than in two places that can
+disagree.
 
 ## JSON API
 
@@ -583,22 +620,19 @@ events carry `manualStandins` (how many hits were provisional) alongside
 `cacheHits`, and `remaining` / `stillMissing` count only ids with no t₀
 at all — a re-queried stand-in is anchored, not missing.
 
-### `GET /api/sites`
+### `GET /api/site`
 
-Return the per-deployment site catalog plus the default site name.
-The token-file paths are *not* echoed — they're a server-side detail.
+Return the one site this server serves. Read-only: the UI renders it as a
+badge in the top bar so nobody misreads summit data as BTS data. The
+token-file path is *not* echoed — it's a server-side detail.
 
 ```jsonc
 {
-  "default_site": "summit",
-  "sites": [
-    { "name": "summit", "cluster": "yagan", "namespace": "rapid-analysis",
-      "lokiAddr": "https://loki-query.ls.lsst.org",
-      "consdbUrl": "https://usdf-rsp.slac.stanford.edu/consdb/query" },
-    { "name": "bts",    "cluster": "manke", "namespace": "rapid-analysis",
-      "lokiAddr": "https://loki-query.ls.lsst.org",
-      "consdbUrl": "https://base-lsp.lsst.codes/consdb/query" }
-  ]
+  "name": "bts",
+  "cluster": "manke",
+  "namespace": "rapid-analysis",
+  "lokiAddr": "https://loki-query.ls.lsst.org",
+  "consdbUrl": "http://consdb-pq.consdb.svc.cluster.local:8080/consdb/query"
 }
 ```
 
@@ -652,18 +686,6 @@ matches the directory being deleted, that state is evicted first
 (the UI gets booted back to the home view on next summary fetch).
 Empty per-cluster / per-namespace parent directories are pruned.
 Returns the same shape as `GET /api/cache`. 404 on a path mismatch.
-
-### `GET /api/settings` / `PUT /api/settings`
-
-Server-side settings persisted under `<cache_root>/settings.json`.
-Today there's exactly one knob — the LRU cache size cap:
-
-```jsonc
-{ "maxCacheBytes": 5368709120 }   // 5 GiB by default
-```
-
-`PUT` validates `maxCacheBytes` is a non-negative integer; rejects
-bad JSON, missing field, non-int, or negative values with 400.
 
 ### `POST /api/fetch`  (exposure)
 

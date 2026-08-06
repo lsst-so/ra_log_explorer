@@ -25,9 +25,8 @@
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
       </div>
-      <div class="site-switcher" id="site-switcher" hidden>
-        <label for="site-select">site</label>
-        <select id="site-select"></select>
+      <div class="site-badge" id="site-badge" hidden>
+        <span class="site-name" id="site-name"></span>
         <span class="muted" id="site-info"></span>
       </div>
     </header>
@@ -57,11 +56,11 @@
               <div class="row">
                 <label>
                   <span class="lbl">window before t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                  <input type="number" name="windowBefore" value="__WINDOW_BEFORE__" step="0.1" />
                 </label>
                 <label>
                   <span class="lbl">window after t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="300" step="1" />
+                  <input type="number" name="windowAfter" value="__WINDOW_AFTER__" step="1" />
                 </label>
               </div>
             </details>
@@ -105,11 +104,11 @@
               <div class="row">
                 <label>
                   <span class="lbl">window before start t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                  <input type="number" name="windowBefore" value="__WINDOW_BEFORE__" step="0.1" />
                 </label>
                 <label>
                   <span class="lbl">window after stop t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="300" step="1" />
+                  <input type="number" name="windowAfter" value="__WINDOW_AFTER__" step="1" />
                 </label>
               </div>
             </details>
@@ -180,65 +179,6 @@
 
       </main>
 
-      <aside id="home-sidebar">
-        <section class="home-card sidebar-card">
-          <h2>App settings</h2>
-          <form id="settings-form">
-            <div class="row">
-              <label>
-                <span class="lbl">parallel fetch workers</span>
-                <input type="number" name="workers" value="8" min="1" max="64" />
-                <span class="hint">used by both exposure &amp; night fetches</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">max cache space (GiB)</span>
-                <input type="number" name="maxCacheGiB" value="5" min="0" step="0.5" />
-                <span class="hint">server LRU-evicts oldest caches above this; updates live</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">cache directory</span>
-                <input type="text" name="cacheDir" placeholder="~/.cache/ra_log_explorer" autocomplete="off" />
-                <span class="hint">blank = default; <code>RA_LOG_EXPLORER_CACHE</code> env var overrides this</span>
-                <span id="cache-dir-effective" class="hint"></span>
-              </label>
-            </div>
-            <div class="row submit-row">
-              <span id="settings-state" class="hint"></span>
-            </div>
-          </form>
-        </section>
-
-        <section class="home-card sidebar-card">
-          <h2>Credentials <span class="muted" id="creds-state"></span></h2>
-          <form id="creds-form">
-            <div class="row">
-              <label>
-                <span class="lbl">Loki username</span>
-                <input type="text" name="username" value="__LOKI_USERNAME__" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">Loki password</span>
-                <input type="password" name="password" placeholder="(falls back to LOKI_PASSWORD env)" autocomplete="off" />
-              </label>
-            </div>
-            <div class="row">
-              <label class="cb">
-                <input type="checkbox" name="remember" /> remember in this browser
-              </label>
-              <span class="hint">localStorage only; never sent anywhere but this server</span>
-            </div>
-            <div class="row submit-row">
-              <button type="button" id="creds-forget" class="ghost mini">forget stored credentials</button>
-            </div>
-          </form>
-        </section>
-      </aside>
     </div>
   </section>
 

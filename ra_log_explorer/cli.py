@@ -249,7 +249,7 @@ def cmdRun(args: argparse.Namespace) -> int:
         return 2
 
     site = _resolveSite(args)
-    sites, defaultName = loadSites()
+    sites, _ = loadSites()
     state: ServerState | None = None
     if eager:
         state = _eagerFetchAndBuildState(args, site)
@@ -265,7 +265,7 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
 
     basePath = normalizeBasePath(args.base_path)
-    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName, basePath=basePath)
+    ctx = ServerContext(jobs=JobManager(), sites=sites, siteName=site.name, basePath=basePath)
     if state is not None:
         ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}{basePath}/"

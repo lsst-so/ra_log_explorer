@@ -194,3 +194,75 @@ def test_defaultBasePath_reads_and_normalizes_env(monkeypatch: pytest.MonkeyPatc
     assert config.defaultBasePath() == "/log-explorer"
     monkeypatch.delenv(config.BASE_PATH_ENV)
     assert config.defaultBasePath() == ""
+
+
+# ----- environment-driven configuration ------------------------------------
+
+
+def test_envInt_and_envFloat_return_the_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RA_LOG_EXPLORER_TEST_KNOB", raising=False)
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 7
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 1.5
+    # An empty or whitespace-only value is what an unset Helm value renders
+    # as; it must mean "unset", not "malformed".
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "   ")
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 7
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 1.5
+
+
+def test_envInt_and_envFloat_read_the_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "16")
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 16
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 16.0
+
+
+def test_envInt_and_envFloat_raise_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo'd deployment value must stop the container, not silently
+    revert to the built-in default — a setting that quietly never took
+    effect is far harder to notice than one that refuses to start."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "eight")
+    with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+        config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+    with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+        config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5)
+    # A float is not an int; the worker count must not silently truncate.
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "8.5")
+    with pytest.raises(config.ConfigError):
+        config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+
+
+def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The knobs the UI used to expose are now read once, at import, from
+    the environment. Reload the module under a patched environment to pin
+    that each name is actually wired to its variable."""
+    import importlib
+
+    monkeypatch.setenv("RA_LOG_EXPLORER_WORKERS", "3")
+    monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_BEFORE_S", "12.5")
+    monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_AFTER_S", "600")
+    monkeypatch.setenv("RA_LOG_EXPLORER_MAX_CACHE_BYTES", "1234567")
+    monkeypatch.setenv("LOKI_USERNAME", "omega")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.DEFAULT_WORKERS == 3
+        assert reloaded.DEFAULT_WINDOW_BEFORE_S == 12.5
+        assert reloaded.DEFAULT_WINDOW_AFTER_S == 600.0
+        assert reloaded.MAX_CACHE_BYTES == 1234567
+        assert reloaded.DEFAULT_USERNAME == "omega"
+    finally:
+        # Other modules hold references to this module object; leaving it
+        # reloaded under a patched environment would leak into them.
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_cacheRoot_ignores_a_stale_settings_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`cache_root` used to consult a persisted settings JSON that the UI
+    wrote. That file is gone; one left over from an older version must not
+    still be able to redirect where a deployment writes its cache."""
+    monkeypatch.delenv("RA_LOG_EXPLORER_CACHE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    stale = tmp_path / ".config" / "ra_log_explorer"
+    stale.mkdir(parents=True)
+    (stale / "settings.json").write_text('{"cacheDir": "/somewhere/else"}')
+    assert config.cache_root() == tmp_path / ".cache" / "ra_log_explorer"

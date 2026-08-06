@@ -198,11 +198,10 @@ docker build -t ra-log-explorer:local .
 # writable path a mounted volume, and a one-site catalog with no ConsDB
 # token. If it works here it will work in the pod.
 docker run --rm --read-only \
-  --tmpfs /tmp --tmpfs /var/cache/ra-log-explorer --tmpfs /var/lib/ra-log-explorer \
+  --tmpfs /tmp --tmpfs /var/cache/ra-log-explorer \
   -v "$PWD/sites:/etc/ra-log-explorer:ro" -p 8080:8080 \
   -e RA_LOG_EXPLORER_BASE_PATH=/log-explorer \
   -e RA_LOG_EXPLORER_CACHE=/var/cache/ra-log-explorer \
-  -e RA_LOG_EXPLORER_CONFIG_DIR=/var/lib/ra-log-explorer \
   -e RA_LOG_EXPLORER_SITES_FILE=/etc/ra-log-explorer/sites.toml \
   -e LOKI_USERNAME=omega \
   ra-log-explorer:local
@@ -218,8 +217,13 @@ Worth checking, in this order — each one has failed for real:
 - `curl localhost:8080/log-explorer/ | grep static` → every asset URL
   carries the prefix and no `__BASE_PATH__` survives. A leftover
   placeholder is a blank page in the browser.
-- `PUT /log-explorer/api/settings` succeeds — proves the config
-  directory is writable despite the read-only root filesystem.
+- `GET /log-explorer/api/cache` reports the mounted cache root — proves
+  the app can write there despite the read-only root filesystem.
+- The window fields in the served HTML carry whatever
+  `RA_LOG_EXPLORER_WINDOW_*_S` was set to, and no `name="password"` /
+  `name="workers"` field exists at all. A malformed numeric env var
+  (`RA_LOG_EXPLORER_WORKERS=eight`) must stop the container with a
+  `ConfigError` rather than start it on the default.
 - `docker exec … logcli --version` reports the pinned version, and a
   query against the real Loki fails with a `401` rather than a TLS
   error — the latter would mean the image has no CA bundle.
