@@ -1,0 +1,77 @@
+name: "Build and push to GHCR"
+
+# Builds the image the Phalanx `log-explorer` application deploys from and
+# pushes it to ghcr.io/lsst-so/ra_log_explorer.
+#
+# The image bakes in no environment: base path, cache dir, site catalog and
+# Loki credentials all arrive at runtime, so one tag serves BTS and the
+# summit alike. A ticket branch publishes as `tickets-DM-xxxxx`, which is
+# what the per-environment values files pin while a change is being
+# iterated on.
+
+"on":
+  workflow_dispatch: {}
+  push:
+    branches:
+      - "main"
+      - "tickets/**"
+    tags:
+      - "v*"
+
+# A superseded commit's image is dead weight while iterating on a ticket
+# branch, so cancel its build; main and tags always build to completion.
+concurrency:
+  group: "build-${{ github.ref }}"
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/tickets/') }}
+
+jobs:
+  # The same pytest + mypy that `CI` runs, repeated here because CI is scoped
+  # to PRs and main while this workflow also fires on every ticket-branch
+  # push. Gating the build on them means a broken commit costs two minutes
+  # rather than an image someone then deploys.
+  checks:
+    name: "Verify before building"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    permissions:
+      contents: "read"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: "Install dev dependencies"
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+          python -m pip install mypy pytest
+
+      - run: mypy
+
+      - run: pytest -q
+
+  build:
+    name: "Build and push the image"
+    needs: "checks"
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    permissions:
+      contents: "read"
+      packages: "write"
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: lsst-sqre/build-and-push-to-ghcr@v1
+        id: build
+        with:
+          image: ${{ github.repository }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: echo "pushed ghcr.io/${{ github.repository }}:${{ steps.build.outputs.tag }}"

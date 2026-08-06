@@ -541,6 +541,50 @@ with `--force-refresh` to write a tighter cache directory and reload.
 for a Python traceback from the server. Re-run with `--port` set to a
 free port if 8780 is in use.
 
+## Running as a deployed service
+
+Most of this README describes running the tool on your own machine.
+It also ships as a container image, deployed on the Base Test Stand and
+the summit through [Phalanx](https://github.com/lsst-sqre/phalanx) as
+the **`log-explorer`** application, served at `https://<fqdn>/log-explorer`
+behind Gafaelfawr. The chart lives in Phalanx under
+`applications/log-explorer/`; this repo owns the image.
+
+`.github/workflows/build.yaml` builds and pushes
+`ghcr.io/lsst-so/ra_log_explorer` on every push to `main`, every
+`tickets/**` branch (tagged `tickets-DM-xxxxx`), and every `v*` tag.
+The image bakes in no environment — one tag serves both deployments —
+so everything site-specific arrives at runtime:
+
+| Variable                      | What it does                                                     |
+|-------------------------------|------------------------------------------------------------------|
+| `RA_LOG_EXPLORER_BASE_PATH`   | URL prefix to serve under, e.g. `/log-explorer`.                 |
+| `RA_LOG_EXPLORER_CACHE`       | Cache root. Points at the deployment's persistent volume.        |
+| `RA_LOG_EXPLORER_CONFIG_DIR`  | Where `settings.json` lives; must be writable.                   |
+| `RA_LOG_EXPLORER_SITES_FILE`  | Site catalog. Each deployment ships a one-site catalog naming its own cluster's ConsDB. |
+| `LOKI_USERNAME`               | Loki basic-auth user, so nobody has to type it into the UI.      |
+| `LOKI_PASSWORD`               | Loki basic-auth password, from the environment's Vault secret.   |
+
+The image runs as UID 1000 with a read-only root filesystem: the cache,
+the config dir and `/tmp` all arrive as mounted volumes. `/healthz`
+answers `{"status": "ok"}` under the base path and is what the readiness
+probe polls.
+
+Build and smoke-test it locally with:
+
+```bash
+docker build -t ra-log-explorer:local .
+docker run --rm -p 8080:8080 \
+  -e RA_LOG_EXPLORER_BASE_PATH=/log-explorer \
+  ra-log-explorer:local
+# then: curl localhost:8080/log-explorer/healthz
+```
+
+The pinned `logcli` version in the `Dockerfile` is deliberate, not
+tracked to latest — the fetch path works around grafana/loki#17270 by
+reasoning about exactly when `logcli` paginates, so bumping it needs the
+same end-to-end verification a fetch-path change does.
+
 ## For developers / contributors
 
 The contributor guide and coding conventions live in
