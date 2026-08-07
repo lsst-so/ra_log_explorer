@@ -185,15 +185,31 @@ jobs:
 
       # The Helm chart that deploys this application lives in another
       # repository, so the two halves can drift apart with nothing to
-      # notice. Check the real chart out and render it. While the chart is
-      # still on a ticket branch, set the PHALANX_REF repository variable to
-      # that branch; the tests skip cleanly if the chart is not in whatever
-      # ref is checked out, so this job stays honest either way.
-      - uses: actions/checkout@v5
-        with:
-          repository: "lsst-sqre/phalanx"
-          ref: ${{ vars.PHALANX_REF || 'main' }}
-          path: "phalanx"
+      # notice. Check the real chart out and render it against this code.
+      #
+      # Both repositories use the same tickets/DM-NNNNN branch name for one
+      # piece of work, so prefer a Phalanx branch matching this one and fall
+      # back to main. That way an app change and its chart change are
+      # checked against each other on the branch where they are written,
+      # rather than only after both have merged. PHALANX_REF overrides.
+      - name: "Check out the chart"
+        env:
+          OVERRIDE: ${{ vars.PHALANX_REF }}
+        run: |
+          set -euo pipefail
+          ref="${OVERRIDE:-}"
+          if [ -z "$ref" ]; then
+            if git ls-remote --exit-code --heads \
+                 https://github.com/lsst-sqre/phalanx "${{ github.ref_name }}" >/dev/null 2>&1; then
+              ref="${{ github.ref_name }}"
+            else
+              ref="main"
+            fi
+          fi
+          echo "Checking Phalanx out at $ref"
+          echo "PHALANX_CHART_REF=$ref" >> "$GITHUB_ENV"
+          git clone --quiet --depth 1 --branch "$ref" \
+            https://github.com/lsst-sqre/phalanx phalanx
 
       - uses: azure/setup-helm@v4
 
@@ -216,7 +232,9 @@ jobs:
           PHALANX_REPO: ${{ github.workspace }}/phalanx
         # -rs reports skips with their reason, so a job that skipped
         # everything is visibly different from one that verified anything.
-        run: pytest -rs -v tests/test_phalanx_chart.py
+        run: |
+          echo "::notice::Phalanx ref: ${PHALANX_CHART_REF}"
+          pytest -rs -v tests/test_phalanx_chart.py
 
   build:
     name: "Build and push the image"
