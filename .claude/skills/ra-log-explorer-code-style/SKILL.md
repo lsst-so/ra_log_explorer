@@ -89,6 +89,39 @@ existing dataclasses (`FetchSpec`, `LogLine`, `Event`, `PodSummary`,
 `ServerState`) are all frozen-ish data carriers, not OO behaviour
 containers.
 
+## Configuration is read from the environment, once
+
+The tool is a deployed service and one process serves every user, so
+anything that varies between deployments is an environment variable read
+at import in `config.py` — never a request field, never a UI control,
+never a file the app writes to itself. If you catch yourself adding a
+form input for a setting, it belongs in the environment instead (and
+therefore in the Helm chart — see the
+[architecture-sync](../ra-log-explorer-architecture-sync/SKILL.md) skill).
+
+The house pattern:
+
+```python
+DEFAULT_WORKERS = _envInt("RA_LOG_EXPLORER_WORKERS", 8)
+```
+
+- Name the variable `RA_LOG_EXPLORER_*`, except where an external tool
+  already owns the name (`LOKI_PASSWORD`, `LOKI_USERNAME`).
+- Read it through `_envInt` / `_envFloat`, which **raise `ConfigError` on
+  a malformed value** rather than falling back to the default. That is
+  the point: a container that refuses to start is noticed immediately,
+  whereas a setting that silently never took effect is not noticed for
+  months.
+- Treat empty or whitespace-only as unset — that's what an unset Helm
+  value renders as.
+- Keep the default sensible for a laptop, so a local run needs no
+  environment at all.
+
+Request handlers must not read configuration out of the request body.
+`_buildSpecFromRequest` and friends take the exposure, the window and
+nothing else; a body carrying `site`, `username`, `password` or `workers`
+is ignored, and there are tests pinning that.
+
 ## When in doubt, match the existing files
 
 `parse.py`, `fetch.py`, and `server.py` are the canonical style examples.

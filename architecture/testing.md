@@ -1,15 +1,24 @@
 # Testing
 
-The project has two test layers:
+The project has three test layers:
 
 1. **Unit tests** under [tests/](../tests/) — pure-Python, no network
    or persistent filesystem state. Each test gets a per-test cache
    root via the `tmpCacheRoot` fixture so on-disk side effects don't
    leak between tests. Run with `pytest`.
-2. **End-to-end smoke test** — running the CLI against the real
-   Loki cluster (and against ConsDB for the shutter-close lookup)
-   for a known dataId or dayObs, which we do by hand before tagging
-   a release-worthy state.
+2. **Container smoke test** — building the image and exercising it under
+   the conditions the deployment imposes (read-only root filesystem, a
+   base path, configuration only from the environment). This is the one
+   that covers *how the tool is actually run*, and nothing in the unit
+   suite substitutes for it. See below.
+3. **End-to-end smoke test** — running against the real Loki cluster
+   (and ConsDB for the shutter-close lookup) for a known dataId or
+   dayObs, by hand, before declaring fetch-path work done.
+
+Layer 2 matters because the deployed service is the product: the tool
+runs as the Phalanx `log-explorer` application on BTS and the summit, and
+a laptop run is a development convenience. A change that works locally
+and breaks in the container has broken the only mode anyone uses.
 
 Pre-commit, `mypy`, `mypy-coverage`, and the unit tests together are
 the supported validation loop; see the
@@ -43,7 +52,6 @@ The unit tests target the deterministic pieces of the codebase:
 
 | Area               | What's tested                                                              | File                              |
 |--------------------|----------------------------------------------------------------------------|------------------------------------|
-| App settings       | `loadAppSettings` defaults, save→load round-trip, corrupt-file fallback, unknown-field tolerance, cache-root creation | `tests/test_appSettings.py`       |
 | Log line parsing   | `parseLogLine` against the rapid-analysis Python log format and fallbacks (Z suffix, naive UTC, explicit offset, nano-precision trim, label-level priority, malformed JSON); `_normalizeLevel` warn/error alias buckets | `tests/test_parse.py`             |
 | Event classification | `classify` for every kind in [parsing.md](parsing.md), including `HEAD_INCOMING`, the `WORKER_REPORT_FAILED` variant, and the calibrate-quantum visit→expId fallback | `tests/test_parse.py`             |
 | Pod classification | `podGroup` (longest-prefix-match, order-independence regression, full real-pod fixture parametrisation), `podOrdinal`, `podInstrument`, `groupLabels` (defensive-copy contract) | `tests/test_parse.py`             |
@@ -63,11 +71,11 @@ The unit tests target the deterministic pieces of the codebase:
 | `_buildSummaryPayload` | Head-define-visit reference point derivation, taskColors collision-freeness, `other`-group surfacing, `groupLabels` shipped to UI | `tests/test_server.py`            |
 | ServerContext      | Keyed `put`/`get`/LRU eviction for both exposure and night states; `evictByCacheDir` drops only matching entries (and is a no-op when nothing matches); two states coexist | `tests/test_server.py`            |
 | Night helpers      | `_taiIsoToUtc`, `_buildNightPayload` (histograms + stats + failures), `_podDetailForNight` (offset from night-start), `_tracebackContextForNight` None on unknown key | `tests/test_server.py`            |
-| Server-side helpers | `_resolveCacheWindow` path-component allowlist + `pods=`-prefix gate; `_buildNightSpecFromRequest` happy path + every validation error + password passthrough; `_maybeSetLokiPassword` sets / doesn't clobber an existing env var; `_parseClientIso` + `_isoForLogcli` parsing / UTC conversion | `tests/test_server.py`            |
+| Server-side helpers | `_resolveCacheWindow` path-component allowlist + `pods=`-prefix gate; `_buildNightSpecFromRequest` happy path + every validation error + that a body-supplied site / credentials / worker count are ignored; `_parseClientIso` + `_isoForLogcli` parsing / UTC conversion | `tests/test_server.py`            |
 | `night.py` rollups | `computeTopStats`, `errorsByType` (sort + sample-message), `errorsByPod`, `firstTaskStartByDataId` (cross-pod min, None-expId skip), `calcZernikesEndByDataId` (substring match, ignores non-DONE), `buildHistogram` (binning, drops, dataId attribution, single-value, parallel-list validation), `computeDeltaShutterOffsets`, `failureRows` (offsetS / sort / unique bodyKey), `tracebackBody` round-trip, `gatherOnlyDataIds` (step1b-without-step1a flag, pipeline pairing, no-gather and all-paired empty cases); all rollups exercise their empty-input degenerate paths | `tests/test_night.py`             |
 | Exposure-time lookup | `queryIsot` happy path, instrument fallthrough, no-row 404, 500 propagation, 500-UndefinedTable fallthrough, missing obs_end column. `queryIsotBatch` single-instrument-hit, multi-instrument fallthrough, chunking, UndefinedTable, malformed rows, missing-column-skip, empty-input short-circuit. `rspTokenFilePath` env-var + explicit-override + tilde-expand. `readRspToken` strip + missing file. `lookupCached` / `storeCached` round-trip + corrupt-recovery + non-string-value. `_sqlFor` wire format. `_postQuery` 400-as-empty + 503-as-error. | `tests/test_exposure_times.py` |
 | Job manager        | `FetchJob` event ordering, status transitions (pending→running→parsing→done), error path captures terminal `error` event, `onComplete` fires before `done` (verified by snapshotting `len(events)` from inside the callback), `startJob` runs in background, condvar wake. `createNightJob` distinct shape. `runJob` populates `cacheDir`/`meta`. `stateLock` is a real Lock (not RLock). | `tests/test_jobs.py`              |
-| HTTP endpoints     | Spins up the real server on an ephemeral port and hits it with `http.client`. Covers: `/api/summary` (empty / by-dataId / by-dayObs / 400-on-bad-int / mode-discriminator / LRU touch on hit), `/api/cache` (lists exposure + night, partial skipping, sidecar fields surfaced), `/api/fetch` + `/api/fetch-night` (body validation, 202 + status polling to done, NightState populated, podRegex on night spec), `/api/pod` (400 no key, 404 not loaded, valid-name allowlist), `/api/exposure-time/<>` (200 / 404 / 503-no-token / 503-empty-token / cache short-circuit / cache write / `?tokenFile=` override), `/api/night/traceback/<key>` (dataId-block context, time-window fallback, 404 unknown bodyKey, 400 bad-int dayObs), `DELETE /api/cache` (all + single + path-traversal-rejection + state-cleared-when-matching), `/api/settings` (GET + PUT round-trip + validation), SSE `/api/fetch/<id>/progress` (history replay + terminal close + 404), `_buildSpecFromRequest` (TAI/UTC, password passthrough, validation errors), `_prefetchNightShutterCloses` (no-token, consdb-error, short-circuit-when-empty) | `tests/test_server_endpoints.py` |
+| HTTP endpoints     | Spins up the real server on an ephemeral port and hits it with `http.client`. Covers: `/api/summary` (empty / by-dataId / by-dayObs / 400-on-bad-int / mode-discriminator / LRU touch on hit), `/api/cache` (lists exposure + night, partial skipping, sidecar fields surfaced), `/api/fetch` + `/api/fetch-night` (body validation, 202 + status polling to done, NightState populated, podRegex on night spec), `/api/pod` (400 no key, 404 not loaded, valid-name allowlist), `/api/exposure-time/<>` (200 / 404 / 503-no-token / 503-empty-token / cache short-circuit / cache write / a `?site=` query param ignored), `/api/night/traceback/<key>` (dataId-block context, time-window fallback, 404 unknown bodyKey, 400 bad-int dayObs), `DELETE /api/cache` (all + single + path-traversal-rejection + state-cleared-when-matching), `/api/site` (the served site, no token path echoed) and `/api/sites` gone, the base-path routing (probe + API under the prefix, 404 outside it, index substitution, no configuration fields in the HTML), SSE `/api/fetch/<id>/progress` (history replay + terminal close + 404), `_buildSpecFromRequest` (TAI/UTC, body-supplied site / credentials ignored, validation errors), `_prefetchNightShutterCloses` (no-token, consdb-error, short-circuit-when-empty) | `tests/test_server_endpoints.py` |
 | CLI parsing        | `_parseIsoUtc` for Z / no-offset / explicit-offset (positive and negative) / microseconds; `_isoForLogcli` Z suffix + UTC conversion; TAI constant pin; subparser arg parsing + `--t-zero-utc` flag; partial-args rejection; eager-fetch TAI→UTC conversion and `--t-zero-utc` opt-out; `--force-refresh` reaches fetchAll; `_warnIfIncompleteFetch` silent-when-clean / shouts on hard `errors` / shouts on soft `incomplete_pods` / caps the list; `cache info` / `cache flush` behaviour (with-yes / decline-prompt / empty-cache-root / night-mode `pods=<slug>` row surfacing) | `tests/test_cli.py`               |
 
 ### What we don't unit-test
@@ -120,7 +128,8 @@ flake8 are dev-only dependencies that live in the venv.
 
 ## End-to-end smoke test
 
-Before declaring work done, hand-verify against a known exposure:
+Local, against real Loki. Do this for fetch-path work; the container
+smoke test above is the one that covers deployment shape.
 
 ```bash
 export LOKI_PASSWORD=...

@@ -8,10 +8,10 @@ repeat runs into instant loads.
 ## On-disk layout
 
 ```
-~/.cache/ra_log_explorer/                          ← override with $RA_LOG_EXPLORER_CACHE
+~/.cache/ra_log_explorer/                          ← $RA_LOG_EXPLORER_CACHE; deployed, this is
+│                                                    the mount point of the cache volume
 ├── _cache_schema_version.txt                      ← schema the cache was built with; a
 │                                                    mismatch flushes the whole tree at startup
-├── settings.json                                  ← server-side settings (maxCacheBytes)
 ├── exposure-times/                                ← persistent dataId → ConsDB exposure record
 │   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
 │   └── bts.json                                     per site so a colliding dataId between scopes
@@ -57,10 +57,16 @@ stopId]` bounds. Because they're plain all-pods windows, they also
 participate in superset reuse: a later single-exposure fetch whose
 window falls inside the range gets served from the range cache for free.
 
-`exposure-times/` and `settings.json` live at the root, not under
-the cluster/namespace tree, so they survive `rm -rf
-~/.cache/ra_log_explorer/<cluster>` but disappear with a full root
-wipe.
+`exposure-times/` lives at the root, not under the cluster/namespace
+tree, so it survives `rm -rf ~/.cache/ra_log_explorer/<cluster>` but
+disappears with a full root wipe.
+
+Deployed, the whole tree sits on a PersistentVolumeClaim. That is
+deliberate rather than incidental: fetching a night out of Loki takes
+minutes, so an emptyDir would throw the cache away on every pod restart —
+worst exactly when someone is restarting things in order to investigate
+something. It also means the cache is *shared*: a window one person
+fetched is instant for the next person to ask for it.
 
 ## Schema-version flush
 
@@ -266,9 +272,13 @@ viewed caches until the on-disk total is at or below `maxBytes`,
 exempting whichever caches the caller passes in (the just-fetched
 one, typically).
 
-- The default `maxBytes` lives in `appSettings.json`'s
-  `maxCacheBytes` field (5 GiB by default). The user can change it
-  via `PUT /api/settings`.
+- `maxBytes` is `config.MAX_CACHE_BYTES`, from
+  `$RA_LOG_EXPLORER_MAX_CACHE_BYTES` (5 GiB if unset). Deployed, the
+  chart derives it from the size of the volume provisioned for the cache
+  rather than setting it separately, so the app cannot come to believe it
+  has more room than the PVC actually gives it. It is not settable at
+  runtime and there is no UI for it — see
+  [architecture.md](architecture.md#configuration).
 - Order: `(last-viewed ASC, dir name)`. Caches without a
   `_last_viewed.txt` sidecar are treated as oldest — they've never
   been opened, so they're the safest to drop.

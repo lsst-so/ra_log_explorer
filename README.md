@@ -16,7 +16,31 @@ Designed for the typical question:
 It is **not** a streaming log tail; it works on snapshots of a fixed
 window. One exposure at a time.
 
-## Quickstart
+## Where to run it
+
+**Use the deployed instance.** The tool runs as the Phalanx application
+`log-explorer` on the two clusters whose pipelines it explains, behind
+the usual RSP login:
+
+| Environment | URL |
+|-------------|-----|
+| Base Test Stand (`manke`) | `https://base-lsp.lsst.codes/log-explorer` |
+| Summit (`yagan`) | `https://summit-lsp.lsst.codes/log-explorer` |
+
+Each instance queries its own cluster and its own ConsDB, so pick the one
+matching the data you care about — the same 13-digit dataId means
+different exposures at the two sites. There is nothing to install, no
+credentials to obtain, and no configuration to fill in: log in and type a
+dataId. The on-disk cache is shared, so a window a colleague already
+fetched opens instantly for you.
+
+Everything below — installing `logcli`, obtaining tokens, exporting
+`LOKI_PASSWORD` — is for **running it on your own machine while
+developing this repo**. That mode binds `127.0.0.1`, has no
+authentication, and needs your own credentials; it is a development
+convenience, not how the tool is meant to be used.
+
+## Quickstart (local development)
 
 ```sh
 # Prerequisites: Python ≥ 3.11, git, and logcli on $PATH.
@@ -43,6 +67,9 @@ For everything else — what's required, where the cache lives, how to
 drive it from the CLI, troubleshooting — read on.
 
 ## Required environment + credentials
+
+*(Local development only — the deployed instances get all of this from
+their environment and their cluster.)*
 
 The tool needs **one env var** and **one ConsDB token file per site
 you want to talk to** (see [Sites](#sites) below — today there are
@@ -140,7 +167,7 @@ summit ConsDB.)
 | `git`                              | There is no PyPI package; you run from a checkout.                                  |
 | A browser                         | The tool opens `http://127.0.0.1:8780/` for you.                                      |
 
-## Getting started — first run, step by step
+## Getting started locally — first run, step by step
 
 ```sh
 # 1. Install logcli (macOS; for Linux see the Grafana releases page).

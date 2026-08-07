@@ -1,6 +1,6 @@
 ---
 name: ra-log-explorer-architecture-sync
-description: Keep the architecture/ docs in sync with code changes in ra_log_explorer. Use this skill whenever a change touches the *shape* of the system — a new event kind or regex pattern in parse.py, a cache-key change in config.py or fetch.py, a new field on the /api/summary JSON, a new pod-group classification, a new task-palette policy, a new CLI flag that affects behaviour, or a module move. The architecture/ files are the canonical source of truth for the system's design; letting them drift from the code is the single biggest way this project would accumulate onboarding debt. Update the relevant doc in the same commit as the code change — not "later". Also apply when the user asks to "document this change", "update the architecture", or reviews a commit that obviously needs doc updates.
+description: Keep the architecture/ docs — and the Phalanx Helm chart — in sync with code changes in ra_log_explorer. Use this skill whenever a change touches the *shape* of the system — a new event kind or regex pattern in parse.py, a cache-key change in config.py or fetch.py, a new field on the /api/summary JSON, a new pod-group classification, a new task-palette policy, a new CLI flag that affects behaviour, a new environment variable, or a module move. The architecture/ files are the canonical source of truth for the system's design; letting them drift from the code is the single biggest way this project would accumulate onboarding debt. Update the relevant doc in the same commit as the code change — not "later". Also apply when the user asks to "document this change", "update the architecture", or reviews a commit that obviously needs doc updates.
 ---
 
 # ra_log_explorer: Keeping architecture docs in sync
@@ -22,7 +22,35 @@ commit as the code change** — don't leave it for later.
 | [architecture/architecture.md](../../../architecture/architecture.md) | Module responsibilities, top-level data flow, JSON API surface |
 | [architecture/parsing.md](../../../architecture/parsing.md)           | The complete event-kind taxonomy, the `_PYLOG_RE` shape, pod classification |
 | [architecture/caching.md](../../../architecture/caching.md)           | On-disk layout, cache-hit policy (exact/superset/none), `.partial` flag |
-| [architecture/testing.md](../../../architecture/testing.md)           | Unit-test scope, fixture inventory, end-to-end smoke procedure |
+| [architecture/testing.md](../../../architecture/testing.md)           | Unit-test scope, fixture inventory, container + end-to-end smoke procedures |
+| [CLAUDE.md](../../../CLAUDE.md)                                       | How the project runs (deployed vs local), orientation tree, validation loop |
+| [Dockerfile](../../../Dockerfile)                                     | The deployed artefact: base image, pinned logcli, runtime user, what is *not* baked in |
+| `applications/log-explorer/` in [Phalanx](https://github.com/lsst-sqre/phalanx) | The Helm chart — **a different repository**. Every environment variable the app reads, the ingress, the PVC, the probe |
+
+## The cross-repo rule (read this one first)
+
+The tool is a **deployed service**: it runs as the Phalanx
+`log-explorer` application on BTS and the summit, and its entire
+configuration arrives as environment variables. The chart that sets them
+lives in a *different repository*.
+
+So: **if you add, rename, or change the meaning of an environment
+variable that `config.py` reads, you are not done until the Phalanx chart
+sets it too.** Concretely, that means `applications/log-explorer/`:
+`values.yaml` (the value plus its `# --` helm-docs comment),
+`templates/deployment.yaml` (the `env:` entry), and often
+`values-base.yaml` / `values-summit.yaml` if the two environments should
+differ. Then re-run helm-docs and commit the regenerated
+`applications/log-explorer/README.md`.
+
+The failure mode if you skip it is nasty precisely because it is quiet:
+the application runs on the built-in default, nothing errors, and the
+setting simply appears to do nothing. Nobody notices for months.
+
+The same applies in reverse to anything the chart depends on — the
+readiness probe path, the port, the user the image runs as, the paths
+that must be writable under a read-only root filesystem. Change one of
+those here and the chart needs to follow.
 
 ## Which doc to update for which change
 
@@ -42,7 +70,11 @@ commit as the code change** — don't leave it for later.
 | New unit-test category or new fixture                           | `architecture/testing.md`                                           |
 | New CLI flag, renamed flag, or changed default                  | **README** (CLI options + workflow examples)                       |
 | New UI feature, browser-visible behaviour, or shipped style change | **README** ("What the UI shows" / "Common workflows")           |
-| New troubleshooting failure mode or new env-var dependency      | **README** ("Troubleshooting" / "What you need")                   |
+| New troubleshooting failure mode or new env-var dependency      | **README** ("Troubleshooting" / "Configuration")                   |
+| A new / renamed / re-meaning'd environment variable             | `architecture/architecture.md` ("Configuration" table) + **README** ("Configuration") + **the Phalanx chart** (see above) |
+| Anything about how the app is deployed, or the local-vs-deployed split | `architecture/architecture.md` ("How it runs") + **CLAUDE.md**  |
+| The Dockerfile — base image, logcli pin, runtime user, writable paths | `architecture/testing.md` (container smoke test) + **README** ("Running as a deployed service") + the chart if a path or UID moved |
+| The readiness probe route, the listening port, or the base-path handling | `architecture/architecture.md` + **the Phalanx chart**           |
 
 ## What doesn't need a doc update
 
@@ -69,6 +101,12 @@ Before you commit, ask yourself:
 7. Did I introduce a new failure mode an end-user might hit
    (missing binary, new env var, new error)? → `README.md`
    (Troubleshooting section)
+8. Did I add or change an **environment variable**? → the Configuration
+   table in `architecture.md`, the one in `README.md`, **and the Phalanx
+   chart**. All three, or the setting quietly does nothing in production.
+9. Did I change something the **container** depends on — a writable
+   path, the port, the probe route, the UID, the logcli version? →
+   `Dockerfile`, `testing.md`, and probably the chart.
 
 If you answered "yes" to any of those and your commit doesn't touch the
 matching file, you almost certainly have drift to fix.

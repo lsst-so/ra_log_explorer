@@ -1,14 +1,20 @@
 ---
 name: ra-log-explorer-validation
-description: Validate Python or UI changes in the ra_log_explorer tool before declaring a task done. Nothing automates pre-commit, mypy, mypy-coverage, or pytest in this repo, so the checks must be run manually. Use this skill whenever you finish editing anything under `ra_log_explorer/`, `tests/`, or `architecture/` and are about to hand the task back to the user; when the user asks to "run the tests", "type check", "validate", or "check my changes"; or when you are about to stage a commit. The validation loop is the same whether the change is to Python, JS, CSS, or HTML — every commit is expected to pass it.
+description: Validate Python or UI changes in the ra_log_explorer tool before declaring a task done. Nothing runs pre-commit, mypy, mypy-coverage, or pytest on a local commit, so the checks must be run by hand. Use this skill whenever you finish editing anything under `ra_log_explorer/`, `tests/`, or `architecture/` and are about to hand the task back to the user; when the user asks to "run the tests", "type check", "validate", or "check my changes"; or when you are about to stage a commit. The validation loop is the same whether the change is to Python, JS, CSS, or HTML — every commit is expected to pass it. For anything touching the Dockerfile, the configuration surface, the base path or the served HTML, the container smoke test is part of validation too: the tool is a deployed service and the unit suite does not cover the shape it runs in.
 ---
 
 # ra_log_explorer: Validating changes
 
-There is no CI on this repo today. None of `pre-commit`, `mypy`,
-`mypy-coverage`, or `pytest` runs automatically — type errors and broken
-tests land silently on `main` unless someone runs them by hand. **You**
-are that someone for every change here.
+CI does run pytest and mypy — `ci.yaml` on PRs and pushes to `main`, and
+`build.yaml` gates the image push on the same two. But **nothing runs on
+a local commit**: pre-commit only does formatting and flake8, so a type
+error or a broken test gets committed happily and you find out minutes
+later in Actions, or not at all on a branch nobody opens a PR for. Run
+them yourself.
+
+`mypy-coverage` runs in CI as an annotation-only job with no threshold,
+so it can never fail a build. If you let coverage slip, the only thing
+that catches it is you.
 
 ## The validation loop
 
@@ -62,10 +68,42 @@ test for it in the same commit. The
 [ra-log-explorer-architecture-sync](../ra-log-explorer-architecture-sync/SKILL.md)
 skill enforces the same idea for the architecture docs.
 
+## Container smoke test (the mode that actually ships)
+
+**Required** for any change touching the Dockerfile, the configuration
+surface (a new or renamed environment variable), the base path, the
+served HTML, or anything a read-only root filesystem could break.
+
+The tool is a deployed service — the Phalanx `log-explorer` application
+on BTS and the summit — and a laptop run is a development convenience.
+The unit suite runs the Python; it does not run the *image*, under a path
+prefix, with a read-only root, configured only from the environment. A
+change that passes every test here and breaks there has broken the only
+mode anyone uses.
+
+The procedure and the specific checks are in
+[architecture/testing.md](../../../architecture/testing.md#container-smoke-test).
+The short version:
+
+```bash
+docker build -t ra-log-explorer:local .
+docker run --rm --read-only --tmpfs /tmp --tmpfs /var/cache/ra-log-explorer \
+  -e RA_LOG_EXPLORER_BASE_PATH=/log-explorer ... ra-log-explorer:local
+curl localhost:8080/log-explorer/healthz     # the readiness probe path
+curl localhost:8080/                          # must 404 — outside the prefix
+```
+
+If you added an environment variable, **also add it to the Helm chart**
+in the [Phalanx](https://github.com/lsst-sqre/phalanx) repo under
+`applications/log-explorer/`. A variable this code reads that the chart
+never sets means production silently runs on the default — a setting that
+appears to do nothing, which is the sort of thing nobody notices for
+months.
+
 ## End-to-end smoke test (separate from the unit suite)
 
-For UI-visible or fetch-path changes, run the real CLI once against a
-known exposure before shipping:
+For fetch-path changes, run the real CLI once against a known exposure
+before shipping:
 
 ```bash
 export LOKI_PASSWORD=...
@@ -88,7 +126,10 @@ When you report back to the user:
 - Say which of the four checks you actually ran. "Validation clean" is
   ambiguous; "pre-commit + mypy + mypy-coverage + pytest all clean" is
   not.
-- If you skipped the smoke test because the change didn't touch fetch
-  or the UI, say so explicitly.
+- Say whether you ran the **container** smoke test, and if not, why the
+  change couldn't affect the deployed shape. This is the one most easily
+  skipped and the most costly to skip.
+- If you skipped the end-to-end smoke test because the change didn't
+  touch the fetch path, say so explicitly.
 - If a check failed and you couldn't fix it, leave the relevant todo as
   `in_progress` and flag the blocker rather than declaring done.

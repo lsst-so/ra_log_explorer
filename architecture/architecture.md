@@ -15,6 +15,37 @@ aren't downloaded N times), resolves each in-range dataId's shutter close
 from ConsDB, and reuses the per-exposure timeline view with a navigator
 to step between exposures — each anchored at its own shutter close.
 
+## How it runs
+
+**The tool is a deployed service.** It runs as the Phalanx application
+`log-explorer` on the two clusters whose pipelines it explains — the Base
+Test Stand (`manke`) and the summit (`yagan`) — served at
+`https://<fqdn>/log-explorer` behind Gafaelfawr, from the container image
+built by this repo. That is how everybody who uses it uses it, and it is
+the code path to keep working.
+
+One deployment serves exactly one observatory. Which one is not a runtime
+choice: it follows from where the process runs, and reaches that
+cluster's own ConsDB at an in-cluster Service address. All the
+configuration that makes an instance *that* instance arrives as
+environment variables (see [Configuration](#configuration)); the browser
+can set none of it.
+
+Running it from a laptop still works and is how this repo is developed —
+`python3 -m ra_log_explorer.cli` binds `127.0.0.1`, serves at the root
+instead of under a path prefix, and reads a ConsDB bearer token from disk
+because it is outside the cluster. Treat that as a development
+convenience rather than a supported way to operate the tool: it is
+single-user, unauthenticated, and depends on the developer's own
+credentials. When the two modes disagree about something, the deployed
+one is right.
+
+The chart lives in the [Phalanx](https://github.com/lsst-sqre/phalanx)
+repository under `applications/log-explorer/`; this repo owns the
+application and the image. A change to the configuration surface here
+means a matching change there — see
+[Configuration](#configuration).
+
 Sibling docs:
 
 - [Log line parsing & event taxonomy](parsing.md)
@@ -295,6 +326,31 @@ the volume provisioned for the cache, so "how much disk may this use" is
 answered once, in the Helm values, rather than in two places that can
 disagree.
 
+### How the deployment supplies it
+
+The Phalanx chart at `applications/log-explorer/` in the
+[Phalanx](https://github.com/lsst-sqre/phalanx) repo is what sets all of
+the above. Its shape, and the reasons behind it:
+
+| Piece | Why it is the way it is |
+|-------|-------------------------|
+| One replica, `Recreate` | Loaded exposures live in the serving process's memory and the cache volume is ReadWriteOnce, so a second replica would answer differently depending on which pod took the request. At one replica RollingUpdate's `maxUnavailable` floors to zero and wedges any rollout whose new pod fails readiness. |
+| PVC for the cache | Fetching a night out of Loki takes minutes. An emptyDir would discard it on every restart — worst precisely when somebody is restarting things to investigate. `RA_LOG_EXPLORER_MAX_CACHE_BYTES` is derived from the volume's own size so the app cannot believe it has more room than it does. |
+| ConfigMap for `sites.toml` | Mounted at `/etc/ra-log-explorer/`, naming exactly one site. A checksum annotation on the pod rolls it when the catalog changes, since a file mount is not an env var and would otherwise go unnoticed. |
+| `GafaelfawrIngress`, `loginRedirect: true` | A browser app, so anonymous users get sent to log in rather than a 401 they cannot act on. Scope `read:image`, matching rubintv on the same environments. |
+| `proxy-buffering: "off"` | `/api/fetch/<id>/progress` is Server-Sent Events for the length of a fetch. nginx buffers proxied responses by default, which would hold the whole stream until the fetch had already finished. |
+| Readiness probe on `<base>/healthz` | With headroom over the defaults: parsing is CPU-bound pure Python contending with the fetch threads, so latency spikes mid-fetch — the worst moment to drop the only pod out of the Service. |
+| `LOKI_PASSWORD` from a VaultSecret | Marked `optional` so the pod still starts before the secret exists, which is safe rather than silent: the app refuses to run logcli without a password and says so. |
+
+**A change to the configuration surface here needs a matching change
+there, in the same breath.** Adding an environment variable this code
+reads without adding it to the chart produces an application that
+silently runs on defaults in production — the failure mode is a setting
+that appears to do nothing, which is exactly the sort of thing nobody
+notices for months. The
+[architecture-sync skill](../.claude/skills/ra-log-explorer-architecture-sync/SKILL.md)
+spells out the cross-repo rule.
+
 ## JSON API
 
 Every path below is relative to the deployment's **base path** (see Key
@@ -569,12 +625,12 @@ Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
 `truncated: true`.
 
-### `GET /api/exposure-time/<dataId>?site=<name>`
+### `GET /api/exposure-time/<dataId>`
 
 dataId → curated ConsDB exposure record, used by the home form to
 resolve a user-typed dataId (and show its properties) before kicking
-off the fetch. The optional `site` query param picks which entry from
-the sites catalog to use; omitted = the catalog's `default_site`.
+off the fetch. Always resolved against the site this server serves; a
+`site` query param is ignored if present.
 
 - 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool,
   "manual": bool, "site", "exposure": {<curated record>}}`. `tZero` is
@@ -689,10 +745,7 @@ Returns the same shape as `GET /api/cache`. 404 on a path mismatch.
 
 ### `POST /api/fetch`  (exposure)
 
-Request body (`site` falls through to the catalog's `default_site`;
-the password is consumed by the fetch worker thread to set
-`LOKI_PASSWORD` in its process env, and is never echoed back or
-persisted):
+Request body — only what is being asked, never how to ask it:
 
 ```jsonc
 {
@@ -700,16 +753,20 @@ persisted):
   "tZero":      "2026-05-20T08:46:16.267",  // required, ISO-8601
   "tZeroUtc":   false,                 // optional; default false (treat as TAI)
   "tZeroManual": false,                // optional; true ⇒ tZero was hand-entered
-  "site":       "summit",              // optional; falls back to default_site
-  "username":   "merlin", "password": "...",
-  "workers":    8,
-  "windowBefore": 5.0, "windowAfter": 300.0
+  "windowBefore": 5.0, "windowAfter": 300.0   // optional; default from the environment
 }
 ```
 
-`cluster` / `namespace` / `lokiAddr` are *derived* server-side from
-the named site — clients no longer send them. An unknown site returns
-`400 Bad Request`.
+`site`, `username`, `password`, `workers`, `cluster`, `namespace` and
+`lokiAddr` are **not** accepted. They are server configuration read from
+the environment, and a body carrying them is ignored rather than
+honoured. Two reasons, and the first is the serious one: the same
+13-digit dataId exists on both BTS and the summit with different
+`obs_end` values, so a server that could be talked into answering for the
+other observatory would return results that looked plausible rather than
+obviously wrong. And `LOKI_PASSWORD` is process-global, so one visitor's
+mistyped password would break fetches for everyone sharing the
+deployment.
 
 `tZeroManual: true` marks a shutter close the user typed by hand because
 ConsDB couldn't resolve the dataId. The server persists it as a
@@ -727,12 +784,12 @@ errors return `400` with `{"error": "..."}`.
 
 ```jsonc
 {
-  "dayObs":   20260521,                // required, YYYYMMDD integer
-  "site":     "summit",                // optional; falls back to default_site
-  "username": "merlin", "password": "...",
-  "workers":  8
+  "dayObs": 20260521                   // required, YYYYMMDD integer
 }
 ```
+
+Same rule as `/api/fetch`: nothing about *how* to reach Loki is accepted
+from the body.
 
 The window is the full 24-hour dayObs (noon UTC → noon UTC) with the
 `pod=~".*aos.*"` filter applied at the Loki layer. Same response
@@ -747,10 +804,7 @@ shape as `/api/fetch`.
   "tZeroStart": "2026-05-20T08:46:16.267",  // required, ISO-8601 (start shutter close)
   "tZeroStop":  "2026-05-20T08:51:09.512",  // required, ISO-8601 (stop shutter close)
   "tZeroUtc":   false,                 // optional; default false (treat both as TAI)
-  "site":       "summit",              // optional; falls back to default_site
-  "username":   "merlin", "password": "...",
-  "workers":    8,
-  "windowBefore": 5.0, "windowAfter": 300.0
+  "windowBefore": 5.0, "windowAfter": 300.0   // optional; default from the environment
 }
 ```
 
@@ -863,7 +917,12 @@ files from disk on each request rather than buffering them in
 memory — the cache for one exposure is typically ~40 MiB so this
 stays cheap.
 
-## Three startup modes
+## Startup modes
+
+Deployed, the container runs home mode with no eager fetch: `run --host
+0.0.0.0 --port 8080 --no-browser`, with everything else supplied as
+environment variables. The other two exist for development and scripting
+on a laptop.
 
 1. **Home mode** — `python3 -m ra_log_explorer.cli` with no
    `--exposure-id`/`--t-zero`. CLI just spins up a fresh `JobManager`
@@ -885,8 +944,8 @@ stays cheap.
    `--t-zero`). Performs the eager fetch + parse, then exits without
    starting the HTTP server. Useful for batch-priming the cache.
 
-All three share `server.py`, `jobs.py`, the JSON API surface, and
-the SPA.
+All three share `server.py`, `jobs.py`, the JSON API surface, and the
+SPA. Only the first is used in the deployment.
 
 ## Non-goals
 
@@ -894,8 +953,13 @@ the SPA.
   fetch.
 - Cross-night aggregation or trending. One dayObs at a time in
   night mode; one exposure at a time in exposure mode.
-- Authentication. Listens on `127.0.0.1` only. The single-user
-  assumption is baked in (e.g. `LOKI_PASSWORD` is set process-wide
-  by a fetch request).
-- A persistent service. Process exits on Ctrl-C; the cache persists
-  on disk and survives restarts.
+- Authentication *of its own*. Deployed, the app sits behind a
+  GafaelfawrIngress with `loginRedirect: true` and a `read:image` scope,
+  so it never sees an unauthenticated request and has no login code
+  itself. Run from a laptop it binds `127.0.0.1` with no auth at all,
+  which is one of the reasons that mode is for development only.
+- Per-user state or preferences. One process serves everyone who opens
+  it, and its configuration is the deployment's — there is deliberately
+  nothing a visitor can set that another visitor would notice. Loaded
+  exposures and the on-disk cache are shared, which is a feature: the
+  expensive fetch someone else already did is one you don't repeat.
