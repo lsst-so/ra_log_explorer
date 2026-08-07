@@ -1352,3 +1352,36 @@ def test_resolveShutterCloses_real_cache_hit_skips_consdb(
     assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
     checked = _phase(job, "cache-checked")
     assert checked["cacheHits"] == 1 and checked["manualStandins"] == 0
+
+
+# ----- the served site -----------------------------------------------------
+
+
+def test_ctx_site_returns_the_configured_site(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    assert ctx.site().name == "summit"
+    # A process serves whichever entry it was started with, not the
+    # catalog's default: `--site bts` locally means BTS for the whole run.
+    ctx.siteName = "bts"
+    assert ctx.site().name == "bts"
+    assert ctx.site().cluster == "manke"
+
+
+def test_ctx_site_raises_for_a_name_not_in_the_catalog(siteCatalog: FakeSiteCatalog) -> None:
+    """Fail loudly rather than falling back to an arbitrary entry. Serving
+    the wrong observatory's logs is worse than serving none, because the
+    same dataId exists at both and the answer would look plausible."""
+    ctx = _ctxWithSites(siteCatalog)
+    ctx.siteName = "ghost"
+    with pytest.raises(sites.SitesConfigError):
+        ctx.site()
+
+
+def test_trimFloat_drops_a_pointless_decimal() -> None:
+    """These land in an HTML number field. "300" reads as the default it
+    is; "300.0" reads as a value somebody has already fiddled with."""
+    assert server._trimFloat(300.0) == "300"
+    assert server._trimFloat(5.0) == "5"
+    assert server._trimFloat(0.0) == "0"
+    assert server._trimFloat(12.5) == "12.5"
+    assert server._trimFloat(0.1) == "0.1"

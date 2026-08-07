@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -266,3 +267,63 @@ def test_cacheRoot_ignores_a_stale_settings_file(monkeypatch: pytest.MonkeyPatch
     stale.mkdir(parents=True)
     (stale / "settings.json").write_text('{"cacheDir": "/somewhere/else"}')
     assert config.cache_root() == tmp_path / ".cache" / "ra_log_explorer"
+
+
+def test_the_set_of_environment_variables_is_pinned() -> None:
+    """Tripwire for the cross-repo contract.
+
+    Every one of these is set by the Phalanx chart in a *different*
+    repository (`applications/log-explorer/`). Adding one here without
+    adding it there gives a production deployment that silently runs on
+    the built-in default — a setting that appears to do nothing, which is
+    the sort of thing nobody notices for months. Renaming one without
+    renaming it there is the same failure with an extra step.
+
+    So: if this test fails, the change is fine, but it is not finished
+    until the chart matches. Update the list, then update
+    `values.yaml`, `templates/deployment.yaml`, and the Configuration
+    tables in `README.md` and `architecture/architecture.md`.
+    """
+    source = Path(config.__file__).read_text()
+    found = set(re.findall(r'"(RA_LOG_EXPLORER_[A-Z_]+|LOKI_[A-Z_]+)"', source))
+    assert found == {
+        "RA_LOG_EXPLORER_BASE_PATH",
+        "RA_LOG_EXPLORER_CACHE",
+        "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
+        "RA_LOG_EXPLORER_WINDOW_AFTER_S",
+        "RA_LOG_EXPLORER_WINDOW_BEFORE_S",
+        "RA_LOG_EXPLORER_WORKERS",
+        "LOKI_USERNAME",
+    }
+
+
+def test_defaults_are_usable_with_no_environment_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A laptop run needs no configuration. Every variable is optional
+    and the built-in defaults have to add up to a working local server,
+    or the development mode stops being a development convenience."""
+    import importlib
+
+    for name in (
+        "RA_LOG_EXPLORER_BASE_PATH",
+        "RA_LOG_EXPLORER_CACHE",
+        "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
+        "RA_LOG_EXPLORER_WINDOW_AFTER_S",
+        "RA_LOG_EXPLORER_WINDOW_BEFORE_S",
+        "RA_LOG_EXPLORER_WORKERS",
+        "LOKI_USERNAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        c = importlib.reload(config)
+        assert c.defaultBasePath() == ""
+        assert c.DEFAULT_WORKERS > 0
+        assert c.DEFAULT_WINDOW_AFTER_S > c.DEFAULT_WINDOW_BEFORE_S >= 0
+        assert c.MAX_CACHE_BYTES > 0
+        assert c.DEFAULT_USERNAME
+        assert c.cache_root() == tmp_path / ".cache" / "ra_log_explorer"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

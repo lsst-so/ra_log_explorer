@@ -227,3 +227,37 @@ def test_loadSites_rejects_non_string_token_file(tmp_path: Path) -> None:
     )
     with pytest.raises(sites.SitesConfigError):
         sites.loadSites(p)
+
+
+def test_the_catalog_the_helm_chart_renders_loads(tmp_path: Path) -> None:
+    """Contract with the Phalanx chart, which lives in another repo.
+
+    This is byte-for-byte what `applications/log-explorer/templates/
+    configmap.yaml` renders into the ConfigMap mounted at
+    /etc/ra-log-explorer/sites.toml. Nothing else checks it: the chart is
+    templated YAML producing TOML, and the first thing that would notice
+    a malformed result is the pod refusing to start. Pin the shape here
+    so a chart change that breaks it fails in this repo's test suite.
+
+    Note the deliberate absences — one `[[site]]` entry, and no
+    `consdbTokenFile`, because an in-cluster ConsDB Service address never
+    passes through Gafaelfawr and takes no bearer token.
+    """
+    rendered = (
+        'default_site = "bts"\n'
+        "\n"
+        "[[site]]\n"
+        'name = "bts"\n'
+        'cluster = "manke"\n'
+        'namespace = "rapid-analysis"\n'
+        'lokiAddr = "https://loki-query.ls.lsst.org"\n'
+        'consdbUrl = "http://consdb-pq.consdb.svc.cluster.local:8080/consdb/query"\n'
+    )
+    catalog, default = sites.loadSites(_writeCatalog(tmp_path / "chart.toml", rendered))
+    assert default == "bts"
+    assert len(catalog) == 1
+    site = catalog[0]
+    assert site.name == "bts"
+    assert site.cluster == "manke"
+    assert site.consdbTokenFile is None
+    assert site.consdbUrl.startswith("http://consdb-pq.consdb")

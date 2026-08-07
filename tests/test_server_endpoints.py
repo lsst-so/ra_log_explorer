@@ -2192,3 +2192,129 @@ def test_index_seeds_the_window_fields_from_the_server(runningServer: RunningSer
     assert "__WINDOW_AFTER__" not in html
     assert 'name="windowBefore" value="5"' in html
     assert 'name="windowAfter" value="300"' in html
+
+
+@pytest.fixture
+def nestedServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterator[RunningServer]:
+    """A server under a two-segment prefix.
+
+    `/log-explorer` is one path component, so a single-component prefix
+    would pass a router that only ever compared the first segment.
+    """
+    from http.server import ThreadingHTTPServer
+
+    ctx = ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        siteName=siteCatalog.defaultName,
+        basePath="/tools/log-explorer",
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield "127.0.0.1", httpd.server_address[1], ctx
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=2.0)
+
+
+def test_static_assets_are_served_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The HTML asks for prefixed asset URLs; the router has to answer
+    them. If it doesn't, the page loads and then renders nothing, which
+    looks like an application bug rather than a routing one."""
+    host, port, _ctx = mountedServer
+    for asset in ("app.js", "home.js", "explore.js", "night.js", "range.js", "style.css"):
+        status, body = _get(host, port, f"/log-explorer/static/{asset}")
+        assert status == 200, asset
+        assert body["_raw"].strip(), asset
+    # And not outside the prefix.
+    assert _get(host, port, "/static/app.js")[0] == 404
+
+
+def test_base_path_survives_a_query_string(mountedServer: RunningServer) -> None:
+    """The prefix is stripped from the path only. Stripping it off the
+    whole request line would take the query with it and silently turn a
+    keyed lookup into a home-view response."""
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/api/summary?dataId=2026051900722")
+    assert status == 200
+    assert body["loaded"] is False  # answered the keyed form, not an error
+
+
+def test_multi_segment_base_path(nestedServer: RunningServer) -> None:
+    """A prefix can be more than one path component."""
+    host, port, _ctx = nestedServer
+    assert _get(host, port, "/tools/log-explorer/healthz")[0] == 200
+    assert _get(host, port, "/tools/log-explorer/api/summary")[0] == 200
+    _s, body = _get(host, port, "/tools/log-explorer/")
+    assert 'src="/tools/log-explorer/static/app.js"' in body["_raw"]
+    # Partial prefixes belong to somebody else.
+    assert _get(host, port, "/tools/healthz")[0] == 404
+    assert _get(host, port, "/log-explorer/healthz")[0] == 404
+
+
+def test_healthz_is_unaffected_by_a_running_fetch(
+    mountedServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """The probe must keep answering while a fetch is in flight. If a
+    long fetch could make it fail, Kubernetes would pull the only pod out
+    of the Service mid-investigation — the one moment it must not."""
+    host, port, _ctx = mountedServer
+    started = threading.Event()
+    release = threading.Event()
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Any = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        started.set()
+        release.wait(timeout=10.0)
+        cacheDir = tmpCacheRoot / "slow"
+        (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, _ = _post(
+        host,
+        port,
+        "/log-explorer/api/fetch",
+        {"exposureId": 2026051900722, "tZero": "2026-05-20T08:46:16.267"},
+    )
+    assert status == 202
+    assert started.wait(timeout=5.0), "fetch worker never started"
+    try:
+        # Mid-fetch, with the worker thread parked inside fetchAll.
+        probeStatus, probeBody = _get(host, port, "/log-explorer/healthz")
+        assert probeStatus == 200
+        assert probeBody["status"] == "ok"
+    finally:
+        release.set()
+
+
+def test_sse_progress_is_reachable_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The progress stream is the one endpoint the browser holds open for
+    minutes; a prefix bug here shows up as a fetch that appears to hang."""
+    host, port, _ctx = mountedServer
+    assert _get(host, port, "/log-explorer/api/fetch/deadbeef/progress")[0] == 404
+    assert _get(host, port, "/api/fetch/deadbeef/progress")[0] == 404
+    assert _get(host, port, "/log-explorer/api/fetch/deadbeef/status")[0] == 404
+
+
+def test_index_window_fields_track_the_configured_defaults(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deployment sets the starting window through the environment;
+    what the form offers has to follow it, or the value in the chart is
+    decorative."""
+    host, port, _ctx = runningServer
+    monkeypatch.setattr(serverModule, "DEFAULT_WINDOW_BEFORE_S", 12.5)
+    monkeypatch.setattr(serverModule, "DEFAULT_WINDOW_AFTER_S", 900.0)
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert 'name="windowBefore" value="12.5"' in html
+    # A whole number renders without a trailing ".0" — a spinner showing
+    # "900" reads as the default it is, "900.0" reads as fiddled-with.
+    assert 'name="windowAfter" value="900"' in html
