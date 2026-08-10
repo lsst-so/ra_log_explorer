@@ -29,6 +29,15 @@ let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
 let tZeroIsManual = false;      // true when resolvedTZero was hand-entered (ConsDB couldn't resolve it)
 let lookupTimer = null;         // debounce timer for the dataId input
 let lookupSeq = 0;              // sequence number to ignore stale lookup responses
+// The instrument the current dataId belongs to, when we know it (a deep
+// link from the Tonight panel carries it). A dataId alone does not name an
+// exposure: every instrument numbers from 1 each night, so on a night where
+// LSSTCam and LATISS both observe the same id exists on both with different
+// shutter closes. Empty means "resolve it the probe-order way", which is
+// what a hand-typed dataId gets — the instrument only applies to the id it
+// arrived with, so editing the field drops it.
+let lookupInstrument = '';
+let lookupInstrumentForExpId = null;
 
 function startHome() {
   if (!homeListenersWired) wireHomeListeners();
@@ -43,6 +52,8 @@ function startHome() {
   // prefilled so a one-click fetch reproduces what the URL implies.
   const params = new URLSearchParams(window.location.search);
   const urlDataId = params.get('dataId');
+  lookupInstrument = params.get('instrument') || '';
+  lookupInstrumentForExpId = lookupInstrument && urlDataId ? parseInt(urlDataId, 10) : null;
   const urlDayObs = params.get('dayObs');
   const urlRangeStart = params.get('rangeStart');
   const urlRangeStop = params.get('rangeStop');
@@ -153,6 +164,7 @@ function renderTonight(live) {
   if (nErr) problems.push(`${nErr} pod${nErr === 1 ? '' : 's'} with fetch failures`);
   if (nInc) problems.push(`${nInc} pod${nInc === 1 ? '' : 's'} with unverifiable chunks`);
   if (live.consdbError) problems.push(`ConsDB: ${live.consdbError}`);
+  if (live.orphanError) problems.push(`an earlier night could not be finalised: ${live.orphanError}`);
   if (live.lastError) problems.push('last poll cycle failed (see server log)');
   banner.hidden = problems.length === 0;
   banner.textContent = problems.length ? `Live fetch problems — ${problems.join(' · ')}` : '';
@@ -172,12 +184,21 @@ function renderTonight(live) {
     } else {
       statusCell = '<span class="tonight-chip tonight-wait">in progress</span>';
     }
+    // The dataId is a server-side integer, so it needs no escaping and
+    // is safe in a URL; every other cell is a ConsDB string. The link
+    // carries the instrument because a dataId alone does not identify an
+    // exposure — LSSTCam and LATISS number from 1 each night, so the
+    // same id means a different image on each.
+    const q = `dataId=${exp.dataId}` +
+      (exp.instrument ? `&instrument=${encodeURIComponent(exp.instrument)}` : '') +
+      '&autoFetch=1';
     const idCell = exp.ready
-      ? `<a class="mono" href="${escapeHtml(apiUrl(`/?dataId=${exp.dataId}&autoFetch=1`))}">${exp.dataId}</a>`
+      ? `<a class="mono" href="${escapeHtml(apiUrl(`/?${q}`))}">${exp.dataId}</a>`
       : `<span class="mono">${exp.dataId}</span>`;
     const tr = document.createElement('tr');
     tr.innerHTML =
       `<td>${idCell}</td>` +
+      `<td>${escapeHtml(exp.instrument || '')}</td>` +
       `<td class="mono">${escapeHtml(closeS)}</td>` +
       `<td>${escapeHtml(rec.img_type || '')}</td>` +
       `<td>${escapeHtml(rec.physical_filter || '')}</td>` +
@@ -417,7 +438,9 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  fetch(apiUrl(`/api/exposure-time/${expId}`))
+  const instrument = expId === lookupInstrumentForExpId ? lookupInstrument : '';
+  const suffix = instrument ? `?instrument=${encodeURIComponent(instrument)}` : '';
+  fetch(apiUrl(`/api/exposure-time/${expId}${suffix}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== lookupSeq) return;  // stale; user typed something newer

@@ -23,8 +23,9 @@ repeat runs into instant loads.
         │                                            fetchComplete + errors + incomplete_pods +
         │                                            pod_event_lines + event_errors
         ├── _live.json                             ← (live night dirs only) watermark + per-pod
-        │                                            byte counts; marks the dir as poller-built —
-        │                                            sliced on demand, never superset-parsed
+        │                                            byte counts + event-only names; marks the dir
+        │                                            as poller-built — sliced on demand, never
+        │                                            superset-parsed, never fetched into
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
@@ -137,7 +138,14 @@ Three rules keep it coherent with everything else here:
 
 ## Cache hit policy
 
-`fetchAll(spec, ...)` decides in order:
+`fetchAll(spec, ...)` runs the whole of the following under a
+**per-window write lock** (`windowWriteLock`, keyed on the requested
+window directory). A cache window is a directory of files plus a
+`_meta.json` vouching for them; two threads asking for the same window
+would otherwise both find no cache and both write the same
+`pods/<pod>.jsonl`. The second caller waits and then takes the first's
+result as an ordinary hit — never longer than the fetch it would have
+duplicated. It then decides in order:
 
 1. **Skip the cache entirely** if either `forceRefresh=True` or the
    requested window's `to` is in the future. (The cluster might still
@@ -161,8 +169,13 @@ Three rules keep it coherent with everything else here:
    disables it. The window is materialized by slicing (see *Live night
    dirs*) and returned with `cacheReuse = "night-slice"`; a repeat
    against an unchanged watermark reuses the previous slice as an exact
-   hit. Any slice failure falls through to the steps below — worst case
-   is the fetch that would have happened anyway.
+   hit. When the window to slice *is* the night's own — the watermark
+   has reached night end but finalisation hasn't run, which is where
+   `--live-day-obs` parks permanently — the night dir is returned
+   directly instead, since it already is that window. Any slice failure
+   falls through to the steps below (leaving `.partial` in place, so a
+   half-copied window can never pass for a hit) — worst case is the
+   fetch that would have happened anyway.
 
 3. **Superset hit** if any other completed cache directory under
    `<cluster>/<namespace>/` (or under `<cluster>/<namespace>/<window>/
@@ -180,10 +193,15 @@ Three rules keep it coherent with everything else here:
 
 4. Otherwise **fetch fresh**: create the requested directory, write
    `.partial`, list pods via `logcli series` (honouring `podRegex`
-   if set), fetch each pod in parallel in count-presized single-batch
-   chunks (every line, verified — see *Completeness* below), write
-   `_meta.json`, remove `.partial`. Returns the requested directory
-   with `cacheReuse = "none"`.
+   if set), drop any pod files a previous attempt on this window left
+   behind (`summarizeAll` reads the directory, not `pods.txt`, so a
+   stale file would be parsed as part of the window), fetch each pod in
+   parallel in count-presized single-batch chunks (every line, verified
+   — see *Completeness* below), write `_meta.json`, remove `.partial`.
+   Returns the requested directory with `cacheReuse = "none"`. A
+   requested directory carrying a `_live.json` is refused outright: it
+   belongs to the poller, and a fresh fetch would truncate files it is
+   appending to.
 
 Steps 2 and 3 ignore any cache whose `fetchSchemaVersion` doesn't match
 the current `CACHE_SCHEMA_VERSION`. That's what keeps a stale snapshot
@@ -405,6 +423,24 @@ id that also exists on the summit, with a completely different record.
 `lookupCachedRecord(..., siteName=...)` and `storeCachedRecord[s](...,
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
+
+Within a site it is keyed **twice**, because an id isn't unique there
+either — `SSSSS` is a per-instrument sequence number, so LSSTCam and
+LATISS share ids on any night both observe:
+
+- `"<instrument>:<id>"` — the unambiguous entry. An instrument-scoped
+  lookup accepts only this key; falling back to the bare one would
+  return a different exposure that happens to share the id.
+- `"<id>"` — the *probe-order* entry: what an unqualified lookup
+  resolves to, i.e. whichever of `INSTRUMENTS_BY_PROBE_ORDER` has the
+  row first. Only writers that resolved the id that way may write it
+  (`storeCachedRecord[s]`'s `bareKey`, `storeCachedRecordList`'s
+  `probeOrderWinners`), so the same dataId can't answer differently
+  depending on who wrote last.
+
+A legacy (pre-instrument) entry has only the bare key and no
+`instrument` field; it keeps resolving unqualified lookups and is
+superseded by a stamped record on the next fresh query.
 
 The lookup is best-effort: a corrupt JSON file, an unexpected schema,
 or an unusable value all return `None` from `lookupCachedRecord` and

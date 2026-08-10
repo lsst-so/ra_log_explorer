@@ -547,16 +547,27 @@ The deployed instances run with `RA_LOG_EXPLORER_LIVE_POLL_S` set, which
 turns on **live mode**: the server continuously fetches the current
 night's logs (all pods, every few minutes) into its cache, and the home
 page grows a **Tonight** panel listing every exposure taken so far —
-newest first, with what kind of image it is and whether its logs are
-ready. An exposure becomes *ready* when the full default window
-(shutter close + 5 minutes) is on disk; clicking it opens the ordinary
-explore view, served by slicing the already-fetched night rather than
-by a fresh Loki query, so it loads in seconds even mid-night.
+newest first, with its instrument, what kind of image it is, and whether
+its logs are ready. An exposure becomes *ready* when the full default
+window (shutter close + 5 minutes) is on disk; clicking it opens the
+ordinary explore view, served by slicing the already-fetched night
+rather than by a fresh Loki query, so it loads in seconds even mid-night.
+
+The instrument column is not decoration. A dataId's last five digits are
+a sequence number that restarts at 1 each night *per instrument*, so on
+a night where LSSTCam and LATISS both observe, `2026071100001` is a
+different image on each — with a different shutter close. Both are
+listed, and the Tonight links carry the instrument so they open the
+right one. Typing a bare dataId into the exposure form still works and
+resolves it the usual way (LSSTCam first, then LATISS, …); add
+`&instrument=latiss` to the URL, or click through from Tonight, to pin
+it.
 
 The panel header shows how far the night has been fetched ("logs
 fetched through …"). A freshly-restarted server shows *catching up*
 while it backfills from noon UTC; a red banner appears if any pod's
-fetch is failing or ConsDB can't be reached.
+fetch is failing, ConsDB can't be reached, or an earlier night couldn't
+be tidied up.
 
 The night view benefits too: opening the *current* night's dayObs no
 longer re-fetches hours of AOS logs from Loki — it slices "the night so
@@ -596,13 +607,23 @@ that dataId under the active site, and a real ConsDB value supersedes it
 once reachable. This is single-dataId only — the range and night forms
 have no manual fallback.
 
-**Shutter close looks off** — check the site badge in the top bar. The
-summit cluster's dataIds resolve against the summit ConsDB; BTS dataIds
-against the BTS ConsDB; the same 13-digit id can mean different
-exposures in each. The per-site cache files at
+**Shutter close looks off** — two things can make a 13-digit id mean
+something other than what you meant.
+
+*Wrong site:* check the site badge in the top bar. The summit cluster's
+dataIds resolve against the summit ConsDB; BTS dataIds against the BTS
+ConsDB, and the same id exists in both. The per-site cache files at
 `~/.cache/ra_log_explorer/exposure-times/` keep them separate. If the
 badge says the wrong thing, you are pointed at the wrong server (or
 started this one with the wrong `--site`).
+
+*Wrong instrument:* within one site, an id is only unique per
+instrument — the sequence number restarts at 1 each night for each — so
+on a night LSSTCam and LATISS both observe, a bare id resolves to the
+LSSTCam one (the probe order). If you wanted the AuxTel exposure, click
+it from the **Tonight** panel, which carries the instrument, or add
+`&instrument=latiss` to the URL. The explore view's info box shows which
+instrument it resolved.
 
 **A few pods show 0 events but the exposure obviously touched them** —
 look at the pod's `.jsonl` directly under the cache directory. If the

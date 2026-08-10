@@ -36,7 +36,10 @@ the current dayObs (near-free in-cluster) and computes which of them are
 *ready*: shutter close plus the standard post-exposure window is at or
 before the watermark, i.e. the whole default exposure view can be served
 from disk. The snapshot of all of this — watermark, exposure list,
-readiness, error states — is what ``GET /api/live`` returns.
+readiness, error states — is what ``GET /api/live`` returns. Exposures
+are listed per *instrument*, because an exposure id is only unique
+within one (see :mod:`.exposureTimes`) and LSSTCam and LATISS share ids
+on any night they both observe.
 """
 
 from __future__ import annotations
@@ -50,7 +53,7 @@ import threading
 import time
 import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -58,13 +61,14 @@ from . import exposureTimes
 from .config import (
     DEFAULT_WINDOW_AFTER_S,
     FetchSpec,
+    cache_root,
     currentDayObs,
     dayObsEndUtc,
     dayObsStartUtc,
     windowCachePath,
 )
 from .fetch import (
-    CACHE_SCHEMA_VERSION,
+    LIVE_SIDECAR_NAME,
     LIVE_SIDECAR_VERSION,
     META_NAME,
     PODS_DIR_NAME,
@@ -77,6 +81,7 @@ from .fetch import (
     fetchEventsWindowInto,
     fetchPodWindowInto,
     listPods,
+    liveNightMeta,
     markCacheViewed,
     readLiveSidecar,
     writeLiveSidecar,
@@ -96,10 +101,38 @@ from .sites import Site
 VERIFY_TOLERANCE_LINES = 100
 VERIFY_TOLERANCE_DIVISOR = 500  # i.e. 0.2% of the expected count
 
+# Temp files the poller stages through, all created inside the night dir
+# (see _stageWindow). Cleaned up on recovery, since a crash strands them.
+_TEMP_PREFIXES = ("live-inc-", "live-events-", "live-refetch-", "_live-")
+
+
+@dataclass
+class _Night:
+    """The night dir the poller is appending to, and its sidecar.
+
+    Passed explicitly rather than held only on the manager so the
+    end-of-night work can also run against a night the poller isn't
+    currently tracking — the one a restart across noon left unfinalised.
+    """
+
+    dayObs: int
+    dir: Path
+    sidecar: dict[str, Any]
+
 
 def _emptyPodRecord(watermarkIso: str) -> dict[str, Any]:
     """A fresh per-pod sidecar record, anchored at ``watermarkIso``."""
     return {"watermarkIso": watermarkIso, "bytes": 0, "lines": 0, "eventBytes": 0, "eventLines": 0}
+
+
+def _emptyEventRecord() -> dict[str, Any]:
+    """A fresh record for a name seen only in the k8s/events stream.
+
+    Deliberately carries no ``watermarkIso``: these names make no claim
+    about app-log coverage, and letting one hold the global watermark
+    back would strand the whole night at its start.
+    """
+    return {"eventBytes": 0, "eventLines": 0}
 
 
 def _appendFile(src: Path, dst: Path) -> None:
@@ -141,12 +174,12 @@ class LiveNightManager:
         self._lock = threading.Lock()
         self._stopEvent = threading.Event()
         self._thread: threading.Thread | None = None
-        # Poller-thread-only state for the currently-open night.
-        self._dayObs: int | None = None
-        self._nightDir: Path | None = None
-        self._sidecar: dict[str, Any] | None = None
-        self._exposures: dict[int, exposureTimes.ExposureRecord] = {}
-        self._storedExposureIds: set[int] = set()
+        # Poller-thread-only state.
+        self._night: _Night | None = None
+        self._orphanDirs: list[Path] = []
+        self._orphanError: str | None = None
+        self._exposures: list[exposureTimes.ExposureRecord] = []
+        self._storedExposureKeys: set[tuple[str, int]] = set()
         self._consdbError: str | None = None
         self._lastTick: dict[str, Any] | None = None
         self._lastError: str | None = None
@@ -191,23 +224,38 @@ class LiveNightManager:
         """One full poll cycle. Public so tests can drive it directly."""
         now = now or dt.datetime.now(dt.timezone.utc)
         dayObs = self._fixedDayObs if self._fixedDayObs is not None else currentDayObs(now)
-        if self._dayObs is not None and dayObs != self._dayObs:
-            self._finaliseNight()
-            self._dayObs = None
-        if self._dayObs is None:
-            self._openNight(dayObs)
+        night = self._night
+        if night is not None and not _nightDirIntact(night):
+            # The cache was wiped underneath us — DELETE /api/cache from
+            # the home page, an LRU pass, or a hand-run rm. Without this
+            # the poller would keep appending to a directory that no
+            # longer exists and fail every tick until the next rollover.
+            night = self._night = None
+        if night is not None and night.dayObs != dayObs:
+            try:
+                self._finaliseNight(night)
+            except Exception as e:  # noqa: BLE001 — yesterday must not block tonight
+                # Finalisation does a real top-up, so Loki being unwell can
+                # fail it. Opening the new night is the urgent half; the
+                # orphan sweep below rediscovers this one and retries.
+                self._orphanError = f"could not finalise {night.dir.name}: {e}"
+            night = self._night = None
+        if night is None:
+            night = self._night = self._openNight(dayObs, now)
             # Publish before the first increment: the initial catch-up
             # can run for minutes, and until it finishes the UI should
             # show "catching up from <watermark>" rather than nothing.
             self._publishSnapshot()
-        assert self._sidecar is not None
         tickStats: dict[str, Any] = {"startedAt": now.isoformat()}
         started = time.time()
-        if not self._sidecar.get("finalised"):
+        if not night.sidecar.get("finalised"):
             target = min(now - dt.timedelta(seconds=self._lagS), dayObsEndUtc(dayObs))
-            newLines, activePods = self._fetchIncrement(target)
+            newLines, activePods = self._fetchIncrement(night, target)
             tickStats.update({"newLines": newLines, "activePods": activePods})
         self._consdbTick(dayObs)
+        # At most one per tick: an orphan's top-up can be a whole night's
+        # worth of fetching, and the current night comes first.
+        self._finaliseOneOrphan()
         tickStats["elapsedS"] = round(time.time() - started, 3)
         self._lastTick = tickStats
         self._lastError = None
@@ -226,7 +274,7 @@ class LiveNightManager:
             workers=self._workers,
         )
 
-    def _openNight(self, dayObs: int) -> None:
+    def _openNight(self, dayObs: int, now: dt.datetime) -> _Night:
         """Create or recover the night dir for ``dayObs`` and adopt it."""
         spec = self._nightSpec(dayObs)
         nightDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
@@ -253,41 +301,76 @@ class LiveNightManager:
                 "finalised": False,
                 "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
                 "pods": {},
+                "eventPods": {},
                 "errors": {},
                 "incomplete_pods": {},
             }
             writeLiveSidecar(nightDir, sidecar)
         else:
-            self._recoverNight(nightDir, sidecar)
-        self._dayObs = dayObs
-        self._nightDir = nightDir
-        self._sidecar = sidecar
-        self._exposures = {}
-        self._storedExposureIds = set()
+            _recoverNight(nightDir, sidecar)
+        night = _Night(dayObs=dayObs, dir=nightDir, sidecar=sidecar)
+        self._orphanDirs = self._findOrphanNights(nightDir, now)
+        self._exposures = []
+        self._storedExposureKeys = set()
         self._consdbError = None
+        return night
 
-    def _recoverNight(self, nightDir: Path, sidecar: dict[str, Any]) -> None:
-        """Reconcile on-disk files with the sidecar after a restart.
+    def _findOrphanNights(self, currentDir: Path, now: dt.datetime) -> list[Path]:
+        """Night dirs this site left unfinalised — usually a restart across noon.
 
-        A crash can leave a pod file longer than its recorded byte count
-        (an append raced the sidecar write) or leave files the sidecar
-        has never heard of. Truncating back to the recorded counts makes
-        the next increment re-fetch exactly the unrecorded span, so no
-        line is duplicated or lost.
+        Nothing else ever revisits a past dayObs, so without this sweep
+        such a directory is stranded forever: no ``_meta.json``, which
+        means the cache listing skips it, LRU eviction can't reclaim it,
+        and yet ``du`` still counts its ~9 GiB against the size cap.
+
+        Only nights whose window has actually *ended* qualify. With
+        ``--live-day-obs`` pinning the poller to a historical night, the
+        real current night's dir is "not the one we're tracking" without
+        being finished, and topping it up to an end-time in the future
+        would mark a night complete that isn't.
         """
-        pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
-        for sub, key in ((PODS_DIR_NAME, "bytes"), (PODS_EVENTS_DIR_NAME, "eventBytes")):
-            subDir = nightDir / sub
-            for f in subDir.glob("*.jsonl"):
-                record = pods.get(f.stem)
-                recorded = int(record.get(key) or 0) if record else 0
-                if recorded <= 0:
-                    f.unlink(missing_ok=True)
-                elif f.stat().st_size > recorded:
-                    with open(f, "ab") as fh:
-                        fh.truncate(recorded)
+        base = cache_root() / self._site.cluster / self._site.namespace
+        out: list[Path] = []
+        if not base.exists():
+            return out
+        for window in sorted(base.iterdir()):
+            if not window.is_dir() or window == currentDir:
+                continue
+            sidecar = readLiveSidecar(window)
+            if sidecar is None or sidecar.get("finalised"):
+                continue
+            dayObs = sidecar.get("dayObs")
+            if isinstance(dayObs, int) and dayObsEndUtc(dayObs) <= now:
+                out.append(window)
+        return out
 
-    def _finaliseNight(self) -> None:
+    def _finaliseOneOrphan(self) -> None:
+        """Finalise one night the poller didn't see through its rollover.
+
+        One per tick, and never allowed to break the tick: the current
+        night is what people are watching. A failure goes to the back of
+        the queue rather than being dropped (a night nobody finalises is
+        the whole problem) or retried immediately; with a single stuck
+        orphan that costs one aborted listing per tick, and it is visible
+        as ``orphanError`` in ``/api/live``.
+        """
+        while self._orphanDirs:
+            window = self._orphanDirs.pop(0)
+            sidecar = readLiveSidecar(window)
+            if sidecar is None or sidecar.get("finalised"):
+                continue
+            dayObs = sidecar.get("dayObs")
+            if not isinstance(dayObs, int):
+                continue
+            try:
+                self._finaliseNight(_Night(dayObs=dayObs, dir=window, sidecar=sidecar))
+                self._orphanError = None
+            except Exception as e:  # noqa: BLE001 — never break the tick over an old night
+                self._orphanError = f"could not finalise {window.name}: {e}"
+                self._orphanDirs.append(window)
+            return
+
+    def _finaliseNight(self, night: _Night) -> None:
         """Top up to night end, verify per-pod totals, write ``_meta.json``.
 
         After this the night dir is a complete, trustworthy all-pods
@@ -295,14 +378,13 @@ class LiveNightManager:
         requests keep being served by slicing, and the ordinary cache
         machinery handles listing, LRU eviction, and deletion.
         """
-        assert self._dayObs is not None and self._nightDir is not None and self._sidecar is not None
-        dayObs, nightDir, sidecar = self._dayObs, self._nightDir, self._sidecar
+        sidecar = night.sidecar
         if sidecar.get("finalised"):
             return
-        spec = self._nightSpec(dayObs)
-        nightStart = dayObsStartUtc(dayObs)
-        nightEnd = dayObsEndUtc(dayObs)
-        self._fetchIncrement(nightEnd)
+        spec = self._nightSpec(night.dayObs)
+        nightStart = dayObsStartUtc(night.dayObs)
+        nightEnd = dayObsEndUtc(night.dayObs)
+        self._fetchIncrement(night, nightEnd)
         pods: dict[str, dict[str, Any]] = sidecar["pods"]
         errors: dict[str, str] = sidecar["errors"]
         incomplete: dict[str, str] = sidecar["incomplete_pods"]
@@ -321,45 +403,39 @@ class LiveNightManager:
             shortfall = expected - int(pods[pod].get("lines") or 0)
             if shortfall <= max(VERIFY_TOLERANCE_LINES, expected // VERIFY_TOLERANCE_DIVISOR):
                 continue
+            # Clear the old flags *before* the refetch, never after: the
+            # refetch sets its own if it comes back unreconcilable, and
+            # popping afterwards would erase exactly that — publishing a
+            # night as complete while a pod is known to be short.
+            errors.pop(pod, None)
+            incomplete.pop(pod, None)
             try:
-                self._refetchWholePod(spec, pod, nightStart, nightEnd)
-                errors.pop(pod, None)
-                incomplete.pop(pod, None)
+                self._refetchWholePod(night, spec, pod, nightStart, nightEnd)
             except FetchError as e:
                 errors[pod] = f"end-of-night refetch failed: {e}"
-        (nightDir / PODS_LIST_NAME).write_text("\n".join(sorted(pods)) + "\n")
-        meta = {
-            "spec": asdict(spec),
-            "fetchSchemaVersion": CACHE_SCHEMA_VERSION,
-            "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
-            "elapsed_s": 0.0,
-            "pod_count": len(pods),
-            "total_bytes": sum(int(r.get("bytes") or 0) for r in pods.values()),
-            "pod_bytes": {p: int(r.get("bytes") or 0) for p, r in pods.items()},
-            "pod_lines": {p: int(r.get("lines") or 0) for p, r in pods.items()},
-            "pod_expected": podExpected,
-            "errors": errors,
-            "incomplete_pods": incomplete,
-            "fetchComplete": not errors and not incomplete,
-            "pod_event_lines": {p: int(r.get("eventLines") or 0) for p, r in pods.items()},
-            "event_errors": {},
-            "window_in_past": True,
-            "fromCache": False,
-            "cacheReuse": "none",
-            "liveBuilt": True,
-        }
-        (nightDir / META_NAME).write_text(json.dumps(meta, indent=2))
+        (night.dir / PODS_LIST_NAME).write_text("\n".join(sorted(pods)) + "\n")
+        meta = liveNightMeta(sidecar, spec, podExpected=podExpected)
+        (night.dir / META_NAME).write_text(json.dumps(meta, indent=2))
         sidecar["finalised"] = True
         sidecar["watermarkIso"] = spec.toIso
         sidecar["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        writeLiveSidecar(nightDir, sidecar)
-        markCacheViewed(nightDir)
+        writeLiveSidecar(night.dir, sidecar)
+        markCacheViewed(night.dir)
 
-    def _refetchWholePod(self, spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime) -> None:
+    def _refetchWholePod(
+        self, night: _Night, spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime
+    ) -> None:
         """Replace one pod's file with a fresh full-window fetch."""
-        assert self._nightDir is not None and self._sidecar is not None
-        podFile = self._nightDir / PODS_DIR_NAME / f"{pod}.jsonl"
-        fd, tmpName = tempfile.mkstemp(prefix="live-refetch-", suffix=".jsonl", dir=self._nightDir)
+        sidecar = night.sidecar
+        podFile = night.dir / PODS_DIR_NAME / f"{pod}.jsonl"
+        record = sidecar["pods"].setdefault(pod, _emptyPodRecord(spec.toIso))
+        # Publish "nothing durable here" before swapping the file out.
+        # A request thread slicing this pod could otherwise pair the old
+        # byte count with the new inode and copy a prefix of the refetch.
+        record["bytes"] = 0
+        record["lines"] = 0
+        writeLiveSidecar(night.dir, sidecar)
+        fd, tmpName = tempfile.mkstemp(prefix="live-refetch-", suffix=".jsonl", dir=night.dir)
         tmpPath = Path(tmpName)
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -367,16 +443,16 @@ class LiveNightManager:
             os.replace(tmpPath, podFile)
         finally:
             tmpPath.unlink(missing_ok=True)
-        record = self._sidecar["pods"].setdefault(pod, _emptyPodRecord(spec.toIso))
         record["bytes"] = podFile.stat().st_size
         record["lines"] = lines
         record["watermarkIso"] = spec.toIso
         if not complete:
-            self._sidecar["incomplete_pods"][pod] = reason
+            sidecar["incomplete_pods"][pod] = reason
+        writeLiveSidecar(night.dir, sidecar)
 
     # ----- increment fetching -----------------------------------------------
 
-    def _fetchIncrement(self, target: dt.datetime) -> tuple[int, int]:
+    def _fetchIncrement(self, night: _Night, target: dt.datetime) -> tuple[int, int]:
         """Advance every pod's coverage to ``target``. Returns (lines, pods).
 
         The listing window is anchored at the *global* watermark (the
@@ -385,10 +461,9 @@ class LiveNightManager:
         each pod then fetches from its own watermark, so nothing is
         double-fetched.
         """
-        assert self._dayObs is not None and self._nightDir is not None and self._sidecar is not None
-        sidecar = self._sidecar
-        spec = self._nightSpec(self._dayObs)
-        nightStart = dayObsStartUtc(self._dayObs)
+        sidecar = night.sidecar
+        spec = self._nightSpec(night.dayObs)
+        nightStart = dayObsStartUtc(night.dayObs)
         globalW = _parseIso(sidecar["watermarkIso"])
         if target <= globalW:
             return 0, 0
@@ -397,14 +472,14 @@ class LiveNightManager:
         active = set(listPods(listSpec))  # a listing failure aborts the tick; retried next poll
         pods: dict[str, dict[str, Any]] = sidecar["pods"]
         newLines = 0
-        podsDir = self._nightDir / PODS_DIR_NAME
+        podsDir = night.dir / PODS_DIR_NAME
         with ThreadPoolExecutor(max_workers=self._workers) as ex:
             futures = {}
             for pod in sorted(active):
                 fromT = _parseIso(pods[pod]["watermarkIso"]) if pod in pods else nightStart
                 if fromT >= target:
                     continue
-                fut = ex.submit(self._stageWindow, spec, pod, fromT, target, podsDir / f"{pod}.jsonl")
+                fut = ex.submit(self._stageWindow, night, spec, pod, fromT, target, podsDir / f"{pod}.jsonl")
                 futures[fut] = (pod, fromT)
             for fut in as_completed(futures):
                 pod, fromT = futures[fut]
@@ -417,9 +492,9 @@ class LiveNightManager:
                     # attempted start, or nothing would hold the global
                     # watermark back over its missed span.
                     sidecar["errors"][pod] = str(e)
-                    pods.setdefault(pod, _emptyPodRecord(_fmtLogcliTime(fromT)))
+                    _adoptPodRecord(sidecar, pod, _fmtLogcliTime(fromT))
                     continue
-                record = pods.setdefault(pod, _emptyPodRecord(sidecar["fromIso"]))
+                record = _adoptPodRecord(sidecar, pod, sidecar["fromIso"])
                 record["bytes"] += nbytes
                 record["lines"] += lines
                 record["watermarkIso"] = targetIso
@@ -438,17 +513,26 @@ class LiveNightManager:
             if pod not in active and _parseIso(record["watermarkIso"]) < target:
                 record["watermarkIso"] = targetIso
                 sidecar["errors"].pop(pod, None)
-        self._appendEventsIncrement(spec, target)
+        self._appendEventsIncrement(night, spec, target)
+        # Only app-log pods have a watermark to contribute; names seen
+        # solely in the k8s/events stream live in ``eventPods`` and make
+        # no coverage claim (see _emptyEventRecord).
         watermarks = [_parseIso(r["watermarkIso"]) for r in pods.values()]
         sidecar["watermarkIso"] = _fmtLogcliTime(min([target, *watermarks]))
         sidecar["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
-        (self._nightDir / PODS_LIST_NAME).write_text("\n".join(sorted(pods)) + "\n")
-        writeLiveSidecar(self._nightDir, sidecar)
-        markCacheViewed(self._nightDir)
+        (night.dir / PODS_LIST_NAME).write_text("\n".join(sorted(pods)) + "\n")
+        writeLiveSidecar(night.dir, sidecar)
+        markCacheViewed(night.dir)
         return newLines, len(active)
 
     def _stageWindow(
-        self, spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, podFile: Path
+        self,
+        night: _Night,
+        spec: FetchSpec,
+        pod: str,
+        fromT: dt.datetime,
+        toT: dt.datetime,
+        podFile: Path,
     ) -> tuple[int, int, bool, str]:
         """Fetch one pod's increment via a temp file, then append it.
 
@@ -456,8 +540,14 @@ class LiveNightManager:
         retryable: nothing reaches the pod's real file unless the whole
         window fetched, so the caller can leave the watermark alone and
         try the same span again next tick.
+
+        The temp lives in the night dir — i.e. on the cache volume —
+        rather than the system temp dir, which under the deployment's
+        read-only root filesystem is a memory-backed tmpfs. A first tick
+        after a restart stages a pod's whole missed span, which for a
+        busy pod mid-night is hundreds of MB, times ``workers`` at once.
         """
-        fd, tmpName = tempfile.mkstemp(prefix="live-inc-", suffix=".jsonl")
+        fd, tmpName = tempfile.mkstemp(prefix="live-inc-", suffix=".jsonl", dir=night.dir)
         tmpPath = Path(tmpName)
         try:
             with os.fdopen(fd, "wb") as fh:
@@ -469,30 +559,38 @@ class LiveNightManager:
         finally:
             tmpPath.unlink(missing_ok=True)
 
-    def _appendEventsIncrement(self, spec: FetchSpec, target: dt.datetime) -> None:
-        """Fetch the namespace's k8s/events increment and demux per pod.
+    def _appendEventsIncrement(self, night: _Night, spec: FetchSpec, target: dt.datetime) -> None:
+        """Fetch the namespace's k8s/events increment and demux per name.
 
         One chunked query per tick for the whole namespace (the stream
         is low-volume), split by the ``name`` label into the same
-        per-pod files a batch fetch writes. Best-effort like the batch
-        path: a failure leaves the events watermark alone (the span is
-        retried next tick) and never blocks the app-log watermark.
+        per-pod files a batch fetch writes. The query is deliberately
+        *not* narrowed to pods: the stream also carries ReplicaSet, Job
+        and Deployment events, and keeping them costs almost nothing
+        while a too-narrow filter would silently drop lifecycle context
+        we might later want. Nothing downstream is confused by them —
+        ``parse.classifyK8sEvent`` ignores any event whose involved
+        object isn't a Pod, and ``summarizeAll`` enumerates pods from
+        ``pods/``, so a name with no app logs is never even opened.
+
+        Best-effort like the batch path: a failure leaves the events
+        watermark alone (so the span is retried next tick) and never
+        blocks the app-log watermark.
         """
-        assert self._nightDir is not None and self._sidecar is not None
-        sidecar = self._sidecar
+        sidecar = night.sidecar
         eventsW = _parseIso(sidecar.get("eventsWatermarkIso") or sidecar["fromIso"])
         if target <= eventsW:
             return
-        fd, tmpName = tempfile.mkstemp(prefix="live-events-", suffix=".jsonl")
+        fd, tmpName = tempfile.mkstemp(prefix="live-events-", suffix=".jsonl", dir=night.dir)
         tmpPath = Path(tmpName)
         try:
             try:
                 with os.fdopen(fd, "wb") as fh:
                     fetchEventsWindowInto(spec, eventsW, target, fh)
-            except FetchError as e:
+            except Exception as e:  # noqa: BLE001 — auxiliary stream; never fail the tick
                 sidecar["eventsError"] = str(e)
                 return
-            perPod: dict[str, list[bytes]] = {}
+            perName: dict[str, list[bytes]] = {}
             with open(tmpPath, "rb") as fh:
                 for raw in fh:
                     try:
@@ -500,19 +598,57 @@ class LiveNightManager:
                     except json.JSONDecodeError:
                         continue
                     if name:
-                        perPod.setdefault(name, []).append(raw)
-            eventsDir = self._nightDir / PODS_EVENTS_DIR_NAME
-            for pod, rawLines in perPod.items():
-                with open(eventsDir / f"{pod}.jsonl", "ab") as out:
-                    for raw in rawLines:
-                        out.write(raw)
-                record = sidecar["pods"].setdefault(pod, _emptyPodRecord(sidecar["fromIso"]))
-                record["eventBytes"] += sum(len(raw) for raw in rawLines)
-                record["eventLines"] += len(rawLines)
+                        perName.setdefault(name, []).append(raw)
+            try:
+                self._appendEventLines(night, perName)
+            except OSError as e:
+                sidecar["eventsError"] = f"events append failed, span retried next tick: {e}"
+                return
             sidecar["eventsWatermarkIso"] = _fmtLogcliTime(target)
             sidecar.pop("eventsError", None)
         finally:
             tmpPath.unlink(missing_ok=True)
+
+    def _appendEventLines(self, night: _Night, perName: dict[str, list[bytes]]) -> None:
+        """Append the demuxed event lines, all-or-nothing.
+
+        The events watermark covers the whole namespace in one span, so
+        unlike the per-pod app-log path there is no per-name watermark to
+        leave behind on a partial failure. Rolling the appends back keeps
+        the span cleanly retryable instead of duplicating every line that
+        did land — which would show up as duplicate POD_* markers on the
+        timeline for the rest of the night.
+        """
+        eventsDir = night.dir / PODS_EVENTS_DIR_NAME
+        undo: list[tuple[Path, int, dict[str, Any], int, int]] = []
+        try:
+            for name, rawLines in sorted(perName.items()):
+                path = eventsDir / f"{name}.jsonl"
+                record = _eventRecordFor(night.sidecar, name)
+                undo.append(
+                    (
+                        path,
+                        path.stat().st_size if path.exists() else 0,
+                        record,
+                        int(record.get("eventBytes") or 0),
+                        int(record.get("eventLines") or 0),
+                    )
+                )
+                with open(path, "ab") as out:
+                    for raw in rawLines:
+                        out.write(raw)
+                record["eventBytes"] += sum(len(raw) for raw in rawLines)
+                record["eventLines"] += len(rawLines)
+        except OSError:
+            for path, size, record, eventBytes, eventLines in undo:
+                if size:
+                    with open(path, "ab") as fh:
+                        fh.truncate(size)
+                else:
+                    path.unlink(missing_ok=True)
+                record["eventBytes"] = eventBytes
+                record["eventLines"] = eventLines
+            raise
 
     # ----- ConsDB + readiness -----------------------------------------------
 
@@ -535,19 +671,36 @@ class LiveNightManager:
             return
         self._consdbError = None
         self._exposures = records
-        # Persist only what's new — records are immutable, and rewriting
-        # the whole per-site cache file every tick for no change is
-        # pointless churn on the cache volume.
-        fresh = {eid: rec for eid, rec in records.items() if eid not in self._storedExposureIds}
-        if fresh:
-            exposureTimes.storeCachedRecords(fresh, siteName=self._site.name)
-            self._storedExposureIds.update(fresh)
+        # Persist only when something new turned up — records are
+        # immutable, and rewriting the whole per-site cache file every
+        # tick for no change is pointless churn on the cache volume. The
+        # *whole* list goes in, not just the new records: the bare-id
+        # keys hold the probe-order winner across every instrument, which
+        # can't be decided from a subset.
+        keys = {k for k in (_exposureKey(r) for r in records) if k is not None}
+        if keys - self._storedExposureKeys:
+            exposureTimes.storeCachedRecordList(records, siteName=self._site.name)
+            self._storedExposureKeys = keys
 
     def _exposureRows(self, watermark: dt.datetime | None) -> list[dict[str, Any]]:
-        """Tonight's exposures, newest first, with readiness computed."""
+        """Tonight's exposures, newest first, with readiness computed.
+
+        One row per (instrument, exposure id) — ids collide across
+        instruments on any night both observe, so collapsing to the id
+        alone would hide one instrument's exposures entirely.
+        """
         rows: list[dict[str, Any]] = []
-        for dataId in sorted(self._exposures, reverse=True):
-            record = self._exposures[dataId]
+        ordered = sorted(
+            self._exposures,
+            key=lambda r: (
+                -(exposureTimes.recordExposureId(r) or 0),
+                exposureTimes.recordInstrument(r) or "",
+            ),
+        )
+        for record in ordered:
+            dataId = exposureTimes.recordExposureId(record)
+            if dataId is None:
+                continue
             obsEndTai = exposureTimes.obsEnd(record)
             obsEndUtc: dt.datetime | None = None
             if obsEndTai is not None:
@@ -559,6 +712,7 @@ class LiveNightManager:
             rows.append(
                 {
                     "dataId": dataId,
+                    "instrument": exposureTimes.recordInstrument(record),
                     "obsEndUtc": obsEndUtc.isoformat() if obsEndUtc else None,
                     "readyAtUtc": readyAt.isoformat() if readyAt else None,
                     "ready": bool(readyAt is not None and watermark is not None and readyAt <= watermark),
@@ -570,7 +724,8 @@ class LiveNightManager:
     # ----- snapshot ---------------------------------------------------------
 
     def _publishSnapshot(self) -> None:
-        sidecar = self._sidecar or {}
+        night = self._night
+        sidecar = night.sidecar if night is not None else {}
         watermarkIso = sidecar.get("watermarkIso")
         watermark = _parseIso(watermarkIso) if watermarkIso else None
         pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
@@ -585,7 +740,7 @@ class LiveNightManager:
         snapshot = {
             "enabled": True,
             "siteName": self._site.name,
-            "dayObs": self._dayObs,
+            "dayObs": night.dayObs if night is not None else None,
             "nightStart": sidecar.get("fromIso"),
             "nightEnd": sidecar.get("toIso"),
             "watermark": watermarkIso,
@@ -602,12 +757,110 @@ class LiveNightManager:
             "incompletePods": dict(sidecar.get("incomplete_pods") or {}),
             "eventsError": sidecar.get("eventsError"),
             "consdbError": self._consdbError,
+            "orphanError": self._orphanError,
             "lastTick": self._lastTick,
             "lastError": self._lastError,
             "exposures": self._exposureRows(watermark),
         }
         with self._lock:
             self._snapshot = snapshot
+
+
+def _nightDirIntact(night: _Night) -> bool:
+    """True while the night dir the poller adopted still exists on disk."""
+    return night.dir.is_dir() and (night.dir / LIVE_SIDECAR_NAME).exists()
+
+
+def _adoptPodRecord(sidecar: dict[str, Any], pod: str, watermarkIso: str) -> dict[str, Any]:
+    """Get or create ``pods[pod]``, absorbing any event-only record.
+
+    A name first seen in the k8s/events stream lives in ``eventPods``
+    until it emits app logs; when it does, its event counters move across
+    so the pod has one record again and nothing is double-counted.
+    """
+    record = sidecar["pods"].get(pod)
+    if record is None:
+        record = _emptyPodRecord(watermarkIso)
+        carried = (sidecar.get("eventPods") or {}).pop(pod, None)
+        if carried:
+            record["eventBytes"] = int(carried.get("eventBytes") or 0)
+            record["eventLines"] = int(carried.get("eventLines") or 0)
+        sidecar["pods"][pod] = record
+    return record
+
+
+def _eventRecordFor(sidecar: dict[str, Any], name: str) -> dict[str, Any]:
+    """The record that counts ``name``'s k8s/events bytes.
+
+    An app-log pod keeps its counters on its own ``pods`` record; anything
+    else gets an ``eventPods`` record, which carries no watermark and so
+    cannot hold the night's coverage back.
+    """
+    record = sidecar["pods"].get(name)
+    if record is not None:
+        return record
+    return sidecar.setdefault("eventPods", {}).setdefault(name, _emptyEventRecord())
+
+
+def _recoverNight(nightDir: Path, sidecar: dict[str, Any]) -> None:
+    """Reconcile on-disk files with the sidecar after a restart.
+
+    A crash can leave a pod file longer than its recorded byte count
+    (an append raced the sidecar write) or leave files the sidecar
+    has never heard of. Truncating back to the recorded counts makes
+    the next increment re-fetch exactly the unrecorded span, so no
+    line is duplicated or lost. Staged temp files are stranded by the
+    same crash and are simply removed.
+    """
+    for f in nightDir.iterdir():
+        if f.is_file() and f.name.startswith(_TEMP_PREFIXES):
+            f.unlink(missing_ok=True)
+    _migrateEventOnlyPods(sidecar)
+    pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
+    eventPods: dict[str, dict[str, Any]] = sidecar.get("eventPods") or {}
+    for sub, key, tables in (
+        (PODS_DIR_NAME, "bytes", (pods,)),
+        (PODS_EVENTS_DIR_NAME, "eventBytes", (pods, eventPods)),
+    ):
+        subDir = nightDir / sub
+        for f in subDir.glob("*.jsonl"):
+            record = next((t[f.stem] for t in tables if f.stem in t), None)
+            recorded = int(record.get(key) or 0) if record else 0
+            if recorded <= 0:
+                f.unlink(missing_ok=True)
+            elif f.stat().st_size > recorded:
+                with open(f, "ab") as fh:
+                    fh.truncate(recorded)
+
+
+def _migrateEventOnlyPods(sidecar: dict[str, Any]) -> None:
+    """Move pre-``eventPods`` event-only names out of ``pods``.
+
+    Sidecars written before event-only names had their own section put
+    them in ``pods`` anchored at night start, where they pinned the
+    global watermark there. Nothing distinguishes them after the fact
+    except having no app-log bytes and some event bytes, which is exactly
+    what an event-only name looks like; an app-log pod misfiled this way
+    is simply re-created (and refetched from night start, over an empty
+    file) the next time it is listed.
+    """
+    pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
+    eventPods: dict[str, dict[str, Any]] = sidecar.setdefault("eventPods", {})
+    for name in [n for n, r in pods.items() if not r.get("bytes") and r.get("eventBytes")]:
+        record = pods.pop(name)
+        eventPods[name] = {
+            "eventBytes": int(record.get("eventBytes") or 0),
+            "eventLines": int(record.get("eventLines") or 0),
+        }
+
+
+def _exposureKey(record: exposureTimes.ExposureRecord) -> tuple[str, int] | None:
+    """``(instrument, exposureId)`` — an exposure's real identity, or None."""
+    instrument = exposureTimes.recordInstrument(record)
+    dataId = exposureTimes.recordExposureId(record)
+    if instrument is None or dataId is None:
+        return None
+    return instrument, dataId
 
 
 def _taiIsoToUtc(taiIso: str) -> dt.datetime:

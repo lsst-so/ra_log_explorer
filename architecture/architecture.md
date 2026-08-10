@@ -162,13 +162,13 @@ Sibling docs:
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
 | `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
-| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, and LRU disk eviction. |
+| `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
-| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
-| `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
+| `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
 | `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, cache list, progress, site badge), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
@@ -229,6 +229,32 @@ Sibling docs:
 
 - **dataId / expId** — 13-digit `YYYYMMDDSSSSS` integer (e.g. `2026051900722`).
   Exposure mode targets a single one of these at a time.
+
+  **A dataId is not unique.** `SSSSS` is a per-instrument sequence
+  number restarting at 1 each night, so on any night LSSTCam and LATISS
+  both observe — most of them — `2026051900001` names a different
+  exposure on each, with a different shutter close. The full identity is
+  `(instrument, dataId)`.
+
+  The **data layer** treats it that way: every ConsDB record carries its
+  `instrument` (stamped from the table it was read out of, not trusted
+  to a column), `queryExposureRecordsForDayObs` returns a list rather
+  than an id-keyed map, the on-disk exposure-time cache keys records
+  under `<instrument>:<id>`, `/api/exposure-time/<id>` accepts an
+  `?instrument=`, the Tonight panel shows the instrument and carries it
+  in its links, and the explore view's info box (and the dataId-link
+  tooltips) lead with it. The **bare id** is still a meaningful question with a
+  defined answer — "whichever instrument `INSTRUMENTS_BY_PROBE_ORDER`
+  reaches first" — and that is what an unqualified lookup and the bare
+  cache key resolve to; every writer agrees on that rule so the answer
+  can't depend on who wrote last.
+
+  What is *not* yet instrument-aware is the layer above: the server's
+  in-memory `exposureStates` dict, the URL routing key, `_exposure_ids.txt`
+  and range mode are all keyed by the bare id. Two colliding exposures
+  therefore share one in-memory slot — each view shows the correct data
+  for the dataId it resolved, but opening one evicts the other. Making
+  those keys `(instrument, dataId)` is its own piece of work.
 
 - **dayObs** — 8-digit `YYYYMMDD` integer. The observatory rolls the
   calendar over at UTC-12, so dayObs 20260521 covers
@@ -316,21 +342,51 @@ Each tick (every `LIVE_POLL_S` seconds):
    ordinary window path for the dayObs's noon→noon span). Consecutive
    ticks tile the night exactly — half-open windows, no line fetched
    twice, none dropped — so a night costs O(night) rather than the
-   O(night²) of re-fetching from night start each time. The k8s/events
-   stream is fetched namespace-wide once per tick and demuxed per pod.
-   The `_live.json` sidecar (schema in `fetch.py`) records watermarks
-   and per-pod byte counts; appends are staged through temp files so a
-   failed pod's span is simply retried next tick, and a crash recovers
-   by truncating files back to the recorded counts.
+   O(night²) of re-fetching from night start each time. The `_live.json`
+   sidecar (schema in `fetch.py`) records watermarks and per-pod byte
+   counts; appends are staged through temp files *on the cache volume*
+   so a failed pod's span is simply retried next tick, and a crash
+   recovers by truncating files back to the recorded counts (and
+   deleting the stranded temps).
+
+   The k8s/events stream is fetched **namespace-wide** once per tick and
+   demuxed by the `name` label. That is deliberately broader than "the
+   pods we know about": the stream also carries ReplicaSet, Job and
+   Deployment events, and keeping them costs almost nothing while a
+   narrower filter would throw away lifecycle context. Nothing
+   downstream is confused by the extra names — `classifyK8sEvent`
+   ignores any event whose involved object isn't a Pod, and
+   `summarizeAll` enumerates pods from `pods/`, so a name with no app
+   logs is never opened. They are filed in the sidecar's `eventPods`
+   section rather than `pods`, because **only app-log pods have a
+   watermark**: the global watermark is the minimum over `pods`, and a
+   name that has never emitted an app log makes no claim about coverage.
+   (Letting one in would drag the watermark back to night start every
+   time a pod was rescheduled.) A name promotes into `pods`, carrying
+   its event counters, the first time it appears in an app-log listing.
 2. **ConsDB.** One id-range query per instrument returns every exposure
-   of the current dayObs (in-cluster, this is ~free). Records land in
-   the per-site exposure-time cache — so the home form resolves tonight's
-   dataIds instantly — and in the live snapshot.
+   of the current dayObs (in-cluster, this is ~free). All instruments
+   are queried, not just the first with rows, and the result is a *list*
+   rather than an id-keyed map: an exposure id is only unique within one
+   instrument, and LSSTCam and LATISS share ids on any night they both
+   observe. Records land in the per-site exposure-time cache — each
+   under its own `(instrument, id)` key, with the probe-order winner
+   also under the bare id — so the home form resolves tonight's dataIds
+   instantly, and in the live snapshot.
 3. **Readiness.** An exposure is *ready* when
    `shutterClose(UTC) + windowAfterS <= watermark`: the whole default
    exposure window is already on disk. The home page's **Tonight** panel
-   lists tonight's exposures newest-first with ready/wait status and
-   links ready ones straight into the ordinary explore flow.
+   lists tonight's exposures newest-first (one row per instrument ×
+   exposure) with ready/wait status, and links ready ones straight into
+   the ordinary explore flow — carrying `&instrument=` so the link
+   resolves the right exposure's shutter close.
+4. **Housekeeping.** When the poller opens a night it sweeps its
+   cluster/namespace for night dirs it left *unfinalised* — what a
+   restart across noon produces — and finalises one per tick. Nothing
+   else ever revisits a past dayObs, so without the sweep such a
+   directory is stranded forever: no `_meta.json`, so the cache listing
+   skips it and LRU eviction can't reclaim it, while `du` still counts
+   its ~9 GiB against the size cap.
 
 Serving leans on one mechanism: `fetch.fetchAll` tries the night dir
 before the superset path, and any request whose window ends at or
@@ -344,6 +400,13 @@ the slice is a first-class window that later requests exact-hit or
 superset-reuse. Night dirs themselves are excluded from superset reuse
 (parsing a whole night to answer a five-minute question would take
 minutes; slicing is near-instant).
+
+The night dir is the poller's, and nothing else may write into it: a
+request for the night's *own* window is handed the directory itself with
+a synthesized meta rather than sliced (copying it onto itself would open
+every pod file for writing while reading it), and a fresh fetch that
+would land on a path carrying a `_live.json` is refused outright rather
+than truncating files the poller is appending to.
 
 One window gets special treatment: a request for the in-progress
 night's *own* window — which is exactly what night mode asks for on the
@@ -724,22 +787,36 @@ Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
 `truncated: true`.
 
-### `GET /api/exposure-time/<dataId>`
+### `GET /api/exposure-time/<dataId>[?instrument=<name>]`
 
 dataId → curated ConsDB exposure record, used by the home form to
 resolve a user-typed dataId (and show its properties) before kicking
 off the fetch. Always resolved against the site this server serves; a
 `site` query param is ignored if present.
 
+`instrument` is the one thing here the caller *does* get to name, and
+the reason is the distinction that runs through this whole API: `site`
+is server configuration (which observatory this deployment explains),
+whereas the instrument is part of the identity of the thing being asked
+about. Omit it and the answer is the probe-order one — `lsstcam` first,
+which is what every caller got before the parameter existed. Supply it
+and only that instrument's table is queried, and only that instrument's
+cache key can satisfy the lookup: falling back to the bare key would
+hand back a *different exposure* that happens to share the id.
+
 - 200 with `{"dataId", "tZero", "scale": "TAI", "fromCache": bool,
-  "manual": bool, "site", "exposure": {<curated record>}}`. `tZero` is
-  the record's `obs_end`; `exposure` carries the rest (filter, exp time,
-  image type, program, reason, group/index, …) for the explore-view info
-  box. `manual: true` flags a hand-entered stand-in (see below) rather
-  than a ConsDB value.
+  "manual": bool, "site", "instrument", "exposure": {<curated record>}}`.
+  `tZero` is the record's `obs_end`; `exposure` carries the rest (filter,
+  exp time, image type, program, reason, group/index, …) for the
+  explore-view info box. `manual: true` flags a hand-entered stand-in
+  (see below) rather than a ConsDB value.
+- 400 `"Unknown instrument '<x>'; known: [...]"` — not one of
+  `INSTRUMENTS_BY_PROBE_ORDER`.
 - 400 `"No site named '<x>'; known: [...]"` — unknown site.
 - 404 `"No exposure-time record for dataId=N"` — every instrument
-  table searched, no row with an `obs_end` anywhere.
+  table searched, no row with an `obs_end` anywhere. With an
+  `?instrument=`, `"... for dataId=N on <instrument>"` — only that one
+  was searched.
 - 502 `"ConsDB query failed: ..."` — typed ConsDB error (5xx, etc.).
 - 503 `"ConsDB token file for site '<name>' not found at <path>. Get a
   token from the relevant RSP and drop it there."` — token missing.
@@ -810,11 +887,13 @@ page makes to decide whether to render the Tonight panel. When on:
   "errors": {},                       // cumulative per-pod hard fetch failures
   "incompletePods": {},               // cumulative unreconcilable chunks
   "eventsError": null, "consdbError": null,
+  "orphanError": null,                // an earlier night couldn't be finalised
   "lastTick": { "startedAt": "...", "elapsedS": 4.2,
                 "newLines": 73200, "activePods": 431 },
   "lastError": null,                  // traceback if the last cycle blew up
   "exposures": [                      // newest first, whole night so far
     { "dataId": 2026071100542,
+      "instrument": "lsstcam",        // part of the id's identity, not a property
       "obsEndUtc": "2026-07-12T03:10:12.500000+00:00",
       "readyAtUtc": "2026-07-12T03:15:12.500000+00:00",
       "ready": false,                 // readyAt vs. watermark
@@ -823,6 +902,11 @@ page makes to decide whether to render the Tonight panel. When on:
   ]
 }
 ```
+
+One row per **(instrument, dataId)**, newest first. The same 13-digit id
+appears once per instrument that took an exposure with that sequence
+number, which on a night where LSSTCam and LATISS both observe is most
+of them — see *dataId / expId* in Key Concepts.
 
 ### `GET /api/cache`
 
@@ -1034,6 +1118,18 @@ Each fetch runs on its own daemon thread spawned by
 `JobManager.startJob`. SSE handlers block on
 `FetchJob.condition.wait()` to be notified when new events arrive.
 
+`fetch.fetchAll` additionally takes a **per-window write lock**
+(`fetch.windowWriteLock`, one re-entrant lock per requested window
+directory) for the whole of its decision-and-write path. A cache window
+is a directory of files with a `_meta.json` vouching for them, and two
+threads asking for the same window would both find no cache and then
+both write the same `pods/<pod>.jsonl` — interleaving bytes and clearing
+each other's `.partial`. Two people clicking the same ready exposure in
+the Tonight panel is enough. The loser simply waits and then takes the
+winner's result as an ordinary cache hit, so the wait is never longer
+than the fetch it would have duplicated (and its SSE progress stream
+just stays quiet until then).
+
 When live mode is on, one more daemon thread runs for the life of the
 process: the `LiveNightManager` poller. It deliberately stays outside
 the `stateLock` world — it mutates only its own night dir and
@@ -1044,7 +1140,14 @@ that `/api/live` returns without copying. Request threads meet the
 poller's output purely through the filesystem: the night-slice path in
 `fetchAll` reads the sidecar and byte ranges the sidecar vouches for,
 so a slice can run concurrently with an append and never see a torn
-line.
+line. Nothing else may *write* a live night dir — `fetchAll` refuses to
+fetch into one, and serves the night's own window by handing over the
+directory rather than copying it onto itself.
+
+The poller also notices when the directory disappears underneath it —
+`DELETE /api/cache` is one button on the home page — and re-opens the
+night on the next tick rather than failing every tick until the noon
+rollover.
 
 ### Multi-tab support
 

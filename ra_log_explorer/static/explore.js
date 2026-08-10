@@ -123,6 +123,11 @@ function exposureInfoItems(rec, compact) {
     if (val !== null && val !== undefined && val !== '') items.push([label, String(val)]);
   };
   const num = (v, dp) => (v === null || v === undefined ? null : Number(v).toFixed(dp));
+  // First, and in the compact set, because it is part of the exposure's
+  // identity rather than one of its properties: a dataId's sequence
+  // number restarts at 1 per instrument each night, so the same id names
+  // a different image on LSSTCam and LATISS.
+  push('instrument', rec.instrument);
   push('image type', rec.img_type);
   push('reason', rec.observation_reason);
   push('program', rec.science_program);

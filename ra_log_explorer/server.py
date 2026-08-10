@@ -1984,7 +1984,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             m = re.match(r"^/api/exposure-time/(\d+)$", path)
             if m:
-                self._handle_exposure_time(int(m.group(1)))
+                # An exposure id is only unique within one instrument
+                # (see exposureTimes), so the caller may name one.
+                params = parse_qs(url.query)
+                instrument = (params.get("instrument") or [""])[0].strip().lower() or None
+                if instrument is not None and instrument not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER:
+                    self._send_error_json(
+                        400,
+                        f"Unknown instrument {instrument!r}; known: "
+                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
+                    )
+                    return
+                self._handle_exposure_time(int(m.group(1)), instrument)
                 return
             m = re.match(r"^/api/fetch/([A-Za-z0-9]+)/status$", path)
             if m:
@@ -2076,13 +2087,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             self._send_json(_podDetail(transient, pod))
 
-        def _handle_exposure_time(self, dataId: int) -> None:
+        def _handle_exposure_time(self, dataId: int, instrument: str | None) -> None:
             # The site picks the (consdbUrl, tokenFile) pair AND which
             # per-site cache file the resolved iso lands in. The same
             # dataId means different things at different sites — BTS
             # simulated values can collide with summit real-camera ids —
             # so the two are never mixed, and the site is the server's,
             # not the caller's.
+            #
+            # ``instrument`` is different: it is part of the *dataId's*
+            # identity, not server configuration, so the caller does get
+            # to name it. Omitted, the answer is the probe-order one,
+            # which is what every pre-instrument caller already got.
             site = ctx.site()
             # Cache check first: exposure properties are immutable once
             # they exist, so a hit lets us skip the token + network call
@@ -2092,7 +2108,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             # (obs_end-only string) is read back as a 1-field record, so
             # the t-zero still resolves even before the richer columns
             # backfill on the next fresh query.
-            cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name)
+            cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name, instrument=instrument)
             cachedIso = exposureTimes.obsEnd(cachedRec)
             cachedManual = exposureTimes.isManual(cachedRec)
             # A *real* (ConsDB-sourced) cached record is immutable truth —
@@ -2108,6 +2124,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         "fromCache": True,
                         "manual": False,
                         "site": site.name,
+                        "instrument": exposureTimes.recordInstrument(cachedRec),
                         "exposure": cachedRec,
                     }
                 )
@@ -2127,6 +2144,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                             "fromCache": True,
                             "manual": True,
                             "site": site.name,
+                            "instrument": exposureTimes.recordInstrument(cachedRec),
                             "exposure": cachedRec,
                         }
                     )
@@ -2155,7 +2173,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     fallbackOrError(503, f"ConsDB token file is empty: {tokenPath}")
                     return
             try:
-                record = exposureTimes.queryExposureRecord(dataId, token, consdbUrl=site.consdbUrl)
+                record = exposureTimes.queryExposureRecord(
+                    dataId, token, consdbUrl=site.consdbUrl, instrument=instrument
+                )
             except exposureTimes.ConsDbError as e:
                 fallbackOrError(502, f"ConsDB query failed: {e}")
                 return
@@ -2164,10 +2184,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             isot = exposureTimes.obsEnd(record)
             if record is None or isot is None:
-                fallbackOrError(404, f"No exposure-time record for dataId={dataId}")
+                where = f" on {instrument}" if instrument else ""
+                fallbackOrError(404, f"No exposure-time record for dataId={dataId}{where}")
                 return
             # A real hit supersedes any manual stand-in we'd stored earlier.
-            exposureTimes.storeCachedRecord(dataId, record, siteName=site.name)
+            # An answer for a *pinned* instrument only claims the bare id
+            # when that instrument is the one a bare lookup probes first.
+            exposureTimes.storeCachedRecord(
+                dataId,
+                record,
+                siteName=site.name,
+                bareKey=exposureTimes.isProbeOrderFirst(instrument),
+            )
             self._send_json(
                 {
                     "dataId": dataId,
@@ -2176,6 +2204,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     "fromCache": False,
                     "manual": False,
                     "site": site.name,
+                    "instrument": exposureTimes.recordInstrument(record),
                     "exposure": record,
                 }
             )

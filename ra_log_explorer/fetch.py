@@ -81,6 +81,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -716,9 +717,21 @@ def _parseIso(s: str) -> dt.datetime:
 #     "updatedAt": "...",
 #     "pods": {"<pod>": {"watermarkIso": "...", "bytes": N, "lines": N,
 #                         "eventBytes": N, "eventLines": N}},
+#     "eventPods": {"<name>": {"eventBytes": N, "eventLines": N}},
 #     "errors": {"<pod>": "..."},             # cumulative hard fetch failures
 #     "incomplete_pods": {"<pod>": "..."}     # cumulative unreconcilable chunks
 #   }
+#
+# ``pods`` holds pods that emitted *app logs*, and only those records
+# carry a ``watermarkIso`` — the global watermark is the minimum over
+# them. ``eventPods`` holds names seen only in the namespace's k8s/events
+# stream: rescheduled pods, and non-Pod objects (ReplicaSets, Jobs) whose
+# events that stream also carries. They are kept — breadth costs nothing
+# and the parser ignores what it can't use — but they make no claim about
+# app-log coverage, so they must not be able to hold the watermark back.
+# A name promotes from ``eventPods`` into ``pods``, carrying its counters,
+# the first time it appears in an app-log listing. (The key is optional:
+# a sidecar written before it existed simply has no event-only names.)
 #
 # The sidecar is the coordination point between the poller (single
 # writer; atomic replace once per tick, only after the tick's bytes are
@@ -729,6 +742,13 @@ def _parseIso(s: str) -> dt.datetime:
 # extracted by binary-searching each file for the boundary offsets and
 # copying the byte range — no index to maintain, no parsing.
 #
+# "Durably" here means the poller wrote and closed those bytes before it
+# published the count — enough that a process restart (the case that
+# happens) recovers exactly, via truncation back to the recorded counts.
+# Neither the appends nor the sidecar replace are fsync'd, so a machine
+# losing power could in principle land the sidecar without the bytes;
+# recovery would then leave a short file the finalisation audit catches.
+#
 # A dir carrying this sidecar (live *or* finalised) is deliberately
 # excluded from superset reuse: handing a whole night to the parser to
 # answer a five-minute question would take minutes, while slicing is
@@ -737,6 +757,35 @@ def _parseIso(s: str) -> dt.datetime:
 
 LIVE_SIDECAR_NAME = "_live.json"
 LIVE_SIDECAR_VERSION = 1
+
+# One lock per window directory, guarding everything that writes into it.
+# Two request threads asking for the same window used to race: both would
+# find no cache, and both would then write the same pods/<pod>.jsonl
+# files — a fresh fetch against a slice, or two slices against each
+# other, interleaving bytes and clearing each other's .partial flag. The
+# window is the unit because the window is what a directory holds; the
+# loser simply waits and then takes the winner's result as an exact hit,
+# which is also what makes a duplicate fetch cost nothing.
+_windowLocks: dict[Path, threading.RLock] = {}
+_windowLocksGuard = threading.Lock()
+
+
+def windowWriteLock(windowDir: Path) -> threading.RLock:
+    """The process-wide write lock for one cache window directory.
+
+    Re-entrant so that nested acquisition — ``fetchAll`` holds the
+    requested window's lock across a slice that can target that same
+    window — is safe by construction rather than by everyone remembering
+    the ordering. The registry only ever grows: one small entry per
+    distinct window this process has written, which is cheap enough not
+    to be worth reclaiming.
+    """
+    with _windowLocksGuard:
+        lock = _windowLocks.get(windowDir)
+        if lock is None:
+            lock = threading.RLock()
+            _windowLocks[windowDir] = lock
+        return lock
 
 
 def readLiveSidecar(nightDir: Path) -> dict | None:
@@ -864,6 +913,12 @@ def _sliceFileByTime(
     (a concurrent append) are ignored. Returns ``(bytes, lines)`` copied;
     ``(0, 0)`` means ``dst`` was not created.
     """
+    if src.resolve() == dst.resolve():
+        # Opening dst "wb" would truncate src before a single byte was
+        # read, silently emptying the file we were asked to copy. Callers
+        # are supposed to prevent this (see materializeNightSlice); this
+        # is the backstop that keeps a bug there from destroying data.
+        raise FetchError(f"refusing to slice {src} into itself")
     limit = min(limit, src.stat().st_size)
     if limit <= 0:
         return 0, 0
@@ -895,6 +950,10 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
     cache at the requested window's own path — so everything downstream
     (parsing, superset reuse, the cache listing, deletion) treats it as
     a first-class window and later identical requests exact-hit it.
+
+    Call under :func:`windowWriteLock` for the destination window (which
+    is what :func:`fetchAll` does): two threads materializing the same
+    slice would otherwise interleave bytes in the same pod files.
     """
     t0 = time.time()
     sidecar = readLiveSidecar(nightDir)
@@ -902,9 +961,37 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
         raise FetchError(f"{nightDir} has no usable {LIVE_SIDECAR_NAME}")
     fromT = _parseIso(spec.fromIso)
     toT = _parseIso(spec.toIso)
-    requestedDir = ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    if requestedDir.resolve() == nightDir.resolve():
+        # The destination *is* the source: every pod file would be opened
+        # for writing while being read, emptying the night. Reachable when
+        # the night's watermark has reached its end but it hasn't been
+        # finalised yet (so the exact-hit check upstream found no
+        # _meta.json) and the request is the night's own all-pods window.
+        # Nothing to extract anyway — the night dir already is that window.
+        raise FetchError(f"night slice for {spec.fromIso}..{spec.toIso} would overwrite {nightDir}")
+    ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     partialPath = requestedDir / PARTIAL_FLAG
     partialPath.write_text("")
+    # Deliberately no try/finally around the flag: if the copy raises,
+    # the flag must *stay*, so a half-copied window can never be mistaken
+    # for a cache hit. The fallback fetch — or the next slice attempt —
+    # rewrites the directory and clears it then.
+    meta = _sliceNightInto(nightDir, sidecar, spec, requestedDir, fromT, toT, t0)
+    partialPath.unlink(missing_ok=True)
+    return requestedDir, meta
+
+
+def _sliceNightInto(
+    nightDir: Path,
+    sidecar: dict,
+    spec: FetchSpec,
+    requestedDir: Path,
+    fromT: dt.datetime,
+    toT: dt.datetime,
+    t0: float,
+) -> dict:
+    """Copy the byte ranges and write the slice's ``_meta.json``."""
     podsDir = requestedDir / PODS_DIR_NAME
     podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
     podsDir.mkdir(parents=True, exist_ok=True)
@@ -937,7 +1024,9 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
         totalBytes += nbytes
         # Events only for pods that emitted app logs in the window —
         # mirroring a real fetch, which enumerates pods via the app-log
-        # series listing before fetching either stream.
+        # series listing before fetching either stream. (The night dir
+        # also holds lifecycle events for non-pod objects; those have no
+        # app-log file, so they never reach a slice.)
         evSrc = nightDir / PODS_EVENTS_DIR_NAME / f"{pod}.jsonl"
         if evSrc.exists():
             _, evLines = _sliceFileByTime(
@@ -949,6 +1038,13 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
                 (podsEventsDir / f"{pod}.jsonl").unlink(missing_ok=True)
 
     pods = sorted(perPodBytes)
+    # A previous attempt on this window (a slice that failed part-way, or
+    # a fetch against an older schema) may have left pod files the night
+    # dir has nothing to say about. summarizeAll reads the directory, not
+    # pods.txt, so anything stale left here would be parsed as part of
+    # this window.
+    _pruneStalePodFiles(podsDir, set(pods))
+    _pruneStalePodFiles(podsEventsDir, set(perPodEventLines))
     (requestedDir / PODS_LIST_NAME).write_text("\n".join(pods) + "\n")
 
     # The night's cumulative fall-short maps are inherited for every pod
@@ -986,8 +1082,57 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
         "sliceSource": str(nightDir),
     }
     (requestedDir / META_NAME).write_text(json.dumps(meta, indent=2))
-    partialPath.unlink(missing_ok=True)
-    return requestedDir, meta
+    return meta
+
+
+def _pruneStalePodFiles(podsDir: Path, keep: set[str]) -> None:
+    """Remove ``<podsDir>/*.jsonl`` for pods not in ``keep``."""
+    for f in podsDir.glob("*.jsonl"):
+        if f.stem not in keep:
+            f.unlink(missing_ok=True)
+
+
+def liveNightMeta(
+    sidecar: dict,
+    spec: FetchSpec,
+    *,
+    podExpected: dict[str, int] | None = None,
+    elapsedS: float = 0.0,
+) -> dict:
+    """Build a normal ``_meta.json`` body from a live night's sidecar.
+
+    One builder for both users so a night dir is described the same way
+    whether it is being finalised (the poller writes this to disk, adding
+    the ``count_over_time`` audit in ``podExpected``) or handed straight
+    to a caller asking for the night's own window before finalisation.
+    The result is deliberately indistinguishable from a batch fetch's
+    meta apart from ``liveBuilt``, so every downstream consumer — the
+    cache listing, LRU eviction, deletion, the rebuild paths — treats it
+    as an ordinary window.
+    """
+    pods: dict[str, dict] = sidecar.get("pods") or {}
+    errors = dict(sidecar.get("errors") or {})
+    incomplete = dict(sidecar.get("incomplete_pods") or {})
+    return {
+        "spec": asdict(spec),
+        "fetchSchemaVersion": CACHE_SCHEMA_VERSION,
+        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "elapsed_s": elapsedS,
+        "pod_count": len(pods),
+        "total_bytes": sum(int(r.get("bytes") or 0) for r in pods.values()),
+        "pod_bytes": {p: int(r.get("bytes") or 0) for p, r in pods.items()},
+        "pod_lines": {p: int(r.get("lines") or 0) for p, r in pods.items()},
+        "pod_expected": dict(podExpected or {}),
+        "errors": errors,
+        "incomplete_pods": incomplete,
+        "fetchComplete": not errors and not incomplete,
+        "pod_event_lines": {p: int(r.get("eventLines") or 0) for p, r in pods.items()},
+        "event_errors": {},
+        "window_in_past": True,
+        "fromCache": False,
+        "cacheReuse": "none",
+        "liveBuilt": True,
+    }
 
 
 def _findNightDirTouching(cluster: str, namespace: str, fromT: dt.datetime) -> tuple[Path, dict] | None:
@@ -1065,6 +1210,15 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
             meta["fromCache"] = True
             meta["cacheReuse"] = "exact"
             return target, meta
+    if target.resolve() == nightDir.resolve():
+        # The request *is* the night's own window, and the night dir
+        # already holds exactly that — hand it over rather than copying
+        # it onto itself (which would truncate every pod file as it read
+        # it). A finalised night takes the exact-hit branch above; this
+        # covers the gap between the watermark reaching night end and
+        # finalisation writing _meta.json, which is where the
+        # --live-day-obs staging mode parks permanently.
+        return nightDir, liveNightMeta(sidecar, sliceSpec)
     try:
         return materializeNightSlice(nightDir, sliceSpec)
     except Exception as e:  # noqa: BLE001 — slice is an optimisation
@@ -1153,8 +1307,25 @@ def fetchAll(
     Returns a ``(cacheDir, meta)`` tuple. ``cacheDir`` is the directory the
     caller should read pod files from — typically the exact-spec dir, but on
     a superset cache hit it points to whichever wider window we found.
+
+    Serialised per requested window (see :func:`windowWriteLock`): a
+    second caller asking for a window someone else is already fetching or
+    slicing blocks until they're done, and then takes their result as an
+    ordinary cache hit rather than writing the same files underneath
+    them. The wait is the price of the fetch it would have duplicated.
     """
     requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    with windowWriteLock(requestedDir):
+        return _fetchAllLocked(spec, requestedDir, progress, forceRefresh)
+
+
+def _fetchAllLocked(
+    spec: FetchSpec,
+    requestedDir: Path,
+    progress: Callable[[str, int, int], None] | None,
+    forceRefresh: bool,
+) -> tuple[Path, dict]:
+    """:func:`fetchAll`'s body, under the requested window's write lock."""
     metaPath = requestedDir / META_NAME
     partialPath = requestedDir / PARTIAL_FLAG
 
@@ -1203,7 +1374,17 @@ def fetchAll(
             meta["cacheReusePath"] = str(superset)
             return superset, meta
 
-    # No usable cache — fetch fresh into the requested dir.
+    # No usable cache — fetch fresh into the requested dir. Unless the
+    # poller owns it: a fresh fetch opens every pods/<pod>.jsonl "wb",
+    # which against a live night dir means truncating files the poller is
+    # concurrently appending to. Refusing loudly beats corrupting the
+    # night. (Normally unreachable — the slice path above serves these —
+    # but forceRefresh skips it, and so does an unparseable sidecar.)
+    if (requestedDir / LIVE_SIDECAR_NAME).exists():
+        raise FetchError(
+            f"{requestedDir} is a live night directory maintained by the poller; "
+            "refusing to overwrite it with a fresh fetch"
+        )
     ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
     podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
@@ -1215,6 +1396,12 @@ def fetchAll(
     t0 = time.time()
     pods = listPods(spec)
     podsListPath.write_text("\n".join(pods) + "\n")
+    # A previous attempt on this window (a fetch that died, or a night
+    # slice that failed part-way) may have left pod files behind.
+    # summarizeAll reads the directory rather than pods.txt, so anything
+    # stale here would be parsed as part of this window.
+    _pruneStalePodFiles(podsDir, set(pods))
+    _pruneStalePodFiles(podsEventsDir, set(pods))
 
     perPodBytes: dict[str, int] = {}
     perPodLines: dict[str, int] = {}

@@ -2318,3 +2318,53 @@ def test_index_window_fields_track_the_configured_defaults(
     # A whole number renders without a trailing ".0" — a spinner showing
     # "900" reads as the default it is, "900.0" reads as fiddled-with.
     assert 'name="windowAfter" value="900"' in html
+
+
+def test_exposure_time_honours_an_instrument_query_param(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """A dataId names an exposure only together with its instrument —
+    LSSTCam and LATISS number from 1 each night, so the same id exists on
+    both with different shutter closes. Unlike `site` (server
+    configuration, ignored if a caller sends it), the instrument is part
+    of what is being asked for, so the caller does get to name it."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    siteCatalog.writeSummitToken()
+    import io as _io
+
+    cols = ["exposure_id", "obs_end"]
+    seen: list[str] = []
+
+    def fakeUrlopen(req: object, **_kw: Any) -> object:
+        sql = json.loads(req.data.decode("utf-8"))["query"]  # type: ignore[attr-defined]
+        seen.append(sql)
+        iso = "2026-07-11T12:06:37" if "cdb_latiss" in sql else "2026-07-11T12:00:37"
+        return _io.BytesIO(json.dumps({"columns": cols, "data": [[2026071100001, iso]]}).encode("utf-8"))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026071100001?instrument=latiss")
+    assert status == 200
+    assert body["tZero"] == "2026-07-11T12:06:37"
+    assert body["instrument"] == "latiss"
+    assert all("cdb_latiss" in sql for sql in seen)  # lsstcam never probed
+
+    # The LATISS answer is cached under its own key and must not shadow a
+    # bare-id lookup, which stays the probe-order (LSSTCam) one.
+    seen.clear()
+    status, body = _get(host, port, "/api/exposure-time/2026071100001")
+    assert status == 200
+    assert body["tZero"] == "2026-07-11T12:00:37"
+    assert body["instrument"] == "lsstcam"
+
+
+def test_exposure_time_rejects_an_unknown_instrument(
+    runningServer: RunningServer, siteCatalog: FakeSiteCatalog
+) -> None:
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026071100001?instrument=hubble")
+    assert status == 400
+    assert "hubble" in body["error"]

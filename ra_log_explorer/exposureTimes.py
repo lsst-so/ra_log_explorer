@@ -26,6 +26,12 @@ the same dataId can refer to a real-camera exposure on the summit and a
 simulated exposure on BTS, with different records. Every helper here
 takes either a ``Site`` directly or its ``consdbUrl`` and the resolved
 bearer token explicitly, so callers can never accidentally mix sources.
+
+An exposure id is also **not unique within a site**: it is only unique
+within one instrument (see :data:`INSTRUMENT_RECORD_KEY`). Every record
+carries the instrument it came from, the on-disk cache keys records both
+ways, and :func:`queryExposureRecordsForDayObs` returns a list rather
+than an id-keyed map so a shared id can't silently drop an exposure.
 """
 
 from __future__ import annotations
@@ -88,8 +94,20 @@ INSTRUMENTS_BY_PROBE_ORDER: tuple[str, ...] = (
     "lsstcomcamsim",
 )
 
+# The instrument is part of an exposure's *identity*, not one of its
+# properties. `exposure_id` is only unique within one instrument's
+# `cdb_<instrument>.exposure` table: the id is `dayObs * 100000 + seqNum`
+# and every instrument counts its own seqNum from 1 each night, so on any
+# night where LSSTCam and LATISS both observe — which is most of them —
+# ids 1..N name a different exposure per instrument. Every record this
+# module hands out is therefore stamped with the table it came from,
+# authoritatively (we know which table we queried), and the on-disk cache
+# keys records by (instrument, id) as well as by the bare id.
+INSTRUMENT_RECORD_KEY = "instrument"
+
 # One exposure's curated ConsDB columns: ``{column -> value}``. ``obs_end``
 # is a TAI ISO string; numeric columns are int/float; others may be None.
+# ``instrument`` is stamped on by us rather than projected from the row.
 ExposureRecord = dict[str, Any]
 
 
@@ -117,6 +135,52 @@ def obsEnd(record: ExposureRecord | None) -> str | None:
         return None
     v = record.get("obs_end")
     return v if isinstance(v, str) else None
+
+
+def recordInstrument(record: ExposureRecord | None) -> str | None:
+    """The ``cdb_<instrument>`` table a record came from, or ``None``.
+
+    ``None`` for a legacy cache entry or a manual stand-in, both of which
+    predate instrument stamping — those are bare-id values by definition.
+    """
+    if not record:
+        return None
+    v = record.get(INSTRUMENT_RECORD_KEY)
+    return v if isinstance(v, str) and v else None
+
+
+def recordExposureId(record: ExposureRecord | None) -> int | None:
+    """The record's ``exposure_id`` as an int, or ``None``."""
+    if not record:
+        return None
+    try:
+        return int(record["exposure_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def probeOrderWinners(records: Iterable[ExposureRecord]) -> dict[int, ExposureRecord]:
+    """Collapse records to one per *bare* exposure id, probe order deciding.
+
+    The bare-id views of the world — ``GET /api/exposure-time/<id>`` with
+    no ``instrument``, and the bare keys in the on-disk cache — answer
+    with whichever instrument :data:`INSTRUMENTS_BY_PROBE_ORDER` reaches
+    first. Anything that writes into those views has to agree with that
+    rule, or a night where two instruments share ids would answer
+    differently depending on who wrote last.
+    """
+    rank = {inst: i for i, inst in enumerate(INSTRUMENTS_BY_PROBE_ORDER)}
+    unranked = len(rank)
+    best: dict[int, tuple[int, ExposureRecord]] = {}
+    for rec in records:
+        eid = recordExposureId(rec)
+        if eid is None:
+            continue
+        r = rank.get(recordInstrument(rec) or "", unranked)
+        current = best.get(eid)
+        if current is None or r < current[0]:
+            best[eid] = (r, rec)
+    return {eid: rec for eid, (_, rec) in best.items()}
 
 
 # A hand-entered shutter close: the user typed a timestamp because ConsDB
@@ -193,7 +257,7 @@ def queryExposureRecordsForDayObs(
     token: str,
     *,
     consdbUrl: str,
-) -> dict[int, ExposureRecord]:
+) -> list[ExposureRecord]:
     """Return every instrument's exposure records for one dayObs.
 
     The 13-digit dataId embeds its dayObs (``YYYYMMDDSSSSS``), so one
@@ -202,10 +266,16 @@ def queryExposureRecordsForDayObs(
     :func:`queryExposureRecordBatch` this does **not** stop at the first
     instrument with rows — LSSTCam and LATISS routinely observe on the
     same night, and the caller wants both.
+
+    Returns a **list**, not a ``{id: record}`` map, precisely because the
+    two instruments' ids collide (see :data:`INSTRUMENT_RECORD_KEY`): a
+    map would silently drop one instrument's exposure for every shared
+    id. Callers that need a bare-id view collapse it themselves with
+    :func:`probeOrderWinners`. Ordered by (probe order, exposure id).
     """
     lo = dayObs * 100000
     hi = lo + 99999
-    out: dict[int, ExposureRecord] = {}
+    out: list[ExposureRecord] = []
     for instrument in INSTRUMENTS_BY_PROBE_ORDER:
         sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id BETWEEN {lo} AND {hi}"
         try:
@@ -216,22 +286,21 @@ def queryExposureRecordsForDayObs(
         rows = payload.get("data") or []
         if "exposure_id" not in cols:
             continue
-        for row in rows:
-            rec = _recordFromRow(cols, row)
-            try:
-                eid = int(rec.get("exposure_id"))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                continue
-            out[eid] = rec
+        found = [_recordFromRow(cols, row, instrument) for row in rows]
+        keyed = [(eid, rec) for eid, rec in ((recordExposureId(r), r) for r in found) if eid is not None]
+        out.extend(rec for _, rec in sorted(keyed, key=lambda pair: pair[0]))
     return out
 
 
-def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
+def _recordFromRow(cols: list[str], row: list, instrument: str) -> ExposureRecord:
     """Project one ConsDB result row to the curated record.
 
     Only columns in :data:`EXPOSURE_RECORD_COLUMNS` that the table
     actually returned are kept — so an instrument missing a column just
-    omits that key rather than failing.
+    omits that key rather than failing. ``instrument`` is stamped on
+    afterwards from the table we queried rather than read out of the row:
+    we know which table this came from, and not every schema carries the
+    column.
     """
     idx = {c: i for i, c in enumerate(cols)}
     out: ExposureRecord = {}
@@ -239,6 +308,7 @@ def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
         i = idx.get(c)
         if i is not None and i < len(row):
             out[c] = row[i]
+    out[INSTRUMENT_RECORD_KEY] = instrument
     return out
 
 
@@ -266,10 +336,9 @@ def _queryBatch(
         if "exposure_id" not in cols:
             continue
         for row in rows:
-            rec = _recordFromRow(cols, row)
-            try:
-                eid = int(rec.get("exposure_id"))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            rec = _recordFromRow(cols, row, instrument)
+            eid = recordExposureId(rec)
+            if eid is None:
                 continue
             out[eid] = rec
     return out
@@ -325,7 +394,7 @@ def _queryOneRecord(dataId: int, token: str, instrument: str, *, consdbUrl: str)
     if not rows:
         return None
     cols = payload.get("columns") or []
-    return _recordFromRow(cols, rows[0])
+    return _recordFromRow(cols, rows[0], instrument)
 
 
 # ----- site-aware convenience wrappers -------------------------------------
@@ -359,9 +428,27 @@ def cachedExposureTimesPath(siteName: str) -> Path:
     return cache_root() / EXPOSURE_TIME_CACHE_DIR / f"{siteName}.json"
 
 
-def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
+def cacheKey(dataId: int, instrument: str | None = None) -> str:
+    """The per-site cache key for a dataId, optionally scoped to an instrument.
+
+    Bare ``"<id>"`` is the probe-order view — what a lookup that doesn't
+    know (or care about) the instrument resolves to, and what every
+    pre-instrument caller already used. ``"<instrument>:<id>"`` is the
+    unambiguous one, and is the only key an instrument-scoped lookup will
+    accept: falling back to the bare key there could hand back a
+    different instrument's exposure with the same id.
+    """
+    return f"{instrument}:{dataId}" if instrument else str(dataId)
+
+
+def lookupCachedRecord(dataId: int, *, siteName: str, instrument: str | None = None) -> ExposureRecord | None:
     """Return a previously-cached exposure record for ``dataId`` under
     this site, or ``None``.
+
+    With ``instrument`` set, only that instrument's entry can match — a
+    bare-id fallback would defeat the point, since the bare key holds the
+    probe-order winner, which for a colliding id is a *different*
+    exposure. Without it, the bare (probe-order) entry is returned.
 
     The cache is best-effort: any read error (missing file, invalid
     JSON, unexpected schema) is swallowed and we return ``None`` so the
@@ -379,7 +466,7 @@ def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
         return None
     if not isinstance(d, dict):
         return None
-    val = d.get(str(dataId))
+    val = d.get(cacheKey(dataId, instrument))
     if isinstance(val, dict):
         return val
     if isinstance(val, str):
@@ -387,13 +474,72 @@ def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
     return None
 
 
-def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str) -> None:
+def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str, bareKey: bool = True) -> None:
     """Persist one ``(dataId, record)`` in the on-disk cache for this site."""
-    storeCachedRecords({int(dataId): record}, siteName=siteName)
+    storeCachedRecords({int(dataId): record}, siteName=siteName, bareKey=bareKey)
 
 
-def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> None:
-    """Persist many ``(dataId, record)`` pairs in one read-modify-write.
+def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str, bareKey: bool = True) -> None:
+    """Persist ``{dataId: record}`` — resolved the bare-id way — in one write.
+
+    For callers that resolved their ids the way a bare-id lookup does
+    (``queryExposureRecord`` / ``queryExposureRecordBatch``, both of which
+    stop at the first instrument that has the row) plus manual
+    stand-ins. Each record lands under the bare key *and*, when it knows
+    its instrument, under the instrument-scoped one.
+
+    ``bareKey=False`` for a caller that pinned a non-first instrument:
+    its answer is right for that instrument but is *not* what a bare-id
+    lookup resolves to, and writing it there would make the same dataId
+    answer differently depending on who asked last.
+    """
+    entries: dict[str, ExposureRecord] = {}
+    for eid, rec in records.items():
+        instrument = recordInstrument(rec)
+        if instrument:
+            entries[cacheKey(int(eid), instrument)] = rec
+        if bareKey:
+            entries[cacheKey(int(eid))] = rec
+    _mergeIntoCache(entries, siteName=siteName)
+
+
+def isProbeOrderFirst(instrument: str | None) -> bool:
+    """True if resolving against ``instrument`` also answers the bare id.
+
+    A bare-id lookup probes :data:`INSTRUMENTS_BY_PROBE_ORDER` and stops
+    at the first table with the row — so a hit against the *first*
+    instrument is, by construction, also the bare-id answer, and may be
+    cached as one. ``None`` means the caller didn't pin an instrument at
+    all, which is the bare-id path itself.
+    """
+    return instrument is None or instrument == INSTRUMENTS_BY_PROBE_ORDER[0]
+
+
+def storeCachedRecordList(records: Iterable[ExposureRecord], *, siteName: str) -> None:
+    """Persist a batch of records whose exposure ids may collide.
+
+    Every record is stored under its own ``(instrument, id)`` key, so no
+    exposure is lost to a shared id; the *probe-order winner* for each id
+    is additionally stored under the bare key, so the bare-id view agrees
+    with what :func:`queryExposureRecord` would have answered. Used by
+    the live poller, which pulls a whole night from every instrument at
+    once (see :func:`queryExposureRecordsForDayObs`).
+    """
+    records = list(records)
+    entries: dict[str, ExposureRecord] = {}
+    for rec in records:
+        eid = recordExposureId(rec)
+        instrument = recordInstrument(rec)
+        if eid is None or not instrument:
+            continue
+        entries[cacheKey(eid, instrument)] = rec
+    for eid, rec in probeOrderWinners(records).items():
+        entries[cacheKey(eid)] = rec
+    _mergeIntoCache(entries, siteName=siteName)
+
+
+def _mergeIntoCache(entries: dict[str, ExposureRecord], *, siteName: str) -> None:
+    """Merge pre-keyed entries into the per-site cache file.
 
     Best-effort: any I/O error is swallowed (the cache is purely an
     optimisation). Records never need to be invalidated — once a
@@ -403,7 +549,7 @@ def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> 
     batch in one rewrite keeps a night-prefetch of hundreds of dataIds
     from re-serialising the file once per id.
     """
-    if not records:
+    if not entries:
         return
     p = cachedExposureTimesPath(siteName)
     try:
@@ -416,8 +562,7 @@ def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> 
                     existing = raw
             except (OSError, json.JSONDecodeError):
                 existing = {}
-        for eid, rec in records.items():
-            existing[str(eid)] = rec
+        existing.update(entries)
         p.write_text(json.dumps(existing, sort_keys=True, indent=2))
     except OSError:
         pass

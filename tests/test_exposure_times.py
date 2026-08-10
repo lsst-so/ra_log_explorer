@@ -288,7 +288,7 @@ def test_queryExposureRecord_returns_record_even_without_obs_end(monkeypatch: py
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     rec = exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
-    assert rec == {"exposure_id": 2026051900722, "img_type": "science"}
+    assert rec == {"exposure_id": 2026051900722, "img_type": "science", "instrument": "lsstcam"}
     assert exposureTimes.obsEnd(rec) is None
 
 
@@ -625,3 +625,110 @@ def test_loadTokenForSite_returns_empty_for_a_token_less_site(tmp_path: Path) ->
         consdbTokenFile=None,
     )
     assert exposureTimes.loadTokenForSite(site) == ""
+
+
+# ----- instrument identity --------------------------------------------------
+
+
+def _payload(rows: list[list[Any]]) -> dict:
+    return {"columns": ["exposure_id", "obs_end"], "data": rows}
+
+
+def test_records_are_stamped_with_the_table_they_came_from(monkeypatch: pytest.MonkeyPatch) -> None:
+    """We know which cdb_<instrument> table we queried, so the record says
+    so — rather than depending on every schema carrying the column."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        return _stubResponse(_payload([[2026071100001, "2026-07-11T12:00:37"]]))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    rec = exposureTimes.queryExposureRecord(2026071100001, "T", consdbUrl=URL, instrument="latiss")
+    assert exposureTimes.recordInstrument(rec) == "latiss"
+
+
+def test_queryExposureRecordsForDayObs_keeps_both_instruments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LSSTCam and LATISS number from 1 each night, so on any night both
+    observe the same id names a different exposure on each. Returning a
+    {id: record} map would silently drop one of every colliding pair."""
+
+    seen: list[str] = []
+
+    def fakePost(sql: str, token: str, *, consdbUrl: str) -> dict:
+        seen.append(sql)
+        if "cdb_lsstcam" in sql:
+            return _payload([[2026071100002, "cam-2"], [2026071100001, "cam-1"]])
+        if "cdb_latiss" in sql:
+            return _payload([[2026071100001, "latiss-1"]])
+        raise exposureTimes._UndefinedTableError()
+
+    monkeypatch.setattr(exposureTimes, "_postQuery", fakePost)
+    recs = exposureTimes.queryExposureRecordsForDayObs(20260711, "T", consdbUrl=URL)
+    assert [(r["exposure_id"], r["instrument"], r["obs_end"]) for r in recs] == [
+        (2026071100001, "lsstcam", "cam-1"),
+        (2026071100002, "lsstcam", "cam-2"),
+        (2026071100001, "latiss", "latiss-1"),
+    ]
+    # Every instrument is asked, not just the first with rows, and the id
+    # range is that dayObs's own 5-digit sequence space.
+    assert len(seen) == len(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)
+    assert "BETWEEN 2026071100000 AND 2026071199999" in seen[0]
+
+
+def test_probeOrderWinners_resolves_a_shared_id_the_bare_lookup_way() -> None:
+    """The bare-id view has to agree with queryExposureRecord, which stops
+    at the first instrument with the row — otherwise the same dataId
+    resolves differently depending on which code path answered."""
+    cam = {"exposure_id": 1, "instrument": "lsstcam"}
+    latiss = {"exposure_id": 1, "instrument": "latiss"}
+    assert exposureTimes.probeOrderWinners([latiss, cam]) == {1: cam}
+    assert exposureTimes.probeOrderWinners([cam, latiss]) == {1: cam}
+    # A record with no instrument (legacy / manual) never beats a real one.
+    assert exposureTimes.probeOrderWinners([{"exposure_id": 1}, latiss]) == {1: latiss}
+
+
+def test_storeCachedRecordList_keys_by_instrument_and_bare_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    cam = {"exposure_id": 2026071100001, "obs_end": "cam", "instrument": "lsstcam"}
+    latiss = {"exposure_id": 2026071100001, "obs_end": "latiss", "instrument": "latiss"}
+    exposureTimes.storeCachedRecordList([latiss, cam], siteName="summit")
+
+    byInstrument = exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="latiss")
+    assert byInstrument is not None and byInstrument["obs_end"] == "latiss"
+    bare = exposureTimes.lookupCachedRecord(2026071100001, siteName="summit")
+    assert bare is not None and bare["obs_end"] == "cam"  # probe order wins
+
+
+def test_instrument_lookup_never_falls_back_to_the_bare_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Falling back would hand out a *different exposure* with the same id."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026071100001,
+        {"exposure_id": 2026071100001, "obs_end": "cam", "instrument": "lsstcam"},
+        siteName="summit",
+    )
+    assert exposureTimes.lookupCachedRecord(2026071100001, siteName="summit") is not None
+    assert exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="latiss") is None
+    # The instrument-scoped key for the record we *did* store is there.
+    assert (
+        exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="lsstcam") is not None
+    )
+
+
+def test_pinning_the_first_probe_instrument_still_answers_the_bare_id() -> None:
+    """A hit against the instrument a bare lookup probes first *is* the
+    bare-id answer, so pinning it may still warm the bare cache key."""
+    assert exposureTimes.isProbeOrderFirst(None) is True
+    assert exposureTimes.isProbeOrderFirst("lsstcam") is True
+    assert exposureTimes.isProbeOrderFirst("latiss") is False
+
+
+def test_storeCachedRecord_can_skip_the_bare_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    latiss = {"exposure_id": 7, "obs_end": "latiss", "instrument": "latiss"}
+    exposureTimes.storeCachedRecord(7, latiss, siteName="summit", bareKey=False)
+    assert exposureTimes.lookupCachedRecord(7, siteName="summit") is None
+    assert exposureTimes.lookupCachedRecord(7, siteName="summit", instrument="latiss") == latiss
