@@ -1488,3 +1488,212 @@ def test_buildSummaryPayload_without_instrument_keeps_every_pod(tmp_path: Path) 
     )
     payload = server._buildSummaryPayload(state)
     assert len(payload["pods"]) == 2
+
+
+# ----- instrument pins through the resolution paths -------------------------
+
+
+def _captureResolvePin(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Replace _resolveShutterClosesInto with a capture of its pin."""
+    captured: dict = {}
+
+    def fakeResolve(
+        needIds: set[int],
+        target: dict,
+        infoTarget: dict,
+        job: FetchJob,
+        site: sites.Site,
+        instrument: str | None = None,
+    ) -> None:
+        captured["needIds"] = set(needIds)
+        captured["instrument"] = instrument
+
+    monkeypatch.setattr(server, "_resolveShutterClosesInto", fakeResolve)
+    return captured
+
+
+def _tracebackSummary(expId: int) -> parse.PodSummary:
+    s = _instrumentSummary("s-lsstcam-run-aos-worker-1", "LSSTCam", expId)
+    s.tracebacks = [
+        parse.TracebackRecord(
+            pod=s.pod,
+            t=dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc),
+            expId=expId,
+            excClass="RuntimeError",
+            excMessage="boom",
+            body="Traceback ...",
+            reachedTerminator=True,
+        )
+    ]
+    return s
+
+
+def test_prefetchNightShutterCloses_pins_lsstcam(
+    siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AOS runs on LSSTCam only, so every dataId in a night's logs is an
+    LSSTCam id — the resolution must never wander to another table."""
+    captured = _captureResolvePin(monkeypatch)
+    state = server.NightState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260711,
+        startTime=dt.datetime(2026, 7, 11, 12, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 7, 12, 12, tzinfo=dt.timezone.utc),
+    )
+    job, site = _prefetchJob(siteCatalog)
+    server._prefetchNightShutterCloses(state, [_tracebackSummary(2026071100050)], job, site)
+    assert captured["needIds"] == {2026071100050}
+    assert captured["instrument"] == "lsstcam"
+
+
+def test_prefetchRangeShutterCloses_pins_the_jobs_instrument(
+    siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A range is a run of ONE instrument's exposures; its server-side
+    batch must resolve against that instrument's table only."""
+    captured = _captureResolvePin(monkeypatch)
+    t0 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc)
+    state = server.RangeState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026071100010,
+        stopId=2026071100012,
+        fromTime=t0,
+        toTime=t0,
+        instrument="latiss",
+    )
+    nightJob, site = _prefetchJob(siteCatalog)
+    job = JobManager().createRangeJob(
+        nightJob.spec, 2026071100010, 2026071100012, t0, t0, siteName="summit", instrument="latiss"
+    )
+    server._prefetchRangeShutterCloses(state, job, site)
+    assert captured["instrument"] == "latiss"
+    assert captured["needIds"] == {2026071100010, 2026071100011, 2026071100012}
+
+
+def test_resolveShutterCloses_pin_reaches_cache_and_batch(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pin governs BOTH halves of resolution: a colliding id already
+    cached for both instruments must anchor to the pinned instrument's
+    shutter close, and the ConsDB batch for misses must carry the pin."""
+    collidingId = 2026071100408
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName="summit",
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName="summit",
+    )
+    batchPins: list[str | None] = []
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        batchPins.append(instrument)
+        return {}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    job, site = _prefetchJob(siteCatalog)
+    missId = 2026071100999  # not cached -> goes to the batch
+    server._resolveShutterClosesInto({collidingId, missId}, target, info, job, site, instrument="latiss")
+
+    # The cached hit anchored to the LATISS shutter close (TAI -37 s).
+    assert target[collidingId] == dt.datetime(2026, 7, 12, 4, 57, 26, 354000, tzinfo=dt.timezone.utc)
+    assert info[collidingId]["instrument"] == "latiss"
+    assert batchPins == ["latiss"]
+
+
+# ----- instrument on the cache-rebuild path ---------------------------------
+
+
+def _plantExposureCache(root: Path, expId: int, fromIso: str, toIso: str, cluster: str = "yagan") -> Path:
+    import json as _json
+
+    windowDir = root / cluster / "rapid-analysis" / "window-a"
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "_meta.json").write_text(
+        _json.dumps(
+            {
+                "spec": {"fromIso": fromIso, "toIso": toIso},
+                "fetched_at": "2026-07-12T06:00:00+00:00",
+                "pod_count": 0,
+            }
+        )
+    )
+    (windowDir / "_exposure_ids.txt").write_text(f"{expId}\n")
+    return windowDir
+
+
+def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """_exposure_ids.txt lists bare ids, so a colliding id can name the
+    OTHER instrument's window. The pinned t0 must fall inside the found
+    window, or the rebuild would dress the wrong logs up as this
+    exposure."""
+    collidingId = 2026071100408
+    # An LSSTCam window around its shutter close in UTC (obs_end is
+    # TAI; -37 s puts t0 at 03:58:15.091 UTC).
+    _plantExposureCache(
+        tmpCacheRoot, collidingId, "2026-07-12T03:58:10.091000Z", "2026-07-12T04:03:15.091000Z"
+    )
+    site = siteCatalog.catalog[0]
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName=site.name,
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName=site.name,
+    )
+    ctx = _ctxWithSites(siteCatalog)
+    # LATISS pin: its 04:58 t0 is outside the window on disk -> refuse.
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    # LSSTCam pin: t0 inside the window -> rebuilt, stamped with the pin.
+    state = server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam")
+    assert state is not None
+    assert state.instrument == "lsstcam"
+    assert state.tZero == dt.datetime(2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc)
+
+
+# ----- instrument through the range per-exposure view -----------------------
+
+
+def test_rangeExposurePayload_filters_pods_by_the_ranges_instrument(tmp_path: Path) -> None:
+    expId = 2026071100010
+    t0 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc)
+    state = server.RangeState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+        ],
+        startId=expId,
+        stopId=expId + 2,
+        fromTime=t0,
+        toTime=t0,
+        instrument="latiss",
+    )
+    state.shutterCloseByExpId[expId] = t0
+    payload = server._buildRangeExposurePayload(state, expId)
+    assert payload is not None
+    assert payload["instrument"] == "latiss"
+    assert {p["pod"] for p in payload["pods"]} == {"s-latiss-run-sfm-runner-1"}

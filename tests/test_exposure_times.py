@@ -760,3 +760,19 @@ def test_storeCachedRecord_can_skip_the_bare_key(monkeypatch: pytest.MonkeyPatch
     exposureTimes.storeCachedRecord(7, latiss, siteName="summit", bareKey=False)
     assert exposureTimes.lookupCachedRecord(7, siteName="summit") is None
     assert exposureTimes.lookupCachedRecord(7, siteName="summit", instrument="latiss") == latiss
+
+
+def test_manualRecord_instrument_stamp_round_trips(tmpCacheRoot: Path) -> None:
+    """A stamped manual record answers instrument-pinned lookups; an
+    unstamped one only answers bare lookups (pre-instrument behaviour)."""
+    stamped = exposureTimes.manualRecord("2026-07-12T05:00:37.000", instrument="latiss")
+    assert exposureTimes.recordInstrument(stamped) == "latiss"
+    exposureTimes.storeCachedRecord(101, stamped, siteName="summit")
+    assert exposureTimes.lookupCachedRecord(101, siteName="summit", instrument="latiss") is not None
+    assert exposureTimes.lookupCachedRecord(101, siteName="summit", instrument="lsstcam") is None
+
+    bare = exposureTimes.manualRecord("2026-07-12T05:00:37.000")
+    assert exposureTimes.recordInstrument(bare) is None
+    exposureTimes.storeCachedRecord(102, bare, siteName="summit")
+    assert exposureTimes.lookupCachedRecord(102, siteName="summit") is not None
+    assert exposureTimes.lookupCachedRecord(102, siteName="summit", instrument="latiss") is None

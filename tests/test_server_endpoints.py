@@ -2368,3 +2368,150 @@ def test_exposure_time_rejects_an_unknown_instrument(
     status, body = _get(host, port, "/api/exposure-time/2026071100001?instrument=hubble")
     assert status == 400
     assert "hubble" in body["error"]
+
+
+# ----- instrument threading through the HTTP surface ------------------------
+
+
+def _completeFetch(
+    host: str, port: int, body: dict, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, slug: str
+) -> None:
+    """POST /api/fetch with ``body`` (fetchAll stubbed) and wait for done."""
+    from collections.abc import Callable
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        cacheDir = tmpCacheRoot / slug
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, posted = _post(host, port, "/api/fetch", body)
+    assert status == 202, posted
+    st: dict = {}
+    for _ in range(100):
+        _s, st = _get(host, port, f"/api/fetch/{posted['jobId']}/status")
+        if st["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert st.get("status") == "done", st
+
+
+def test_fetch_rejects_an_unknown_instrument(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch",
+        {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "instrument": "hubble"},
+    )
+    assert status == 400
+    assert "instrument" in body["error"]
+
+
+def test_fetch_instrument_lands_on_the_state_and_summary_guard_enforces_it(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The body's instrument is the state's instrument, the payload says
+    so, and a same-id request pinned to the OTHER instrument is treated
+    as not loaded rather than answered with the wrong exposure."""
+    host, port, ctx = runningServer
+    expId = 2026071100408
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-07-12T04:58:03.354", "instrument": "latiss"},
+        tmpCacheRoot,
+        monkeypatch,
+        "latiss-408",
+    )
+    with ctx.jobs.stateLock:
+        state = ctx.getExposureState(expId)
+        assert state is not None and state.instrument == "latiss"
+
+    # Pinned to the matching instrument: served, and labelled.
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=latiss")
+    assert status == 200 and body["loaded"] is True
+    assert body["instrument"] == "latiss"
+    # Unpinned: the loaded state is served (bare ids stay meaningful).
+    status, body = _get(host, port, f"/api/summary?dataId={expId}")
+    assert status == 200 and body["loaded"] is True
+    # Pinned to the other instrument: same bare id, different exposure —
+    # never served; falls through to not-loaded (no cache to rebuild).
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=lsstcam")
+    assert status == 200 and body["loaded"] is False
+    # Unknown instrument name: a 400, not a silent probe-order answer.
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=hubble")
+    assert status == 400
+
+
+def test_fetch_defaults_the_instrument_to_lsstcam(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host, port, ctx = runningServer
+    expId = 2026051900722
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-05-20T08:46:16.267"},
+        tmpCacheRoot,
+        monkeypatch,
+        "default-inst",
+    )
+    with ctx.jobs.stateLock:
+        state = ctx.getExposureState(expId)
+        assert state is not None and state.instrument == "lsstcam"
+
+
+def test_fetch_range_rejects_an_unknown_instrument(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900722,
+            "rangeStop": 2026051900724,
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:47:16.267",
+            "instrument": "hubble",
+        },
+    )
+    assert status == 400
+    assert "instrument" in body["error"]
+
+
+def test_manual_tZero_is_stamped_with_the_fetches_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-entered shutter close for a LATISS exposure must be found
+    by LATISS-pinned lookups later — an unstamped stand-in only answers
+    bare lookups."""
+    host, port, _ctx = runningServer
+    expId = 2026071100777
+    _completeFetch(
+        host,
+        port,
+        {
+            "exposureId": expId,
+            "tZero": "2026-07-12T05:00:00.000",
+            "instrument": "latiss",
+            "tZeroManual": True,
+        },
+        tmpCacheRoot,
+        monkeypatch,
+        "manual-latiss",
+    )
+    rec = exposureTimes.lookupCachedRecord(expId, siteName="summit", instrument="latiss")
+    assert rec is not None and exposureTimes.isManual(rec)
+    assert exposureTimes.recordInstrument(rec) == "latiss"
