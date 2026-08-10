@@ -37,6 +37,26 @@ def tracebackJsonl() -> Path:
 
 
 @pytest.fixture
+def podCrashEventsJsonl() -> Path:
+    """One pod's whole `k8s/events` stream through a real crash loop.
+
+    Captured from BTS (`manke`, dayObs 20260622): a step1b-AOS worker
+    that restarted in place five times, was rescheduled, and then wedged
+    in ImagePullBackOff — `Failed to pull image … pull QPS exceeded`,
+    `ErrImagePull`, `BackOff`, `ImagePullBackOff`. Nothing about it is
+    invented; only the timestamps are shifted, onto the night the UI
+    tests' corpus covers, so the same file can serve both.
+
+    It exists because the healthy nights we have captured contain only
+    `Started` / `Killing` events. A crash is exactly the thing these
+    markers are for — "the pod died here" is the answer to a log that
+    stops mid-work — so the paths that classify and surface one need
+    real data behind them rather than a couple of hand-typed lines.
+    """
+    return DATA_DIR / "pod_crash_events.jsonl"
+
+
+@pytest.fixture
 def truncatedTracebackJsonl() -> Path:
     """Real-world slice from an AOS worker on 20260602 where the log
     forwarder dropped the tail of one chained traceback.

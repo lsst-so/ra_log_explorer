@@ -125,6 +125,24 @@ pod) are dropped too.
 | `POD_FAILED`    | `Failed`/`BackOff`/`Evicted`/`Preempted`/`NodeNotReady`/`FailedKillPod` | error | Container failed / crash-looping / evicted. |
 | `POD_UNHEALTHY` | `Unhealthy`                                              | warn    | Liveness/readiness probe failed (often precedes a `Killing`). |
 
+**What real data exists behind these.** The nights we have captured are
+mostly healthy: their lifecycle streams hold `Started`, `Killing`,
+`Pulling`/`Pulled`/`Created`, `Scheduled` and little else. Two reasons
+show up that we deliberately drop — `FailedMount`, and
+`TaintManagerEviction`, whose message is *"Cancelling deletion of Pod …"*
+(the controller calling an eviction off, not a pod dying). One real crash
+is captured: a step1b-AOS worker on BTS that restarted in place five
+times and then wedged in `ImagePullBackOff`, kept as
+`tests/data/pod_crash_events.jsonl` and used by both the parser tests and
+the browser tests.
+
+`POD_OOMKILLED` and `POD_UNHEALTHY` have **no** real capture behind them
+and are covered by hand-written event lines only. That is not an
+oversight: container-limit OOM emits no k8s event on these clusters at
+all (see the row above), so there is nothing to capture; `Unhealthy`
+simply hasn't occurred in a night we pulled. If one ever does, add it to
+the crash fixture rather than inventing a line.
+
 All lifecycle kinds share the `POD_` prefix (and are enumerated in
 `parse.LIFECYCLE_EVENT_KINDS`). They carry **no dataId** — `expId` is always
 `None`, since they're pod-global, not per-exposure — so `who`/`detector`/

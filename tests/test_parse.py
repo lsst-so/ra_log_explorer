@@ -1417,3 +1417,94 @@ def _countLines(path: Path) -> int:
         if line.strip():
             n += 1
     return n
+
+
+# ----- a real crash loop, end to end ----------------------------------------
+
+
+def test_classifyK8sEvent_reads_a_whole_real_crash_loop(podCrashEventsJsonl: Path) -> None:
+    """The captured stream of a pod that flapped and then wedged.
+
+    Hand-written event lines prove each branch in isolation; this proves
+    the sequence a human actually has to read. The pod restarts in place
+    five times (`Started` with a rising `count`), gets rescheduled, and
+    then fails to pull its image — which is the shape of "why did this
+    pod stop doing work" in practice.
+    """
+    kinds: list[str] = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("s-lsstcam-run-step-1b-aos-worker-gather1baosset-0", json.loads(line))
+        if ev is not None:
+            kinds.append(ev.kind)
+    # Image pulls, scheduling and interface attachment are chatter; only
+    # the lifecycle facts survive.
+    assert kinds == [
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_STARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_STARTED",
+    ]
+
+
+def test_a_restart_marker_says_which_restart_it_was(podCrashEventsJsonl: Path) -> None:
+    """The count is the whole signal: a container on its sixth start has
+    died five times, and that number is what tells a reader whether they
+    are looking at a blip or a crash loop."""
+    restarts = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("pod", json.loads(line))
+        if ev is not None and ev.kind == "POD_RESTARTED":
+            restarts.append(ev.message)
+    assert len(restarts) == 5
+    assert "restart #2" in restarts[0]
+    assert "restart #6" in restarts[-1]
+    # And the node, so a pod that keeps dying on one machine is visible.
+    assert "manke" in restarts[0]
+
+
+def test_the_crash_reason_survives_into_the_event(podCrashEventsJsonl: Path) -> None:
+    """`flavor` carries the k8s reason and the message carries the text,
+    because "it failed" is not actionable and "ImagePullBackOff" is."""
+    failures = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("pod", json.loads(line))
+        if ev is not None and ev.kind == "POD_FAILED":
+            failures.append(ev)
+    assert [e.flavor for e in failures] == ["Failed", "Failed", "BackOff", "Failed"]
+    assert all(e.level == "error" for e in failures)
+    joined = " ".join(e.message or "" for e in failures)
+    assert "ErrImagePull" in joined
+    assert "ImagePullBackOff" in joined
+    assert "pull QPS exceeded" in joined
+
+
+def test_summarizePod_carries_crash_markers_onto_the_timeline(
+    aosWorkerJsonl: Path, podCrashEventsJsonl: Path
+) -> None:
+    """The markers have to reach the pod summary, which is what both the
+    exposure timeline and the night rollups read."""
+    summary = parse.summarizePod(aosWorkerJsonl, podCrashEventsJsonl)
+    lifecycle = [e for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS]
+    assert len(lifecycle) == 15
+    assert {e.kind for e in lifecycle} == {
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_RESTARTED",
+        "POD_FAILED",
+    }
+    # Lifecycle events carry no dataId: a pod dies, not an exposure.
+    assert all(e.expId is None for e in lifecycle)
+    # And they stay in time order alongside the app-log events.
+    stamps = [e.t for e in summary.events]
+    assert stamps == sorted(stamps)

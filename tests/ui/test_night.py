@@ -159,3 +159,32 @@ def test_the_night_fetch_banner_names_pods_that_fell_short(app: Any, corpus: Sta
     banner = app.page.locator("#night-fetch-banner")
     expect(banner).to_be_visible()
     expect(banner).to_contain_text("aosworkerset-2")
+
+
+def test_a_crash_loop_is_spelled_out_in_the_restarts_table(app: Any, corpus: StagedCorpus) -> None:
+    """A pod that dies mid-visit explains a gap no traceback accounts
+    for, so the night view has to say which pod, how many times, and —
+    when k8s knows — why. This is a real crash loop: five in-place
+    restarts, then an image pull it never recovered from."""
+    pod = corpus.plantPodCrash()
+    openNight(app, corpus)
+    rows = app.page.locator("#night-restarts tbody tr")
+    text = rows.all_inner_texts()
+    joined = " ".join(text)
+    assert len(text) >= 10, f"expected the whole crash loop, got {len(text)} rows"
+    assert pod.split("-run-")[1] in joined
+    # The escalation, in the words k8s used.
+    assert "restart #6" in joined
+    assert "ImagePullBackOff" in joined
+    # And the stat tile counts them rather than leaving them to the table.
+    assert statValue(app, "pod restarts") >= 5
+
+
+def test_the_crash_is_attributed_to_what_the_pod_was_working_on(app: Any, corpus: StagedCorpus) -> None:
+    """A restart is only actionable next to the visit it interrupted."""
+    corpus.plantPodCrash()
+    openNight(app, corpus)
+    links = app.page.locator("#night-restarts tbody a[href*='dataId=']")
+    assert links.count() >= 1, "no restart was tied to a dataId"
+    href = links.first.get_attribute("href")
+    assert href is not None and "dataId=20260711" in href

@@ -1,6 +1,6 @@
 ---
 name: ra-log-explorer-validation
-description: Validate Python or UI changes in the ra_log_explorer tool before declaring a task done. Nothing runs pre-commit, mypy, mypy-coverage, or pytest on a local commit, so the checks must be run by hand. Use this skill whenever you finish editing anything under `ra_log_explorer/`, `tests/`, or `architecture/` and are about to hand the task back to the user; when the user asks to "run the tests", "type check", "validate", or "check my changes"; or when you are about to stage a commit. The validation loop is the same whether the change is to Python, JS, CSS, or HTML — every commit is expected to pass it. For anything touching the Dockerfile, the configuration surface, the base path or the served HTML, the container smoke test is part of validation too: the tool is a deployed service and the unit suite does not cover the shape it runs in.
+description: Validate Python or UI changes in the ra_log_explorer tool before declaring a task done. Nothing runs pre-commit, mypy, mypy-coverage, or pytest on a local commit, so the checks must be run by hand. UI changes are covered by browser tests (tests/ui/) that run as part of pytest — they need `pip install -e '.[ui-test]'` + `playwright install chromium` once, and they fail rather than skip without it. Use this skill whenever you finish editing anything under `ra_log_explorer/`, `tests/`, or `architecture/` and are about to hand the task back to the user; when the user asks to "run the tests", "type check", "validate", or "check my changes"; or when you are about to stage a commit. The validation loop is the same whether the change is to Python, JS, CSS, or HTML — every commit is expected to pass it. For anything touching the Dockerfile, the configuration surface, the base path or the served HTML, the container smoke test is part of validation too: the tool is a deployed service and the unit suite does not cover the shape it runs in.
 ---
 
 # ra_log_explorer: Validating changes
@@ -20,13 +20,14 @@ that catches it is you.
 
 From the repo root, with the dev venv created (`python3.13 -m venv .venv
 && .venv/bin/pip install pre-commit black isort flake8 flake8-bugbear mypy
-mypy-coverage pytest`):
+mypy-coverage pytest` and `.venv/bin/pip install -e '.[ui-test]' &&
+.venv/bin/playwright install chromium` for the browser tests):
 
 ```bash
 .venv/bin/pre-commit run --all-files
 .venv/bin/mypy
 .venv/bin/mypy-coverage
-.venv/bin/pytest -q
+.venv/bin/pytest -q -n auto
 ```
 
 All four must pass before you commit. The four are independent — pre-commit
@@ -56,15 +57,34 @@ types. The project's current bar is **100% / 100%**. If your change drops
 coverage, either annotate the missing piece or justify the gap in the
 commit message.
 
-### 4. `pytest`
+### 4. `pytest -n auto`
 
-Unit tests live under [tests/](../../../tests/) and run in seconds.
-They use small JSONL fixtures under `tests/data/` — no network, no Loki,
-no real cache state. See [architecture/testing.md](../../../architecture/testing.md)
-for the test scope.
+Two kinds of test, one command. Unit tests under
+[tests/](../../../tests/) run in seconds against small JSONL fixtures in
+`tests/data/` — no network, no Loki, no real cache state. **Browser
+tests** under [tests/ui/](../../../tests/ui/) drive Chromium against the
+real server over a real cut-down night of logs; they cover the UI and
+the integration behind it. See
+[architecture/testing.md](../../../architecture/testing.md) for the
+scope of both.
+
+`-n auto` is worth typing. Measured on 8 cores: the unit tests take 75 s
+serially and 31 s in parallel, and adding all the browser tests to the
+parallel run costs **0.1 s** — they parallelise far better than the unit
+suite. Serially they double the wall clock.
+
+The browser tests **fail rather than skip** when Playwright or its
+Chromium build is missing, on purpose: a UI suite that skips itself
+reads exactly like one that passes. If you see the install message, run
+the two commands it names — do not reach for `-m "not ui"` to make it
+quiet.
 
 If you added a new event kind, parser branch, or cache helper, add a
-test for it in the same commit. The
+test for it in the same commit. **If you changed the UI — a new control,
+a new panel, a changed selector — add or update a browser test in the
+same commit too.** Hand-verification still has a job (layout, colour,
+whether a thing reads well) but it is no longer the evidence that
+something works. The
 [ra-log-explorer-architecture-sync](../ra-log-explorer-architecture-sync/SKILL.md)
 skill enforces the same idea for the architecture docs.
 
@@ -126,6 +146,9 @@ When you report back to the user:
 - Say which of the four checks you actually ran. "Validation clean" is
   ambiguous; "pre-commit + mypy + mypy-coverage + pytest all clean" is
   not.
+- If you touched the UI, say whether the browser tests covered the
+  change or whether you added one. "The UI tests pass" is weak evidence
+  for a control none of them touch.
 - Say whether you ran the **container** smoke test, and if not, why the
   change couldn't affect the deployed shape. This is the one most easily
   skipped and the most costly to skip.

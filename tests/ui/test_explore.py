@@ -12,12 +12,14 @@ from typing import Any
 
 from playwright.sync_api import expect
 
-from .corpus import SHARED_ID, StagedCorpus
+from .corpus import CRASH_ID, SHARED_ID, StagedCorpus
 
 
-def openExposure(app: Any, corpus: StagedCorpus, instrument: str = "lsstcam") -> None:
-    corpus.stageExposure(SHARED_ID, instrument)
-    app.goto(f"/?dataId={SHARED_ID}&instrument={instrument}")
+def openExposure(
+    app: Any, corpus: StagedCorpus, instrument: str = "lsstcam", dataId: int = SHARED_ID
+) -> None:
+    corpus.stageExposure(dataId, instrument)
+    app.goto(f"/?dataId={dataId}&instrument={instrument}")
     expect(app.page.locator("#explore-view")).to_be_visible()
     expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
 
@@ -217,3 +219,34 @@ def test_the_task_legend_lists_the_pipeline_tasks(app: Any, corpus: StagedCorpus
     tasks = app.page.locator("#task-legend .lg-task").all_inner_texts()
     assert tasks, "the legend should name the tasks the coloured bars stand for"
     assert any("isr" in t.lower() for t in tasks), tasks
+
+
+def test_a_pod_death_shows_up_on_the_timeline(app: Any, corpus: StagedCorpus) -> None:
+    """`looksTruncatedEnd` says a pod stopped without finishing; a
+    lifecycle marker says why. They are complementary, and the marker is
+    drawn full-height so "the whole pod went" reads differently from a
+    task tick.
+
+    The crash here is real (see StagedCorpus.plantPodCrash) and its final
+    ImagePullBackOff burst falls inside this exposure's window.
+    """
+    corpus.plantPodCrash()
+    openExposure(app, corpus, dataId=CRASH_ID)
+    row = app.page.locator("#timeline .tl-row", has_text="gather1baosset-0").first
+    expect(row).to_be_visible()
+    markers = row.locator(".tl-event.lifecycle")
+    assert markers.count() >= 1, "the crash left no marker on the pod's lane"
+    markers.first.hover()
+    tooltip = app.page.locator("#tooltip")
+    expect(tooltip).to_be_visible()
+    expect(tooltip).to_contain_text("POD_")
+
+
+def test_lifecycle_markers_are_kept_across_the_whole_window(app: Any, corpus: StagedCorpus) -> None:
+    """Unlike dataId-keyed events these are kept on the broad exposure
+    window, not the tight per-dataId one: a pod usually dies a few
+    seconds after its last work line, and cutting at the last line would
+    hide exactly the marker that explains the gap."""
+    corpus.plantPodCrash()
+    openExposure(app, corpus, dataId=CRASH_ID)
+    assert app.page.locator("#timeline .tl-event.lifecycle").count() >= 1

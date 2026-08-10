@@ -54,6 +54,12 @@ SHARED_ID = 2026071100445
 CAM_T_ZERO_UTC = dt.datetime(2026, 7, 12, 4, 21, 22, 502000, tzinfo=UTC)
 LATISS_T_ZERO_UTC = dt.datetime(2026, 7, 12, 5, 24, 53, 895000, tzinfo=UTC)
 
+# The exposure a real crash loop is planted onto (see plantPodCrash):
+# 2026071100448 is the visit that pod was really gathering, and the
+# transplanted events are timed to wedge a minute into its window.
+CRASH_ID = 2026071100448
+CRASH_POD = "s-lsstcam-run-step-1b-aos-worker-gather1baosset-0"
+
 # Three consecutive LSSTCam exposures, for range mode.
 RANGE_START = 2026071100445
 RANGE_STOP = 2026071100447
@@ -149,6 +155,42 @@ class StagedCorpus:
         """
         (self.nightDir / fetch.LIVE_SIDECAR_NAME).unlink(missing_ok=True)
 
+    def plantPodCrash(self) -> str:
+        """Drop a real crash loop into one of the night's pods.
+
+        The captured nights we have are healthy ones: their lifecycle
+        streams hold `Started` and `Killing` and nothing else. A crash is
+        the case these markers exist for — "the pod died here" is the
+        answer to an app log that stops mid-work — so the corpus gets a
+        real one transplanted in, from the same StatefulSet on BTS, with
+        only its timestamps moved onto this night (see the
+        ``podCrashEventsJsonl`` fixture for provenance).
+
+        Kept out of the archive and planted per test on purpose: the
+        archive is one honest cut of one night, and this is the one thing
+        in the suite that came from somewhere else. It goes onto the pod
+        of the same name — the same StatefulSet member — and is timed to
+        wedge inside :data:`CRASH_ID`, the visit that pod really was
+        gathering. Returns the pod, which is AOS-flavoured, so the crash
+        reaches night mode as well as that exposure's timeline.
+        """
+        source = Path(__file__).resolve().parents[1] / "data" / "pod_crash_events.jsonl"
+        pod = CRASH_POD
+        target = self.nightDir / fetch.PODS_EVENTS_DIR_NAME / f"{pod}.jsonl"
+        assert (self.nightDir / fetch.PODS_DIR_NAME / f"{pod}.jsonl").exists(), pod
+        # Unlink before writing: the corpus's JSONL is hard-linked into
+        # this cache root, and writing in place would go straight through
+        # to the copy every other test shares.
+        target.unlink(missing_ok=True)
+        target.write_bytes(source.read_bytes())
+        sidecar = fetch.readLiveSidecar(self.nightDir)
+        if sidecar is not None:
+            record = sidecar["pods"][pod]
+            record["eventBytes"] = target.stat().st_size
+            record["eventLines"] = target.read_bytes().count(b"\n")
+            fetch.writeLiveSidecar(self.nightDir, sidecar)
+        return pod
+
     def rewindWatermark(self, to: dt.datetime) -> None:
         """Pretend the night has only been fetched up to ``to``.
 
@@ -218,6 +260,12 @@ def linkInto(corpus: Path, cacheRoot: Path) -> StagedCorpus:
     one test's stand-in leak into another's lookups, which is the kind of
     cross-test coupling that shows up as a test that only fails in a full
     run. The small files cost microseconds.
+
+    The links are made read-only so that mistake cannot happen twice: an
+    in-place write to a shared inode now raises instead of quietly
+    rewriting the corpus for every test that follows. Removing them still
+    works — deletion needs the *directory* to be writable, not the file —
+    which is what the cache-deletion tests do.
     """
     for src in corpus.rglob("*"):
         rel = src.relative_to(corpus)
@@ -227,6 +275,7 @@ def linkInto(corpus: Path, cacheRoot: Path) -> StagedCorpus:
             continue
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.suffix == ".jsonl":
+            src.chmod(0o444)
             os.link(src, dst)
         else:
             shutil.copy2(src, dst)

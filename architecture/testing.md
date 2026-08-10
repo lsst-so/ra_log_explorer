@@ -122,8 +122,8 @@ exists to catch rather than an injected flag.
 |---|---|
 | URL → view routing, the base path (every asset and API call carrying the prefix, and paths outside it 404ing), the FAQ overlay | `test_shell.py` |
 | The instrument pin: default, persistence, URL precedence, night mode hidden for LATISS, the *same real dataId* resolving to shutter closes an hour apart on the two instruments, a pinned view excluding the other instrument's pods, Tonight filtering and link-carrying | `test_instrument.py` |
-| Timeline rendering and grouping, event placement in time order, re-anchoring t₀, the pod filter, the detail drawer (read back off disk) and its warn/error filter, collapse/expand, traceback flags, the incomplete-fetch banner, the task legend | `test_explore.py` |
-| Night stats against the real counts, errors by type and pod, histograms and the click-through from a bin to its dataIds, the failure drilldown fetching its traceback context, pod restarts, the gather-only banner | `test_night.py` |
+| Timeline rendering and grouping, event placement in time order, re-anchoring t₀, the pod filter, the detail drawer (read back off disk) and its warn/error filter, collapse/expand, traceback flags, a pod death drawing a full-height lifecycle marker with its kind in the tooltip, the incomplete-fetch banner, the task legend | `test_explore.py` |
+| Night stats against the real counts, errors by type and pod, histograms and the click-through from a bin to its dataIds, the failure drilldown fetching its traceback context, a real crash loop spelled out in the restarts table (`restart #6`, `ImagePullBackOff`) and attributed to the visit it interrupted, the gather-only banner | `test_night.py` |
 | dataId lookup and its debounce, both no-token and no-row failures, a hand-typed shutter close driving a fetch, the full fetch flow (form → job → SSE → parse → timeline) for exposure, night and range, the window pads reaching the fetch, ConsDB strings escaped | `test_home.py` |
 | The Tonight panel: hidden when live mode is off, ready vs waiting rows, the viewable count, catching-up / finalised status, every kind of live problem reaching the banner, the row cap and its expander, escaping, surviving `/api/live` failing — plus one end-to-end run of the real poller where an exposure crosses from "wait" to "view" and opening it slices the night | `test_tonight.py` |
 | The cache table's contents and links, single-window and whole-cache deletion (checked on disk, not just in the table), the confirmation being declinable, a deleted window booting its loaded view home, and the live night dir being absent from the listing | `test_admin.py` |
@@ -143,6 +143,7 @@ The unit tests target the deterministic pieces of the codebase:
 |--------------------|----------------------------------------------------------------------------|------------------------------------|
 | Log line parsing   | `parseLogLine` against the rapid-analysis Python log format and fallbacks (Z suffix, naive UTC, explicit offset, nano-precision trim, label-level priority, malformed JSON); `_normalizeLevel` warn/error alias buckets | `tests/test_parse.py`             |
 | Event classification | `classify` for every kind in [parsing.md](parsing.md), including `HEAD_INCOMING`, the `WORKER_REPORT_FAILED` variant, and the calibrate-quantum visit→expId fallback | `tests/test_parse.py`             |
+| Pod lifecycle       | `classifyK8sEvent` per kind (hand-written lines), the noise and non-Pod drops, and a whole **real** crash loop end to end: the classified sequence, the restart counter (`restart #6`) and node, the k8s reason and text surviving into the event (`ErrImagePull`, `ImagePullBackOff`, `pull QPS exceeded`), and the markers reaching `summarizePod` in time order with no dataId | `tests/test_parse.py`             |
 | Pod classification | `podGroup` (longest-prefix-match, order-independence regression, full real-pod fixture parametrisation), `podOrdinal`, `podInstrument`, `groupLabels` (defensive-copy contract) | `tests/test_parse.py`             |
 | Per-pod summary    | `summarizePod` against JSONL fixtures, including carryover (worker vs head), traceback capture (single, multi, chained, back-to-back, truncated body, no-class-line split into `<unclassified>` vs `<truncated>`, blank-line termination), per-dataId first/last/wait stats; `tagLinesWithExpId` empty-input edge case; `podsTouchingExp` no-match base case | `tests/test_parse.py`             |
 | Cache paths        | `windowCachePath` determinism + slug-cleaning + per-`podRegex` nesting; `ensureWindowCacheDir` is the only I/O side; `NIGHT_AOS_POD_REGEX` constant pin; `dayObsStartUtc`/`dayObsEndUtc` (UTC-12 rollover + 24 h invariant + year-boundary alignment) | `tests/test_config.py`            |
@@ -215,6 +216,17 @@ Sample Loki JSONL lines live under [tests/data/](../tests/data/):
   plus the donut tasks).
 - `traceback_sample.jsonl` — a small synthetic traceback so the
   detail-drawer logic has something to grab.
+- `pod_crash_events.jsonl` — one pod's whole `k8s/events` stream through
+  a real crash loop: five in-place restarts, a reschedule, then
+  `ImagePullBackOff`. Captured from BTS (dayObs 20260622) because the
+  nights we have pulled from the summit are healthy ones — theirs hold
+  `Started` and `Killing` and nothing else, and a crash is precisely what
+  these markers exist to explain. Only the timestamps are edited, onto
+  the night the browser tests' corpus covers, so the same file serves the
+  parser tests and gets planted into the corpus by
+  `StagedCorpus.plantPodCrash`. See
+  [parsing.md](parsing.md#pod-lifecycle-events-from-the-k8sevents-stream-not-the-app-log)
+  for which lifecycle kinds still have no real capture behind them.
 
 These are hand-trimmed from real cluster logs to keep the fixtures
 small and to make the test assertions specific. When you extend the

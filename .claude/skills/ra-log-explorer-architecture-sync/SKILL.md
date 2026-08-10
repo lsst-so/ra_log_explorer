@@ -68,8 +68,10 @@ those here and the chart needs to follow.
 | Module split / rename / new file under `ra_log_explorer/`         | `architecture/architecture.md` (the table + tree)                  |
 | Default window size, TAI/UTC handling                           | `architecture/architecture.md` ("Key Concepts") **and** README     |
 | New unit-test category or new fixture                           | `architecture/testing.md`                                           |
+| A new UI control, panel, or a renamed DOM id/class the tests select on | a **browser test** in `tests/ui/` — the selectors are a contract now, and a rename that only breaks a test is far cheaper than one that only breaks a user |
+| A change to the browser tests' corpus (re-cut windows, different pods) | `tests/data/ui/README.md` + the pinned constants in `tests/ui/corpus.py` + `architecture/testing.md` |
 | New CLI flag, renamed flag, or changed default                  | **README** (CLI options + workflow examples)                       |
-| New UI feature, browser-visible behaviour, or shipped style change | **README** ("What the UI shows" / "Common workflows")           |
+| New UI feature, browser-visible behaviour, or shipped style change | **README** ("What the UI shows" / "Common workflows") + a **browser test** covering it |
 | New troubleshooting failure mode or new env-var dependency      | **README** ("Troubleshooting" / "Configuration")                   |
 | A new / renamed / re-meaning'd environment variable             | `architecture/architecture.md` ("Configuration" table) + **README** ("Configuration") + **the Phalanx chart** (see above) |
 | Anything about how the app is deployed, or the local-vs-deployed split | `architecture/architecture.md` ("How it runs") + **CLAUDE.md**  |
@@ -95,7 +97,10 @@ Before you commit, ask yourself:
 2. Did I change *what* gets cached or *when* we reuse a cache? → `caching.md`
 3. Did I add or change a JSON field a client reads? → `architecture.md`
 4. Did I add a new module or move code between modules? → `architecture.md`
-5. Did I add a new test category? → `testing.md`
+5. Did I add a new test category or fixture? → `testing.md`
+5b. Did I add, move or rename anything in the UI — a control, a panel,
+   an element id or class? → a test in `tests/ui/`. "I clicked it once"
+   stopped being the evidence when those tests landed.
 6. Did I add a CLI flag, rename one, change a default, or alter
    user-visible UI behaviour? → `README.md`
 7. Did I introduce a new failure mode an end-user might hit
