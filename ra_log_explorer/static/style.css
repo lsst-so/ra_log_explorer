@@ -584,6 +584,12 @@ button.ghost.mini.delete:disabled {
   background: rgba(127, 127, 127, 0.12);
   color: var(--text-2);
 }
+#tonight-more { margin-top: 6px; }
+#tonight-more a {
+  color: var(--accent);
+  text-decoration: none;
+}
+#tonight-more a:hover { text-decoration: underline; }
 
 /* Inline progress region — rendered inside the form that launched
    the fetch (#fetch-form / #night-form). The progress bar + the

@@ -91,11 +91,13 @@ async function loadSite() {
 // ----- tonight (live mode) -------------------------------------------------
 
 // How many exposures the Tonight table shows before folding the rest into
-// a "…and N older" note. Older exposures stay reachable through the
-// ordinary exposure form; the panel is for what's happening *now*.
-const TONIGHT_MAX_ROWS = 150;
+// an expandable "…and N older" note — the panel is for what's happening
+// *now*, and the full night is one click away.
+const TONIGHT_MAX_ROWS = 20;
 const TONIGHT_REFRESH_MS = 30_000;
 let tonightTimerWired = false;
+let tonightShowAll = false;   // toggled by the "…and N older" note
+let tonightLastLive = null;   // last snapshot, so the toggle re-renders instantly
 
 async function refreshTonight() {
   let live;
@@ -125,6 +127,7 @@ function renderTonight(live) {
     card.hidden = true;
     return;
   }
+  tonightLastLive = live;
   card.hidden = false;
   const exposures = live.exposures || [];
   const nReady = exposures.filter((e) => e.ready).length;
@@ -156,7 +159,8 @@ function renderTonight(live) {
 
   const tbody = document.getElementById('tonight-tbody');
   tbody.innerHTML = '';
-  for (const exp of exposures.slice(0, TONIGHT_MAX_ROWS)) {
+  const shown = tonightShowAll ? exposures : exposures.slice(0, TONIGHT_MAX_ROWS);
+  for (const exp of shown) {
     const rec = exp.record || {};
     const closeS = (exp.obsEndUtc || '').replace('T', ' ').replace(/\..*$/, '');
     let statusCell;
@@ -184,8 +188,16 @@ function renderTonight(live) {
   const more = document.getElementById('tonight-more');
   if (exposures.length > TONIGHT_MAX_ROWS) {
     more.hidden = false;
-    more.textContent =
-      `…and ${exposures.length - TONIGHT_MAX_ROWS} older exposures — use the exposure form below to open one.`;
+    more.innerHTML = tonightShowAll
+      ? `showing all ${exposures.length} exposures from tonight — ` +
+        `<a href="#">show only the latest ${TONIGHT_MAX_ROWS}</a>`
+      : `…and ${exposures.length - TONIGHT_MAX_ROWS} older exposures — ` +
+        `<a href="#">show the full list from tonight</a>`;
+    more.querySelector('a').onclick = (ev) => {
+      ev.preventDefault();
+      tonightShowAll = !tonightShowAll;
+      renderTonight(tonightLastLive);
+    };
   } else {
     more.hidden = true;
   }

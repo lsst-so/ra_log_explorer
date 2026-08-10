@@ -99,13 +99,11 @@
         <section class="home-card">
           <h2>Explore a range of exposures</h2>
           <p class="hint">
-            Give a start and stop dataId. One Loki fetch covers the whole
-            span (shutter close of the start, through shutter close of the
-            stop plus the after-buffer) as a single cache block — far
-            cheaper than fetching each exposure's overlapping window
-            separately. Step through each exposure's timeline in the
-            explore view, anchored at its own shutter close. Skipped
-            integers in the range are expected and simply omitted.
+            Give a start and stop dataId to load a run of consecutive
+            exposures in one go, then step through each exposure's
+            timeline in the explore view, anchored at its own shutter
+            close. Skipped integers in the range are expected and simply
+            omitted.
           </p>
           <form id="range-form">
             <div class="row">
