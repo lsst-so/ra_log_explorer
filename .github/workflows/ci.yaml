@@ -37,19 +37,37 @@ jobs:
 
       - name: "Install dev dependencies"
         # Runtime deps: none (the package is stdlib-only). Dev tooling:
-        # pytest + pytest-cov for the suite + report; mypy is installed
-        # by the mypy job, not here.
+        # pytest + pytest-cov for the suite + report, and the ui-test
+        # extra (Playwright + xdist) for tests/ui/. mypy is installed by
+        # the mypy job, not here.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[ui-test]"
           python -m pip install pytest pytest-cov
 
+      - name: "Cache the Playwright browser"
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          # Keyed on the Playwright version: a new one wants a new build.
+          key: playwright-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: "Install Chromium"
+        # The browser tests fail rather than skip when this is missing,
+        # deliberately: a UI suite that quietly skips itself in CI reads
+        # exactly like one that passes.
+        run: python -m playwright install --with-deps chromium
+
       - name: "Run pytest with coverage"
-        # ``--cov-fail-under=85`` is a floor: the current value is ~91%,
+        # ``--cov-fail-under=85`` is a floor: the current value is ~93%,
         # so anything dropping below 85 means something material was lost.
         # Bump it if/when we add a substantial well-tested surface.
+        #
+        # ``-n auto`` because the browser tests parallelise almost
+        # perfectly: measured locally, adding all 81 of them to a
+        # ``-n 8`` run costs 0.1 s. Serial they would double the suite.
         run: |
-          pytest \
+          pytest -n auto \
             --cov=ra_log_explorer \
             --cov-report=xml \
             --cov-report=term \
@@ -65,7 +83,7 @@ jobs:
             echo "### pytest coverage"
             echo ""
             echo '```'
-            pytest --cov=ra_log_explorer --cov-report=term-missing tests/ 2>&1 \
+            pytest -n auto --cov=ra_log_explorer --cov-report=term-missing tests/ 2>&1 \
               | tail -25
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
@@ -89,7 +107,7 @@ jobs:
         # bundle even though we don't run the suite in this job.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[ui-test]"
           python -m pip install mypy pytest
       - name: "Run mypy"
         # mypy.ini at the repo root pins files= ra_log_explorer/, tests/

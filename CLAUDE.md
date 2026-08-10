@@ -65,6 +65,8 @@ ra_log_explorer/
     testing.md                   test scope, fixtures, dev loop
   tests/                       Unit tests + fixtures (pytest)
     data/                        sample Loki JSONL files
+    data/ui/july11.tar.gz        a real cut-down night; the browser tests' corpus
+    ui/                          Playwright browser tests (see testing.md)
   .claude/skills/              Per-project agent skills
   pyproject.toml, setup.cfg,
   mypy.ini, .pre-commit-config.yaml   ← lint/type-check config
@@ -187,9 +189,23 @@ The UI is plain HTML + CSS + JS, no build step. Edit
 directly; reload the browser. The server serves static files with
 `Cache-Control: no-store` so reloads pick up changes immediately.
 
-There's no UI test framework today; hand-verify in a browser. When you
-change the JSON API shape, update [architecture/architecture.md](architecture/architecture.md)
-and the matching JSON-handling code in `app.js` in the same commit.
+**The UI has browser tests** — [tests/ui/](tests/ui/), Playwright
+driving Chromium against the real server and a real (cut-down) night of
+captured logs. They run as part of `pytest`; they are not optional and
+they never skip. Add to them when you add UI behaviour: the whole point
+is that "I clicked through it once" stops being the only evidence.
+
+```bash
+pip install -e '.[ui-test]' && playwright install chromium   # once
+.venv/bin/pytest -n auto                                     # 32 s for everything
+```
+
+Hand-verification still has a job — layout, colour, whether a thing
+*reads* well — but not for "does this still work".
+
+When you change the JSON API shape, update
+[architecture/architecture.md](architecture/architecture.md) and the
+matching JSON-handling code in `app.js` in the same commit.
 
 ## Working on the parser
 

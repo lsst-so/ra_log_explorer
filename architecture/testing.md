@@ -1,17 +1,24 @@
 # Testing
 
-The project has three test layers:
+The project has four test layers:
 
 1. **Unit tests** under [tests/](../tests/) — pure-Python, no network
    or persistent filesystem state. Each test gets a per-test cache
    root via the `tmpCacheRoot` fixture so on-disk side effects don't
    leak between tests. Run with `pytest`.
-2. **Container smoke test** — building the image and exercising it under
+2. **Browser tests** under [tests/ui/](../tests/ui/) — Playwright
+   driving Chromium against the real server, the real cache on disk, and
+   a real (cut-down) night of captured logs. They cover the UI *and* the
+   integration behind it: a click goes through the actual HTTP handler,
+   parser and renderer, so an assertion about what is on screen is an
+   assertion about the whole stack. Run by `pytest` like everything
+   else. See *Browser tests* below.
+3. **Container smoke test** — building the image and exercising it under
    the conditions the deployment imposes (read-only root filesystem, a
    base path, configuration only from the environment). This is the one
    that covers *how the tool is actually run*, and nothing in the unit
    suite substitutes for it. See below.
-3. **End-to-end smoke test** — running against the real Loki cluster
+4. **End-to-end smoke test** — running against the real Loki cluster
    (and ConsDB for the shutter-close lookup) for a known dataId or
    dayObs, by hand, before declaring fetch-path work done.
 
@@ -45,6 +52,88 @@ pushes to `main`:
   today (the package + tests are both at 100% mypy body-coverage so
   any regression is already a deliberate change worth blocking on,
   but we haven't wired a threshold gate yet).
+
+## Browser tests
+
+[tests/ui/](../tests/ui/) drives Chromium at the real application with
+[Playwright](https://playwright.dev/python/). They are ordinary pytest
+tests, collected and run by a bare `pytest`; the `ui` marker exists only
+so they can be deselected (`-m "not ui"`), never so they can be
+forgotten.
+
+```sh
+pip install -e '.[ui-test]'     # pytest-playwright + pytest-xdist
+playwright install chromium     # once per machine
+pytest -n auto                  # everything, ~32 s
+```
+
+**They fail rather than skip when Playwright or the browser is
+missing** — a UI suite that skips itself is indistinguishable from one
+that passes, in a terminal and in CI alike. A missing package is an
+import error at collection; a missing browser is a single `UsageError`
+naming the install command. Both exit non-zero. CI installs both and
+runs the whole suite in one job for the same reason.
+
+`-n auto` is worth the habit: measured on an 8-core laptop, the unit
+tests take 75 s serially and 31 s in parallel, and adding all 81 browser
+tests to the parallel run costs **0.1 s** — they parallelise almost
+perfectly, where the unit suite does not. Serially they would double
+the suite.
+
+### What they run against
+
+One archive, [`tests/data/ui/july11.tar.gz`](../tests/data/ui/) (1.8 MB
+packed, ~20 MB unpacked), holding a cut-down but **entirely real** night:
+dayObs 20260711 on the summit, 32 pods across every pod group and both
+instruments, ~93k captured log lines at their real timestamps. Its
+[README](../tests/data/ui/README.md) explains how it was cut and how to
+rebuild it.
+
+It is laid out as a **live night dir**, which is the load-bearing
+choice: every other window a test needs — one exposure's, the AOS
+night's, a range's — is produced from it by the application's own
+slicing code, so a test that opens an exposure is looking at exactly the
+bytes a user would. A ~30-line fake `logcli` reads the same corpus for
+the tests that drive a real fetch, deliberately re-implementing the
+window filter so a bug in slicing cannot hide behind a fixture that
+shares it.
+
+Being real data pays off in places a synthetic fixture would not reach.
+The night's AOS workers fail often enough to populate the failures table
+and six distinct exception classes; a pod really does restart; and the
+time cut genuinely leaves two visits with step1b activity and no step1a,
+so the gather-only banner is tested against the exact condition it
+exists to catch rather than an injected flag.
+
+### The three ways a test drives the app
+
+- **End to end** — real server, staged cache, real clicks. The default,
+  and what makes these integration tests rather than DOM checks.
+- **Stubbed** (`page.route`) — canned `/api/*` payloads for states the
+  corpus cannot produce on demand: live mode catching up, a pod's fetch
+  failing, a night that could not be finalised, a hostile ConsDB string.
+- **In-browser evaluation** (`page.evaluate`) — reading computed
+  geometry, which is the only honest way to assert that events land in
+  the right place along a track.
+
+### What they cover
+
+| Area | File |
+|---|---|
+| URL → view routing, the base path (every asset and API call carrying the prefix, and paths outside it 404ing), the FAQ overlay | `test_shell.py` |
+| The instrument pin: default, persistence, URL precedence, night mode hidden for LATISS, the *same real dataId* resolving to shutter closes an hour apart on the two instruments, a pinned view excluding the other instrument's pods, Tonight filtering and link-carrying | `test_instrument.py` |
+| Timeline rendering and grouping, event placement in time order, re-anchoring t₀, the pod filter, the detail drawer (read back off disk) and its warn/error filter, collapse/expand, traceback flags, the incomplete-fetch banner, the task legend | `test_explore.py` |
+| Night stats against the real counts, errors by type and pod, histograms and the click-through from a bin to its dataIds, the failure drilldown fetching its traceback context, pod restarts, the gather-only banner | `test_night.py` |
+| dataId lookup and its debounce, both no-token and no-row failures, a hand-typed shutter close driving a fetch, the full fetch flow (form → job → SSE → parse → timeline) for exposure, night and range, the window pads reaching the fetch, ConsDB strings escaped | `test_home.py` |
+| The Tonight panel: hidden when live mode is off, ready vs waiting rows, the viewable count, catching-up / finalised status, every kind of live problem reaching the banner, the row cap and its expander, escaping, surviving `/api/live` failing — plus one end-to-end run of the real poller where an exposure crosses from "wait" to "view" and opening it slices the night | `test_tonight.py` |
+| The cache table's contents and links, single-window and whole-cache deletion (checked on disk, not just in the table), the confirmation being declinable, a deleted window booting its loaded view home, and the live night dir being absent from the listing | `test_admin.py` |
+| The range navigator: a chip per exposure, stepping by button and arrow key re-anchoring the timeline to each exposure's own shutter close, jumping by chip, failure flags | `test_range.py` |
+
+The corpus's pinned facts — the shared dataId, its two shutter closes,
+the range bounds — live in [`tests/ui/corpus.py`](../tests/ui/corpus.py)
+rather than in the tests, so rebuilding the archive has one place to
+re-check.
+
 
 ## Unit-test scope
 
@@ -82,6 +171,7 @@ The unit tests target the deterministic pieces of the codebase:
 | CLI parsing        | `_parseIsoUtc` for Z / no-offset / explicit-offset (positive and negative) / microseconds; `_isoForLogcli` Z suffix + UTC conversion; TAI constant pin; subparser arg parsing + `--t-zero-utc` flag; partial-args rejection; eager-fetch TAI→UTC conversion and `--t-zero-utc` opt-out; `--force-refresh` reaches fetchAll; `_warnIfIncompleteFetch` silent-when-clean / shouts on hard `errors` / shouts on soft `incomplete_pods` / caps the list; `cache info` / `cache flush` behaviour (with-yes / decline-prompt / empty-cache-root / night-mode `pods=<slug>` row surfacing) | `tests/test_cli.py`               |
 | Live night cache   | `currentDayObs` (noon-UTC rollover, inverse of `dayObsStartUtc`); `firstOffsetAtOrAfter` byte-bisect (exact line start, between lines, before-all, after-all, torn-write-beyond-limit invisibility); `findNightDirCovering` watermark/cluster gating; `materializeNightSlice` (half-open boundary exactness, first-class result that exact-hits on repeat, `podRegex` filtering into the nested `pods=` dir, fall-short-map inheritance scoped to the filter, lifecycle-event slicing by its own byte count and only for pods with app logs, pruning files a failed attempt stranded, `.partial` surviving a failure); `fetchAll` integration (slice served with no `_run_logcli` call, in-progress night's own window clamped to the watermark + exact reuse at an unchanged watermark, arbitrary past-watermark windows falling through to a real fetch, an exact cache beating the slice path, the night's own window handed over rather than sliced into itself, a fresh fetch into a live dir refused, four concurrent `fetchAll`s for one window serialised to one writer); `_sliceFileByTime` refusing `src == dst`; `findSupersetCache` refusing live-built dirs | `tests/test_live.py`              |
 | Instrument threading | `_instrumentFromBody` default/normalise/validate; `_podBelongsToInstrument` rules; exposure payload filters `pods` + `podsAll` by the state's instrument (and filters nothing when unpinned); `queryExposureRecordBatch` pinned never falls through to another table; `_resolveShutterClosesInto` pin reaches both the cache lookups (colliding id anchors to the pinned instrument's t₀) and the ConsDB batch; night prefetch hard-pins `lsstcam`, range prefetch pins the job's instrument; `_loadExposureFromCache` refuses a window that doesn't contain the pinned t₀ and stamps the rebuilt state; range per-exposure payload filters by the range's instrument; `manualRecord` instrument stamping round-trips through the cache. Endpoint level: POST bodies validate the name (400 unknown), the fetch's instrument lands on the state and payload, defaults to `lsstcam`, a manual t₀ is stamped, and `/api/summary?instrument=` refuses a same-id state pinned to the other instrument while unpinned requests still serve | `tests/test_server.py`, `tests/test_server_endpoints.py`, `tests/test_exposure_times.py` |
+| Browser (UI)       | Chromium against the real app over a real cut-down night — routing, the base path, the instrument pin, the timeline, the night view, the forms and fetch flow, the Tonight panel, the cache admin table, and the range navigator. See *Browser tests* above for the breakdown | `tests/ui/` |
 | Live poller        | `LiveNightManager.tick` driven with stubbed fetch edges: increments tile across ticks — asserted on the *windows requested*, not just the bytes, since the stub applies half-open semantics itself and would mask an off-by-one; a failed pod pins the global watermark and self-heals by refetching its whole missed span (including the pod-fails-on-first-fetch case); pods absent from the listing advance for free (a dead pod can't pin the night); readiness follows the watermark and persists records to the per-site exposure-time cache; colliding ids from two instruments both appear and cache separately; restart recovery truncates unrecorded (torn) bytes, clears stranded temp files, and migrates legacy event-only pods; noon rollover finalises (`_meta.json`, `liveBuilt`, sidecar `finalised`) and moves to the new night; the verification pass refetches a pod beyond the dedup-slack tolerance, leaves one within it alone, keeps an incompleteness flag its own refetch set, and publishes zero durable bytes before swapping the file; a night left unfinalised by a restart across noon is swept up on a later tick (and a failure to do so is reported, not fatal); a cache wipe under the poller re-opens the night instead of wedging it; `_runLoop` survives a failing tick; `--live-day-obs` pins the night and adopts an already-finalised one without re-fetching | `tests/test_live.py`              |
 | k8s/events demux   | The namespace-wide events stream is demuxed by `name` into `pods_events/`, deliberately including non-Pod objects: a new name must not drag the global watermark back to night start, it is filed in `eventPods` with no watermark of its own, it promotes into `pods` (carrying its counters) when it first emits app logs, and `pods.txt` stays the app-log pod list. Failure handling: a failed fetch leaves the events watermark alone without blocking app logs, and a failed *append* rolls every file back so the retry can't duplicate lines. Plus the tolerance the breadth relies on — `summarizeAll` never opens a lifecycle file with no app-log sibling, and `classifyK8sEvent` declines a non-Pod event | `tests/test_live.py`              |
 
@@ -90,10 +180,18 @@ The unit tests target the deterministic pieces of the codebase:
 - The actual `logcli` subprocess invocation — the wrapper is
   thoroughly mocked but a real Loki round-trip only happens during
   the smoke test. CI doesn't have a Loki instance.
-- The browser UI itself (including the Tonight panel). We rely on
-  hand verification.
-- The full end-to-end fetch+UI flow with real Loki traffic. That's
-  the smoke test.
+- The full end-to-end fetch+UI flow with **real Loki traffic**. The
+  browser tests stand `logcli` in for a cluster; the subprocess boundary
+  itself is only exercised by the smoke test.
+- **Scale.** The browser tests' corpus has ~6 SFM pods where a real
+  LSSTCam visit fans out to ~189. Correctness is covered; how a 435-row
+  timeline renders and performs is not.
+- **Browsers other than Chromium**, pixel-level appearance, responsive
+  layouts, and accessibility beyond what the DOM assertions incidentally
+  touch. Adding Firefox/WebKit is a one-line config change if it ever
+  matters; screenshot diffing was considered and rejected — font and
+  platform differences make it flaky enough to get ignored, which is
+  worse than not having it.
 - The live poller against real Loki — its fetch edges are stubbed in
   the unit tests; real ticks are exercised by running the container
   with `RA_LOG_EXPLORER_LIVE_POLL_S` set (see the container smoke
@@ -129,14 +227,15 @@ parsed event.
 From the repo root, with the venv active or its tools on `$PATH`:
 
 ```bash
-.venv/bin/pytest -q
+.venv/bin/pytest -q -n auto
 .venv/bin/mypy
 .venv/bin/mypy-coverage     # body-coverage target: 100%
 .venv/bin/pre-commit run --all-files
 ```
 
 The runtime itself is stdlib-only; pytest / mypy / black / isort /
-flake8 are dev-only dependencies that live in the venv.
+flake8 are dev-only dependencies that live in the venv, as are
+Playwright and pytest-xdist (the `ui-test` extra).
 
 ## End-to-end smoke test
 

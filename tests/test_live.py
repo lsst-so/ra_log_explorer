@@ -500,12 +500,12 @@ def test_concurrent_fetchAll_for_one_window_is_serialised(
     monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no net")))
 
     results: list[tuple[Path, dict]] = []
-    errors: list[BaseException] = []
+    errors: list[Exception] = []
 
     def run() -> None:
         try:
             results.append(fetch.fetchAll(spec))
-        except BaseException as e:  # noqa: BLE001 — surfaced by the assert below
+        except Exception as e:  # noqa: BLE001 — collected, then asserted on below
             errors.append(e)
 
     threads = [threading.Thread(target=run) for _ in range(4)]

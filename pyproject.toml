@@ -27,6 +27,18 @@ include = ["ra_log_explorer*"]
 # install can find them via ``Path(__file__).parent / "static"``.
 ra_log_explorer = ["static/*", "templates/*"]
 
+[project.optional-dependencies]
+# The browser tests (tests/ui/). Deliberately an extra rather than a
+# hard dependency: the runtime is stdlib-only and installing a browser
+# is not something a deployment should ever be asked to do. But once
+# selected they never skip — see tests/ui/conftest.py.
+ui-test = ["pytest-playwright", "pytest-xdist"]
+
+[tool.pytest.ini_options]
+markers = [
+    "ui: browser tests (tests/ui/); need `pip install -e '.[ui-test]'` + `playwright install chromium`",
+]
+
 [tool.isort]
 profile = "black"
 line_length = 110
