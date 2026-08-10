@@ -291,6 +291,8 @@ def test_the_set_of_environment_variables_is_pinned() -> None:
     assert found == {
         "RA_LOG_EXPLORER_BASE_PATH",
         "RA_LOG_EXPLORER_CACHE",
+        "RA_LOG_EXPLORER_LIVE_LAG_S",
+        "RA_LOG_EXPLORER_LIVE_POLL_S",
         "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
         "RA_LOG_EXPLORER_SITES_FILE",
         "RA_LOG_EXPLORER_WINDOW_AFTER_S",

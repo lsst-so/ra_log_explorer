@@ -79,15 +79,22 @@ The unit tests target the deterministic pieces of the codebase:
 | Job manager        | `FetchJob` event ordering, status transitions (pending→running→parsing→done), error path captures terminal `error` event, `onComplete` fires before `done` (verified by snapshotting `len(events)` from inside the callback), `startJob` runs in background, condvar wake. `createNightJob` distinct shape. `runJob` populates `cacheDir`/`meta`. `stateLock` is a real Lock (not RLock). | `tests/test_jobs.py`              |
 | HTTP endpoints     | Spins up the real server on an ephemeral port and hits it with `http.client`. Covers: `/api/summary` (empty / by-dataId / by-dayObs / 400-on-bad-int / mode-discriminator / LRU touch on hit), `/api/cache` (lists exposure + night, partial skipping, sidecar fields surfaced), `/api/fetch` + `/api/fetch-night` (body validation, 202 + status polling to done, NightState populated, podRegex on night spec), `/api/pod` (400 no key, 404 not loaded, valid-name allowlist), `/api/exposure-time/<>` (200 / 404 / 503-no-token / 503-empty-token / cache short-circuit / cache write / a `?site=` query param ignored), `/api/night/traceback/<key>` (dataId-block context, time-window fallback, 404 unknown bodyKey, 400 bad-int dayObs), `DELETE /api/cache` (all + single + path-traversal-rejection + state-cleared-when-matching), `/api/site` (the served site, no token path echoed) and `/api/sites` gone, the base-path routing (probe + API + static assets + SSE under the prefix, 404 outside it and for partial prefixes, multi-segment prefixes, query strings surviving the strip, index substitution, window fields tracking the configured defaults, no configuration fields in the HTML), `/healthz` still answering while a fetch worker is parked mid-`fetchAll`, SSE `/api/fetch/<id>/progress` (history replay + terminal close + 404), `_buildSpecFromRequest` (TAI/UTC, body-supplied site / credentials ignored, validation errors), `_prefetchNightShutterCloses` (no-token, consdb-error, short-circuit-when-empty) | `tests/test_server_endpoints.py` |
 | CLI parsing        | `_parseIsoUtc` for Z / no-offset / explicit-offset (positive and negative) / microseconds; `_isoForLogcli` Z suffix + UTC conversion; TAI constant pin; subparser arg parsing + `--t-zero-utc` flag; partial-args rejection; eager-fetch TAI→UTC conversion and `--t-zero-utc` opt-out; `--force-refresh` reaches fetchAll; `_warnIfIncompleteFetch` silent-when-clean / shouts on hard `errors` / shouts on soft `incomplete_pods` / caps the list; `cache info` / `cache flush` behaviour (with-yes / decline-prompt / empty-cache-root / night-mode `pods=<slug>` row surfacing) | `tests/test_cli.py`               |
+| Live night cache   | `currentDayObs` (noon-UTC rollover, inverse of `dayObsStartUtc`); `firstOffsetAtOrAfter` byte-bisect (exact line start, between lines, before-all, after-all, torn-write-beyond-limit invisibility); `findNightDirCovering` watermark/cluster gating; `materializeNightSlice` (half-open boundary exactness, first-class result that exact-hits on repeat, `podRegex` filtering into the nested `pods=` dir, fall-short-map inheritance scoped to the filter); `fetchAll` integration (slice served with no `_run_logcli` call, in-progress night's own window clamped to the watermark + exact reuse at an unchanged watermark, arbitrary past-watermark windows falling through to a real fetch); `findSupersetCache` refusing live-built dirs | `tests/test_live.py`              |
+| Live poller        | `LiveNightManager.tick` driven with stubbed fetch edges: increments tile across ticks (no duplicate, no gap); a failed pod pins the global watermark and self-heals by refetching its whole missed span (including the pod-fails-on-first-fetch case); pods absent from the listing advance for free (a dead pod can't pin the night); readiness follows the watermark and persists records to the per-site exposure-time cache; restart recovery truncates unrecorded (torn) bytes; noon rollover finalises (`_meta.json`, `liveBuilt`, sidecar `finalised`) and moves to the new night; the verification pass refetches a pod beyond the dedup-slack tolerance and leaves one within it alone | `tests/test_live.py`              |
 
 ### What we don't unit-test
 
 - The actual `logcli` subprocess invocation — the wrapper is
   thoroughly mocked but a real Loki round-trip only happens during
   the smoke test. CI doesn't have a Loki instance.
-- The browser UI itself. We rely on hand verification.
+- The browser UI itself (including the Tonight panel). We rely on
+  hand verification.
 - The full end-to-end fetch+UI flow with real Loki traffic. That's
   the smoke test.
+- The live poller against real Loki — its fetch edges are stubbed in
+  the unit tests; real ticks are exercised by running the container
+  with `RA_LOG_EXPLORER_LIVE_POLL_S` set (see the container smoke
+  test below) and watching `/api/live`'s watermark advance.
 
 ## Fixtures
 
@@ -183,11 +190,15 @@ logcli --username=… --addr=… --quiet instant-query \
   --now=<toIso> -o jsonl
 ```
 
-They should agree to within a handful of lines (the count covers
-`(from,to]`, the fetch `[from,to)`, so they differ only at the window
-edges). A gap of percent-scale means a regression — that's exactly the
+They should agree to ~0.03% — the oracle runs a stable *hair high*
+against a byte-perfect fetch because metric queries count duplicate
+entries in overlapping storage chunks that the log path deduplicates
+(verified on 20260711: refetching a "short" pod reproduces identical
+bytes). A gap of percent-scale means a regression — that's exactly the
 symptom #17270 produced before the chunker. (Live 2026-06-05, a 2 h busy
 window: chunker 56212 vs oracle 56227; the old `--limit=0` got 54091.)
+The live poller's finalisation audit codifies this as
+`live.VERIFY_TOLERANCE_*`.
 
 The first run for a given window takes 60–90 s (exposure) to
 several minutes (night). A second run for the same — or any
@@ -238,3 +249,9 @@ Worth checking, in this order — each one has failed for real:
 - `docker exec … logcli --version` reports the pinned version, and a
   query against the real Loki fails with a `401` rather than a TLS
   error — the latter would mean the image has no CA bundle.
+- `GET /log-explorer/api/live` → `{"enabled": false}` when
+  `RA_LOG_EXPLORER_LIVE_POLL_S` is unset. For live-path work, re-run
+  with it set (plus a real `LOKI_PASSWORD`) and watch the snapshot: the
+  watermark should advance by one poll interval per tick, `catchingUp`
+  should clear once the backfill lands, and a quiet namespace should
+  advance cleanly with zero pods rather than error.

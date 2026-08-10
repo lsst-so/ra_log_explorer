@@ -50,7 +50,10 @@ ra_log_explorer/
   ra_log_explorer/             ← Python package (runtime is stdlib-only)
     config.py                    cache paths, FetchSpec, defaults
     fetch.py                     logcli wrapper, parallel per-pod fetch, cache
+                                 + live-night slicing (timestamp bisect)
     parse.py                     log line parser + event classifier
+    live.py                      live-mode poller: keeps the current night
+                                 fetched so views are served from disk
     server.py                    stdlib HTTP server + JSON API
     cli.py                       argument parsing + composition
     static/                      vanilla-JS UI (app.js, style.css)

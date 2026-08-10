@@ -103,6 +103,15 @@ back full and logcli asks for another. `_fetchOnePod` exploits that:
   exact oracle. It's a *server-side aggregation* (no entry pagination), so
   it's immune to the bug — `1717 == 1717` on a complete window. Use it to
   presize chunks (target `CHUNK_TARGET_LINES`, below the batch size).
+  One caveat when using it to *audit* a fetch: the metric path counts
+  duplicate entries sitting in overlapping storage chunks that the
+  log-query path deduplicates, so on real nights the oracle runs a
+  stable ~0.03% (tens of lines per pod) *high* against a byte-perfect
+  fetch — verified by refetching (identical bytes) and by fetching the
+  padded sliver (empty). Never treat a small `expected > got` as data
+  loss; `live.VERIFY_TOLERANCE_*` is the tolerance the finalisation
+  audit uses. (It can never run *low*, which is what chunk presizing
+  and the zero-count short-circuit rely on.)
   Mind the interval mismatch: a `[range]` selector at `--now=to` covers
   `(to - range, to]`, but the fetch covers `[from, to)`. Round the range
   **up** and pad it (we add 1 ms) so the count is a strict superset —

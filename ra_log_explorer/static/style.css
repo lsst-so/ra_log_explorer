@@ -489,6 +489,63 @@ button.ghost.mini.delete:disabled {
   color: var(--text-2);
 }
 
+/* Tonight panel (live mode) — same table treatment as the cache list,
+   but rows are only clickable through their dataId link. */
+#tonight-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin-top: 4px;
+}
+#tonight-table th,
+#tonight-table td {
+  text-align: left;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+#tonight-table th {
+  background: var(--surface-sub);
+  color: var(--text-2);
+  font-weight: 600;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+#tonight-table tbody tr:hover { background: var(--surface-sub); }
+#tonight-table tbody tr:last-child td { border-bottom: 0; }
+#tonight-table a.mono {
+  color: var(--accent);
+  text-decoration: none;
+}
+#tonight-table a.mono:hover { text-decoration: underline; }
+.tonight-reason {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+}
+.tonight-chip {
+  display: inline-block;
+  font-size: 10px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.tonight-ready {
+  background: rgba(77, 146, 33, 0.14);
+  color: #35670f;
+}
+.tonight-wait {
+  background: rgba(127, 127, 127, 0.12);
+  color: var(--text-2);
+}
+
 /* Inline progress region — rendered inside the form that launched
    the fetch (#fetch-form / #night-form). The progress bar + the
    single-line status text live together; no rolling pod log. */

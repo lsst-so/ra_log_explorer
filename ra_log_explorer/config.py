@@ -82,6 +82,19 @@ BASE_PATH_ENV = "RA_LOG_EXPLORER_BASE_PATH"
 # pathologically wide Loki window.
 MAX_RANGE_SPAN = 500
 
+# Live mode: a deployed instance polls Loki on this interval, keeping a
+# rolling all-pods cache of the current night hot so exposure views are
+# served by slicing rather than fetching. 0 (the local default) disables
+# it — live mode only makes sense where the process runs continuously
+# next to the data, so the deployment turns it on via the Helm chart.
+LIVE_POLL_S = _envFloat("RA_LOG_EXPLORER_LIVE_POLL_S", 0.0)
+# How far behind "now" each live increment stops. Loki ingestion is not
+# instantaneous; a line stamped t can arrive seconds later, and an
+# increment that raced it would miss it forever (the next increment
+# starts strictly after). The lag keeps the fetch frontier behind the
+# ingestion frontier.
+LIVE_LAG_S = _envFloat("RA_LOG_EXPLORER_LIVE_LAG_S", 60.0)
+
 
 def normalizeBasePath(raw: str | None) -> str:
     """Normalize a URL prefix to the one form the router and template agree on.
@@ -178,6 +191,17 @@ def dayObsStartUtc(dayObs: int) -> dt.datetime:
 def dayObsEndUtc(dayObs: int) -> dt.datetime:
     """Return the UTC end (exclusive) of the given ``dayObs``."""
     return dayObsStartUtc(dayObs) + dt.timedelta(hours=24)
+
+
+def currentDayObs(now: dt.datetime) -> int:
+    """Return the dayObs that ``now`` (an aware UTC datetime) falls in.
+
+    Inverse of :func:`dayObsStartUtc`: the observatory's calendar rolls
+    over at UTC-12, so anything before noon UTC still belongs to the
+    previous calendar date's night.
+    """
+    shifted = now.astimezone(dt.timezone.utc) - dt.timedelta(hours=12)
+    return int(shifted.strftime("%Y%m%d"))
 
 
 # LogQL pod-regex used by night mode to scope the 24h fetch to AOS-flavoured

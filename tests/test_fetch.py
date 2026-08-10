@@ -612,7 +612,8 @@ def test_countOverTime_builds_instant_query_and_parses(monkeypatch: pytest.Monke
     monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
     fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
     toT = dt.datetime(2026, 5, 20, 8, 0, 5, tzinfo=dt.timezone.utc)
-    n = fetch._countOverTime(_stubSpec(), "pod-x", fromT, toT)
+    spec = _stubSpec()
+    n = fetch._countOverTime(spec, fetch._matcher(spec, pod="pod-x"), fromT, toT)
     assert n == 42
     args = captured["args"]
     assert args[0] == "instant-query"

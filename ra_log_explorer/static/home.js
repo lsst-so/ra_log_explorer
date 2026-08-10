@@ -35,6 +35,8 @@ function startHome() {
   prefillForm();
   loadSite();
   refreshCache();
+  refreshTonight();
+  wireTonightTimer();
   // URL-driven entry. We land here either via a deep-link
   // (/?dataId=…&autoFetch=1) or because the URL points at a key the
   // server hasn't loaded yet — in both cases we want the form
@@ -84,6 +86,109 @@ async function loadSite() {
   const info = document.getElementById('site-info');
   if (info) info.textContent = `consdb=${site.consdbUrl.replace(/^https?:\/\//, '')}`;
   document.getElementById('site-badge').hidden = false;
+}
+
+// ----- tonight (live mode) -------------------------------------------------
+
+// How many exposures the Tonight table shows before folding the rest into
+// a "…and N older" note. Older exposures stay reachable through the
+// ordinary exposure form; the panel is for what's happening *now*.
+const TONIGHT_MAX_ROWS = 150;
+const TONIGHT_REFRESH_MS = 30_000;
+let tonightTimerWired = false;
+
+async function refreshTonight() {
+  let live;
+  try {
+    const r = await fetch(apiUrl('/api/live'));
+    if (!r.ok) return;
+    live = await r.json();
+  } catch (_) {
+    return;  // leave whatever is rendered; next poll retries
+  }
+  renderTonight(live);
+}
+
+function wireTonightTimer() {
+  if (tonightTimerWired) return;
+  tonightTimerWired = true;
+  setInterval(() => {
+    // Only poll while the home view is actually on screen — an explore
+    // tab doesn't need the panel refreshed behind its back.
+    if (!document.getElementById('home-view').hidden) refreshTonight();
+  }, TONIGHT_REFRESH_MS);
+}
+
+function renderTonight(live) {
+  const card = document.getElementById('tonight-card');
+  if (!live || !live.enabled) {
+    card.hidden = true;
+    return;
+  }
+  card.hidden = false;
+  const exposures = live.exposures || [];
+  const nReady = exposures.filter((e) => e.ready).length;
+  document.getElementById('tonight-summary').textContent =
+    `dayObs ${live.dayObs ?? '?'} · ${exposures.length} exposure${exposures.length === 1 ? '' : 's'}` +
+    (exposures.length ? ` · ${nReady} viewable` : '');
+
+  const watermarkS = (live.watermark || '').replace('T', ' ').replace(/\..*Z?$/, '');
+  let statusText;
+  if (live.finalised) {
+    statusText = `night complete · logs fetched through ${watermarkS}Z`;
+  } else if (live.catchingUp) {
+    statusText = `catching up — logs fetched through ${watermarkS}Z so far`;
+  } else {
+    statusText = `logs fetched through ${watermarkS}Z · refreshes every ${Math.round(live.pollSeconds)}s`;
+  }
+  document.getElementById('tonight-status').textContent = statusText;
+
+  const banner = document.getElementById('tonight-banner');
+  const problems = [];
+  const nErr = Object.keys(live.errors || {}).length;
+  const nInc = Object.keys(live.incompletePods || {}).length;
+  if (nErr) problems.push(`${nErr} pod${nErr === 1 ? '' : 's'} with fetch failures`);
+  if (nInc) problems.push(`${nInc} pod${nInc === 1 ? '' : 's'} with unverifiable chunks`);
+  if (live.consdbError) problems.push(`ConsDB: ${live.consdbError}`);
+  if (live.lastError) problems.push('last poll cycle failed (see server log)');
+  banner.hidden = problems.length === 0;
+  banner.textContent = problems.length ? `Live fetch problems — ${problems.join(' · ')}` : '';
+
+  const tbody = document.getElementById('tonight-tbody');
+  tbody.innerHTML = '';
+  for (const exp of exposures.slice(0, TONIGHT_MAX_ROWS)) {
+    const rec = exp.record || {};
+    const closeS = (exp.obsEndUtc || '').replace('T', ' ').replace(/\..*$/, '');
+    let statusCell;
+    if (exp.ready) {
+      statusCell = '<span class="tonight-chip tonight-ready">view</span>';
+    } else if (exp.readyAtUtc && live.watermark) {
+      const waitS = Math.max(0, (Date.parse(exp.readyAtUtc) - Date.parse(live.watermark)) / 1000);
+      statusCell = `<span class="tonight-chip tonight-wait">ready in ~${Math.ceil(waitS / 60)} min</span>`;
+    } else {
+      statusCell = '<span class="tonight-chip tonight-wait">in progress</span>';
+    }
+    const idCell = exp.ready
+      ? `<a class="mono" href="${escapeHtml(apiUrl(`/?dataId=${exp.dataId}&autoFetch=1`))}">${exp.dataId}</a>`
+      : `<span class="mono">${exp.dataId}</span>`;
+    const tr = document.createElement('tr');
+    tr.innerHTML =
+      `<td>${idCell}</td>` +
+      `<td class="mono">${escapeHtml(closeS)}</td>` +
+      `<td>${escapeHtml(rec.img_type || '')}</td>` +
+      `<td>${escapeHtml(rec.physical_filter || '')}</td>` +
+      `<td class="tonight-reason">${escapeHtml(rec.observation_reason || '')}</td>` +
+      `<td>${statusCell}</td>`;
+    tbody.appendChild(tr);
+  }
+  const more = document.getElementById('tonight-more');
+  if (exposures.length > TONIGHT_MAX_ROWS) {
+    more.hidden = false;
+    more.textContent =
+      `…and ${exposures.length - TONIGHT_MAX_ROWS} older exposures — use the exposure form below to open one.`;
+  } else {
+    more.hidden = true;
+  }
 }
 
 function waitAndAutoFetch(expId) {

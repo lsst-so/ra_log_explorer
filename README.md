@@ -270,7 +270,10 @@ The browser app has three views:
 - **Home view** — the landing page when nothing is loaded. Hosts the
   three fetch forms (single exposure, a range of exposures, an
   investigate-night), the cached-runs table, and the live progress bar
-  for an in-flight fetch.
+  for an in-flight fetch. On a deployment running live mode it also
+  shows the **Tonight** panel: every exposure taken so far tonight,
+  newest first, with a ready/wait status chip — see *Live mode
+  (deployments)* below.
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is
@@ -472,6 +475,9 @@ The first loads after such an upgrade re-fetch and so are slower.
                          (default $RA_LOG_EXPLORER_BASE_PATH, else the root)
 --no-serve               with --exposure-id: fetch + parse only, no UI
 --no-browser             launch the UI but don't auto-open a browser tab
+--live-poll-s SECONDS    live mode: continuously fetch the current night so
+                         exposure views load instantly; 0 = off
+                         (default $RA_LOG_EXPLORER_LIVE_POLL_S, else 0)
 ```
 
 `--base-path` exists for deployments that share a hostname with other
@@ -504,6 +510,8 @@ last change how everyone else's fetches behave.
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_SITES_FILE` | which site catalog to load | the packaged `sites.toml` |
 | `RA_LOG_EXPLORER_BASE_PATH` | URL prefix to serve under | `""` (the root) |
+| `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables | `0` (off) |
+| `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* live fetches stop | `60` |
 
 Most have a matching CLI flag (`--workers`, `--window-after`, `--site`,
 `--base-path`, …) that wins over the environment for a one-off run.
@@ -527,6 +535,32 @@ instant.
 
 The cache layout, reuse rules, and `.partial` flag are described in
 [architecture/caching.md](architecture/caching.md).
+
+## Live mode (deployments)
+
+The deployed instances run with `RA_LOG_EXPLORER_LIVE_POLL_S` set, which
+turns on **live mode**: the server continuously fetches the current
+night's logs (all pods, every few minutes) into its cache, and the home
+page grows a **Tonight** panel listing every exposure taken so far —
+newest first, with what kind of image it is and whether its logs are
+ready. An exposure becomes *ready* when the full default window
+(shutter close + 5 minutes) is on disk; clicking it opens the ordinary
+explore view, served by slicing the already-fetched night rather than
+by a fresh Loki query, so it loads in seconds even mid-night.
+
+The panel header shows how far the night has been fetched ("logs
+fetched through …"). A freshly-restarted server shows *catching up*
+while it backfills from noon UTC; a red banner appears if any pod's
+fetch is failing or ConsDB can't be reached.
+
+The night view benefits too: opening the *current* night's dayObs no
+longer re-fetches hours of AOS logs from Loki — it slices "the night so
+far" out of the live cache (the parse still takes a little while for a
+busy night, but the minutes-long fetch is gone).
+
+Locally, live mode is off by default (an ordinary laptop run shouldn't
+be quietly pulling gigabytes per night). `--live-poll-s 180` turns it
+on for development against a real cluster.
 
 ## Troubleshooting
 

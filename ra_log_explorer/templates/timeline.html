@@ -33,6 +33,26 @@
 
     <div id="home-layout">
       <main id="home-main">
+        <section class="home-card" id="tonight-card" hidden>
+          <h2>Tonight <span class="muted" id="tonight-summary"></span></h2>
+          <div id="tonight-status" class="hint"></div>
+          <div id="tonight-banner" class="fetch-banner" hidden></div>
+          <table id="tonight-table">
+            <thead>
+              <tr>
+                <th>dataId</th>
+                <th>shutter close</th>
+                <th>type</th>
+                <th>filter</th>
+                <th>reason</th>
+                <th>status</th>
+              </tr>
+            </thead>
+            <tbody id="tonight-tbody"></tbody>
+          </table>
+          <div id="tonight-more" class="hint" hidden></div>
+        </section>
+
         <section class="home-card">
           <h2>Explore exposure processing</h2>
           <form id="fetch-form">

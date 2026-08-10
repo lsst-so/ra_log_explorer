@@ -44,6 +44,8 @@ from .config import (
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
     DEFAULT_WORKERS,
+    LIVE_LAG_S,
+    LIVE_POLL_S,
     FetchSpec,
     cache_root,
     defaultBasePath,
@@ -119,6 +121,14 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
         help="Seconds after t-zero to end the fetch window",
     )
     p.add_argument("--force-refresh", action="store_true", help="Re-fetch even if cached results exist")
+    p.add_argument(
+        "--live-poll-s",
+        type=float,
+        default=LIVE_POLL_S,
+        help="Poll interval (seconds) for live mode, which keeps the current "
+        "night's logs continuously fetched so exposure views load instantly. "
+        "0 disables it. Defaults to $RA_LOG_EXPLORER_LIVE_POLL_S, or 0.",
+    )
 
 
 def _resolveSite(args: argparse.Namespace) -> Site:
@@ -266,6 +276,26 @@ def cmdRun(args: argparse.Namespace) -> int:
 
     basePath = normalizeBasePath(args.base_path)
     ctx = ServerContext(jobs=JobManager(), sites=sites, siteName=site.name, basePath=basePath)
+    if args.live_poll_s > 0:
+        # Live mode: keep the current night hot on disk so exposure
+        # views are served by slicing. Deployment-only in practice (the
+        # chart sets RA_LOG_EXPLORER_LIVE_POLL_S); the flag exists so a
+        # laptop can exercise the same path against a real cluster.
+        from .live import LiveNightManager
+
+        ctx.live = LiveNightManager(
+            site=site,
+            username=args.username,
+            workers=args.workers,
+            pollS=args.live_poll_s,
+            lagS=LIVE_LAG_S,
+        )
+        ctx.live.start()
+        print(
+            f"Live mode: polling {site.name} every {args.live_poll_s:.0f}s "
+            f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot.",
+            file=sys.stderr,
+        )
     if state is not None:
         ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}{basePath}/"

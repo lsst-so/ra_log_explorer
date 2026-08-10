@@ -71,6 +71,7 @@ from .fetch import (
     markCacheViewed,
 )
 from .jobs import FetchJob, JobManager
+from .live import LiveNightManager
 from .sites import Site, SitesConfigError, siteByCluster, siteByName
 
 STATIC_DIR = Path(__file__).parent / "static"
@@ -243,6 +244,10 @@ class ServerContext:
     jobs: JobManager
     sites: list[Site] = field(default_factory=list)
     siteName: str = ""
+    # The live night poller, when live mode is enabled (deployments set
+    # RA_LOG_EXPLORER_LIVE_POLL_S > 0). None means /api/live reports
+    # {enabled: false} and nothing else changes.
+    live: "LiveNightManager | None" = None
     # URL prefix the app is served under (``""`` at the root). Stripped off
     # every incoming request path before routing, and substituted into the
     # HTML so the browser asks for the prefixed URLs back.
@@ -1826,6 +1831,17 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self.send_error(400)
                     return
                 self._send_file(STATIC_DIR / rel)
+                return
+            if path == "/api/live":
+                # Snapshot of the live night poller: watermark, tonight's
+                # exposure list with readiness, error states. Static
+                # {enabled: false} when live mode isn't running, so the
+                # UI can decide whether to render the Tonight panel with
+                # one unconditional call.
+                if ctx.live is None:
+                    self._send_json({"enabled": False})
+                else:
+                    self._send_json(ctx.live.snapshot())
                 return
             if path == "/api/summary":
                 # ?dataId=<int> selects a loaded exposure; ?dayObs=<int>

@@ -79,6 +79,15 @@ Sibling docs:
                   │
                   ▼
     ┌────────────────────────────┐
+    │   live.py                  │  live-mode poller (deployments): one daemon
+    │   (LiveNightManager)       │  thread appending the current night into a
+    │                            │  live night dir via fetch.py, ConsDB per
+    │                            │  tick, readiness snapshot for /api/live
+    └─────────────┬──────────────┘
+                  │ (the night dir it maintains is what fetchAll's
+                  │  night-slice path serves windows out of)
+                  ▼
+    ┌────────────────────────────┐
     │   jobs.py                  │  FetchJob + JobManager; one daemon thread
     │   (in-process worker pool) │  per fetch (exposure OR night), append-only
     │                            │  event log + threading.Condition; the
@@ -100,6 +109,7 @@ Sibling docs:
     │                            │ ◄────── DELETE /api/cache/.../<slug>[/<pods=…>]
     │                            │ ◄────── GET    /api/exposure-time/<id>
     │                            │ ◄────── GET    /api/site                   (read-only label)
+    │                            │ ◄────── GET    /api/live                   (live-mode snapshot)
     │                            │ ◄────── POST   /api/fetch                  (exposure)
     │                            │ ◄────── POST   /api/fetch-night            (dayObs)
     │                            │ ◄────── POST   /api/fetch-range            (start/stop)
@@ -158,6 +168,7 @@ Sibling docs:
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *`). `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` (a legacy obs_end-only string entry still reads back as a 1-field record) — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
+| `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
 | `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, cache list, progress, site badge), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/explore/night sections; the bootstrap shows whichever matches the URL. No build step. |
@@ -288,6 +299,91 @@ Sibling docs:
   the rapid analysis system uses to distinguish concurrent pipelines on
   the same exposure. Surfaced on head-node events.
 
+## Live mode
+
+Deployed next to the data, the tool no longer treats Loki as distant and
+expensive: when `RA_LOG_EXPLORER_LIVE_POLL_S > 0`, a
+`live.LiveNightManager` daemon thread keeps the **current night hot on
+disk** so that routine "how did that image process" questions during
+observing are answered from the cache volume, not by a fresh Loki fetch.
+
+Each tick (every `LIVE_POLL_S` seconds):
+
+1. **Incremental fetch.** Every pod's app logs are advanced from its
+   per-pod watermark to `now - LIVE_LAG_S` with the same lossless
+   count-presized single-batch chunking as a batch fetch, appended to
+   the per-pod JSONL files of one all-pods *live night dir* (the
+   ordinary window path for the dayObs's noon→noon span). Consecutive
+   ticks tile the night exactly — half-open windows, no line fetched
+   twice, none dropped — so a night costs O(night) rather than the
+   O(night²) of re-fetching from night start each time. The k8s/events
+   stream is fetched namespace-wide once per tick and demuxed per pod.
+   The `_live.json` sidecar (schema in `fetch.py`) records watermarks
+   and per-pod byte counts; appends are staged through temp files so a
+   failed pod's span is simply retried next tick, and a crash recovers
+   by truncating files back to the recorded counts.
+2. **ConsDB.** One id-range query per instrument returns every exposure
+   of the current dayObs (in-cluster, this is ~free). Records land in
+   the per-site exposure-time cache — so the home form resolves tonight's
+   dataIds instantly — and in the live snapshot.
+3. **Readiness.** An exposure is *ready* when
+   `shutterClose(UTC) + windowAfterS <= watermark`: the whole default
+   exposure window is already on disk. The home page's **Tonight** panel
+   lists tonight's exposures newest-first with ready/wait status and
+   links ready ones straight into the ordinary explore flow.
+
+Serving leans on one mechanism: `fetch.fetchAll` tries the night dir
+before the superset path, and any request whose window ends at or
+before the watermark is **sliced** out of it (`materializeNightSlice`:
+binary-search each time-ascending JSONL for the boundary offsets, copy
+the byte ranges) into a completely ordinary cache dir, returned with
+`cacheReuse: "night-slice"`. A `podRegex` request (night mode) slices
+only the matching pods, into the nested `pods=` dir a real filtered
+fetch would use. No Loki round trip, no new serving path downstream —
+the slice is a first-class window that later requests exact-hit or
+superset-reuse. Night dirs themselves are excluded from superset reuse
+(parsing a whole night to answer a five-minute question would take
+minutes; slicing is near-instant).
+
+One window gets special treatment: a request for the in-progress
+night's *own* window — which is exactly what night mode asks for on the
+current dayObs — is served **clamped to the watermark**, i.e. "the
+night so far", so opening the night view during observing costs no Loki
+fetch (the parse still takes its normal time). Only the night's own
+window is clamped; an arbitrary user window extending past the
+watermark falls through to a real fetch rather than silently coming
+back short. Successive opens as the watermark advances each materialize
+a fresh clamped slice (an unchanged watermark reuses the previous one);
+the stale ones are ordinary windows that LRU eviction reclaims.
+
+At noon-UTC rollover the night is **finalised**: a last top-up to night
+end, then a verification pass comparing each pod's appended line count
+against the `count_over_time` oracle — a pod falling short by more than
+the oracle's dedup slack (metric queries count duplicate storage-chunk
+entries the log path deduplicates; measured ~0.03%, so the bar is
+`max(100, 0.2%)` — see `live.VERIFY_TOLERANCE_*`) is refetched whole,
+catching e.g. lines ingested later than `LIVE_LAG_S` allowed for — and
+a normal `_meta.json` is written. From then on the dir is a
+complete, trustworthy all-pods night window (still sliced, never
+superset-parsed), subject to ordinary LRU eviction; the poller moves on
+to the new night. On the deployments, one busy night is ~9 GiB of JSONL
+on the cache volume (measured: 35.7M lines / 576 pods for 20260711), so
+the chart's 50 GiB volume holds four-or-so finalised nights plus slices
+before LRU eviction reclaims the oldest.
+
+The parse cost of the *night view* is deliberately left alone: opening
+the in-progress night slices the AOS subset instantly but still parses
+it (~1–2 minutes for a busy night), and that is an accepted cost — an
+incremental in-memory summarizer that the poller feeds each tick was
+considered and rejected as not worth the refactor of the parser's
+stateful loop. If that ever changes, the path is a resumable
+`summarizePod` plus more pod memory (whole-night summaries measure
+~1–2 GiB); nothing in the current design blocks it.
+
+Live mode changes nothing when it is off (the local default): no
+thread starts, `/api/live` reports `{enabled: false}`, the Tonight
+panel stays hidden, and every fetch path behaves as before.
+
 ## Configuration
 
 Everything that varies between deployments is an environment variable,
@@ -306,6 +402,8 @@ touched it last change how everyone else's fetches behave.
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
+| `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables live mode | `0` (off) |
+| `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* each live increment stops (Loki ingestion lag) | `60` |
 | `LOKI_USERNAME` | `DEFAULT_USERNAME`, the Loki basic-auth user | `merlin` |
 | `LOKI_PASSWORD` | the Loki basic-auth password, read by `logcli` | *(required)* |
 
@@ -335,7 +433,8 @@ the above. Its shape, and the reasons behind it:
 | Piece | Why it is the way it is |
 |-------|-------------------------|
 | One replica, `Recreate` | Loaded exposures live in the serving process's memory and the cache volume is ReadWriteOnce, so a second replica would answer differently depending on which pod took the request. At one replica RollingUpdate's `maxUnavailable` floors to zero and wedges any rollout whose new pod fails readiness. |
-| PVC for the cache | Fetching a night out of Loki takes minutes. An emptyDir would discard it on every restart — worst precisely when somebody is restarting things to investigate. `RA_LOG_EXPLORER_MAX_CACHE_BYTES` is derived from the volume's own size so the app cannot believe it has more room than it does. |
+| PVC for the cache | Fetching a night out of Loki takes minutes. An emptyDir would discard it on every restart — worst precisely when somebody is restarting things to investigate. `RA_LOG_EXPLORER_MAX_CACHE_BYTES` is derived from the volume's own size so the app cannot believe it has more room than it does. With live mode on, the volume also absorbs ~9 GiB of live night per night, and a restart resumes the night from the sidecar's watermark instead of re-pulling from noon — another reason it must not be an emptyDir. |
+| `livePollS: 300` / `liveLagS: 60` | Turns on live mode (see *Live mode*). 300 s keeps the steady Loki load modest — an exposure becomes viewable at most ~5 min later than its shutter+5 min ideal — and 60 s of lag keeps the fetch frontier behind Loki's ingestion frontier so late-arriving lines aren't skipped. `livePollS: 0` reverts the deployment to purely on-demand fetching. |
 | ConfigMap for `sites.toml` | Mounted at `/etc/ra-log-explorer/`, naming exactly one site. A checksum annotation on the pod rolls it when the catalog changes, since a file mount is not an env var and would otherwise go unnoticed. |
 | `GafaelfawrIngress`, `loginRedirect: true` | A browser app, so anonymous users get sent to log in rather than a 401 they cannot act on. Scope `read:image`, matching rubintv on the same environments. |
 | `proxy-buffering: "off"` | `/api/fetch/<id>/progress` is Server-Sent Events for the length of a fetch. nginx buffers proxied responses by default, which would hold the whole stream until the fetch had already finished. |
@@ -692,6 +791,39 @@ token-file path is *not* echoed — it's a server-side detail.
 }
 ```
 
+### `GET /api/live`
+
+Snapshot of the live night poller (see *Live mode*). `{"enabled":
+false}` when live mode is off — the one unconditional call the home
+page makes to decide whether to render the Tonight panel. When on:
+
+```jsonc
+{
+  "enabled": true, "siteName": "summit", "dayObs": 20260711,
+  "nightStart": "2026-07-11T12:00:00.000000Z",
+  "nightEnd":   "2026-07-12T12:00:00.000000Z",
+  "watermark":  "2026-07-12T03:14:00.000000Z",  // all logs ≤ this are on disk
+  "updatedAt":  "...", "finalised": false,
+  "catchingUp": false,                // true while a fresh deployment backfills
+  "pollSeconds": 180.0, "lagSeconds": 60.0, "windowAfterSeconds": 300.0,
+  "nPods": 576, "totalBytes": 9876543210, "totalLines": 24681357,
+  "errors": {},                       // cumulative per-pod hard fetch failures
+  "incompletePods": {},               // cumulative unreconcilable chunks
+  "eventsError": null, "consdbError": null,
+  "lastTick": { "startedAt": "...", "elapsedS": 4.2,
+                "newLines": 73200, "activePods": 431 },
+  "lastError": null,                  // traceback if the last cycle blew up
+  "exposures": [                      // newest first, whole night so far
+    { "dataId": 2026071100542,
+      "obsEndUtc": "2026-07-12T03:10:12.500000+00:00",
+      "readyAtUtc": "2026-07-12T03:15:12.500000+00:00",
+      "ready": false,                 // readyAt vs. watermark
+      "record": { "img_type": "science", "physical_filter": "r_03", ... } },
+    ...
+  ]
+}
+```
+
 ### `GET /api/cache`
 
 ```jsonc
@@ -902,6 +1034,18 @@ Each fetch runs on its own daemon thread spawned by
 `JobManager.startJob`. SSE handlers block on
 `FetchJob.condition.wait()` to be notified when new events arrive.
 
+When live mode is on, one more daemon thread runs for the life of the
+process: the `LiveNightManager` poller. It deliberately stays outside
+the `stateLock` world — it mutates only its own night dir and
+`_live.json` sidecar (single writer, atomic replace, only after the
+tick's bytes are on disk), and its one cross-thread surface is
+`snapshot()`, an immutable dict swapped under the manager's own lock
+that `/api/live` returns without copying. Request threads meet the
+poller's output purely through the filesystem: the night-slice path in
+`fetchAll` reads the sidecar and byte ranges the sidecar vouches for,
+so a slice can run concurrently with an append and never see a torn
+line.
+
 ### Multi-tab support
 
 All three keyed-state dicts are LRU-ordered (`OrderedDict.move_to_end`
@@ -921,8 +1065,9 @@ stays cheap.
 
 Deployed, the container runs home mode with no eager fetch: `run --host
 0.0.0.0 --port 8080 --no-browser`, with everything else supplied as
-environment variables. The other two exist for development and scripting
-on a laptop.
+environment variables — including `RA_LOG_EXPLORER_LIVE_POLL_S`, which
+starts the live poller alongside the server (see *Live mode*). The
+other two modes exist for development and scripting on a laptop.
 
 1. **Home mode** — `python3 -m ra_log_explorer.cli` with no
    `--exposure-id`/`--t-zero`. CLI just spins up a fresh `JobManager`
@@ -950,7 +1095,10 @@ SPA. Only the first is used in the deployment.
 ## Non-goals
 
 - Streaming / live tailing of logs. Snapshot-based; one window per
-  fetch.
+  fetch. Live mode does not change this: it is a *poller* that extends
+  an on-disk snapshot every few minutes, not a `--tail` stream, and
+  every view is still served from a bounded window of what is already
+  on disk.
 - Cross-night aggregation or trending. One dayObs at a time in
   night mode; one exposure at a time in exposure mode.
 - Authentication *of its own*. Deployed, the app sits behind a

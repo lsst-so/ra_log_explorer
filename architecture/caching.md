@@ -22,6 +22,9 @@ repeat runs into instant loads.
         │                                            byte/line counts + count_over_time oracle +
         │                                            fetchComplete + errors + incomplete_pods +
         │                                            pod_event_lines + event_errors
+        ├── _live.json                             ← (live night dirs only) watermark + per-pod
+        │                                            byte counts; marks the dir as poller-built —
+        │                                            sliced on demand, never superset-parsed
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
@@ -96,6 +99,42 @@ history: v1 (implicit) capped each pod at 50 000 lines; v2 used
 `k8s/events` lifecycle stream into `pods_events/` — a v3 cache has no such
 tree, so the bump forces a re-fetch to pick up the new markers.
 
+## Live night dirs
+
+Live mode (see [architecture.md](architecture.md#live-mode)) maintains
+one additional kind of window dir: the **live night dir**, the ordinary
+all-pods window path for the current dayObs's noon→noon span, grown
+incrementally by the poller rather than written once by a fetch. It is
+marked by a `_live.json` sidecar (full schema in `fetch.py`) recording
+the *watermark* — the time up to which every pod's lines are durably on
+disk — per-pod byte/line counts, and the cumulative fall-short maps.
+The sidecar is the coordination point between the poller (single
+writer, atomic replace once per tick, only after the tick's bytes hit
+disk) and readers; bytes beyond the recorded counts are treated as not
+yet there.
+
+Three rules keep it coherent with everything else here:
+
+- While active it has **no `_meta.json`**, so nothing mistakes it for a
+  completed fetch and LRU eviction leaves it alone. Finalisation (at
+  noon-UTC rollover: final top-up, per-pod `count_over_time`
+  verification with whole-pod refetch on mismatch) writes a normal
+  `_meta.json`, after which it is listed, evictable, and deletable like
+  any window.
+- It is **excluded from superset reuse** forever (the sidecar stays
+  after finalisation as the marker): handing a whole night to the
+  parser to answer a five-minute window takes minutes.
+- Contained windows are instead served by **slicing**
+  (`materializeNightSlice`): each per-pod JSONL is time-ascending, so
+  the request's boundary offsets are found by binary-searching
+  timestamps and the byte range is copied into an ordinary exposure
+  cache dir at the requested window's own path, with a synthesized
+  `_meta.json` (`cacheReuse: "night-slice"`, `sliceSource` pointing
+  back at the night dir, the night's fall-short maps inherited
+  wholesale). The result is a first-class window: later identical
+  requests exact-hit it, nearby ones superset-reuse it, LRU eviction
+  reclaims it.
+
 ## Cache hit policy
 
 `fetchAll(spec, ...)` decides in order:
@@ -109,6 +148,21 @@ tree, so the bump forces a re-fetch to pick up the new markers.
    current `fetchSchemaVersion`, and there's no `.partial` flag.
    Returns the requested directory and the saved meta with
    `cacheReuse = "exact"`.
+
+2½. **Night slice** if the request falls inside a live/finalised night
+   dir. Two windows qualify: one the watermark fully covers (its `to`
+   at or before the watermark — all-pods *and* `podRegex` requests
+   alike; a filtered request slices only matching pods into the nested
+   `pods=` dir a real filtered fetch would use), and the night's *own*
+   window while the night is in progress (night mode on the current
+   dayObs), which is served clamped to the watermark — "the night so
+   far". This step deliberately sits **outside** the window-in-the-past
+   gate so the in-progress night qualifies; only `forceRefresh`
+   disables it. The window is materialized by slicing (see *Live night
+   dirs*) and returned with `cacheReuse = "night-slice"`; a repeat
+   against an unchanged watermark reuses the previous slice as an exact
+   hit. Any slice failure falls through to the steps below — worst case
+   is the fetch that would have happened anyway.
 
 3. **Superset hit** if any other completed cache directory under
    `<cluster>/<namespace>/` (or under `<cluster>/<namespace>/<window>/
@@ -317,7 +371,9 @@ one, typically).
 
 - When disk pressure matters above the configured cap. (Below the
   cap, LRU eviction handles it automatically.) Each exposure
-  window is roughly 40–50 MiB; a night cache is GiB-scale.
+  window is roughly 40–50 MiB; an AOS night cache is GiB-scale; a
+  live-built all-pods night is ~9 GiB (measured: 35.7M lines / 576
+  pods for dayObs 20260711).
 
 Cache management lives in both the CLI (`python3 -m
 ra_log_explorer.cli cache info|flush`) and the home page in the

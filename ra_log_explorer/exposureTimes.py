@@ -188,6 +188,44 @@ def queryExposureRecordBatch(
     return out
 
 
+def queryExposureRecordsForDayObs(
+    dayObs: int,
+    token: str,
+    *,
+    consdbUrl: str,
+) -> dict[int, ExposureRecord]:
+    """Return every instrument's exposure records for one dayObs.
+
+    The 13-digit dataId embeds its dayObs (``YYYYMMDDSSSSS``), so one
+    range predicate per instrument table covers the whole night without
+    needing a ``day_obs`` column in every schema. Unlike
+    :func:`queryExposureRecordBatch` this does **not** stop at the first
+    instrument with rows — LSSTCam and LATISS routinely observe on the
+    same night, and the caller wants both.
+    """
+    lo = dayObs * 100000
+    hi = lo + 99999
+    out: dict[int, ExposureRecord] = {}
+    for instrument in INSTRUMENTS_BY_PROBE_ORDER:
+        sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id BETWEEN {lo} AND {hi}"
+        try:
+            payload = _postQuery(sql, token, consdbUrl=consdbUrl)
+        except _UndefinedTableError:
+            continue
+        cols = payload.get("columns") or []
+        rows = payload.get("data") or []
+        if "exposure_id" not in cols:
+            continue
+        for row in rows:
+            rec = _recordFromRow(cols, row)
+            try:
+                eid = int(rec.get("exposure_id"))  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            out[eid] = rec
+    return out
+
+
 def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
     """Project one ConsDB result row to the curated record.
 
