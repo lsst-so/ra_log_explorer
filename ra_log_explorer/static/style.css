@@ -500,6 +500,10 @@ button.ghost.mini.delete:disabled {
   justify-content: center;
   padding-top: 10vh;
 }
+/* The explicit display above outranks the UA stylesheet's
+   [hidden] { display: none }, so restate it — without this the panel
+   can never be dismissed (or hidden at all). */
+#faq-overlay[hidden] { display: none; }
 #faq-panel {
   position: relative;
   background: var(--surface, #fff);
