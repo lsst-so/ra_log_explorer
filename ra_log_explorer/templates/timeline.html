@@ -25,6 +25,7 @@
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
+        <a href="__BASE_PATH__/?admin=1" class="ghost mini" id="admin-link">admin</a>
       </div>
       <div class="site-badge" id="site-badge" hidden>
         <span class="site-name" id="site-name"></span>
@@ -34,27 +35,6 @@
 
     <div id="home-layout">
       <main id="home-main">
-        <section class="home-card" id="tonight-card" hidden>
-          <h2>Tonight <span class="muted" id="tonight-summary"></span></h2>
-          <div id="tonight-status" class="hint"></div>
-          <div id="tonight-banner" class="fetch-banner" hidden></div>
-          <table id="tonight-table">
-            <thead>
-              <tr>
-                <th>dataId</th>
-                <th>instrument</th>
-                <th>shutter close</th>
-                <th>type</th>
-                <th>filter</th>
-                <th>reason</th>
-                <th>status</th>
-              </tr>
-            </thead>
-            <tbody id="tonight-tbody"></tbody>
-          </table>
-          <div id="tonight-more" class="hint" hidden></div>
-        </section>
-
         <div class="home-card-row">
         <section class="home-card">
           <h2>All RA processing <span class="muted">explore one exposure</span></h2>
@@ -169,37 +149,70 @@
         </section>
         </div>
 
-        <!-- Hidden rather than removed: the cache browser is useful for
-             operators/debugging and may come back, but day-to-day users
-             shouldn't need to think about caching at all. -->
-        <section class="home-card" id="cache-card" hidden>
-          <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
-          <p class="hint">
-            Click a row to open that run in a new tab. The ✕ button removes a
-            window from disk.
-            <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
-            <button type="button" id="cache-delete-all" class="ghost mini delete">delete all</button>
-          </p>
-          <table id="cache-table">
+        <section class="home-card" id="tonight-card" hidden>
+          <h2>Tonight <span class="muted" id="tonight-summary"></span></h2>
+          <div id="tonight-status" class="hint"></div>
+          <div id="tonight-banner" class="fetch-banner" hidden></div>
+          <table id="tonight-table">
             <thead>
               <tr>
-                <th>cluster / ns</th>
-                <th>key</th>
-                <th>window</th>
-                <th>fetched</th>
-                <th>last viewed</th>
-                <th>pods</th>
-                <th>size</th>
-                <th></th>
+                <th>dataId</th>
+                <th>instrument</th>
+                <th>shutter close</th>
+                <th>type</th>
+                <th>filter</th>
+                <th>reason</th>
+                <th>status</th>
               </tr>
             </thead>
-            <tbody id="cache-tbody"></tbody>
-            <tfoot id="cache-tfoot"></tfoot>
+            <tbody id="tonight-tbody"></tbody>
           </table>
+          <div id="tonight-more" class="hint" hidden></div>
         </section>
 
       </main>
 
+    </div>
+  </section>
+
+  <!-- ===================== ADMIN VIEW ===================== -->
+  <section id="admin-view" hidden>
+    <header id="topbar">
+      <div class="title">
+        <a href="__BASE_PATH__/" class="ghost mini">&larr; home</a>
+        <span class="brand-mark" aria-hidden="true"></span>
+        <strong>Rapid Analysis Log Explorer</strong>
+        <span class="muted">admin</span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
+      </div>
+    </header>
+
+    <div id="admin-layout">
+      <section class="home-card">
+        <h2>Cached windows <span class="muted" id="cache-summary"></span></h2>
+        <p class="hint">
+          Every log window currently held on disk. Click a row to open
+          that run in a new tab; the ✕ button removes one window.
+          <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+          <button type="button" id="cache-delete-all" class="ghost mini delete">flush entire cache</button>
+        </p>
+        <table id="cache-table">
+          <thead>
+            <tr>
+              <th>cluster / ns</th>
+              <th>key</th>
+              <th>window</th>
+              <th>fetched</th>
+              <th>last viewed</th>
+              <th>pods</th>
+              <th>size</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="cache-tbody"></tbody>
+          <tfoot id="cache-tfoot"></tfoot>
+        </table>
+      </section>
     </div>
   </section>
 

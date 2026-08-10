@@ -268,15 +268,19 @@ port. Ctrl-C in the terminal stops the server.
 The browser app has three views:
 
 - **Home view** — the landing page when nothing is loaded. Two
-  side-by-side mode cards: **All RA processing** (one exposure, with a
-  single *advanced options* disclosure holding the shared window pads
-  and the range-of-exposures form) and **AOS processing**
+  side-by-side mode cards on top: **All RA processing** (one exposure,
+  with a single *advanced options* disclosure holding the shared window
+  pads and the range-of-exposures form) and **AOS processing**
   (investigate a whole night), each with its own inline progress bar.
-  On a deployment running live mode it also shows the **Tonight**
+  Below them, on a deployment running live mode, sits the **Tonight**
   panel: every exposure taken so far tonight, newest first, with a
-  ready/wait status chip — see *Live mode (deployments)* below. (The
-  cached-runs table still exists in the markup but is hidden — caching
-  is no longer something users should need to think about.)
+  ready/wait status chip, refreshing itself every 30 s while the page
+  is open — see *Live mode (deployments)* below.
+- **Admin view** — `/?admin=1`, linked from the home topbar (no
+  separate permissions; anyone can open it). Hosts the cached-windows
+  table — every log window on disk, per-row delete — and a *flush
+  entire cache* button. Caching is invisible to day-to-day use; this
+  page is for operators.
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is

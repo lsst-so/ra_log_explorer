@@ -133,7 +133,8 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   border-radius: 999px;
   padding: 3px 10px;
 }
-#topbar button.ghost {
+#topbar button.ghost,
+#topbar a.ghost {
   background: transparent;
   color: var(--nav-text);
   border: 1px solid var(--nav-border);
@@ -145,8 +146,10 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
   display: inline-flex;
   align-items: center;
   gap: 6px;
+  text-decoration: none;
 }
-#topbar button.ghost:hover { background: var(--nav-bg-2); }
+#topbar button.ghost:hover,
+#topbar a.ghost:hover { background: var(--nav-bg-2); }
 /* Site badge: deliberately loud — which observatory's logs you are
    looking at is the most important thing on the page, and there is no way
    to change it from here, so it reads as a statement rather than a
@@ -205,12 +208,23 @@ body[data-site="bts"]    { --site-accent: #ff8a3a; }
   padding: 18px 22px;
   box-shadow: var(--shadow-sm);
 }
-/* The first card (fetch form) gets a touch more visual weight — it's the
-   primary action on the page. */
-#home-main .home-card:first-child {
+/* The two mode cards get a touch more visual weight — they're the
+   primary actions on the page. */
+.home-card-row > .home-card {
   box-shadow: var(--shadow);
   padding-top: 22px;
   padding-bottom: 20px;
+}
+
+/* Admin page shares the home page's column layout. */
+#admin-layout {
+  max-width: 1100px;
+  margin: 24px auto 80px;
+  padding: 0 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  min-width: 0;
 }
 
 /* The two fetch modes sit side by side so they read as alternatives —

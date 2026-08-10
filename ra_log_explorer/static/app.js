@@ -21,6 +21,10 @@ async function bootstrap() {
   // tabs hits the server state for *that tab's* key without disturbing
   // the others.
   const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('admin') === '1') {
+    window.showAdmin();
+    return;
+  }
   const urlDataId = urlParams.get('dataId');
   const urlDayObs = urlParams.get('dayObs');
   const urlRangeStart = urlParams.get('rangeStart');
@@ -80,12 +84,19 @@ function hideAllViews() {
   document.getElementById('home-view').hidden = true;
   document.getElementById('explore-view').hidden = true;
   document.getElementById('night-view').hidden = true;
+  document.getElementById('admin-view').hidden = true;
 }
 
 window.showHome = function showHome() {
   hideAllViews();
   document.getElementById('home-view').hidden = false;
   window.startHome();
+};
+
+window.showAdmin = function showAdmin() {
+  hideAllViews();
+  document.getElementById('admin-view').hidden = false;
+  window.startAdmin();
 };
 
 function _applyActiveSite(summary) {

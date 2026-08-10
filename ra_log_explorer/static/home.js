@@ -43,7 +43,6 @@ function startHome() {
   if (!homeListenersWired) wireHomeListeners();
   prefillForm();
   loadSite();
-  refreshCache();
   refreshTonight();
   wireTonightTimer();
   // URL-driven entry. We land here either via a deep-link
@@ -1110,9 +1109,25 @@ function wireHomeListeners() {
   const rangeForm = document.getElementById('range-form');
   rangeForm.elements.rangeStart.addEventListener('input', () => scheduleRangeLookup(rangeStartSlot));
   rangeForm.elements.rangeStop.addEventListener('input', () => scheduleRangeLookup(rangeStopSlot));
-  document.getElementById('cache-refresh').addEventListener('click', refreshCache);
-  document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
   homeListenersWired = true;
   updateSubmitButton();  // start with submit disabled until lookup resolves
   updateRangeSubmit();   // same for the range card
 }
+
+// ----- admin view ----------------------------------------------------------
+// The cache browser lives on its own page (/?admin=1): day-to-day users
+// shouldn't need to think about caching, but operators still want to see
+// what's on disk and be able to flush it.
+
+let adminListenersWired = false;
+
+function startAdmin() {
+  if (!adminListenersWired) {
+    document.getElementById('cache-refresh').addEventListener('click', refreshCache);
+    document.getElementById('cache-delete-all').addEventListener('click', deleteAllCache);
+    adminListenersWired = true;
+  }
+  loadSite();
+  refreshCache();
+}
+window.startAdmin = startAdmin;
