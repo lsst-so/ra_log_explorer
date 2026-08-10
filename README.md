@@ -269,7 +269,8 @@ The browser app has three views:
 
 - **Home view** — the landing page when nothing is loaded. Two
   side-by-side mode cards: **All RA processing** (one exposure, with a
-  range-of-exposures form under *advanced*) and **AOS processing**
+  single *advanced options* disclosure holding the shared window pads
+  and the range-of-exposures form) and **AOS processing**
   (investigate a whole night), each with its own inline progress bar.
   On a deployment running live mode it also shows the **Tonight**
   panel: every exposure taken so far tonight, newest first, with a

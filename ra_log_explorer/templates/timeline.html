@@ -73,19 +73,6 @@
                 <span id="manual-tzero-status" class="hint">enter the shutter close as TAI ISO-8601, e.g. 2026-06-24T14:38:41.380663</span>
               </label>
             </div>
-            <details>
-              <summary>per-exposure tuning</summary>
-              <div class="row">
-                <label>
-                  <span class="lbl">window before t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="__WINDOW_BEFORE__" step="0.1" />
-                </label>
-                <label>
-                  <span class="lbl">window after t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="__WINDOW_AFTER__" step="1" />
-                </label>
-              </div>
-            </details>
             <div class="row submit-row">
               <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
               <span id="fetch-message" class="hint"></span>
@@ -95,49 +82,59 @@
               <div class="progress-text hint"></div>
             </div>
           </form>
-          <details id="range-advanced">
-            <summary>advanced: explore a range of exposures</summary>
-            <p class="hint">
-              Give a start and stop dataId to load a run of consecutive
-              exposures in one go, then step through each exposure's
-              timeline in the explore view, anchored at its own shutter
-              close. Skipped integers in the range are expected and simply
-              omitted.
-            </p>
-            <form id="range-form">
+          <details id="advanced-options">
+            <summary>advanced options</summary>
+            <!-- One shared pair of window fields. They belong to the
+                 single-exposure form (form="fetch-form") but apply to
+                 both flows: a range is fetched from the *start*
+                 exposure's t0 minus the before-pad through the *stop*
+                 exposure's t0 plus the after-pad, so a single exposure
+                 is just the start==stop case. -->
             <div class="row">
               <label>
-                <span class="lbl">start dataId</span>
-                <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
-                <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
+                <span class="lbl">window before t<sub>0</sub> (s)</span>
+                <input type="number" name="windowBefore" value="__WINDOW_BEFORE__"
+                       form="fetch-form" step="0.1" />
               </label>
               <label>
-                <span class="lbl">stop dataId</span>
-                <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
-                <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
+                <span class="lbl">window after t<sub>0</sub> (s)</span>
+                <input type="number" name="windowAfter" value="__WINDOW_AFTER__"
+                       form="fetch-form" step="1" />
               </label>
             </div>
-            <details>
-              <summary>per-exposure tuning</summary>
+            <p class="hint">
+              For a range, the window runs from the start exposure's
+              t<sub>0</sub> (minus the before-pad) through the stop
+              exposure's t<sub>0</sub> (plus the after-pad).
+            </p>
+            <p class="hint">
+              <strong>Explore a range of exposures:</strong> give a start
+              and stop dataId to load a run of consecutive exposures in
+              one go, then step through each exposure's timeline in the
+              explore view, anchored at its own shutter close. Skipped
+              integers in the range are expected and simply omitted.
+            </p>
+            <form id="range-form">
               <div class="row">
                 <label>
-                  <span class="lbl">window before start t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="__WINDOW_BEFORE__" step="0.1" />
+                  <span class="lbl">start dataId</span>
+                  <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
+                  <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
                 </label>
                 <label>
-                  <span class="lbl">window after stop t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="__WINDOW_AFTER__" step="1" />
+                  <span class="lbl">stop dataId</span>
+                  <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
+                  <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
                 </label>
               </div>
-            </details>
-            <div class="row submit-row">
-              <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
-              <span id="range-message" class="hint"></span>
-            </div>
-            <div id="range-progress" class="inline-progress" hidden>
-              <div class="progress-bar"><div class="progress-fill"></div></div>
-              <div class="progress-text hint"></div>
-            </div>
+              <div class="row submit-row">
+                <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
+                <span id="range-message" class="hint"></span>
+              </div>
+              <div id="range-progress" class="inline-progress" hidden>
+                <div class="progress-bar"><div class="progress-fill"></div></div>
+                <div class="progress-text hint"></div>
+              </div>
             </form>
           </details>
         </section>

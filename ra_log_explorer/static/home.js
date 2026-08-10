@@ -1030,7 +1030,10 @@ async function startRangeFetch(ev) {
     msgEl.classList.add('error');
     return;
   }
-  const form = document.getElementById('range-form');
+  // The window pads live in the shared "advanced options" section and
+  // are form-associated with fetch-form: one pair of knobs serves both
+  // flows, since a range applies them to its first/last exposure only.
+  const expForm = document.getElementById('fetch-form');
   const body = {
     rangeStart: rangeStartSlot.forId,
     rangeStop: rangeStopSlot.forId,
@@ -1038,8 +1041,8 @@ async function startRangeFetch(ev) {
     // as the single-exposure form).
     tZeroStart: rangeStartSlot.tZero,
     tZeroStop: rangeStopSlot.tZero,
-    windowBefore: parseFloat(form.elements.windowBefore.value),
-    windowAfter: parseFloat(form.elements.windowAfter.value),
+    windowBefore: parseFloat(expForm.elements.windowBefore.value),
+    windowAfter: parseFloat(expForm.elements.windowAfter.value),
   };
 
   const submit = document.getElementById('range-submit');
