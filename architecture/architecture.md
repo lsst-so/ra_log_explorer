@@ -594,6 +594,8 @@ shapes:
   "loaded": true,
   "mode": "exposure",
   "site": "summit",
+  "instrument": "lsstcam",          // the pin this state was fetched under; null
+                                    // only for pre-instrument states
   "expId": 2026051900722,
   "tZero": "2026-05-20T08:45:39.267000+00:00",
   "exposure": {                                  // curated ConsDB record, or null
@@ -621,8 +623,12 @@ shapes:
 ```
 
 `pods` is the subset whose `expIdsSeen` contains `expId`, plus every
-`group == "other"` pod as a safety net for unknown roles. `podsAll` is
-every pod that emitted in the window.
+`group == "other"` pod as a safety net for unknown roles — restricted
+to pods of the state's `instrument` (plus instrument-neutral pods like
+redis; see `_podBelongsToInstrument`), because a cross-instrument pod
+that logged this bare id was working on a *different exposure*.
+`podsAll` is every pod that emitted in the window, under the same
+instrument restriction.
 
 `meta` is the fetch's `_meta.json` verbatim. Beyond `cacheReuse`, the
 fields the UI cares about are `fetchComplete` (bool) and the two
@@ -660,6 +666,7 @@ former says "no finish event", the latter says *why*.
   "loaded": true,
   "mode": "night",
   "site": "summit",
+  "instrument": "lsstcam",          // always: AOS runs on LSSTCam only
   "dayObs": 20260521,
   "startTime": "2026-05-21T12:00:00+00:00",
   "endTime":   "2026-05-22T12:00:00+00:00",
@@ -714,6 +721,8 @@ below).
   "loaded": true,
   "mode": "range",
   "site": "summit",
+  "instrument": "lsstcam",          // the run's instrument: all in-range ids
+                                    // resolved against this one table
   "startId": 2026051900722,
   "stopId":  2026051900750,
   "fromTime": "2026-05-20T08:45:34+00:00",   // fetch window (UTC)

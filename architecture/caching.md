@@ -328,7 +328,12 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
   shortcuts. Written by `addExposureToCache`; deduped and sorted on
   every write. The on-demand cache rebuild path in `/api/summary`
   uses this file to map a deep-linked dataId back to its cache
-  window without needing the in-memory state to already exist.
+  window without needing the in-memory state to already exist. The
+  ids are *bare* (no instrument), so on a colliding id the file can
+  name the other instrument's window — the rebuild path guards this
+  by requiring the found window to contain the instrument-pinned t₀
+  (see *dataId / expId* in
+  [architecture.md](architecture.md#key-concepts)).
 
 - **`_range.txt`** — range caches only. Two lines, `startId` then
   `stopId`. Written by `markCacheRange` when a range fetch completes.
