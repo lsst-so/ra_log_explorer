@@ -478,6 +478,8 @@ The first loads after such an upgrade re-fetch and so are slower.
 --live-poll-s SECONDS    live mode: continuously fetch the current night so
                          exposure views load instantly; 0 = off
                          (default $RA_LOG_EXPLORER_LIVE_POLL_S, else 0)
+--live-day-obs N         testing: pin live mode to dayObs N so a staged
+                         historical night plays the role of "tonight"
 ```
 
 `--base-path` exists for deployments that share a hostname with other

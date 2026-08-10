@@ -571,6 +571,26 @@ def test_rollover_verification_tolerates_oracle_dedup_slack(
     assert meta["fetchComplete"] is True
 
 
+def test_fixed_dayobs_pins_the_night(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--live-day-obs: a staged historical night plays 'tonight' — the
+    poller opens that night and the clock-driven rollover never fires."""
+    monkeypatch.setattr(live, "listPods", lambda spec: [])
+    monkeypatch.setattr(live, "fetchEventsWindowInto", lambda spec, a, b, fh: (0, True, ""))
+    monkeypatch.setattr(
+        live.exposureTimes, "queryExposureRecordsForDayObs", lambda dayObs, token, *, consdbUrl: {}
+    )
+    mgr = live.LiveNightManager(
+        site=_site(), username="u", workers=2, pollS=60.0, lagS=0.0, fixedDayObs=20260711
+    )
+    mgr.tick(now=dt.datetime(2026, 8, 10, 15, 0, tzinfo=UTC))  # "today" is a month later
+    snap = mgr.snapshot()
+    assert snap["dayObs"] == 20260711
+    assert snap["nightStart"] == fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+    # A second tick on yet another day still doesn't roll the night over.
+    mgr.tick(now=dt.datetime(2026, 8, 11, 15, 0, tzinfo=UTC))
+    assert mgr.snapshot()["dayObs"] == 20260711
+
+
 def test_snapshot_disabled_shape_from_server() -> None:
     """The /api/live contract when live mode is off is a static shape."""
     from ra_log_explorer.jobs import JobManager

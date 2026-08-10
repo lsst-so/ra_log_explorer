@@ -189,4 +189,25 @@ function renderFetchBanner(bannerEl, summary) {
 }
 window.renderFetchBanner = renderFetchBanner;
 
+// ----- "what is this?" overlay ---------------------------------------------
+// One shared panel, toggled from every view's topbar. Wired here (the
+// bootstrap script) because the buttons exist in all three views.
+
+function wireFaq() {
+  const overlay = document.getElementById('faq-overlay');
+  if (!overlay) return;
+  const setOpen = (open) => { overlay.hidden = !open; };
+  for (const btn of document.querySelectorAll('.faq-toggle')) {
+    btn.addEventListener('click', () => setOpen(overlay.hidden));
+  }
+  document.getElementById('faq-close').addEventListener('click', () => setOpen(false));
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) setOpen(false);  // click outside the panel
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !overlay.hidden) setOpen(false);
+  });
+}
+wireFaq();
+
 bootstrap();

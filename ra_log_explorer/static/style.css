@@ -489,6 +489,41 @@ button.ghost.mini.delete:disabled {
   color: var(--text-2);
 }
 
+/* "What is this?" overlay — one shared, deliberately terse panel. */
+#faq-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 24, 28, 0.45);
+  z-index: 200;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding-top: 10vh;
+}
+#faq-panel {
+  position: relative;
+  background: var(--surface, #fff);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  max-width: 560px;
+  width: calc(100% - 48px);
+  padding: 18px 22px 14px;
+  font-size: 13.5px;
+  line-height: 1.45;
+}
+#faq-panel h2 { margin: 0 0 8px; font-size: 15px; }
+#faq-panel p { margin: 6px 0; }
+#faq-panel ul { margin: 6px 0; padding-left: 20px; }
+#faq-panel li { margin: 4px 0; }
+#faq-close {
+  position: absolute;
+  top: 8px;
+  right: 10px;
+  font-size: 15px;
+  line-height: 1;
+}
+
 /* Tonight panel (live mode) — same table treatment as the cache list,
    but rows are only clickable through their dataId link. */
 #tonight-table {

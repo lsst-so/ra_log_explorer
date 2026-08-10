@@ -24,6 +24,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
       <div class="site-badge" id="site-badge" hidden>
         <span class="site-name" id="site-name"></span>
@@ -210,6 +211,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span id="expId-display"></span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
     </header>
 
@@ -301,6 +303,7 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span id="night-dayobs-display"></span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
       <div class="cache">
         <span id="night-cache-info"></span>
@@ -411,6 +414,32 @@
       </section>
     </main>
   </section>
+
+  <!-- Shared "what is this?" panel, toggled from every view's topbar.
+       Deliberately terse: it says what is being shown, not how. -->
+  <div id="faq-overlay" hidden>
+    <div id="faq-panel" role="dialog" aria-label="What is this?">
+      <button type="button" id="faq-close" class="ghost mini" aria-label="close">&times;</button>
+      <h2>What am I looking at?</h2>
+      <p>What the <strong>rapid analysis</strong> pipeline did for each
+        image, reconstructed from its logs.</p>
+      <ul>
+        <li><strong>Tonight</strong> — exposures as they are taken;
+          <em>view</em> appears once an exposure's logs are ready
+          (~5&nbsp;min after shutter close).</li>
+        <li><strong>Exposure view</strong> — one exposure's processing.
+          Each row is a pipeline worker, coloured bars are its tasks,
+          and time runs from that exposure's shutter close
+          (t<sub>0</sub>&nbsp;=&nbsp;0). Click a row for its full
+          log.</li>
+        <li><strong>Night view</strong> — a whole night at a glance:
+          how long processing took per image, and every failure with a
+          click-through to its traceback.</li>
+      </ul>
+      <p class="muted">Times are UTC. A red banner means some logs
+        could not be retrieved, so that view may be incomplete.</p>
+    </div>
+  </div>
 
   <script src="__BASE_PATH__/static/explore.js"></script>
   <script src="__BASE_PATH__/static/home.js"></script>

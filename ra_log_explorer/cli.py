@@ -129,6 +129,14 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
         "night's logs continuously fetched so exposure views load instantly. "
         "0 disables it. Defaults to $RA_LOG_EXPLORER_LIVE_POLL_S, or 0.",
     )
+    p.add_argument(
+        "--live-day-obs",
+        type=int,
+        default=None,
+        help="Testing: pin live mode to this dayObs instead of tracking the "
+        "clock, so a staged historical night plays the role of 'tonight'. "
+        "Only meaningful with --live-poll-s > 0.",
+    )
 
 
 def _resolveSite(args: argparse.Namespace) -> Site:
@@ -289,11 +297,13 @@ def cmdRun(args: argparse.Namespace) -> int:
             workers=args.workers,
             pollS=args.live_poll_s,
             lagS=LIVE_LAG_S,
+            fixedDayObs=args.live_day_obs,
         )
         ctx.live.start()
+        pinned = f" (pinned to dayObs {args.live_day_obs})" if args.live_day_obs else ""
         print(
             f"Live mode: polling {site.name} every {args.live_poll_s:.0f}s "
-            f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot.",
+            f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot{pinned}.",
             file=sys.stderr,
         )
     if state is not None:

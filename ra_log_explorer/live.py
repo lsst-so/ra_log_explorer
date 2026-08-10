@@ -125,6 +125,7 @@ class LiveNightManager:
         pollS: float,
         lagS: float,
         windowAfterS: float = DEFAULT_WINDOW_AFTER_S,
+        fixedDayObs: int | None = None,
     ) -> None:
         self._site = site
         self._username = username
@@ -132,6 +133,11 @@ class LiveNightManager:
         self._pollS = max(30.0, pollS)
         self._lagS = max(0.0, lagS)
         self._windowAfterS = windowAfterS
+        # Testing hook (--live-day-obs): pin the poller to one dayObs
+        # instead of tracking the clock. A staged historical night then
+        # plays the role of "tonight" — same code paths, real data —
+        # and the noon-UTC rollover never fires.
+        self._fixedDayObs = fixedDayObs
         self._lock = threading.Lock()
         self._stopEvent = threading.Event()
         self._thread: threading.Thread | None = None
@@ -184,7 +190,7 @@ class LiveNightManager:
     def tick(self, now: dt.datetime | None = None) -> None:
         """One full poll cycle. Public so tests can drive it directly."""
         now = now or dt.datetime.now(dt.timezone.utc)
-        dayObs = currentDayObs(now)
+        dayObs = self._fixedDayObs if self._fixedDayObs is not None else currentDayObs(now)
         if self._dayObs is not None and dayObs != self._dayObs:
             self._finaliseNight()
             self._dayObs = None
