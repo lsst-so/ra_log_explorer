@@ -54,7 +54,11 @@ async function bootstrap() {
   if (urlDataId) {
     let summary;
     try {
-      const r = await fetch(apiUrl(`/api/summary?dataId=${encodeURIComponent(urlDataId)}`));
+      // Carry the URL's instrument so the server can refuse to serve a
+      // same-id state that belongs to the *other* instrument.
+      const urlInstrument = urlParams.get('instrument');
+      const instQ = urlInstrument ? `&instrument=${encodeURIComponent(urlInstrument)}` : '';
+      const r = await fetch(apiUrl(`/api/summary?dataId=${encodeURIComponent(urlDataId)}${instQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {

@@ -325,6 +325,34 @@ def test_queryExposureRecordBatch_returns_resolved_in_one_call(monkeypatch: pyte
     assert callCount == 1
 
 
+def test_queryExposureRecordBatch_pinned_instrument_never_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``instrument`` pinned, only that instrument's table is asked —
+    even for ids it has no row for. A probe-order fallthrough would hand
+    back the *other* instrument's exposure for a colliding id, anchoring
+    every downstream Δshutter offset to the wrong shutter."""
+    tablesQueried: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        sentSql = json.loads(req.data.decode("utf-8"))["query"]
+        tablesQueried.append(sentSql.split("FROM ")[1].split(".")[0])
+        # latiss knows one of the two ids; the other resolves nowhere.
+        return _stubResponse(
+            {
+                "columns": _FULL_COLS,
+                "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryExposureRecordBatch(
+        [2026051900722, 2026051900999], "TOKEN", consdbUrl=URL, instrument="latiss"
+    )
+    assert set(out) == {2026051900722}
+    assert tablesQueried == ["cdb_latiss"]  # nothing else was ever asked
+
+
 def test_queryExposureRecordBatch_falls_through_to_other_instruments(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

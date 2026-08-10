@@ -694,7 +694,7 @@ def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> ServerContext:
 
 def test_buildSpecFromRequest_TAI_default(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, expId, tZero = serverModule._buildSpecFromRequest(
+    spec, site, expId, tZero, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267"}
     )
     assert expId == 1
@@ -711,7 +711,7 @@ def test_buildSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCa
     hand back BTS logs — worse than an error, because the same dataId
     exists on both and the answer would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, _, _ = serverModule._buildSpecFromRequest(
+    spec, site, _, _, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "bts"}
     )
     assert site.name == "summit"
@@ -720,7 +720,7 @@ def test_buildSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCa
 
 def test_buildSpecFromRequest_UTC_opt_out(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, tZero = serverModule._buildSpecFromRequest(
+    _, _, _, tZero, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:45:39.267", "tZeroUtc": True}
     )
     # No 37s offset applied
@@ -733,7 +733,7 @@ def test_buildSpecFromRequest_ignores_credentials_and_workers(siteCatalog: FakeS
     process-global, so one browser's wrong password would otherwise break
     fetches for every other user of the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, _, _, _ = serverModule._buildSpecFromRequest(
+    spec, _, _, _, _ = serverModule._buildSpecFromRequest(
         ctx,
         {
             "exposureId": 1,

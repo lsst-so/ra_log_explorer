@@ -24,6 +24,14 @@
         <span class="brand-mark" aria-hidden="true"></span>
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">pick an exposure to explore</span>
+        <!-- The page-level instrument. Exposure ids restart at 1 per
+             instrument each night, so everything below — the Tonight
+             list, dataId lookups, fetches — is pinned to exactly one
+             instrument at a time. LSSTCam is the default. -->
+        <div id="instrument-switch" role="group" aria-label="instrument">
+          <button type="button" data-instrument="lsstcam" class="active">LSSTCam</button>
+          <button type="button" data-instrument="latiss">LATISS</button>
+        </div>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
         <a href="__BASE_PATH__/?admin=1" class="ghost mini" id="admin-link">admin</a>
       </div>
@@ -120,8 +128,8 @@
           </details>
         </section>
 
-        <section class="home-card">
-          <h2>AOS processing <span class="muted">investigate a whole night</span></h2>
+        <section class="home-card" id="night-card">
+          <h2>AOS processing <span class="muted">investigate a whole night · LSSTCam only</span></h2>
           <p class="hint">
             Covers the full 24-hour night for the AOS-flavoured pods
             (<code>*aos*</code>) for the given <code>dayObs</code> and
@@ -157,7 +165,6 @@
             <thead>
               <tr>
                 <th>dataId</th>
-                <th>instrument</th>
                 <th>shutter close</th>
                 <th>type</th>
                 <th>filter</th>

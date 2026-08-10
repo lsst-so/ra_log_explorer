@@ -150,6 +150,31 @@ input[type=checkbox], input[type=radio] { accent-color: var(--accent); }
 }
 #topbar button.ghost:hover,
 #topbar a.ghost:hover { background: var(--nav-bg-2); }
+
+/* Instrument switch: a segmented control. The active side is the page's
+   instrument; everything on the page is pinned to it. */
+#instrument-switch {
+  display: inline-flex;
+  border: 1px solid var(--nav-border);
+  border-radius: 999px;
+  overflow: hidden;
+  margin-left: 10px;
+}
+#instrument-switch button {
+  background: transparent;
+  color: var(--nav-text);
+  border: 0;
+  padding: 3px 12px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+}
+#instrument-switch button + button { border-left: 1px solid var(--nav-border); }
+#instrument-switch button.active {
+  background: var(--nav-bg-2);
+  font-weight: 700;
+}
 /* Site badge: deliberately loud — which observatory's logs you are
    looking at is the most important thing on the page, and there is no way
    to change it from here, so it reads as a statement rather than a

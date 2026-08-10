@@ -57,6 +57,13 @@ class FetchJob:
     # resulting ServerState / NightState and which per-site exposure-
     # time cache file the resolved values land in.
     siteName: str = ""
+    # The instrument this fetch is *for* (lowercase table name, e.g.
+    # "lsstcam"). Part of the exposure's identity — the same dataId
+    # names a different exposure per instrument — so it pins every
+    # ConsDB resolution downstream of this job and scopes which pods
+    # the resulting view attributes work to. None only for night jobs,
+    # which are AOS and therefore LSSTCam by construction.
+    instrument: str | None = None
     kind: JobKind = "exposure"
     expId: int | None = None
     tZero: dt.datetime | None = None
@@ -105,11 +112,24 @@ class JobManager:
         self._lock = threading.Lock()
         self.stateLock = threading.Lock()
 
-    def createJob(self, spec: FetchSpec, expId: int, tZero: dt.datetime, siteName: str = "") -> FetchJob:
+    def createJob(
+        self,
+        spec: FetchSpec,
+        expId: int,
+        tZero: dt.datetime,
+        siteName: str = "",
+        instrument: str | None = None,
+    ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
             job = FetchJob(
-                jobId=jobId, spec=spec, siteName=siteName, kind="exposure", expId=expId, tZero=tZero
+                jobId=jobId,
+                spec=spec,
+                siteName=siteName,
+                instrument=instrument,
+                kind="exposure",
+                expId=expId,
+                tZero=tZero,
             )
             self._jobs[jobId] = job
             return job
@@ -129,6 +149,7 @@ class JobManager:
         tZeroStart: dt.datetime,
         tZeroStop: dt.datetime,
         siteName: str = "",
+        instrument: str | None = None,
     ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
@@ -136,6 +157,7 @@ class JobManager:
                 jobId=jobId,
                 spec=spec,
                 siteName=siteName,
+                instrument=instrument,
                 kind="range",
                 startId=startId,
                 stopId=stopId,

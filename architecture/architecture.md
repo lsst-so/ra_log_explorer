@@ -240,21 +240,34 @@ Sibling docs:
   `instrument` (stamped from the table it was read out of, not trusted
   to a column), `queryExposureRecordsForDayObs` returns a list rather
   than an id-keyed map, the on-disk exposure-time cache keys records
-  under `<instrument>:<id>`, `/api/exposure-time/<id>` accepts an
-  `?instrument=`, the Tonight panel shows the instrument and carries it
-  in its links, and the explore view's info box (and the dataId-link
-  tooltips) lead with it. The **bare id** is still a meaningful question with a
+  under `<instrument>:<id>`, and `/api/exposure-time/<id>` accepts an
+  `?instrument=`. The **bare id** is still a meaningful question with a
   defined answer — "whichever instrument `INSTRUMENTS_BY_PROBE_ORDER`
   reaches first" — and that is what an unqualified lookup and the bare
   cache key resolve to; every writer agrees on that rule so the answer
   can't depend on who wrote last.
 
-  What is *not* yet instrument-aware is the layer above: the server's
-  in-memory `exposureStates` dict, the URL routing key, `_exposure_ids.txt`
-  and range mode are all keyed by the bare id. Two colliding exposures
-  therefore share one in-memory slot — each view shows the correct data
-  for the dataId it resolved, but opening one evicts the other. Making
-  those keys `(instrument, dataId)` is its own piece of work.
+  The **serving layer** is pinned per page. The home topbar carries an
+  instrument switch (LSSTCam default — always the default when one must
+  be picked); the Tonight list, every dataId lookup, and every fetch it
+  launches are scoped to the selected instrument. `POST /api/fetch` and
+  `POST /api/fetch-range` take an `instrument` (defaulting to
+  `lsstcam`), the resulting states carry it, their shutter-close
+  resolutions — including the range mode's server-side batch — query
+  only that instrument's table, and the exposure payload attributes
+  work only to pods of that instrument (plus instrument-neutral pods
+  like redis; see `_podBelongsToInstrument`). Night mode needs no
+  parameter: AOS runs on LSSTCam only, and its resolutions are
+  hard-pinned there.
+
+  One deliberate simplification remains: the in-memory `exposureStates`
+  dict, `_exposure_ids.txt` and the range key are still keyed by the
+  bare id, so two colliding exposures share one in-memory slot —
+  opening one evicts the other. Correctness is protected by a guard
+  rather than by the key: `/api/summary?dataId=&instrument=` refuses to
+  serve a state pinned to a different instrument (falling through to
+  the rebuild/fetch path, which re-pins), and the cache-rebuild path
+  verifies the window it found actually contains the pinned t₀.
 
 - **dayObs** — 8-digit `YYYYMMDD` integer. The observatory rolls the
   calendar over at UTC-12, so dayObs 20260521 covers
@@ -375,11 +388,12 @@ Each tick (every `LIVE_POLL_S` seconds):
    instantly, and in the live snapshot.
 3. **Readiness.** An exposure is *ready* when
    `shutterClose(UTC) + windowAfterS <= watermark`: the whole default
-   exposure window is already on disk. The home page's **Tonight** panel
-   lists tonight's exposures newest-first (one row per instrument ×
-   exposure) with ready/wait status, and links ready ones straight into
-   the ordinary explore flow — carrying `&instrument=` so the link
-   resolves the right exposure's shutter close.
+   exposure window is already on disk. The snapshot carries one row per
+   (instrument, exposure); the home page's **Tonight** panel shows the
+   rows for the topbar's selected instrument, newest-first, with
+   ready/wait status, and links ready ones straight into the ordinary
+   explore flow — carrying `&instrument=` so the link resolves the
+   right exposure's shutter close.
 4. **Housekeeping.** When the poller opens a night it sweeps its
    cluster/namespace for night dirs it left *unfinalised* — what a
    restart across noon produces — and finalises one per tick. Nothing
@@ -532,8 +546,12 @@ investigation.
 The view-state lookup. The query string picks which loaded state to
 return:
 
-- `?dataId=<int>` — return that exposure's payload, or `{loaded:
-  false, cache}` if not loaded.
+- `?dataId=<int>[&instrument=<name>]` — return that exposure's payload,
+  or `{loaded: false, cache}` if not loaded. With `instrument` given, a
+  loaded state pinned to a *different* instrument is treated as not
+  loaded rather than served — the same bare id names a different
+  exposure per instrument — and the rebuild path resolves under the
+  pin. 400 for an unknown instrument name.
 - `?dayObs=<int>` — return that night's payload, or `{loaded: false,
   cache}` if not loaded.
 - `?rangeStart=<int>&rangeStop=<int>` — return that range's **index**
@@ -967,6 +985,10 @@ Request body — only what is being asked, never how to ask it:
 {
   "exposureId": 2026051900722,         // required, integer
   "tZero":      "2026-05-20T08:46:16.267",  // required, ISO-8601
+  "instrument": "lsstcam",             // optional; default "lsstcam". Part of the
+                                       // exposure's identity: pins the info-box
+                                       // lookup, stamps the resulting state, and
+                                       // scopes pod attribution. 400 if unknown.
   "tZeroUtc":   false,                 // optional; default false (treat as TAI)
   "tZeroManual": false,                // optional; true ⇒ tZero was hand-entered
   "windowBefore": 5.0, "windowAfter": 300.0   // optional; default from the environment
@@ -1019,6 +1041,10 @@ shape as `/api/fetch`.
   "rangeStop":  2026051900750,         // required, integer; > rangeStart
   "tZeroStart": "2026-05-20T08:46:16.267",  // required, ISO-8601 (start shutter close)
   "tZeroStop":  "2026-05-20T08:51:09.512",  // required, ISO-8601 (stop shutter close)
+  "instrument": "lsstcam",             // optional; default "lsstcam". A range is a
+                                       // run of ONE instrument's exposures; the
+                                       // server-side shutter-close batch resolves
+                                       // against that table only. 400 if unknown.
   "tZeroUtc":   false,                 // optional; default false (treat both as TAI)
   "windowBefore": 5.0, "windowAfter": 300.0   // optional; default from the environment
 }

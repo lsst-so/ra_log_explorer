@@ -267,8 +267,12 @@ port. Ctrl-C in the terminal stops the server.
 
 The browser app has three views:
 
-- **Home view** — the landing page when nothing is loaded. Two
-  side-by-side mode cards on top: **All RA processing** (one exposure,
+- **Home view** — the landing page when nothing is loaded. The topbar
+  carries the **instrument switch** (LSSTCam / LATISS, LSSTCam default)
+  that the whole page follows — exposure ids restart at 1 per
+  instrument each night, so every list, lookup, and fetch is pinned to
+  exactly one instrument at a time. Two side-by-side mode cards on top:
+  **All RA processing** (one exposure,
   with a single *advanced options* disclosure holding the shared window
   pads and the range-of-exposures form) and **AOS processing**
   (investigate a whole night), each with its own inline progress bar.
@@ -551,21 +555,21 @@ The deployed instances run with `RA_LOG_EXPLORER_LIVE_POLL_S` set, which
 turns on **live mode**: the server continuously fetches the current
 night's logs (all pods, every few minutes) into its cache, and the home
 page grows a **Tonight** panel listing every exposure taken so far —
-newest first, with its instrument, what kind of image it is, and whether
-its logs are ready. An exposure becomes *ready* when the full default
-window (shutter close + 5 minutes) is on disk; clicking it opens the
-ordinary explore view, served by slicing the already-fetched night
-rather than by a fresh Loki query, so it loads in seconds even mid-night.
+newest first, with what kind of image it is and whether its logs are
+ready. An exposure becomes *ready* when the full default window
+(shutter close + 5 minutes) is on disk; clicking it opens the ordinary
+explore view, served by slicing the already-fetched night rather than
+by a fresh Loki query, so it loads in seconds even mid-night.
 
-The instrument column is not decoration. A dataId's last five digits are
-a sequence number that restarts at 1 each night *per instrument*, so on
-a night where LSSTCam and LATISS both observe, `2026071100001` is a
-different image on each — with a different shutter close. Both are
-listed, and the Tonight links carry the instrument so they open the
-right one. Typing a bare dataId into the exposure form still works and
-resolves it the usual way (LSSTCam first, then LATISS, …); add
-`&instrument=latiss` to the URL, or click through from Tonight, to pin
-it.
+The **instrument switch** in the topbar decides whose exposures you are
+looking at. A dataId's last five digits are a sequence number that
+restarts at 1 each night *per instrument*, so on a night where LSSTCam
+and LATISS both observe, `2026071100001` is a different image on each —
+with a different shutter close — and mixing them would be actively
+wrong. The whole page follows the switch: the Tonight list shows only
+the selected instrument's exposures, and every dataId lookup and fetch
+resolves against it. LSSTCam is the default; the AOS card only appears
+for LSSTCam (AOS runs nowhere else).
 
 The panel header shows how far the night has been fetched ("logs
 fetched through …"). A freshly-restarted server shows *catching up*
@@ -623,11 +627,11 @@ started this one with the wrong `--site`).
 
 *Wrong instrument:* within one site, an id is only unique per
 instrument — the sequence number restarts at 1 each night for each — so
-on a night LSSTCam and LATISS both observe, a bare id resolves to the
-LSSTCam one (the probe order). If you wanted the AuxTel exposure, click
-it from the **Tonight** panel, which carries the instrument, or add
-`&instrument=latiss` to the URL. The explore view's info box shows which
-instrument it resolved.
+on a night LSSTCam and LATISS both observe, the same id names a
+different image on each. Check the **instrument switch** in the topbar:
+everything on the page (the Tonight list, lookups, fetches) follows it,
+and LSSTCam is the default. The explore view's info box shows which
+instrument a loaded exposure resolved against.
 
 **A few pods show 0 events but the exposure obviously touched them** —
 look at the pod's `.jsonl` directly under the cache directory. If the

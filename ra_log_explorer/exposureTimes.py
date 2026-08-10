@@ -192,9 +192,17 @@ def probeOrderWinners(records: Iterable[ExposureRecord]) -> dict[int, ExposureRe
 MANUAL_RECORD_KEY = "_manual"
 
 
-def manualRecord(obsEndTai: str) -> ExposureRecord:
-    """Build a minimal manual exposure record carrying just ``obs_end``."""
-    return {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+def manualRecord(obsEndTai: str, instrument: str | None = None) -> ExposureRecord:
+    """Build a minimal manual exposure record carrying just ``obs_end``.
+
+    Stamped with ``instrument`` when the caller knows it, so the
+    instrument-pinned lookups used everywhere else can find the
+    stand-in — an unstamped manual record only answers bare lookups.
+    """
+    record: ExposureRecord = {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+    if instrument:
+        record[INSTRUMENT_RECORD_KEY] = instrument
+    return record
 
 
 def isManual(record: ExposureRecord | None) -> bool:
@@ -226,14 +234,20 @@ def queryExposureRecordBatch(
     *,
     consdbUrl: str,
     chunkSize: int = 500,
+    instrument: str | None = None,
 ) -> dict[int, ExposureRecord]:
     """Resolve many dataIds in one round trip per instrument.
 
-    For each instrument in :data:`INSTRUMENTS_BY_PROBE_ORDER` we send
-    a single ``SELECT * … WHERE exposure_id IN (…)`` covering whatever
-    dataIds are still unresolved. Returns ``{dataId: record}`` for the
-    matches found; dataIds with no row in any instrument's table
-    simply don't appear in the output.
+    With ``instrument`` pinned, only that instrument's table is asked —
+    the caller knows which instrument's exposures these ids name (a
+    range of one instrument's exposures, a night of AOS work), and a
+    probe-order answer could silently hand back the *other* instrument's
+    rows for colliding ids, anchoring every downstream Δshutter offset
+    to the wrong shutter. Unpinned, each instrument in
+    :data:`INSTRUMENTS_BY_PROBE_ORDER` is asked in turn with a single
+    ``SELECT * … WHERE exposure_id IN (…)`` covering whatever dataIds
+    are still unresolved. Returns ``{dataId: record}`` for the matches
+    found; dataIds with no row simply don't appear in the output.
 
     ``chunkSize`` caps the IN-list size per query so an enormous
     night doesn't trip ConsDB's SQL-length limits. With the default
@@ -243,10 +257,11 @@ def queryExposureRecordBatch(
     """
     out: dict[int, ExposureRecord] = {}
     remaining = [int(x) for x in dataIds]
-    for instrument in INSTRUMENTS_BY_PROBE_ORDER:
+    instruments = (instrument,) if instrument else INSTRUMENTS_BY_PROBE_ORDER
+    for inst in instruments:
         if not remaining:
             break
-        found = _queryBatch(remaining, token, instrument, chunkSize, consdbUrl=consdbUrl)
+        found = _queryBatch(remaining, token, inst, chunkSize, consdbUrl=consdbUrl)
         out.update(found)
         remaining = [d for d in remaining if d not in out]
     return out

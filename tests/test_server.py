@@ -959,7 +959,9 @@ def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     start anchor (minus the before-buffer) to the stop anchor (plus the
     after-buffer), with the TAI→UTC conversion applied to both anchors."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, startId, stopId, tZeroStart, tZeroStop = server._buildRangeSpecFromRequest(ctx, _rangeBody())
+    spec, site, startId, stopId, tZeroStart, tZeroStop, _ = server._buildRangeSpecFromRequest(
+        ctx, _rangeBody()
+    )
     assert (startId, stopId) == (2026051900722, 2026051900750)
     assert site.name == "summit"
     assert spec.podRegex is None  # range is an all-pods fetch
@@ -975,13 +977,13 @@ def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
 
 def test_buildRangeSpecFromRequest_tZeroUtc_skips_conversion(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, _, tZeroStart, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
+    _, _, _, _, tZeroStart, _, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(tZeroUtc=True))
     assert tZeroStart == dt.datetime(2026, 5, 20, 8, 46, 16, 267000, tzinfo=dt.timezone.utc)
 
 
 def test_buildRangeSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, site, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
+    _, site, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
     assert site.name == "summit"
 
 
@@ -1010,7 +1012,7 @@ def test_buildRangeSpecFromRequest_rejects_missing_anchor(siteCatalog: FakeSiteC
 
 def test_buildRangeSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2", workers=999))
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2", workers=999))
     assert spec.username == server.DEFAULT_USERNAME
     assert spec.workers == server.DEFAULT_WORKERS
 
@@ -1021,7 +1023,7 @@ def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog
     handler doesn't catch — it would drop the connection with no
     response)."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
     # Defaults: start 08:45:39.267 − 5 s, stop 08:50:32.512 + 300 s.
     assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
     assert spec.toIso.startswith("2026-05-20T08:55:32.512")
@@ -1031,7 +1033,7 @@ def test_buildRangeSpecFromRequest_zero_window_is_preserved(siteCatalog: FakeSit
     """``0`` is a legitimate window (start exactly at the shutter close)
     and must not be coerced to the default."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
     assert spec.fromIso.startswith("2026-05-20T08:45:39.267")
 
 
@@ -1259,7 +1261,12 @@ def test_resolveShutterCloses_requeries_manual_standins(
     queried: list[list[int]] = []
 
     def fakeBatch(
-        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
     ) -> dict[int, exposureTimes.ExposureRecord]:
         queried.append(sorted(dataIds))
         return {2026052000001: {"obs_end": "2026-05-20T08:46:16.267000", "physical_filter": "r"}}
@@ -1293,7 +1300,12 @@ def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
     siteCatalog.writeSummitToken()
 
     def emptyBatch(
-        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
     ) -> dict[int, exposureTimes.ExposureRecord]:
         return {}
 
@@ -1385,3 +1397,94 @@ def test_trimFloat_drops_a_pointless_decimal() -> None:
     assert server._trimFloat(0.0) == "0"
     assert server._trimFloat(12.5) == "12.5"
     assert server._trimFloat(0.1) == "0.1"
+
+
+# ----- instrument threading -------------------------------------------------
+
+
+def test_instrumentFromBody_defaults_to_lsstcam() -> None:
+    """A body that doesn't say is an LSSTCam fetch — the default
+    instrument is always LSSTCam."""
+    assert server._instrumentFromBody({}) == "lsstcam"
+    assert server._instrumentFromBody({"instrument": ""}) == "lsstcam"
+    assert server._instrumentFromBody({"instrument": None}) == "lsstcam"
+
+
+def test_instrumentFromBody_normalises_and_validates() -> None:
+    assert server._instrumentFromBody({"instrument": "LATISS"}) == "latiss"
+    with pytest.raises(ValueError):
+        server._instrumentFromBody({"instrument": "hubble"})
+    with pytest.raises(ValueError):
+        server._instrumentFromBody({"instrument": 7})
+
+
+def test_podBelongsToInstrument_rules() -> None:
+    """Cross-instrument pods never belong; neutral pods always do; an
+    unknown side keeps the pod rather than hiding work."""
+    assert server._podBelongsToInstrument("LSSTCam", "lsstcam") is True
+    assert server._podBelongsToInstrument("LATISS", "lsstcam") is False
+    assert server._podBelongsToInstrument(None, "lsstcam") is True  # redis, squid, misc
+    assert server._podBelongsToInstrument("LSSTCam", None) is True
+    assert server._podBelongsToInstrument(None, None) is True
+
+
+def _instrumentSummary(pod: str, instrument: str | None, expId: int) -> parse.PodSummary:
+    return parse.PodSummary(
+        pod=pod,
+        group="sfm",
+        instrument=instrument,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen={expId},
+        events=[],
+    )
+
+
+def test_buildSummaryPayload_filters_pods_by_instrument(tmp_path: Path) -> None:
+    """A LATISS view of id N must not attribute an LSSTCam pod's work —
+    the same bare id names a different exposure on each instrument."""
+    expId = 2026071100470
+    tZero = dt.datetime(2026, 7, 12, 5, 42, 20, tzinfo=dt.timezone.utc)
+    state = server.ServerState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+            _instrumentSummary("redis-0", None, expId),
+        ],
+        expId=expId,
+        tZero=tZero,
+        siteName="summit",
+        instrument="latiss",
+    )
+    payload = server._buildSummaryPayload(state)
+    assert payload["instrument"] == "latiss"
+    assert {p["pod"] for p in payload["pods"]} == {"s-latiss-run-sfm-runner-1", "redis-0"}
+    assert {p["pod"] for p in payload["podsAll"]} == {"s-latiss-run-sfm-runner-1", "redis-0"}
+
+
+def test_buildSummaryPayload_without_instrument_keeps_every_pod(tmp_path: Path) -> None:
+    """A state built before the instrument was known filters nothing —
+    hiding work on an unknown pin would be worse than showing extra."""
+    expId = 2026071100470
+    state = server.ServerState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+        ],
+        expId=expId,
+        tZero=dt.datetime(2026, 7, 12, 5, 42, 20, tzinfo=dt.timezone.utc),
+        siteName="summit",
+    )
+    payload = server._buildSummaryPayload(state)
+    assert len(payload["pods"]) == 2

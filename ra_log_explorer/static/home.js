@@ -10,13 +10,19 @@
 'use strict';
 
 const LS = {
-  // Last per-exposure tuning (windowBefore/After). The only thing the home
-  // view still remembers per browser: everything else that used to live
-  // here — credentials, worker count, cache size and location, which site
-  // to query — is deployment configuration the server reads from its
-  // environment, not something a visitor gets to set.
+  // Last per-exposure tuning (windowBefore/After) and the last-used
+  // instrument. The only things the home view still remembers per
+  // browser: everything else that used to live here — credentials,
+  // worker count, cache size and location, which site to query — is
+  // deployment configuration the server reads from its environment,
+  // not something a visitor gets to set.
   lastExpTuning: 'ra_log_explorer.lastExpTuning',  // {windowBefore, windowAfter}
+  instrument: 'ra_log_explorer.instrument',        // 'lsstcam' | 'latiss'
 };
+
+function readLsInstrument() {
+  try { return localStorage.getItem(LS.instrument) || ''; } catch (_) { return ''; }
+}
 
 // This deployment's site, from /api/site. Read-only: it labels the page so
 // nobody mistakes summit data for BTS data, and it is decided by where the
@@ -29,15 +35,49 @@ let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
 let tZeroIsManual = false;      // true when resolvedTZero was hand-entered (ConsDB couldn't resolve it)
 let lookupTimer = null;         // debounce timer for the dataId input
 let lookupSeq = 0;              // sequence number to ignore stale lookup responses
-// The instrument the current dataId belongs to, when we know it (a deep
-// link from the Tonight panel carries it). A dataId alone does not name an
-// exposure: every instrument numbers from 1 each night, so on a night where
-// LSSTCam and LATISS both observe the same id exists on both with different
-// shutter closes. Empty means "resolve it the probe-order way", which is
-// what a hand-typed dataId gets — the instrument only applies to the id it
-// arrived with, so editing the field drops it.
-let lookupInstrument = '';
-let lookupInstrumentForExpId = null;
+// The page-level instrument context. A dataId alone does not name an
+// exposure: every instrument numbers from 1 each night, so on a night
+// where LSSTCam and LATISS both observe, the same id exists on both
+// with different shutter closes — the two must never be mixed. The
+// topbar switch pins the whole page (Tonight list, lookups, fetches)
+// to exactly one instrument; LSSTCam is always the default.
+const INSTRUMENTS = ['lsstcam', 'latiss'];
+let pageInstrument = 'lsstcam';
+
+function getInstrument() {
+  return pageInstrument;
+}
+
+function setInstrument(inst, opts) {
+  inst = (inst || '').toLowerCase();
+  if (!INSTRUMENTS.includes(inst)) inst = 'lsstcam';
+  const changed = inst !== pageInstrument;
+  pageInstrument = inst;
+  try { localStorage.setItem(LS.instrument, inst); } catch (_) { /* private mode */ }
+  for (const b of document.querySelectorAll('#instrument-switch button')) {
+    b.classList.toggle('active', b.dataset.instrument === inst);
+  }
+  // Keep the URL in step so a reload (or a copied link) lands on the
+  // same instrument.
+  const url = new URL(window.location);
+  url.searchParams.set('instrument', inst);
+  history.replaceState(null, '', url);
+  // AOS (night mode) runs on LSSTCam only — its wavefront sensors live
+  // in LSSTCam's corners — so the card has nothing to offer for LATISS.
+  document.getElementById('night-card').hidden = inst !== 'lsstcam';
+  if (changed && !(opts && opts.initial)) {
+    // Same typed ids, different instrument => different exposures with
+    // different shutter closes: drop every resolved t0 and re-resolve
+    // under the new pin, and refilter the Tonight list.
+    clearResolvedTZero();
+    hideManualEntry();
+    clearRangeSlot(rangeStartSlot);
+    clearRangeSlot(rangeStopSlot);
+    triggerLookupIfReady();
+    triggerRangeLookupsIfReady();
+    if (tonightLastLive) renderTonight(tonightLastLive);
+  }
+}
 
 function startHome() {
   if (!homeListenersWired) wireHomeListeners();
@@ -51,8 +91,10 @@ function startHome() {
   // prefilled so a one-click fetch reproduces what the URL implies.
   const params = new URLSearchParams(window.location.search);
   const urlDataId = params.get('dataId');
-  lookupInstrument = params.get('instrument') || '';
-  lookupInstrumentForExpId = lookupInstrument && urlDataId ? parseInt(urlDataId, 10) : null;
+  // Instrument context: an explicit URL param (deep links from the
+  // Tonight panel carry one) wins; otherwise whatever this browser used
+  // last; otherwise LSSTCam.
+  setInstrument(params.get('instrument') || readLsInstrument(), { initial: true });
   const urlDayObs = params.get('dayObs');
   const urlRangeStart = params.get('rangeStart');
   const urlRangeStop = params.get('rangeStop');
@@ -139,10 +181,15 @@ function renderTonight(live) {
   }
   tonightLastLive = live;
   card.hidden = false;
-  const exposures = live.exposures || [];
+  // Only the page's instrument: the same id in both lists would be two
+  // different exposures, so mixing the lists would be actively wrong.
+  const exposures = (live.exposures || []).filter(
+    (e) => (e.instrument || 'lsstcam') === getInstrument(),
+  );
   const nReady = exposures.filter((e) => e.ready).length;
   document.getElementById('tonight-summary').textContent =
-    `dayObs ${live.dayObs ?? '?'} · ${exposures.length} exposure${exposures.length === 1 ? '' : 's'}` +
+    `dayObs ${live.dayObs ?? '?'} · ${exposures.length} ${getInstrument() === 'latiss' ? 'LATISS' : 'LSSTCam'} ` +
+    `exposure${exposures.length === 1 ? '' : 's'}` +
     (exposures.length ? ` · ${nReady} viewable` : '');
 
   const watermarkS = (live.watermark || '').replace('T', ' ').replace(/\..*Z?$/, '');
@@ -197,7 +244,6 @@ function renderTonight(live) {
     const tr = document.createElement('tr');
     tr.innerHTML =
       `<td>${idCell}</td>` +
-      `<td>${escapeHtml(exp.instrument || '')}</td>` +
       `<td class="mono">${escapeHtml(closeS)}</td>` +
       `<td>${escapeHtml(rec.img_type || '')}</td>` +
       `<td>${escapeHtml(rec.physical_filter || '')}</td>` +
@@ -287,6 +333,9 @@ function readFormValues() {
   out.exposureId = parseInt(out.exposureId, 10);
   out.windowBefore = parseFloat(out.windowBefore);
   out.windowAfter = parseFloat(out.windowAfter);
+  // Which exposure this id names depends on the page's instrument; the
+  // server keys the resulting view (and its pod attribution) off it.
+  out.instrument = getInstrument();
   // Always TAI; the server applies the -37 s conversion. We deliberately
   // never expose a UTC opt-out in the UI now that timings come from a
   // service that's TAI by construction (and a manual entry is, by the
@@ -437,8 +486,9 @@ function triggerLookupIfReady() {
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
   const mySeq = ++lookupSeq;
-  const instrument = expId === lookupInstrumentForExpId ? lookupInstrument : '';
-  const suffix = instrument ? `?instrument=${encodeURIComponent(instrument)}` : '';
+  // Always pinned: the page's instrument decides which exposure this
+  // bare id names, and therefore which shutter close comes back.
+  const suffix = `?instrument=${encodeURIComponent(getInstrument())}`;
   fetch(apiUrl(`/api/exposure-time/${expId}${suffix}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
@@ -541,7 +591,7 @@ function triggerRangeLookup(slot) {
   }
   setRangeStatus(slot.status, `looking up ${expId}…`, 'info');
   const mySeq = ++slot.seq;
-  fetch(apiUrl(`/api/exposure-time/${expId}`))
+  fetch(apiUrl(`/api/exposure-time/${expId}?instrument=${encodeURIComponent(getInstrument())}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== slot.seq) return;  // stale; user typed something newer
@@ -1065,6 +1115,7 @@ async function startRangeFetch(ev) {
     tZeroStop: rangeStopSlot.tZero,
     windowBefore: parseFloat(expForm.elements.windowBefore.value),
     windowAfter: parseFloat(expForm.elements.windowAfter.value),
+    instrument: getInstrument(),
   };
 
   const submit = document.getElementById('range-submit');
@@ -1109,6 +1160,9 @@ function wireHomeListeners() {
   const rangeForm = document.getElementById('range-form');
   rangeForm.elements.rangeStart.addEventListener('input', () => scheduleRangeLookup(rangeStartSlot));
   rangeForm.elements.rangeStop.addEventListener('input', () => scheduleRangeLookup(rangeStopSlot));
+  for (const b of document.querySelectorAll('#instrument-switch button')) {
+    b.addEventListener('click', () => setInstrument(b.dataset.instrument));
+  }
   homeListenersWired = true;
   updateSubmitButton();  // start with submit disabled until lookup resolves
   updateRangeSubmit();   // same for the range card

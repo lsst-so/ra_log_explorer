@@ -158,6 +158,13 @@ class ServerState:
     # fetch time from the request body's `site` field (or derived from
     # the cache path's cluster component when rehydrating from disk).
     siteName: str = ""
+    # The instrument this exposure belongs to (lowercase, e.g.
+    # "lsstcam"). Part of the exposure's identity — the same dataId
+    # names a different exposure per instrument — so it scopes which
+    # pods the timeline attributes work to and lets /api/summary refuse
+    # to serve this state to a request pinned to a different instrument.
+    # None only for states built before the instrument was known.
+    instrument: str | None = None
     # Curated ConsDB exposure record for this dataId (filter, exp time,
     # image type, program, reason, …) — drives the explore-view info box.
     # None if ConsDB never resolved it (no token, unknown dataId).
@@ -207,6 +214,10 @@ class RangeState:
     toTime: dt.datetime  # fetch window end (UTC)
     # See ``ServerState.siteName``.
     siteName: str = ""
+    # See ``ServerState.instrument`` — a range is a run of *one*
+    # instrument's exposures, and its server-side shutter-close batch
+    # must resolve against that instrument's table only.
+    instrument: str | None = None
     # dataId -> shutter-close (t₀) UTC datetime for every exposure in
     # [startId, stopId] that ConsDB knew about. Ids absent here are the
     # "skipped" integers the user was warned to expect.
@@ -485,8 +496,27 @@ def _summaryToDict(s: parser.PodSummary, tZero: dt.datetime, expId: int) -> dict
     }
 
 
+def _podBelongsToInstrument(podInstrument: str | None, instrument: str | None) -> bool:
+    """Whether a pod belongs on a view pinned to ``instrument``.
+
+    A dataId is only unique within one instrument, so an LSSTCam pod
+    that logged id N is talking about a *different exposure* than the
+    LATISS view of id N — cross-instrument pods must never be
+    attributed. Instrument-neutral pods (name carries no instrument:
+    redis, squid, misc) always belong, and when either side is unknown
+    we keep the pod rather than silently hide work.
+    """
+    if instrument is None or podInstrument is None:
+        return True
+    return podInstrument.lower() == instrument.lower()
+
+
 def _buildSummaryPayload(state: ServerState) -> dict:
-    matchingSummaries = parser.podsForTimeline(state.summaries, state.expId)
+    matchingSummaries = [
+        s
+        for s in parser.podsForTimeline(state.summaries, state.expId)
+        if _podBelongsToInstrument(s.instrument, state.instrument)
+    ]
     refs = list(state.referencePoints)
     # Head node's first acknowledgement of this exposure — the moment
     # ButlerWatcher+head observed it as "ready to process". Useful for
@@ -523,6 +553,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "loaded": True,
         "mode": "exposure",
         "site": state.siteName,
+        "instrument": state.instrument,
         "expId": state.expId,
         "tZero": state.tZero.isoformat(),
         # Curated ConsDB exposure record (filter, exp time, image type,
@@ -539,6 +570,7 @@ def _buildSummaryPayload(state: ServerState) -> dict:
         "podsAll": [
             {"pod": s.pod, "group": s.group, "nLines": s.nLines, "nWarn": s.nWarn, "nError": s.nError}
             for s in state.summaries
+            if _podBelongsToInstrument(s.instrument, state.instrument)
         ],
     }
 
@@ -658,7 +690,19 @@ def _prefetchNightShutterCloses(
     needIds = _neededDataIdsForNight(summaries)
     if not needIds:
         return
-    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
+    # Night mode is the AOS pipeline, and AOS runs on LSSTCam only (the
+    # wavefront sensors live in its corners) — so every dataId in these
+    # logs is an LSSTCam id. Pinning matters: on a night where LATISS
+    # also observed, a probe-order lookup for a colliding id could
+    # anchor an AOS histogram bar to the *LATISS* shutter close.
+    _resolveShutterClosesInto(
+        needIds,
+        state.shutterCloseByExpId,
+        state.exposureInfoByExpId,
+        job,
+        site,
+        instrument="lsstcam",
+    )
 
 
 def _prefetchRangeShutterCloses(state: RangeState, job: FetchJob, site: Site) -> None:
@@ -676,7 +720,14 @@ def _prefetchRangeShutterCloses(state: RangeState, job: FetchJob, site: Site) ->
     needIds = set(range(state.startId, state.stopId + 1))
     if not needIds:
         return
-    _resolveShutterClosesInto(needIds, state.shutterCloseByExpId, state.exposureInfoByExpId, job, site)
+    _resolveShutterClosesInto(
+        needIds,
+        state.shutterCloseByExpId,
+        state.exposureInfoByExpId,
+        job,
+        site,
+        instrument=job.instrument,
+    )
 
 
 def _resolveShutterClosesInto(
@@ -685,6 +736,7 @@ def _resolveShutterClosesInto(
     infoTarget: dict[int, exposureTimes.ExposureRecord],
     job: FetchJob,
     site: Site,
+    instrument: str | None = None,
 ) -> None:
     """Resolve each id in ``needIds`` into ``target`` (shutter close t₀,
     UTC) and ``infoTarget`` (the full ConsDB exposure record) — on-disk
@@ -712,7 +764,7 @@ def _resolveShutterClosesInto(
     cachedHits = 0
     manualStandins = 0
     for expId in needIds:
-        rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
         iso = exposureTimes.obsEnd(rec)
         if rec is None or iso is None:
             misses.append(expId)
@@ -771,7 +823,9 @@ def _resolveShutterClosesInto(
             job.push({"type": "shutter-close", "phase": "empty-token", "remaining": unanchored()})
             return
     try:
-        resolved = exposureTimes.queryExposureRecordBatch(misses, token, consdbUrl=site.consdbUrl)
+        resolved = exposureTimes.queryExposureRecordBatch(
+            misses, token, consdbUrl=site.consdbUrl, instrument=instrument
+        )
     except (exposureTimes.ConsDbError, OSError) as e:
         job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
         return
@@ -866,6 +920,10 @@ def _buildNightPayload(state: NightState) -> dict:
         "loaded": True,
         "mode": "night",
         "site": state.siteName,
+        # Night mode is the AOS pipeline, which runs on LSSTCam only —
+        # every dataId in this payload is an LSSTCam id and was resolved
+        # against the LSSTCam table.
+        "instrument": "lsstcam",
         "dayObs": state.dayObs,
         "startTime": state.startTime.isoformat(),
         "endTime": state.endTime.isoformat(),
@@ -939,6 +997,7 @@ def _buildRangePayload(state: RangeState) -> dict:
         "loaded": True,
         "mode": "range",
         "site": state.siteName,
+        "instrument": state.instrument,
         "startId": state.startId,
         "stopId": state.stopId,
         "fromTime": state.fromTime.isoformat(),
@@ -972,6 +1031,7 @@ def _rangeExposureState(state: RangeState, dataId: int) -> ServerState | None:
         expId=dataId,
         tZero=tZero,
         siteName=state.siteName,
+        instrument=state.instrument,
         exposureInfo=state.exposureInfoByExpId.get(dataId),
         referencePoints=[
             {
@@ -1279,7 +1339,9 @@ def _findNightCacheDir(dayObs: int) -> Path | None:
     return best[1] if best else None
 
 
-def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None:
+def _loadExposureFromCache(
+    ctx: ServerContext, expId: int, instrument: str | None = None
+) -> ServerState | None:
     """Reconstruct a :class:`ServerState` from disk for ``expId``, if possible.
 
     Lets the user open a deep-linked exposure URL (e.g. from the cache
@@ -1290,7 +1352,10 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
     The site is derived from the cache path's cluster component (the
     layout is ``<cache_root>/<cluster>/<namespace>/<window>/…``), so the
     right per-site exposure-time cache gets consulted for the shutter
-    close.
+    close. ``instrument`` pins that lookup, and the cache window found
+    for the bare id must actually contain the pinned t₀ — the sidecar
+    lists bare ids, so on a colliding id it could name the *other*
+    instrument's window, whose logs would be a different exposure's.
     """
     cacheDir = _findExposureCacheDir(expId)
     if cacheDir is None:
@@ -1298,7 +1363,7 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
     site = _siteForCacheDir(ctx, cacheDir)
     if site is None:
         return None
-    record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+    record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
     tZeroIso = exposureTimes.obsEnd(record)
     if tZeroIso is None:
         return None
@@ -1307,6 +1372,18 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
     except (OSError, json.JSONDecodeError, FileNotFoundError):
         return None
     tZero = _taiIsoToUtc(tZeroIso)
+    specMeta = meta.get("spec") or {}
+    try:
+        windowFrom = _parseClientIso(str(specMeta.get("fromIso")))
+        windowTo = _parseClientIso(str(specMeta.get("toIso")))
+    except (TypeError, ValueError):
+        return None
+    if not (windowFrom <= tZero <= windowTo):
+        # The window on disk was fetched for a different t₀ — with an
+        # instrument pinned, that means the other instrument's exposure
+        # of the same bare id. Better to make the client fetch than to
+        # dress the wrong logs up as this exposure.
+        return None
     summaries = parser.summarizeAll(cacheDir)
     state = ServerState(
         cacheDir=cacheDir,
@@ -1316,6 +1393,7 @@ def _loadExposureFromCache(ctx: ServerContext, expId: int) -> ServerState | None
         expId=expId,
         tZero=tZero,
         siteName=site.name,
+        instrument=instrument or exposureTimes.recordInstrument(record),
         exposureInfo=record,
         referencePoints=[
             {
@@ -1633,6 +1711,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 fromTime=dt.datetime.fromisoformat(job.spec.fromIso.replace("Z", "+00:00")),
                 toTime=dt.datetime.fromisoformat(job.spec.toIso.replace("Z", "+00:00")),
                 siteName=site.name,
+                instrument=job.instrument,
             )
             # Seed the two anchors the client already resolved so even a
             # token-less server has start + stop; the prefetch fills the
@@ -1647,9 +1726,13 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         assert job.expId is not None and job.tZero is not None
         # The home page resolves the dataId via /api/exposure-time before
         # firing the fetch, so the full ConsDB record is already in the
-        # per-site cache — read it back for the explore-view info box.
+        # per-site cache — read it back for the explore-view info box,
+        # pinned to the job's instrument (a bare lookup could hand back
+        # the other instrument's record for a colliding id).
         # No extra ConsDB call here; None just means no info box.
-        exposureInfo = exposureTimes.lookupCachedRecord(job.expId, siteName=site.name)
+        exposureInfo = exposureTimes.lookupCachedRecord(
+            job.expId, siteName=site.name, instrument=job.instrument
+        )
         newState = ServerState(
             cacheDir=job.cacheDir,
             cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -1658,6 +1741,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             expId=job.expId,
             tZero=job.tZero,
             siteName=site.name,
+            instrument=job.instrument,
             exposureInfo=exposureInfo,
             referencePoints=[
                 {
@@ -1853,6 +1937,17 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
                 rangeStartRaw = qs.get("rangeStart", [""])[0] or None
                 rangeStopRaw = qs.get("rangeStop", [""])[0] or None
+                instrumentRaw = (qs.get("instrument", [""])[0] or "").strip().lower() or None
+                if (
+                    instrumentRaw is not None
+                    and instrumentRaw not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER
+                ):
+                    self._send_error_json(
+                        400,
+                        f"Unknown instrument {instrumentRaw!r}; known: "
+                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
+                    )
+                    return
                 if rangeStartRaw is not None and rangeStopRaw is not None:
                     self._handle_range_summary(rangeStartRaw, rangeStopRaw, dataIdRaw)
                     return
@@ -1864,12 +1959,23 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     with ctx.jobs.stateLock:
                         state = ctx.getExposureState(dataId)
+                    if (
+                        state is not None
+                        and instrumentRaw is not None
+                        and state.instrument is not None
+                        and state.instrument != instrumentRaw
+                    ):
+                        # Same bare id, different instrument — a
+                        # different exposure entirely. Never serve one
+                        # instrument's timeline to a tab pinned to the
+                        # other; fall through to the rebuild/fetch path.
+                        state = None
                     if state is None:
                         # Not loaded in memory — try rebuilding from the
                         # on-disk cache so a deep-linked tab (e.g. the
                         # dataId column in the cache table) doesn't
                         # silently fall back to home view.
-                        state = _loadExposureFromCache(ctx, dataId)
+                        state = _loadExposureFromCache(ctx, dataId, instrument=instrumentRaw)
                     if state is not None:
                         # Touch the LRU sidecar so eviction sees this
                         # window as freshly used. Done here (rather
@@ -2255,19 +2361,24 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 # window. Everything about *how* we talk to Loki is server
                 # configuration and is never taken from a request body.
                 try:
-                    spec, site, expId, tZero = _buildSpecFromRequest(ctx, body)
+                    spec, site, expId, tZero, instrument = _buildSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
                 # A hand-entered shutter close (the dataId didn't resolve via
                 # ConsDB) is persisted to the per-site exposure-time cache as
                 # a tagged stand-in, so reopening or refreshing the explore
-                # view finds a t-zero without the user re-typing it.
+                # view finds a t-zero without the user re-typing it. Stamped
+                # with the request's instrument so the pinned lookups that
+                # follow (the job's info-box read, later /api/exposure-time
+                # calls) can actually find it.
                 if body.get("tZeroManual"):
                     exposureTimes.storeCachedRecord(
-                        expId, exposureTimes.manualRecord(_utcToTaiIso(tZero)), siteName=site.name
+                        expId,
+                        exposureTimes.manualRecord(_utcToTaiIso(tZero), instrument=instrument),
+                        siteName=site.name,
                     )
-                job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name)
+                job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name, instrument=instrument)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
@@ -2293,12 +2404,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
                 try:
-                    spec, site, startId, stopId, tZeroStart, tZeroStop = _buildRangeSpecFromRequest(ctx, body)
+                    spec, site, startId, stopId, tZeroStart, tZeroStop, instrument = (
+                        _buildRangeSpecFromRequest(ctx, body)
+                    )
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
                 job = ctx.jobs.createRangeJob(
-                    spec, startId, stopId, tZeroStart, tZeroStop, siteName=site.name
+                    spec, startId, stopId, tZeroStart, tZeroStop, siteName=site.name, instrument=instrument
                 )
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
@@ -2311,7 +2424,29 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 # ----- request body helpers -------------------------------------------------
 
 
-def _buildSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, dt.datetime]:
+def _instrumentFromBody(body: dict) -> str:
+    """The instrument a fetch body names, defaulting to LSSTCam.
+
+    An exposure id is only unique within one instrument, so every fetch
+    is *for* some instrument even when the client didn't say — and the
+    default is LSSTCam, the instrument that owns ~all rapid-analysis
+    traffic. Raises ``ValueError`` for an unknown name so a typo can't
+    silently resolve against the wrong table.
+    """
+    raw = body.get("instrument")
+    if raw is None or (isinstance(raw, str) and not raw.strip()):
+        return "lsstcam"
+    if not isinstance(raw, str):
+        raise ValueError("instrument must be a string")
+    instrument = raw.strip().lower()
+    if instrument not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER:
+        raise ValueError(
+            f"Unknown instrument {instrument!r}; known: {list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}"
+        )
+    return instrument
+
+
+def _buildSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, dt.datetime, str]:
     """Translate a JSON fetch request body into (FetchSpec, Site, expId, tZero).
 
     The body says *what* to fetch — which exposure, which window. Which
@@ -2357,7 +2492,7 @@ def _buildSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Si
         toIso=_isoForLogcli(toT),
         workers=DEFAULT_WORKERS,
     )
-    return spec, site, expId, tZero
+    return spec, site, expId, tZero, _instrumentFromBody(body)
 
 
 def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int]:
@@ -2393,9 +2528,9 @@ def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpe
 
 def _buildRangeSpecFromRequest(
     ctx: ServerContext, body: dict
-) -> tuple[FetchSpec, Site, int, int, dt.datetime, dt.datetime]:
+) -> tuple[FetchSpec, Site, int, int, dt.datetime, dt.datetime, str]:
     """Translate a JSON range-fetch body into (FetchSpec, Site, startId,
-    stopId, tZeroStartUtc, tZeroStopUtc).
+    stopId, tZeroStartUtc, tZeroStopUtc, instrument).
 
     The window is one wide span: ``[tZeroStart - windowBefore,
     tZeroStop + windowAfter]`` with no pod filter (all pods, like a single
@@ -2444,7 +2579,7 @@ def _buildRangeSpecFromRequest(
         toIso=_isoForLogcli(toT),
         workers=DEFAULT_WORKERS,
     )
-    return spec, site, startId, stopId, tZeroStart, tZeroStop
+    return spec, site, startId, stopId, tZeroStart, tZeroStop, _instrumentFromBody(body)
 
 
 def _requireRangeInt(body: dict, field: str) -> int:
