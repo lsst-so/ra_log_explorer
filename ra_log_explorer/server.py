@@ -1258,17 +1258,21 @@ def _cacheRootInfo() -> dict:
     }
 
 
-def _findExposureCacheDir(expId: int) -> Path | None:
-    """Return the most-recently-fetched exposure cache containing ``expId``.
+def _findExposureCacheDirs(expId: int) -> list[Path]:
+    """Exposure caches listing ``expId``, most-recently-fetched first.
 
-    Walks the cache root, skips partial / night-mode caches, and picks the
-    cache with the latest ``fetched_at`` whose ``_exposure_ids.txt`` lists
-    this dataId. Returns ``None`` if no such cache exists.
+    A *list*, because ``_exposure_ids.txt`` records bare ids and a bare id
+    is not unique: on a night where two instruments both observe, the
+    same id names an exposure on each, and both their windows can be
+    cached at once. Handing back only the newest would make whichever
+    deep link was opened second break the first — and re-fetching to fix
+    it just swaps which one is broken. The caller picks the window that
+    actually holds the t₀ it is after.
     """
     root = cache_root()
     if not root.exists():
-        return None
-    best: tuple[str, Path] | None = None
+        return []
+    found: list[tuple[str, Path]] = []
     for cluster in root.iterdir():
         if not cluster.is_dir():
             continue
@@ -1290,10 +1294,8 @@ def _findExposureCacheDir(expId: int) -> Path | None:
                     continue  # night-mode cache; lives one level deeper
                 if expId not in getCacheExposureIds(window):
                     continue
-                fetchedAt = str(meta.get("fetched_at") or "")
-                if best is None or fetchedAt > best[0]:
-                    best = (fetchedAt, window)
-    return best[1] if best else None
+                found.append((str(meta.get("fetched_at") or ""), window))
+    return [window for _, window in sorted(found, key=lambda pair: pair[0], reverse=True)]
 
 
 def _findNightCacheDir(dayObs: int) -> Path | None:
@@ -1339,6 +1341,41 @@ def _findNightCacheDir(dayObs: int) -> Path | None:
     return best[1] if best else None
 
 
+def _pickExposureCache(
+    ctx: ServerContext, expId: int, instrument: str | None
+) -> tuple[Path, Site, dict, dict, dt.datetime] | None:
+    """The cached window that really holds this exposure, or ``None``.
+
+    A window qualifies only if it spans the exposure's own shutter close.
+    That is what separates the two instruments' windows for a colliding
+    bare id: they are an hour apart, so at most one of them can contain
+    a given t₀. Newest-first among the ones that do, so a re-fetch still
+    wins over an older window of the same exposure.
+    """
+    for cacheDir in _findExposureCacheDirs(expId):
+        site = _siteForCacheDir(ctx, cacheDir)
+        if site is None:
+            continue
+        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
+        tZeroIso = exposureTimes.obsEnd(record)
+        if record is None or tZeroIso is None:
+            return None  # nothing to anchor on; another window won't help
+        try:
+            meta = loadCacheMeta(cacheDir)
+        except (OSError, json.JSONDecodeError, FileNotFoundError):
+            continue
+        tZero = _taiIsoToUtc(tZeroIso)
+        specMeta = meta.get("spec") or {}
+        try:
+            windowFrom = _parseClientIso(str(specMeta.get("fromIso")))
+            windowTo = _parseClientIso(str(specMeta.get("toIso")))
+        except (TypeError, ValueError):
+            continue
+        if windowFrom <= tZero <= windowTo:
+            return cacheDir, site, record, meta, tZero
+    return None
+
+
 def _loadExposureFromCache(
     ctx: ServerContext, expId: int, instrument: str | None = None
 ) -> ServerState | None:
@@ -1357,33 +1394,10 @@ def _loadExposureFromCache(
     lists bare ids, so on a colliding id it could name the *other*
     instrument's window, whose logs would be a different exposure's.
     """
-    cacheDir = _findExposureCacheDir(expId)
-    if cacheDir is None:
+    found = _pickExposureCache(ctx, expId, instrument)
+    if found is None:
         return None
-    site = _siteForCacheDir(ctx, cacheDir)
-    if site is None:
-        return None
-    record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
-    tZeroIso = exposureTimes.obsEnd(record)
-    if tZeroIso is None:
-        return None
-    try:
-        meta = loadCacheMeta(cacheDir)
-    except (OSError, json.JSONDecodeError, FileNotFoundError):
-        return None
-    tZero = _taiIsoToUtc(tZeroIso)
-    specMeta = meta.get("spec") or {}
-    try:
-        windowFrom = _parseClientIso(str(specMeta.get("fromIso")))
-        windowTo = _parseClientIso(str(specMeta.get("toIso")))
-    except (TypeError, ValueError):
-        return None
-    if not (windowFrom <= tZero <= windowTo):
-        # The window on disk was fetched for a different t₀ — with an
-        # instrument pinned, that means the other instrument's exposure
-        # of the same bare id. Better to make the client fetch than to
-        # dress the wrong logs up as this exposure.
-        return None
+    cacheDir, site, record, meta, tZero = found
     summaries = parser.summarizeAll(cacheDir)
     state = ServerState(
         cacheDir=cacheDir,
@@ -1457,7 +1471,7 @@ def _findRangeCacheDir(startId: int, stopId: int) -> Path | None:
 
     Range caches are exposure-style (top-level, all pods) and identified
     by the ``_range.txt`` sidecar, so we walk the same depth as
-    :func:`_findExposureCacheDir` and match on the recorded bounds.
+    :func:`_findExposureCacheDirs` and match on the recorded bounds.
     """
     root = cache_root()
     if not root.exists():

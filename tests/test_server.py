@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,8 +11,11 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import config, exposureTimes, parse, server, sites
+from ra_log_explorer import config, exposureTimes
+from ra_log_explorer import fetch as fetchModule
+from ra_log_explorer import parse, server, sites
 from ra_log_explorer.jobs import FetchJob, JobManager
+from ra_log_explorer.server import ServerContext, _loadExposureFromCache
 
 from .conftest import FakeSiteCatalog
 
@@ -1697,3 +1701,54 @@ def test_rangeExposurePayload_filters_pods_by_the_ranges_instrument(tmp_path: Pa
     assert payload is not None
     assert payload["instrument"] == "latiss"
     assert {p["pod"] for p in payload["pods"]} == {"s-latiss-run-sfm-runner-1"}
+
+
+def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, siteCatalog: FakeSiteCatalog
+) -> None:
+    """`_exposure_ids.txt` records bare ids, and a bare id is not unique:
+    on a night both instruments observe, the same id names an exposure on
+    each and both windows can be cached at once. Taking the newest and
+    giving up if it doesn't fit made whichever deep link was opened
+    second break the first — and re-fetching to repair it only swapped
+    which one was broken."""
+    ctx = ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
+    expId = 2026071100445
+    windows = {
+        "lsstcam": (
+            "2026-07-12T04:21:17.502000Z",
+            "2026-07-12T04:26:22.502000Z",
+            "2026-07-12T04:21:59.502000",
+        ),
+        "latiss": (
+            "2026-07-12T05:24:48.895000Z",
+            "2026-07-12T05:29:53.895000Z",
+            "2026-07-12T05:25:30.895000",
+        ),
+    }
+    for i, (instrument, (fromIso, toIso, obsEnd)) in enumerate(windows.items()):
+        d = tmpCacheRoot / "yagan" / "rapid-analysis" / f"{fromIso}__{toIso}".replace(":", "")
+        (d / "pods").mkdir(parents=True)
+        (d / "_meta.json").write_text(
+            json.dumps(
+                {
+                    "spec": {"fromIso": fromIso, "toIso": toIso, "podRegex": None},
+                    "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+                    # The LATISS window is the more recently fetched one.
+                    "fetched_at": f"2026-07-12T0{i}:00:00+00:00",
+                }
+            )
+        )
+        (d / "_exposure_ids.txt").write_text(f"{expId}\n")
+        exposureTimes.storeCachedRecord(
+            expId,
+            {"exposure_id": expId, "obs_end": obsEnd, "instrument": instrument},
+            siteName="summit",
+            bareKey=(instrument == "lsstcam"),
+        )
+
+    for instrument, (fromIso, _toIso, _obsEnd) in windows.items():
+        state = _loadExposureFromCache(ctx, expId, instrument=instrument)
+        assert state is not None, f"{instrument} deep link fell back to a re-fetch"
+        assert state.cacheDir.name.startswith(fromIso.replace(":", "")[:17])
+        assert state.instrument == instrument
