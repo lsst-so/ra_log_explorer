@@ -54,8 +54,9 @@
           <div id="tonight-more" class="hint" hidden></div>
         </section>
 
+        <div class="home-card-row">
         <section class="home-card">
-          <h2>Explore exposure processing</h2>
+          <h2>All RA processing <span class="muted">explore one exposure</span></h2>
           <form id="fetch-form">
             <div class="row">
               <label>
@@ -94,18 +95,16 @@
               <div class="progress-text hint"></div>
             </div>
           </form>
-        </section>
-
-        <section class="home-card">
-          <h2>Explore a range of exposures</h2>
-          <p class="hint">
-            Give a start and stop dataId to load a run of consecutive
-            exposures in one go, then step through each exposure's
-            timeline in the explore view, anchored at its own shutter
-            close. Skipped integers in the range are expected and simply
-            omitted.
-          </p>
-          <form id="range-form">
+          <details id="range-advanced">
+            <summary>advanced: explore a range of exposures</summary>
+            <p class="hint">
+              Give a start and stop dataId to load a run of consecutive
+              exposures in one go, then step through each exposure's
+              timeline in the explore view, anchored at its own shutter
+              close. Skipped integers in the range are expected and simply
+              omitted.
+            </p>
+            <form id="range-form">
             <div class="row">
               <label>
                 <span class="lbl">start dataId</span>
@@ -139,13 +138,14 @@
               <div class="progress-bar"><div class="progress-fill"></div></div>
               <div class="progress-text hint"></div>
             </div>
-          </form>
+            </form>
+          </details>
         </section>
 
         <section class="home-card">
-          <h2>Investigate night</h2>
+          <h2>AOS processing <span class="muted">investigate a whole night</span></h2>
           <p class="hint">
-            Pulls the full 24-hour log window for the AOS-flavoured pods
+            Covers the full 24-hour night for the AOS-flavoured pods
             (<code>*aos*</code>) for the given <code>dayObs</code> and
             serves a failure breakdown — error counts by type and pod,
             per-dataId tracebacks, and Δshutter histograms for the first
@@ -169,8 +169,12 @@
             </div>
           </form>
         </section>
+        </div>
 
-        <section class="home-card">
+        <!-- Hidden rather than removed: the cache browser is useful for
+             operators/debugging and may come back, but day-to-day users
+             shouldn't need to think about caching at all. -->
+        <section class="home-card" id="cache-card" hidden>
           <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
           <p class="hint">
             Click a row to open that run in a new tab. The ✕ button removes a

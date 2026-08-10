@@ -267,13 +267,15 @@ port. Ctrl-C in the terminal stops the server.
 
 The browser app has three views:
 
-- **Home view** — the landing page when nothing is loaded. Hosts the
-  three fetch forms (single exposure, a range of exposures, an
-  investigate-night), the cached-runs table, and the live progress bar
-  for an in-flight fetch. On a deployment running live mode it also
-  shows the **Tonight** panel: every exposure taken so far tonight,
-  newest first, with a ready/wait status chip — see *Live mode
-  (deployments)* below.
+- **Home view** — the landing page when nothing is loaded. Two
+  side-by-side mode cards: **All RA processing** (one exposure, with a
+  range-of-exposures form under *advanced*) and **AOS processing**
+  (investigate a whole night), each with its own inline progress bar.
+  On a deployment running live mode it also shows the **Tonight**
+  panel: every exposure taken so far tonight, newest first, with a
+  ready/wait status chip — see *Live mode (deployments)* below. (The
+  cached-runs table still exists in the markup but is hidden — caching
+  is no longer something users should need to think about.)
 - **Explore view** — the timeline + detail drawer for one loaded
   exposure. Click the **← home** button in its topbar to return to
   the home view (the loaded state stays in memory; the back arrow is

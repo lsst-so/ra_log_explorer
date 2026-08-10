@@ -213,6 +213,20 @@ body[data-site="bts"]    { --site-accent: #ff8a3a; }
   padding-bottom: 20px;
 }
 
+/* The two fetch modes sit side by side so they read as alternatives —
+   "All RA processing" (one exposure / a range) vs "AOS processing" (a
+   whole night). Wraps to a column when the viewport is too narrow. */
+.home-card-row {
+  display: flex;
+  gap: 18px;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
+.home-card-row > .home-card {
+  flex: 1 1 380px;
+  min-width: 0;
+}
+
 .home-card h2 {
   font-size: 15px;
   font-weight: 600;
