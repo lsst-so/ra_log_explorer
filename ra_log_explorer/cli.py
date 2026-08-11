@@ -61,6 +61,7 @@ from .config import (
 from .exposureTimes import INSTRUMENTS_BY_PROBE_ORDER, TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    dropLiveSidecarsUnder,
     ensureCacheSchemaCurrent,
     fetchAll,
     humanBytes,
@@ -308,6 +309,15 @@ def cmdRun(args: argparse.Namespace) -> int:
             f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot{pinned}.",
             file=sys.stderr,
         )
+    elif args.live_day_obs is not None:
+        # The flag only means anything to the poller, and without live mode
+        # there is no poller — say so rather than starting a server that
+        # silently ignores it and shows no Tonight panel.
+        print(
+            f"Warning: --live-day-obs {args.live_day_obs} has no effect without "
+            "--live-poll-s > 0 (or $RA_LOG_EXPLORER_LIVE_POLL_S); live mode is off.",
+            file=sys.stderr,
+        )
     if state is not None:
         ctx.putExposureState(state)
     url = f"http://{args.host}:{args.port}{basePath}/"
@@ -369,7 +379,17 @@ def cmdCacheFlush(args: argparse.Namespace) -> int:
         print("Nothing to flush.")
         return 0
     if args.yes or input(f"Delete entire cache at {root}? [y/N] ").lower() == "y":
-        shutil.rmtree(root)
+        # Sidecars first, then the tree (see fetch.dropLiveSidecarsUnder).
+        # A server may be running against this same cache with its live
+        # poller writing into tonight's night dir, which can make the
+        # rmtree fail part-way — and a night that lost pod files while
+        # keeping its `_live.json` would be resumed and sliced from as
+        # though it were whole.
+        dropLiveSidecarsUnder(root)
+        try:
+            shutil.rmtree(root)
+        except OSError:
+            shutil.rmtree(root, ignore_errors=True)
         print("Cache flushed.")
     return 0
 

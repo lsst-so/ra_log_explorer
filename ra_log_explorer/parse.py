@@ -1071,8 +1071,9 @@ def summarizeAll(cacheDir: Path) -> list[PodSummary]:
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
             continue
-        # The sibling pods_events/<pod>.jsonl is optional: absent for v3
-        # caches (pre-events) and for pods that had no lifecycle events.
+        # The sibling pods_events/<pod>.jsonl is optional: absent for a pod
+        # that had no lifecycle events in the window. (Not for an older
+        # cache: those don't survive the schema flush — see caching.md.)
         eventsFile = eventsDir / podFile.name
         summaries.append(summarizePod(podFile, eventsFile if eventsFile.exists() else None))
     return summaries

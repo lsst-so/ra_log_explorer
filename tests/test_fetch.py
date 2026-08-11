@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -204,37 +205,55 @@ def test_getCacheExposureIds_returns_empty_when_no_sidecar(tmp_path: Path) -> No
 
 
 def test_addExposureToCache_then_get_roundtrips(tmp_path: Path) -> None:
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900722)]
 
 
 def test_addExposureToCache_accumulates_distinct_ids_sorted(tmp_path: Path) -> None:
     # Same cache, multiple triggering dataIds (the superset-reuse case).
-    fetch.addExposureToCache(tmp_path, 2026051900723)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900724)
+    fetch.addExposureToCache(tmp_path, 2026051900723, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900724, "lsstcam")
     assert fetch.getCacheExposureIds(tmp_path) == [
-        2026051900722,
-        2026051900723,
-        2026051900724,
+        ("lsstcam", 2026051900722),
+        ("lsstcam", 2026051900723),
+        ("lsstcam", 2026051900724),
     ]
 
 
 def test_addExposureToCache_dedupes_repeated_ids(tmp_path: Path) -> None:
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900722)]
+
+
+def test_addExposureToCache_keeps_both_instruments_of_a_shared_id(tmp_path: Path) -> None:
+    """A window wide enough to be reused by both instruments' exposures of
+    one id holds two *different* exposures. Collapsing them to the bare id
+    would drop one of them from the cache listing — and make the other's
+    link the only way back into a window that holds both."""
+    fetch.addExposureToCache(tmp_path, 2026051900722, "latiss")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [
+        ("latiss", 2026051900722),
+        ("lsstcam", 2026051900722),
+    ]
 
 
 def test_addExposureToCache_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
     # No raise.
-    fetch.addExposureToCache(tmp_path / "does-not-exist", 2026051900722)
+    fetch.addExposureToCache(tmp_path / "does-not-exist", 2026051900722, "lsstcam")
 
 
-def test_getCacheExposureIds_skips_unparseable_lines(tmp_path: Path) -> None:
-    (tmp_path / fetch.EXPOSURE_IDS_NAME).write_text("2026051900722\nnot-a-number\n2026051900723\n")
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722, 2026051900723]
+def test_getCacheExposureIds_skips_unqualified_lines(tmp_path: Path) -> None:
+    """An entry that names no instrument names no exposure. Nothing
+    tolerates one — the deploy-time schema flush is how an older
+    sidecar's bare ids go away, not a reader that guesses at them."""
+    (tmp_path / fetch.EXPOSURE_IDS_NAME).write_text(
+        "2026051900722\nnot-a-number\nlatiss:nope\nlsstcam:2026051900723\n:2026051900724\n"
+    )
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900723)]
 
 
 # ----- markCacheRange / getCacheRange -------------------------------------
@@ -1494,3 +1513,39 @@ def test_ensureCacheSchemaCurrent_noop_when_already_current(tmpCacheRoot: Path) 
     removed = fetch.ensureCacheSchemaCurrent()
     assert removed == 0
     assert d.exists()  # current-schema cache survives untouched
+
+
+def test_ensureCacheSchemaCurrent_drops_live_sidecars_before_removing(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flush is best-effort per top-level entry, so its rmtree can fail
+    part-way — a concurrent `cache flush` from another process is enough.
+    A night that lost pod files while keeping its `_live.json` is worse
+    than either outcome: the poller would resume appending to files that
+    now start mid-night, and every slice cut from them would be short
+    while claiming to be complete."""
+    nightDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night"
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    fetch.writeLiveSidecar(
+        nightDir,
+        {
+            "version": fetch.LIVE_SIDECAR_VERSION,
+            "fromIso": "2026-07-11T12:00:00.000000Z",
+            "watermarkIso": "2026-07-11T13:00:00.000000Z",
+            "pods": {},
+        },
+    )
+    realRmtree = shutil.rmtree
+    doomed = nightDir.parent.parent  # the cluster tree the flush removes
+
+    def wedgedRmtree(path: Any, *a: Any, **k: Any) -> None:
+        if Path(path) == doomed:
+            # Fails having removed nothing, which is the case that leaves a
+            # sidecar behind to vouch for files that may already be gone.
+            raise OSError(39, "Directory not empty")
+        realRmtree(path, *a, **k)
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", wedgedRmtree)
+    fetch.ensureCacheSchemaCurrent()
+    assert nightDir.exists(), "this test is about the delete failing, not succeeding"
+    assert fetch.readLiveSidecar(nightDir) is None

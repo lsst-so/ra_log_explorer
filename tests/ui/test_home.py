@@ -12,7 +12,15 @@ from typing import Any
 
 from playwright.sync_api import expect
 
-from .corpus import DAY_OBS, RANGE_START, RANGE_STOP, SHARED_ID, UNKNOWN_ID, StagedCorpus
+from .corpus import (
+    DAY_OBS,
+    RANGE_START,
+    RANGE_STOP,
+    SHARED_ID,
+    UNKNOWN_ID,
+    StagedCorpus,
+    holdsExposure,
+)
 
 
 def test_typing_a_dataId_resolves_its_shutter_close(app: Any) -> None:
@@ -116,7 +124,7 @@ def test_a_fetched_window_lands_in_the_cache(app: Any, corpus: StagedCorpus, fak
     expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
 
     listing = app.apiJson("/api/cache")
-    windows = [w for w in listing["windows"] if SHARED_ID in (w.get("exposureIds") or [])]
+    windows = [w for w in listing["windows"] if holdsExposure(w, SHARED_ID)]
     assert windows, listing["windows"]
     assert windows[0]["kind"] == "exposure"
     assert windows[0]["podCount"] > 5
@@ -150,7 +158,7 @@ def test_the_window_pads_are_editable_and_reach_the_fetch(
     expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
 
     windows = app.apiJson("/api/cache")["windows"]
-    fetched = [w for w in windows if SHARED_ID in (w.get("exposureIds") or [])]
+    fetched = [w for w in windows if holdsExposure(w, SHARED_ID)]
     assert fetched, windows
     # t0 + 60 s, not the default t0 + 300 s.
     assert fetched[0]["toIso"].startswith("2026-07-12T04:22:22"), fetched[0]["toIso"]

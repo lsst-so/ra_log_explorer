@@ -228,9 +228,12 @@ In the browser:
 Caching is invisible in day-to-day use, but the **admin** link in the
 topbar (or `/?admin=1` directly) opens a *Cached windows* table listing
 every window on disk. Each row carries a **key** column showing the
-dataId(s) that triggered fetches landing on that cache — the `dayObs`
-for night caches, the seq-number span for range caches — as clickable
-links that open the cached view in a new tab. The ✕ button on a row
+exposure(s) that triggered fetches landing on that cache, each with the
+instrument it was fetched under — the `dayObs` for night caches, the
+seq-number span for range caches — as clickable links that open the
+cached view in a new tab. (The instrument is part of the link because a
+dataId alone doesn't name an exposure: LSSTCam and LATISS both number
+from 1 each night, so the same 13 digits are two different images.) The ✕ button on a row
 deletes that one window; *flush entire cache* above the table wipes the
 lot. Nothing here needs tending: the server LRU-evicts the
 least-recently-viewed windows on its own once the on-disk total exceeds

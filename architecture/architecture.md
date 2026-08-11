@@ -279,9 +279,11 @@ Sibling docs:
   hard-pinned there.
 
   One deliberate simplification remains: the in-memory `exposureStates`
-  dict, `_exposure_ids.txt` and the range key are still keyed by the
-  bare id, so two colliding exposures share one in-memory slot —
-  opening one evicts the other. Correctness is protected by a guard
+  dict and the range key are still keyed by the bare id, so two
+  colliding exposures share one in-memory slot — opening one evicts the
+  other. (The on-disk `_exposure_ids.txt` is not: it records
+  `<instrument>:<dataId>`, because a cache listing has to say which of
+  the two a window holds.) Correctness is protected by a guard
   rather than by the key, and the guard covers **both** keyed forms.
   `/api/summary` and `/api/pod/<pod>` refuse to serve a loaded state
   pinned to a different instrument, whether the key is `dataId=` or
@@ -416,6 +418,14 @@ Each tick (every `LIVE_POLL_S` seconds):
    time a pod was rescheduled.) A name promotes into `pods`, carrying
    its event counters, the first time it appears in an app-log listing.
 
+   A line carrying no `name` label at all can't be filed under anything,
+   so it is dropped — and the watermark advances past it, so nothing
+   comes back for it later. Whether live Loki ever emits one isn't
+   answerable from this repo (the captured corpus is already demuxed, so
+   every line in it lost the label on the way in), so they are counted
+   cumulatively into the snapshot's `eventsUnfiled` instead of assumed
+   away. A non-zero value there means POD_\* markers are going missing.
+
    The events stream keeps its own watermark, and a failed events fetch
    is retried even on a tick where the app-log frontier has nothing to
    do — which is permanent at night end, where every later tick (and
@@ -506,7 +516,10 @@ superset-parsed), subject to ordinary LRU eviction; the poller moves on
 to the new night. On the deployments, one busy night is ~9 GiB of JSONL
 on the cache volume (measured: 35.7M lines / 576 pods for 20260711), so
 the chart's 50 GiB volume holds four-or-so finalised nights plus slices
-before LRU eviction reclaims the oldest.
+before LRU eviction reclaims the oldest. Night mode's own "night so
+far" windows do not accumulate against that: each fetch supersedes the
+last one's, and the fetch-job callback drops the windows it contains
+(see *Night slice* in [caching.md](caching.md)).
 
 The parse cost of the *night view* is deliberately left alone: opening
 the in-progress night slices the AOS subset instantly but still parses
@@ -648,7 +661,8 @@ return:
 If the requested key isn't in the in-memory state dict, the server
 makes one attempt to reconstruct it from disk: it walks the cache root
 for a matching window (an exposure-mode cache whose
-`_exposure_ids.txt` lists the dataId; a night-mode cache whose
+`_exposure_ids.txt` lists the dataId *under the pinned instrument*; a
+night-mode cache whose
 window starts at noon UTC of the dayObs; or a range cache whose
 `_range.txt` records the `[startId, stopId]` bounds), reparses it with
 `parser.summarizeAll`, and returns the rebuilt payload. This lets a
@@ -1013,7 +1027,11 @@ page makes to decide whether to render the Tonight panel. When on:
   "nPods": 576, "totalBytes": 9876543210, "totalLines": 24681357,
   "errors": {},                       // cumulative per-pod hard fetch failures
   "incompletePods": {},               // cumulative unreconcilable chunks
-  "eventsError": null, "consdbError": null,
+  "eventsError": null,
+  "eventsUnfiled": 0,                 // cumulative k8s/events lines that carried no
+                                      // `name` label and so could not be filed under
+                                      // a pod; expected to stay 0 (see Live mode)
+  "consdbError": null,
   "orphanError": null,                // an earlier night couldn't be finalised
   "lastTick": { "startedAt": "...", "elapsedS": 4.2,
                 "newLines": 73200, "activePods": 431 },
@@ -1055,8 +1073,10 @@ of them — see *dataId / expId* in Key Concepts.
       "rangeInstrument": null,                       // and the instrument it recorded, so
                                                      // the row's link reopens this run and
                                                      // not the other instrument's twin span
-      "exposureIds": [2026051900722, 2026051900723], // (exposure caches) dataIds that
-                                                     // triggered fetches landing here
+      "exposures": [                                 // (exposure caches) the exposures that
+        {"dataId": 2026051900722,                    // triggered fetches landing here, each
+         "instrument": "lsstcam"}, ...               // with the pin it was fetched under so
+      ],                                             // the row links to this run, not the twin
       "fromIso":      "...", "toIso":       "...",
       "fetchedAt":    "...", "lastViewedAt": "...",
       "podCount": 432, "totalBytes": 42289444, "sizeOnDisk": 42330276

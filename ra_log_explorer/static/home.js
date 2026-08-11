@@ -749,7 +749,10 @@ function renderCache(data) {
     // (linking back to the range view). Exposure caches carry one *or
     // more* dataIds — superset reuse means consecutive fetches often
     // land on the same cache, so we render every dataId that's known to
-    // have triggered this cache as a clickable link.
+    // have triggered this cache as a clickable link. Each carries the
+    // instrument it was fetched under: the same 13 digits name a
+    // different exposure on the other instrument, so a bare link would
+    // open the twin rather than the run this row holds.
     let keyCell;
     if (isNight) {
       keyCell = `<a class="mono cache-key-link" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener">${w.dayObs}</a>`;
@@ -758,9 +761,14 @@ function renderCache(data) {
       // dayObs (the leading 8 digits of the id), which made the row
       // ambiguous about which night it covers.
       keyCell = `<a class="mono cache-key-link cache-key-range" href="${escapeHtml(url || '#')}" target="_blank" rel="noopener" title="range ${w.rangeStart} → ${w.rangeStop}">${w.rangeStart}<br>→ ${w.rangeStop}</a>`;
-    } else if (w.exposureIds && w.exposureIds.length > 0) {
-      keyCell = w.exposureIds
-        .map((id) => `<a class="mono cache-key-link" href="${apiUrl(`/?dataId=${encodeURIComponent(id)}`)}" target="_blank" rel="noopener">${id}</a>`)
+    } else if (w.exposures && w.exposures.length > 0) {
+      keyCell = w.exposures
+        .map((e) => {
+          const q = `/?dataId=${encodeURIComponent(e.dataId)}`
+            + (e.instrument ? `&instrument=${encodeURIComponent(e.instrument)}` : '');
+          const label = e.instrument ? `${e.dataId} (${e.instrument})` : String(e.dataId);
+          return `<a class="mono cache-key-link" href="${escapeHtml(apiUrl(q))}" target="_blank" rel="noopener">${escapeHtml(label)}</a>`;
+        })
         .join(' ');
     } else {
       keyCell = `<span class="muted">—</span>`;

@@ -1738,6 +1738,7 @@ def _plantExposureCache(
     toIso: str,
     cluster: str = "yagan",
     fetchedAt: str = "2026-07-12T06:00:00+00:00",
+    instruments: tuple[str, ...] = ("lsstcam",),
 ) -> Path:
     import json as _json
 
@@ -1752,22 +1753,29 @@ def _plantExposureCache(
             }
         )
     )
-    (windowDir / "_exposure_ids.txt").write_text(f"{expId}\n")
+    (windowDir / "_exposure_ids.txt").write_text("".join(f"{inst}:{expId}\n" for inst in instruments))
     return windowDir
 
 
 def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
 ) -> None:
-    """_exposure_ids.txt lists bare ids, so a colliding id can name the
-    OTHER instrument's window. The pinned t0 must fall inside the found
-    window, or the rebuild would dress the wrong logs up as this
-    exposure."""
+    """Being recorded under an instrument is not enough on its own: the
+    pinned t0 must also fall inside the window, or the rebuild would dress
+    the wrong logs up as this exposure. One window can legitimately be
+    recorded for both instruments' exposures of an id (a wide enough
+    window gets reused by both), which is what leaves this check the only
+    thing standing between the two.
+    """
     collidingId = 2026071100408
     # An LSSTCam window around its shutter close in UTC (obs_end is
     # TAI; -37 s puts t0 at 03:58:15.091 UTC).
     _plantExposureCache(
-        tmpCacheRoot, collidingId, "2026-07-12T03:58:10.091000Z", "2026-07-12T04:03:15.091000Z"
+        tmpCacheRoot,
+        collidingId,
+        "2026-07-12T03:58:10.091000Z",
+        "2026-07-12T04:03:15.091000Z",
+        instruments=("lsstcam", "latiss"),
     )
     site = siteCatalog.catalog[0]
     exposureTimes.storeCachedRecords(
@@ -1786,6 +1794,37 @@ def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
     assert state is not None
     assert state.instrument == "lsstcam"
     assert state.tZero == dt.datetime(2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc)
+
+
+def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """The recorded pin rules a window out even when the t0 falls inside
+    it. The pads are the user's to widen, and an hour-wide LSSTCam window
+    swallows the LATISS twin's shutter close — at which point containment
+    alone would hand LSSTCam's logs back as the LATISS exposure. What the
+    fetch actually ran as is not a guess.
+    """
+    collidingId = 2026071100408
+    _plantExposureCache(
+        tmpCacheRoot,
+        collidingId,
+        "2026-07-12T03:58:10.091000Z",
+        "2026-07-12T05:03:15.091000Z",  # widened: spans both instruments' t0
+        instruments=("lsstcam",),
+    )
+    site = siteCatalog.catalog[0]
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName=site.name,
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName=site.name,
+    )
+    ctx = _ctxWithSites(siteCatalog)
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam") is not None
 
 
 # ----- instrument through the range per-exposure view -----------------------
@@ -1818,12 +1857,11 @@ def test_rangeExposurePayload_filters_pods_by_the_ranges_instrument(tmp_path: Pa
 def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
     tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, siteCatalog: FakeSiteCatalog
 ) -> None:
-    """`_exposure_ids.txt` records bare ids, and a bare id is not unique:
-    on a night both instruments observe, the same id names an exposure on
-    each and both windows can be cached at once. Taking the newest and
-    giving up if it doesn't fit made whichever deep link was opened
-    second break the first — and re-fetching to repair it only swapped
-    which one was broken."""
+    """A bare id is not unique: on a night both instruments observe, the
+    same id names an exposure on each and both windows can be cached at
+    once. Taking the newest and giving up if it doesn't fit made whichever
+    deep link was opened second break the first — and re-fetching to
+    repair it only swapped which one was broken."""
     ctx = ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
     expId = 2026071100445
     windows = {
@@ -1851,7 +1889,7 @@ def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
                 }
             )
         )
-        (d / "_exposure_ids.txt").write_text(f"{expId}\n")
+        (d / "_exposure_ids.txt").write_text(f"{instrument}:{expId}\n")
         exposureTimes.storeCachedRecord(
             expId,
             {"exposure_id": expId, "obs_end": obsEnd, "instrument": instrument},
@@ -2028,3 +2066,180 @@ def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
     # The evicted window's state is gone; the fresh fetch's state is in.
     assert ctx.getExposureState(2026052000001) is None
     assert ctx.getExposureState(2026052000002) is not None
+
+
+# ----- superseded "night so far" windows ------------------------------------
+
+
+def _plantNightSlice(root: Path, fromIso: str, toIso: str, *, cluster: str = "yagan") -> Path:
+    """A night-mode cache dir at the window path a real one would use."""
+    windowDir = fetchModule.windowCachePath(
+        cluster, "rapid-analysis", fromIso, toIso, config.NIGHT_AOS_POD_REGEX
+    )
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "pods" / "s-lsstcam-run-aos-worker-1.jsonl").write_text("")
+    (windowDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "cluster": cluster,
+                    "namespace": "rapid-analysis",
+                    "fromIso": fromIso,
+                    "toIso": toIso,
+                    "podRegex": config.NIGHT_AOS_POD_REGEX,
+                },
+                "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+                "fetched_at": f"2026-07-12T{toIso[11:13]}:00:00+00:00",
+                "pod_count": 1,
+            }
+        )
+    )
+    fetchModule.markCacheViewed(windowDir)
+    return windowDir
+
+
+def _nightJob(cacheDir: Path, fromIso: str, toIso: str, siteName: str) -> FetchJob:
+    """A finished night job whose *written* window is [fromIso, toIso).
+
+    The requested window is always the whole night; the clamped one is
+    what landed on disk, and only ``meta`` knows it.
+    """
+    job = FetchJob(
+        jobId="n1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="2026-07-11T12:00:00.000000Z",
+            toIso="2026-07-12T12:00:00.000000Z",
+            podRegex=config.NIGHT_AOS_POD_REGEX,
+        ),
+        siteName=siteName,
+        kind="night",
+        dayObs=20260711,
+    )
+    job.cacheDir = cacheDir
+    job.meta = {
+        "spec": {
+            "cluster": "yagan",
+            "namespace": "rapid-analysis",
+            "fromIso": fromIso,
+            "toIso": toIso,
+            "podRegex": config.NIGHT_AOS_POD_REGEX,
+        }
+    }
+    return job
+
+
+NIGHT_START = "2026-07-11T12:00:00.000000Z"
+
+
+def test_night_fetch_drops_the_night_so_far_windows_it_supersedes(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """An in-progress night is served clamped to the watermark, so each
+    fetch mints a new `[nightStart, watermark]` window and the previous
+    one becomes a strict subset nothing will read again. Left alone they
+    accumulate a few hundred MiB a click — and LRU reaches them *last*,
+    because they are the freshest thing on disk, so the pass that
+    eventually runs prefers yesterday's 9 GiB finalised night dir.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    older = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    earlier = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # A tab is sitting on one of the doomed windows.
+    ctx.putNightState(
+        server.NightState(
+            cacheDir=older,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            dayObs=20260711,
+            startTime=config.dayObsStartUtc(20260711),
+            endTime=config.dayObsEndUtc(20260711),
+        )
+    )
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+
+    assert current.exists()
+    assert not older.exists() and not earlier.exists()
+    # The stale window's own parent went with it, not just its pods= subdir.
+    assert not older.parent.exists()
+    # The tab's state was replaced rather than left pointing at a deleted
+    # directory, which would serve a summary with empty pod drilldowns.
+    state = ctx.getNightState(20260711)
+    assert state is not None and state.cacheDir == current
+
+
+def test_the_superseded_window_is_reclaimed_before_eviction_looks(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering, which is the whole point of doing this here rather than
+    leaving it to the LRU pass.
+
+    These are bytes already known to be dead, and freeing them first is
+    often the entire overage. A sweep that ran first would instead reach
+    for the least-recently-viewed window — typically yesterday's
+    finalised night dir, 9 GiB that cost minutes of Loki — and then this
+    would free the redundant copy anyway, having paid for it.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    stale = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    sawStale: list[bool] = []
+
+    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+        sawStale.append(stale.exists())
+        return []
+
+    monkeypatch.setattr(server, "evictToFit", recordingEvict)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert sawStale == [False], "eviction ran while the superseded window was still on disk"
+
+
+def test_supersededNightSlices_tolerates_a_meta_without_a_window(tmp_path: Path) -> None:
+    """A meta that can't say which window was written can't be reasoned
+    about — return nothing rather than raising on the job thread, where
+    the exception would surface as a failed fetch of a window that
+    actually succeeded."""
+    job = _nightJob(tmp_path, NIGHT_START, "2026-07-11T22:00:00.000000Z", "summit")
+    job.meta = {}
+    assert server._supersededNightSlices(job) == []
+    job.meta = {"spec": {"fromIso": NIGHT_START, "toIso": None}}
+    assert server._supersededNightSlices(job) == []
+
+
+def test_night_fetch_keeps_windows_it_does_not_contain(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """Only strict subsets go. A wider window still holds coverage this
+    one doesn't — reachable when the watermark regresses (a cache wipe
+    mid-night, or one tick of a newly-seen pod failing) — and another
+    night, another site, or a different pod filter is simply not this
+    night's business.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    wider = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-12T02:00:00.000000Z")
+    otherNight = _plantNightSlice(tmpCacheRoot, "2026-07-10T12:00:00.000000Z", "2026-07-11T12:00:00.000000Z")
+    otherSite = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z", cluster="manke")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # An exposure-mode window inside the night: all pods, no filter, and
+    # nothing the AOS slice could stand in for.
+    exposureWindow = fetchModule.windowCachePath(
+        "yagan", "rapid-analysis", NIGHT_START, "2026-07-11T18:00:00.000000Z"
+    )
+    (exposureWindow / "pods").mkdir(parents=True)
+    (exposureWindow / "_meta.json").write_text(
+        json.dumps({"spec": {"fromIso": NIGHT_START, "toIso": "2026-07-11T18:00:00.000000Z"}})
+    )
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+
+    for survivor in (wider, otherNight, otherSite, current, exposureWindow):
+        assert survivor.exists(), survivor

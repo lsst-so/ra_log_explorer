@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -623,6 +624,37 @@ def test_storeCachedRecords_recovers_from_corrupt_existing_file(
     )
     data = json.loads(cachePath.read_text())
     assert data == {"2026051900722": {"obs_end": "2026-05-20T08:46:16.267000"}}
+
+
+def test_concurrent_stores_all_survive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Several threads write this one file in a deployed process: request
+    threads resolving a dataId, a fetch job's night prefetch, and the live
+    poller's per-tick exposure list. Two of them interleaving a truncate
+    and a write leaves a file that parses as nothing at all — and a
+    ``_manual`` stand-in exists nowhere else, so a hand-typed shutter
+    close would be gone for good.
+    """
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    # Big enough records that a rewrite is not a single small write.
+    padding = {f"col{i}": "x" * 200 for i in range(20)}
+    ids = list(range(2026051900001, 2026051900081))
+
+    def store(expId: int) -> None:
+        exposureTimes.storeCachedRecord(
+            expId, {"obs_end": "2026-05-20T08:46:16.267000", **padding}, siteName="summit"
+        )
+
+    threads = [threading.Thread(target=store, args=(i,)) for i in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    data = json.loads(exposureTimes.cachedExposureTimesPath("summit").read_text())
+    assert sorted(data) == sorted(str(i) for i in ids)
+    # Nothing but the finished file is left behind.
+    assert [p.name for p in exposureTimes.cachedExposureTimesPath("summit").parent.iterdir()] == [
+        "summit.json"
+    ]
 
 
 def test_postQuery_omits_auth_header_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:

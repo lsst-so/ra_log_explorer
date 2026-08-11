@@ -1238,8 +1238,14 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
     lastViewed = getCacheLastViewed(window)
     # Only plain exposure caches carry the dataId sidecar (night caches
     # are keyed by dayObs, range caches by their bounds — both recovered
-    # below).
-    exposureIds: list[int] = getCacheExposureIds(window) if kind == "exposure" else []
+    # below). Each entry keeps the instrument it was fetched under, so
+    # the listing's link opens this run rather than the same-numbered
+    # exposure on the other instrument.
+    exposures: list[dict[str, object]] = (
+        [{"dataId": eid, "instrument": inst} for inst, eid in getCacheExposureIds(window)]
+        if kind == "exposure"
+        else []
+    )
     # For night caches the dayObs is recoverable from the window start
     # (noon UTC of dayObs). For exposure caches there's no single
     # dataId in the meta — the UI looks it up against the loaded state
@@ -1270,7 +1276,7 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             # reopen *this* run rather than the twin span the other
             # instrument fetched over the same bounds.
             "rangeInstrument": (getCacheRangeInstrument(window) if rangeBounds else None),
-            "exposureIds": exposureIds,
+            "exposures": exposures,
             "fromIso": spec.get("fromIso"),
             "toIso": spec.get("toIso"),
             "fetchedAt": meta.get("fetched_at"),
@@ -1282,6 +1288,67 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
     )
 
 
+def _supersededNightSlices(job: FetchJob) -> list[Path]:
+    """Night windows for this night that the job's own window contains.
+
+    Night mode on the *current* dayObs is served clamped to the live
+    watermark, so the window's path moves as the watermark advances:
+    every fetch while the night is in progress mints a new
+    ``[nightStart, watermark]`` directory, and the previous one becomes a
+    strict subset of it — same pod filter, same start, fewer lines.
+    Nothing looks at it again (a reload picks the newest by
+    ``fetched_at``, and a contained request is served by the newer one),
+    so it is dead weight from the moment the next fetch lands: a few
+    hundred MiB a click, and a click is all it takes.
+
+    Leaving them to LRU eviction is not good enough, because eviction
+    reaches them *last*. Each is freshly stamped, so a pass under
+    pressure prefers whatever was viewed longest ago — which is
+    typically *yesterday's finalised night dir*, 9 GiB that took minutes
+    of Loki to build and that today's redundant copies would evict to
+    keep themselves. Same inversion ``_tryNightSlice``'s
+    ``markCacheViewed`` guards against, arriving from the other side.
+
+    Deliberately keyed off ``job.meta``'s spec rather than ``job.spec``:
+    the requested window is the whole night, and the window actually
+    written is the clamped one. Only strict subsets are returned, so a
+    watermark that regressed (a cache wipe, or one tick of a newly-seen
+    pod failing) leaves the wider dir alone rather than deleting live
+    coverage. Night mode is browser-only, so the fetch-job callback is
+    the one path that needs this.
+    """
+    if job.cacheDir is None:
+        return []
+    spec = job.meta.get("spec") or {}
+    fromIso, toIso = spec.get("fromIso"), spec.get("toIso")
+    if not isinstance(fromIso, str) or not isinstance(toIso, str):
+        return []
+    try:
+        keptTo = _parseClientIso(toIso)
+    except ValueError:
+        return []
+    keep = job.cacheDir.resolve()
+    stale: list[Path] = []
+    for window, meta in _iterCompletedCaches(nightMode=True):
+        if window.resolve() == keep:
+            continue
+        cSpec = meta.get("spec") or {}
+        if (cSpec.get("cluster"), cSpec.get("namespace"), cSpec.get("podRegex")) != (
+            spec.get("cluster"),
+            spec.get("namespace"),
+            spec.get("podRegex"),
+        ):
+            continue
+        if cSpec.get("fromIso") != fromIso:
+            continue
+        try:
+            if _parseClientIso(str(cSpec.get("toIso"))) < keptTo:
+                stale.append(window)
+        except (TypeError, ValueError):
+            continue
+    return stale
+
+
 def _cacheRootInfo() -> dict:
     root = cache_root()
     return {
@@ -1290,22 +1357,32 @@ def _cacheRootInfo() -> dict:
     }
 
 
-def _findExposureCacheDirs(expId: int) -> list[Path]:
-    """Exposure caches listing ``expId``, most-recently-fetched first.
+def _findExposureCacheDirs(expId: int, instrument: str | None = None) -> list[Path]:
+    """Exposure caches recorded as holding ``expId``, newest fetch first.
 
-    A *list*, because ``_exposure_ids.txt`` records bare ids and a bare id
-    is not unique: on a night where two instruments both observe, the
-    same id names an exposure on each, and both their windows can be
-    cached at once. Handing back only the newest would make whichever
-    deep link was opened second break the first — and re-fetching to fix
-    it just swaps which one is broken. The caller picks the window that
-    actually holds the t₀ it is after.
+    A *list*, because a bare id is not unique: on a night where two
+    instruments both observe, the same id names an exposure on each, and
+    both their windows can be cached at once. Handing back only the
+    newest would make whichever deep link was opened second break the
+    first — and re-fetching to fix it just swaps which one is broken. The
+    caller picks the window that actually holds the t₀ it is after.
+
+    With ``instrument`` given, only windows whose sidecar records that
+    exposure *under that instrument* qualify. The recorded pin is what
+    the fetch actually ran as, so this is a stronger discriminator than
+    the caller's t₀-containment check: the two instruments' twins are an
+    hour apart, but a widened window can span both, and then containment
+    alone would happily hand back the wrong run's logs. Unpinned (the
+    bare-id path) every window listing the id qualifies, as before.
     """
     found = [
         (str(meta.get("fetched_at") or ""), window)
         for window, meta in _iterCompletedCaches(nightMode=False)
         if not (meta.get("spec") or {}).get("podRegex")  # night caches live one level deeper
-        and expId in getCacheExposureIds(window)
+        and any(
+            eid == expId and (instrument is None or inst == instrument)
+            for inst, eid in getCacheExposureIds(window)
+        )
     ]
     return [window for _, window in sorted(found, reverse=True)]
 
@@ -1335,13 +1412,11 @@ def _pickExposureCache(
 ) -> tuple[Path, Site, dict, dict, dt.datetime] | None:
     """The cached window that really holds this exposure, or ``None``.
 
-    A window qualifies only if it spans the exposure's own shutter close,
-    resolved under the caller's instrument. That is what usually
-    separates the two instruments' windows for a colliding bare id —
-    though not always: sequence numbers converge early in the night and
-    the window pads are the user's to widen, so both windows can span
-    the pinned t₀. Newest-first among the ones that do, which also means
-    a re-fetch wins over an older window of the same exposure.
+    A window qualifies only if it was fetched for this exposure under the
+    caller's instrument (see :func:`_findExposureCacheDirs`) *and* spans
+    the exposure's own shutter close, resolved under that same
+    instrument. Newest-first among the ones that do, which also means a
+    re-fetch wins over an older window of the same exposure.
 
     Being wrong here is bounded rather than dangerous: any window that
     spans this t₀ does contain this exposure's logs, at worst
@@ -1349,7 +1424,7 @@ def _pickExposureCache(
     already decided *which* exposure is being asked about, by the time
     the record was looked up.
     """
-    for cacheDir in _findExposureCacheDirs(expId):
+    for cacheDir in _findExposureCacheDirs(expId, instrument):
         site = _siteForCacheDir(ctx, cacheDir)
         if site is None:
             continue
@@ -1657,11 +1732,22 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     with ctx.jobs.stateLock:
         ctx.evictByCacheDir(target)
     dropLiveSidecarsUnder(target)
-    shutil.rmtree(target)
-    # Tidy up empty parents.
+    # A single rmtree can legitimately fail: another request thread
+    # slicing out of this window writes its `_last_viewed.txt` as we go,
+    # and a directory that regrew a file raises ENOTEMPTY. One retry
+    # settles it, and letting the OSError out instead would drop the
+    # connection with no response at all rather than answering.
+    try:
+        shutil.rmtree(target)
+    except OSError:
+        shutil.rmtree(target, ignore_errors=True)
+    # Tidy up empty parents — best-effort for the same reason.
     parent = target.parent
     while parent != cache_root() and parent.exists() and not any(parent.iterdir()):
-        parent.rmdir()
+        try:
+            parent.rmdir()
+        except OSError:
+            break
         parent = parent.parent
 
 
@@ -1714,11 +1800,24 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         # it can't get caught up in its own cleanup pass.
         markCacheViewed(job.cacheDir)
         # Record the dataId that triggered this fetch alongside the
-        # cache (exposure jobs only; night jobs are keyed by dayObs).
+        # cache (exposure jobs only; night jobs are keyed by dayObs and
+        # range jobs by their bounds). The instrument goes in with it:
+        # the id alone doesn't say which exposure this window holds.
         # Done before eviction so a later eviction pass can't race
         # with the sidecar write.
-        if job.kind != "night" and job.expId is not None:
-            addExposureToCache(job.cacheDir, job.expId)
+        if job.kind != "night" and job.expId is not None and job.instrument:
+            addExposureToCache(job.cacheDir, job.expId, job.instrument)
+        # Drop the "night so far" windows this fetch supersedes. *Before*
+        # eviction, not after: these are bytes already known to be dead,
+        # and freeing them first is often the whole overage — where a
+        # sweep running first would reach for the least-recently-viewed
+        # window instead, which is typically yesterday's finalised night
+        # dir. (Also before the new state is published, since the delete
+        # evicts any loaded state pointing at a doomed window and one of
+        # those is this dayObs's.)
+        if job.kind == "night":
+            for stale in _supersededNightSlices(job):
+                _deleteCacheDir(ctx, stale)
         # Run LRU eviction so the on-disk total stays at or under the
         # configured cap. The just-fetched cache is exempted; we
         # accept a brief over-cap state during the fetch itself and

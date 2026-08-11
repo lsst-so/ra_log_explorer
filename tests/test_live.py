@@ -12,7 +12,7 @@ from typing import Any, BinaryIO
 
 import pytest
 
-from ra_log_explorer import exposureTimes, fetch, live, sites
+from ra_log_explorer import exposureTimes, fetch, live, server, sites
 from ra_log_explorer.config import (
     FetchSpec,
     currentDayObs,
@@ -20,6 +20,9 @@ from ra_log_explorer.config import (
     dayObsStartUtc,
     windowCachePath,
 )
+from ra_log_explorer.jobs import FetchJob, JobManager
+
+from .conftest import FakeSiteCatalog
 
 UTC = dt.timezone.utc
 
@@ -268,7 +271,7 @@ def test_fetchAll_serves_inprogress_night_clamped_to_watermark(
         "s-lsstcam-run-aos-worker-1": [_t(6), _t(40)],
         "s-lsstcam-run-sfm-runner-1": [_t(7)],
     }
-    _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes=podTimes)
+    nightDir = _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes=podTimes)
 
     def boom(*args: Any, **kwargs: Any) -> bytes:
         raise AssertionError("in-progress night should be sliced, not fetched")
@@ -291,6 +294,85 @@ def test_fetchAll_serves_inprogress_night_clamped_to_watermark(
     again, meta2 = fetch.fetchAll(spec)
     assert again == cacheDir
     assert meta2["cacheReuse"] == "exact"
+
+    # Once it advances, the *path* moves with it — the window is
+    # [nightStart, watermark] — so the same request writes a second,
+    # wider directory and the first becomes a strict subset nothing will
+    # read again. Both are on disk here; whose job it is to reclaim the
+    # loser is server._supersededNightSlices, on the fetch-job callback.
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    sidecar["watermarkIso"] = fetch._fmtLogcliTime(_t(45))
+    for record in sidecar["pods"].values():
+        record["watermarkIso"] = sidecar["watermarkIso"]
+    fetch.writeLiveSidecar(nightDir, sidecar)
+    wider, meta3 = fetch.fetchAll(spec)
+    assert wider != cacheDir
+    assert meta3["spec"]["toIso"] == fetch._fmtLogcliTime(_t(45))
+    assert cacheDir.exists() and wider.exists()
+
+
+def test_a_night_refetch_reclaims_the_window_it_supersedes(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The two halves run together: a real clamped slice, then the real
+    fetch-job callback over it.
+
+    Both halves are pinned separately above — that an advancing watermark
+    writes a second directory, and that the callback deletes what it
+    supersedes — but the seam between them is ``job.meta["spec"]["toIso"]``
+    carrying the *written* window rather than the requested one, which
+    only real metas can show. An echo of the request would compare
+    against night end and pass every assertion about the window it *did*
+    supersede, while quietly deleting one it didn't: hence the regressed
+    watermark below, which is what a cache wipe mid-night or one tick of
+    a newly-seen pod failing leaves behind.
+    """
+    podTimes = {"s-lsstcam-run-aos-worker-1": [_t(6), _t(40)]}
+    nightDir = _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes=podTimes)
+    monkeypatch.setattr(
+        fetch,
+        "_run_logcli",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must be sliced, not fetched")),
+    )
+    spec = replace(_sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711)), podRegex=".*aos.*")
+
+    def watermarkTo(when: dt.datetime) -> None:
+        sidecar = fetch.readLiveSidecar(nightDir)
+        assert sidecar is not None
+        sidecar["watermarkIso"] = fetch._fmtLogcliTime(when)
+        for record in sidecar["pods"].values():
+            record["watermarkIso"] = sidecar["watermarkIso"]
+        fetch.writeLiveSidecar(nightDir, sidecar)
+
+    earlierDir, _m = fetch.fetchAll(spec)  # [nightStart, 12:30)
+    watermarkTo(_t(50))
+    aheadDir, _m = fetch.fetchAll(spec)  # [nightStart, 12:50)
+    watermarkTo(_t(45))  # the watermark regressed
+    secondDir, secondMeta = fetch.fetchAll(spec)  # [nightStart, 12:45)
+    assert len({earlierDir, aheadDir, secondDir}) == 3
+
+    ctx = server.ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
+    job = FetchJob(
+        jobId="night-1",
+        spec=spec,
+        siteName=siteCatalog.defaultName,
+        kind="night",
+        dayObs=20260711,
+    )
+    job.cacheDir, job.meta = secondDir, secondMeta
+    server._onFetchComplete(ctx)(job)
+
+    assert not earlierDir.exists(), "the superseded window survived a real refetch"
+    # The window that reaches *past* this one stays: it holds coverage
+    # 12:45 doesn't, and only the written window's own end says so.
+    assert aheadDir.exists(), "a window this fetch does not contain was deleted"
+    # What was kept holds the line the earliest window was too early for.
+    assert secondDir.exists()
+    kept = (secondDir / fetch.PODS_DIR_NAME / "s-lsstcam-run-aos-worker-1.jsonl").read_bytes()
+    assert kept == b"".join(_lokiLine(t) for t in (_t(6), _t(40)))
+    state = ctx.getNightState(20260711)
+    assert state is not None and state.cacheDir == secondDir
 
 
 def test_fetchAll_does_not_clamp_arbitrary_future_windows(
@@ -1222,6 +1304,38 @@ def test_a_pod_being_refetched_suspends_slicing(
     sidecar.pop("rewritingPod")
     fetch.writeLiveSidecar(nightDir, sidecar)
     assert fetch._tryNightSlice(spec) is not None
+
+
+def test_a_refetch_starting_mid_slice_is_still_caught(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate in `_tryNightSlice` reads the sidecar, then waits for the
+    destination window's lock — which another thread's slice can hold for
+    as long as its copy takes. A refetch beginning in that gap would be
+    invisible to the check that already ran, so the copy itself has to
+    look again. Otherwise the pod is omitted from a window written as
+    complete, and every later identical request exact-hits it.
+    """
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3), _t(5)]))
+    manager.tick(now=_t(10))
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    # The refetch has started since the gate looked: the pod publishes
+    # zero durable bytes, and its error flags were cleared before it.
+    sidecar["rewritingPod"] = "pod-a"
+    sidecar["pods"]["pod-a"]["bytes"] = 0
+    fetch.writeLiveSidecar(nightDir, sidecar)
+
+    with pytest.raises(fetch.FetchError, match="rewriting pod-a"):
+        fetch.materializeNightSlice(nightDir, _sliceSpec(_t(2), _t(6)))
+    # And the aborted attempt left no window that could pass for a hit.
+    target = windowCachePath(
+        "yagan", "rapid-analysis", fetch._fmtLogcliTime(_t(2)), fetch._fmtLogcliTime(_t(6))
+    )
+    assert not (target / fetch.META_NAME).exists()
 
 
 def test_unfilable_event_lines_are_counted_rather_than_silently_dropped(

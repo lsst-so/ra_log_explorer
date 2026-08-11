@@ -36,13 +36,21 @@ def test_cached_windows_are_listed_with_their_kind(app: Any, corpus: StagedCorpu
 
 
 def test_each_row_links_back_to_the_run_it_holds(app: Any, corpus: StagedCorpus) -> None:
-    corpus.stageExposure(SHARED_ID, "lsstcam")
+    corpus.stageExposure(SHARED_ID, "latiss")
     corpus.stageNight()
     corpus.stageRange(RANGE_START, RANGE_STOP)
     openAdmin(app)
-    hrefs = [a.get_attribute("href") for a in app.page.locator("#cache-tbody a.cache-key-link").all()]
+    # Wait for the rows the links live in: the table is filled by an
+    # async /api/cache call, so reading the links straight after the view
+    # appears samples an empty tbody often enough to matter.
+    links = app.page.locator("#cache-tbody a.cache-key-link")
+    expect(links).to_have_count(3)
+    hrefs = [a.get_attribute("href") for a in links.all()]
     joined = " ".join(h or "" for h in hrefs)
-    assert f"dataId={SHARED_ID}" in joined
+    # The exposure link carries the instrument the window was fetched
+    # under. Without it the id is ambiguous — this very id exists on
+    # LSSTCam too, an hour away — and the link would open that one.
+    assert f"dataId={SHARED_ID}&instrument=latiss" in joined, joined
     assert f"dayObs={DAY_OBS}" in joined
     assert f"rangeStart={RANGE_START}" in joined and f"rangeStop={RANGE_STOP}" in joined
 

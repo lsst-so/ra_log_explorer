@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import http.client
 import json
+import shutil
 import socket
 import threading
 import time
@@ -1251,6 +1252,35 @@ def test_delete_night_cache_window_with_encoded_pods_segment(
     assert not nightDir.exists()
 
 
+def test_delete_answers_even_when_the_tree_regrows_mid_delete(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window being deleted can be written into as it goes: another
+    request thread slicing out of it touches its `_last_viewed.txt`, and
+    `rmtree` then raises ENOTEMPTY. Letting that out of the handler drops
+    the connection with no response at all — the browser reports a network
+    error for a delete that mostly happened."""
+    host, port, _ = runningServer
+    slug = "2026-05-20T084500Z__2026-05-20T085000Z"
+    d = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug)
+    realRmtree = shutil.rmtree
+    calls: list[int] = []
+
+    def regrowingRmtree(path: Any, *a: Any, **k: Any) -> None:
+        calls.append(1)
+        realRmtree(path, *a, **k)
+        if len(calls) == 1:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "_last_viewed.txt").write_text("2026-05-20T09:00:00+00:00")
+            raise OSError(39, "Directory not empty")
+
+    monkeypatch.setattr(serverModule.shutil, "rmtree", regrowingRmtree)
+    status, body = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}")
+    assert status == 200
+    assert body["windows"] == []
+    assert not d.exists()
+
+
 def test_delete_unknown_cache_window(runningServer: RunningServer) -> None:
     host, port, _ = runningServer
     status, body = _delete(host, port, "/api/cache/yagan/rapid-analysis/nope")
@@ -1686,12 +1716,14 @@ def test_cache_list_includes_lastViewedAt_and_dayObs(
     assert w["lastViewedAt"].startswith("2026-05-22T14:00")
 
 
-def test_cache_list_includes_exposureIds_for_exposure_caches(
+def test_cache_list_includes_exposures_for_exposure_caches(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:
-    """An exposure cache row carries the dataIds that triggered fetches
+    """An exposure cache row carries the exposures that triggered fetches
     landing on it, so the UI can render them as deep-links back to the
-    per-visit view."""
+    per-visit view. Each carries its instrument: without it the link is
+    a bare id, which on a colliding id opens the other instrument's
+    exposure — a different image, an hour away."""
     from ra_log_explorer.fetch import addExposureToCache
 
     host, port, _ctx = runningServer
@@ -1721,13 +1753,16 @@ def test_cache_list_includes_exposureIds_for_exposure_caches(
             }
         )
     )
-    addExposureToCache(d, 2026051900722)
-    addExposureToCache(d, 2026051900723)
+    addExposureToCache(d, 2026051900722, "lsstcam")
+    addExposureToCache(d, 2026051900723, "latiss")
     status, body = _get(host, port, "/api/cache")
     assert status == 200
     rows = [w for w in body["windows"] if w["kind"] == "exposure"]
     assert len(rows) == 1
-    assert rows[0]["exposureIds"] == [2026051900722, 2026051900723]
+    assert rows[0]["exposures"] == [
+        {"dataId": 2026051900722, "instrument": "lsstcam"},
+        {"dataId": 2026051900723, "instrument": "latiss"},
+    ]
 
 
 def test_summary_get_bumps_lastViewedAt(runningServer: RunningServer, tmpCacheRoot: Path) -> None:

@@ -141,9 +141,10 @@ between the two projects doesn't have to context-switch.
   anyone supports. No deprecation shims, no re-exports, no tolerant
   readers for old on-disk formats, no migration code: rename across all
   call sites in the same commit and move on, and when an on-disk shape
-  changes (`_meta.json`, `_live.json`, `_range.txt`, the exposure-time
-  records), bump `CACHE_SCHEMA_VERSION` in the same commit and delete
-  the old reader outright. Deploys invalidate everything intentionally;
+  changes (`_meta.json`, `_live.json`, `_range.txt`,
+  `_exposure_ids.txt`, the exposure-time records), bump
+  `CACHE_SCHEMA_VERSION` in the same commit and delete the old reader
+  outright. Deploys invalidate everything intentionally;
   the schema flush is the upgrade path. See *No backwards
   compatibility* in [architecture/caching.md](architecture/caching.md).
 

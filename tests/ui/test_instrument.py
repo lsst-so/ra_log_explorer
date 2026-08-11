@@ -104,11 +104,15 @@ def test_fetching_the_same_id_under_each_instrument_gives_different_exposures(
 
     app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
     expect(app.page.locator("#explore-view")).to_be_visible()
+    # The pod names are read as a snapshot, so wait for the timeline
+    # itself rather than for the view that hosts it.
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
     camInfo = app.page.locator("#exposure-info").inner_text()
     camPods = app.page.locator("#timeline .tl-podname").all_inner_texts()
 
     app.goto(f"/?dataId={SHARED_ID}&instrument=latiss")
     expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
     latissInfo = app.page.locator("#exposure-info").inner_text()
     latissPods = app.page.locator("#timeline .tl-podname").all_inner_texts()
 
@@ -129,6 +133,7 @@ def test_an_instrument_pinned_view_shows_no_other_instruments_pods(app: Any, cor
     corpus.stageExposure(SHARED_ID, "lsstcam")
     app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
     expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
     pods = app.page.locator("#timeline .tl-podname").all_inner_texts()
     assert pods, "the LSSTCam exposure should have pods of its own"
     # Pod names carry their instrument; the pinned view keeps only its own

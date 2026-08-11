@@ -38,6 +38,9 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
+import tempfile
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -575,6 +578,15 @@ def storeCachedRecordList(records: Iterable[ExposureRecord], *, siteName: str) -
     _mergeIntoCache(entries, siteName=siteName)
 
 
+# Serialises the read-modify-write below. Several threads write this file
+# in one process: request threads resolving a dataId, a fetch job's
+# night/range prefetch, and — every tick — the live poller's exposure
+# list. Without the lock two of them interleave their writes into one
+# truncated file, and the loser's entries are lost along with anything
+# else the file held.
+_cacheWriteLock = threading.Lock()
+
+
 def _mergeIntoCache(entries: dict[str, ExposureRecord], *, siteName: str) -> None:
     """Merge pre-keyed entries into the per-site cache file.
 
@@ -585,21 +597,35 @@ def _mergeIntoCache(entries: dict[str, ExposureRecord], *, siteName: str) -> Non
     ``_manual`` stand-in (see :func:`manualRecord`). Taking the whole
     batch in one rewrite keeps a night-prefetch of hundreds of dataIds
     from re-serialising the file once per id.
+
+    Written via a temp file and ``os.replace`` under a process-wide lock,
+    so a reader only ever sees a whole file and a crash or a concurrent
+    writer cannot leave a truncated one. Losing this file is not the
+    harmless cache miss it looks like: a ``_manual`` stand-in exists
+    nowhere else, so a hand-typed shutter close would be gone for good.
     """
     if not entries:
         return
     p = cachedExposureTimesPath(siteName)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        existing: dict = {}
-        if p.exists():
+    with _cacheWriteLock:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            existing: dict = {}
+            if p.exists():
+                try:
+                    raw = json.loads(p.read_text())
+                    if isinstance(raw, dict):
+                        existing = raw
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            existing.update(entries)
+            fd, tmpName = tempfile.mkstemp(prefix=f"{p.stem}-", suffix=".json", dir=p.parent)
+            tmpPath = Path(tmpName)
             try:
-                raw = json.loads(p.read_text())
-                if isinstance(raw, dict):
-                    existing = raw
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        existing.update(entries)
-        p.write_text(json.dumps(existing, sort_keys=True, indent=2))
-    except OSError:
-        pass
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(existing, fh, sort_keys=True, indent=2)
+                os.replace(tmpPath, p)
+            finally:
+                tmpPath.unlink(missing_ok=True)
+        except OSError:
+            pass

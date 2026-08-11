@@ -108,10 +108,13 @@ from .parse import _parseTimestamp as _parseLokiTimestamp
 # exposure-time entries, two-line _range.txt sidecars, pre-eventPods live
 # sidecars) — nothing written by an older build is interpreted, per the
 # no-backwards-compatibility rule in caching.md, and this flush is what
-# makes that safe. Bumping this value flushes the whole cache (see
+# makes that safe; v6 qualifies every _exposure_ids.txt entry with the
+# instrument it was fetched under, since a bare id names a different
+# exposure on each and the cache listing links back to one of them.
+# Bumping this value flushes the whole cache (see
 # ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
 # individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 5
+CACHE_SCHEMA_VERSION = 6
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so
@@ -172,11 +175,13 @@ PODS_EVENTS_DIR_NAME = "pods_events"
 # the cache (rather than in a central index) means deleting the
 # directory takes the bookkeeping with it.
 LAST_VIEWED_NAME = "_last_viewed.txt"
-# Per-cache sidecar holding the dataIds (one per line, ascending) that
-# have been the *trigger* for a fetch landing on this cache. One cache
-# can serve multiple dataIds via superset reuse — the user-facing cache
-# table surfaces all of them as clickable shortcuts back to each
-# exposure's per-visit view. See ``addExposureToCache`` for the writer.
+# Per-cache sidecar holding the exposures that have been the *trigger*
+# for a fetch landing on this cache: one ``<instrument>:<dataId>`` per
+# line, ascending by id. One cache can serve multiple dataIds via
+# superset reuse — the user-facing cache table surfaces all of them as
+# clickable shortcuts back to each exposure's per-visit view, and each
+# needs its instrument to link anywhere useful (a bare id names a
+# different exposure on each). See ``addExposureToCache`` for the writer.
 EXPOSURE_IDS_NAME = "_exposure_ids.txt"
 # Per-cache sidecar marking a range-mode fetch: three lines, ``startId``,
 # ``stopId``, then the instrument the run was fetched under — the bounds
@@ -225,6 +230,13 @@ def ensureCacheSchemaCurrent() -> int:
             continue
         try:
             if child.is_dir():
+                # Sidecars first, for the reason spelled out in
+                # ``dropLiveSidecarsUnder``: this rmtree is best-effort, and
+                # a night dir that lost pod files but kept its ``_live.json``
+                # would be adopted by the poller and sliced from as though it
+                # were whole. A concurrent ``cache flush`` from another
+                # process is enough to make that partial delete happen.
+                dropLiveSidecarsUnder(child)
                 shutil.rmtree(child)
             else:
                 child.unlink()
@@ -968,6 +980,15 @@ def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
     sidecar = readLiveSidecar(nightDir)
     if sidecar is None:
         raise FetchError(f"{nightDir} has no usable {LIVE_SIDECAR_NAME}")
+    if sidecar.get("rewritingPod"):
+        # Re-checked against *this* read of the sidecar, not only the one
+        # ``_tryNightSlice`` gated on: acquiring the destination window's
+        # lock can block for as long as another thread's slice takes, and
+        # end-of-night verification can start swapping a pod's file in
+        # that gap. The slice would then honour that pod's zeroed byte
+        # count by omitting it — and be written as complete, because
+        # finalisation clears the pod's error flags before refetching.
+        raise FetchError(f"{nightDir} is rewriting {sidecar['rewritingPod']}; refusing to slice it")
     fromT = _parseIso(spec.fromIso)
     toT = _parseIso(spec.toIso)
     requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
@@ -1599,9 +1620,8 @@ def markCacheViewed(cacheDir: Path, when: dt.datetime | None = None) -> None:
         pass
 
 
-def addExposureToCache(cacheDir: Path, expId: int) -> None:
-    """Record that ``expId`` was a trigger for the contents of this
-    cache window.
+def addExposureToCache(cacheDir: Path, expId: int, instrument: str) -> None:
+    """Record that ``(instrument, expId)`` was a trigger for this cache window.
 
     A given window can be reused by multiple dataIds (the default
     fetch window is ~5 minutes wide, so consecutive exposures often
@@ -1609,38 +1629,49 @@ def addExposureToCache(cacheDir: Path, expId: int) -> None:
     de-duplicate, and keep the file sorted so the UI can render a
     stable list. Best-effort: a write failure does not interrupt the
     request — the sidecar just won't carry that id.
+
+    ``instrument`` is required, for the same reason ``markCacheRange``
+    requires one: a bare id names a different exposure on each
+    instrument, so an unqualified entry can't tell the cache listing
+    which run this window holds — and the link it renders would open the
+    twin. There is one sidecar format and no reader tolerates a bare id.
     """
     if not cacheDir.exists():
         return
     existing = set(getCacheExposureIds(cacheDir))
-    existing.add(int(expId))
-    body = "\n".join(str(i) for i in sorted(existing)) + "\n"
+    existing.add((instrument, int(expId)))
+    body = "\n".join(f"{inst}:{eid}" for eid, inst in sorted((e, i) for i, e in existing)) + "\n"
     try:
         (cacheDir / EXPOSURE_IDS_NAME).write_text(body)
     except OSError:
         pass
 
 
-def getCacheExposureIds(cacheDir: Path) -> list[int]:
-    """Return the dataIds previously recorded as triggers for this
-    cache, sorted ascending. ``[]`` if the sidecar is missing or
-    unparseable — same best-effort contract as the writer."""
+def getCacheExposureIds(cacheDir: Path) -> list[tuple[str, int]]:
+    """The ``(instrument, dataId)`` pairs recorded as triggers for this cache.
+
+    Sorted by ascending dataId, then instrument. ``[]`` if the sidecar is
+    missing or unparseable — same best-effort contract as the writer. A
+    line that isn't ``<instrument>:<dataId>`` is skipped rather than
+    interpreted: the deploy-time schema flush is the upgrade path from an
+    older format, not a tolerant reader (see caching.md).
+    """
     p = cacheDir / EXPOSURE_IDS_NAME
     if not p.exists():
         return []
-    out: list[int] = []
+    out: set[tuple[str, int]] = set()
     try:
         for line in p.read_text().splitlines():
-            s = line.strip()
-            if not s:
+            instrument, sep, rawId = line.strip().partition(":")
+            if not sep or not instrument:
                 continue
             try:
-                out.append(int(s))
+                out.add((instrument, int(rawId)))
             except ValueError:
                 continue
     except OSError:
         return []
-    return sorted(set(out))
+    return [(inst, eid) for eid, inst in sorted((e, i) for i, e in out)]
 
 
 def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str) -> None:

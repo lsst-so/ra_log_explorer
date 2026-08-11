@@ -19,7 +19,7 @@ from typing import Any
 from playwright.sync_api import expect
 
 from .conftest import routeJson
-from .corpus import CAM_T_ZERO_UTC, DAY_OBS, SHARED_ID, StagedCorpus
+from .corpus import CAM_T_ZERO_UTC, DAY_OBS, SHARED_ID, StagedCorpus, holdsExposure
 
 UTC = dt.timezone.utc
 
@@ -235,7 +235,7 @@ def test_live_mode_serves_a_ready_exposure_by_slicing_the_night(
     expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
     # Sliced out of the night, not fetched: no Loki was reachable at all.
     windows = app.apiJson("/api/cache")["windows"]
-    assert any(SHARED_ID in (w.get("exposureIds") or []) for w in windows), windows
+    assert any(holdsExposure(w, SHARED_ID) for w in windows), windows
 
 
 def _site() -> Any:

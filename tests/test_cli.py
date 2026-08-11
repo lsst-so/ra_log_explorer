@@ -481,6 +481,35 @@ def test_cmdRun_home_mode_starts_server(monkeypatch: pytest.MonkeyPatch) -> None
     assert len(ctx.nightStates) == 0
 
 
+def test_cmdRun_live_mode_starts_the_poller_pinned_to_a_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--live-poll-s`` + ``--live-day-obs`` is how a staged historical
+    night plays the role of tonight, so the flags have to reach the
+    manager rather than only the help text."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "serve", lambda host, port, ctx: captured.setdefault("ctx", ctx))
+    monkeypatch.setattr(cli.LiveNightManager, "start", lambda self: captured.setdefault("started", True))
+    args = cli.build_parser().parse_args(
+        ["run", "--no-browser", "--live-poll-s", "60", "--live-day-obs", "20260711"]
+    )
+    assert cli.cmdRun(args) == 0
+    live = captured["ctx"].live
+    assert live is not None and captured["started"] is True
+    assert live._fixedDayObs == 20260711
+    assert live._pollS == 60.0
+
+
+def test_cmdRun_warns_that_live_day_obs_alone_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without live mode there is no poller to pin, so the flag is a
+    silent no-op — and a staged test night that never appears looks like
+    the staging failed rather than like a missing flag."""
+    monkeypatch.setattr(cli, "serve", lambda host, port, ctx: None)
+    args = cli.build_parser().parse_args(["run", "--no-browser", "--live-day-obs", "20260711"])
+    assert cli.cmdRun(args) == 0
+    assert "--live-day-obs 20260711 has no effect" in capsys.readouterr().err
+
+
 def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """``--force-refresh`` must reach `fetchAll` as `forceRefresh=True`.
     Without it, cached results would silently override the user's

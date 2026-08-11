@@ -29,8 +29,9 @@ repeat runs into instant loads.
         │                                            superset-parsed, never fetched into
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
-        ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
-        │                                            that triggered fetches landing here
+        ├── _exposure_ids.txt                      ← (exposure caches only) the exposures that
+        │                                            triggered fetches landing here, one
+        │                                            <instrument>:<dataId> per line, ascending
         ├── _range.txt                             ← (range caches only) startId, stopId,
         │                                            instrument — one per line
         ├── pods/<pod>.jsonl                       ← raw Loki JSONL (app logs), --forward order
@@ -102,14 +103,18 @@ history: v1 (implicit) capped each pod at 50 000 lines; v2 used
 `k8s/events` lifecycle stream into `pods_events/` — a v3 cache has no such
 tree, so the bump forces a re-fetch to pick up the new markers; v5
 dropped every compatibility reader (see *No backwards compatibility*
-below) — the flush is what makes that safe.
+below) — the flush is what makes that safe; v6 qualifies every
+`_exposure_ids.txt` entry with the instrument the fetch ran under, so
+the cache listing and the rebuild path can tell which of two
+same-numbered exposures a window holds.
 
 ## No backwards compatibility
 
 **Nothing written by an older build is ever interpreted.** This is app
 code, not a library, and the cache is a temporary convenience, not a
 data store anyone supports: every on-disk shape here — `_meta.json`,
-`_live.json`, `_range.txt`, the exposure-time records — has exactly one
+`_live.json`, `_range.txt`, `_exposure_ids.txt`, the exposure-time
+records — has exactly one
 current format, readers treat anything else as absent or malformed, and
 a deploy invalidates everything on purpose (that is what the
 schema-version flush is *for*). When a format changes, bump
@@ -140,13 +145,17 @@ than after a torn line the counts will later be extended over.
 One operation is not an append, and so has to announce itself:
 finalisation's whole-pod refetch swaps the file wholesale, and while it
 does the sidecar carries `rewritingPod: "<pod>"`. `_tryNightSlice`
-refuses to slice a night carrying it and falls back to a real fetch.
-Zeroing the pod's counts is not enough on its own — a slicer reading a
-zeroed record doesn't wait, it omits the pod, and the resulting slice
-would be written `fetchComplete: true` with a pod missing and then
-exact-hit forever. The key is cleared on failure as well as success, so
-a failed refetch leaves a night that is visibly short rather than
-unsliceable.
+refuses to slice a night carrying it and falls back to a real fetch,
+and `materializeNightSlice` checks again against its own read of the
+sidecar — the gate and the copy are separated by acquiring the
+destination window's lock, which another thread's slice can hold for as
+long as its copy takes, and a refetch beginning in that gap would be
+invisible to the check that already ran. Zeroing the pod's counts is
+not enough on its own — a slicer reading a zeroed record doesn't wait,
+it omits the pod, and the resulting slice would be written
+`fetchComplete: true` with a pod missing and then exact-hit forever.
+The key is cleared on failure as well as success, so a failed refetch
+leaves a night that is visibly short rather than unsliceable.
 
 Three rules keep it coherent with everything else here:
 
@@ -217,7 +226,20 @@ duplicated. It then decides in order:
    hit. When the window to slice *is* the night's own — the watermark
    has reached night end but finalisation hasn't run, which is where
    `--live-day-obs` parks permanently — the night dir is returned
-   directly instead, since it already is that window. Any slice failure
+   directly instead, since it already is that window.
+
+   The clamped window's *path* moves with the watermark, so each night
+   fetch while the night is in progress mints a new
+   `[nightStart, watermark]` directory and the previous one becomes a
+   strict subset of it — a few hundred MiB nothing will read again (a
+   reload picks the newest by `fetched_at`). `server`'s fetch-job
+   callback deletes them as each new one lands, rather than leaving them
+   to LRU: they are the *freshest* thing on disk, so a pass under
+   pressure would reclaim yesterday's finalised 9 GiB night dir first —
+   the same inversion `markCacheViewed` on the night dir guards against,
+   arriving from the other side. Only strict subsets go, so a watermark
+   that regressed (a cache wipe mid-night, one tick of a newly-seen pod
+   failing) leaves the wider directory alone. Any slice failure
    falls through to the steps below (leaving `.partial` in place, so a
    half-copied window can never pass for a hit) — worst case is the
    fetch that would have happened anyway.
@@ -376,19 +398,28 @@ reused instead, so the flagged directory is never revisited.
   best-effort by `markCacheViewed`; absent caches are treated as
   "never opened" (epoch zero) for LRU purposes.
 
-- **`_exposure_ids.txt`** — exposure caches only. Ascending list of
-  the dataIds that have ever triggered a fetch landing on this
-  cache. One window can serve many dataIds via superset reuse, and
-  the `/api/cache` listing surfaces all of them as clickable
-  shortcuts. Written by `addExposureToCache`; deduped and sorted on
-  every write. The on-demand cache rebuild path in `/api/summary`
-  uses this file to map a deep-linked dataId back to its cache
-  window without needing the in-memory state to already exist. The
-  ids are *bare* (no instrument), so on a colliding id the file can
-  name the other instrument's window — the rebuild path guards this
-  by requiring the found window to contain the instrument-pinned t₀
-  (see *dataId / expId* in
-  [architecture.md](architecture.md#key-concepts)).
+- **`_exposure_ids.txt`** — exposure caches only. One
+  `<instrument>:<dataId>` per line, ascending by id: the exposures
+  that have ever triggered a fetch landing on this cache. One window
+  can serve many of them via superset reuse, and the `/api/cache`
+  listing surfaces all of them as clickable shortcuts. Written by
+  `addExposureToCache`; deduped and sorted on every write. The
+  on-demand cache rebuild path in `/api/summary` uses this file to map
+  a deep-linked exposure back to its cache window without needing the
+  in-memory state to already exist.
+
+  The instrument is recorded because a bare id doesn't name an
+  exposure (see *dataId / expId* in
+  [architecture.md](architecture.md#key-concepts)), so without it
+  neither consumer can tell which run this window holds: the listing's
+  link would open the twin, and the rebuild path would have only the
+  t₀-containment check to go on — which a widened window that spans
+  *both* instruments' shutter closes doesn't settle. A window really
+  can hold both, so both entries are kept; the rebuild path takes the
+  pin as the first filter and still requires the pinned t₀ to fall
+  inside the window. A line without an instrument is skipped, not
+  guessed at: the flush is the upgrade path (see *No backwards
+  compatibility*).
 
 - **`_range.txt`** — range caches only. Three lines: `startId`,
   `stopId`, then the `instrument` the range was fetched under. Written
@@ -465,19 +496,22 @@ one, typically).
 
 - When disk pressure matters above the configured cap. (Below the
   cap, LRU eviction handles it automatically.) Each exposure
-  window is roughly 40–50 MiB; an AOS night cache is GiB-scale; a
-  live-built all-pods night is ~9 GiB (measured: 35.7M lines / 576
-  pods for dayObs 20260711).
+  window is roughly 40–50 MiB; a live-built all-pods night is ~9 GiB
+  (measured: 35.7M lines / 576 pods for dayObs 20260711), of which
+  ~8.7 GiB is the 378 SFM workers — so an AOS night cache, which
+  excludes them, is a few hundred MiB rather than GiB-scale.
 
 Cache management lives in both the CLI (`python3 -m
 ra_log_explorer.cli cache info|flush`) and the browser's admin view at
 `/?admin=1` (the cached-windows table, with a per-row ✕ delete and a
 "flush entire cache" button).
 
-Every path that removes cache trees — both browser deletes *and* LRU
-eviction — unlinks every `_live.json` under the target *before*
-removing the tree. A partial delete is a real possibility —
-the poller may be creating files in there as `rmtree` walks it — and
+Every path that removes cache trees — the browser deletes, LRU
+eviction, `cache flush`, and the schema-version flush alike — unlinks
+every `_live.json` under the target *before* removing the tree. A
+partial delete is a real possibility — the poller may be creating files
+in there as `rmtree` walks it, and a request thread slicing out of it
+touches its `_last_viewed.txt` — and
 one that took the pod files but left the sidecar is worse than either
 clean outcome: the poller's intactness check would pass, it would
 resume appending to files that now begin mid-night, and every slice cut
@@ -510,6 +544,16 @@ id that also exists on the summit, with a completely different record.
 `lookupCachedRecord(..., siteName=...)` and `storeCachedRecord[s](...,
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
+
+Unlike the window caches this file is *not* disposable, so it is the one
+thing here written with care: every merge takes a process-wide lock and
+lands via a temp file and `os.replace`. Several threads write it in a
+deployed process — request threads resolving a dataId, a fetch job's
+night/range prefetch, the live poller's per-tick exposure list — and two
+of them interleaving a truncate and a write leave a file that parses as
+nothing at all. A re-queryable ConsDB row would survive that; a
+`_manual` stand-in exists nowhere else, so a hand-typed shutter close
+would be gone for good.
 
 Within a site it is keyed **twice**, because an id isn't unique there
 either — `SSSSS` is a per-instrument sequence number, so LSSTCam and

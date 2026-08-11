@@ -125,7 +125,7 @@ class StagedCorpus:
         t0 = self.tZero(dataId, instrument)
         spec = self.spec(t0 - dt.timedelta(seconds=windowBeforeS), t0 + dt.timedelta(seconds=windowAfterS))
         cacheDir, _ = fetch.materializeNightSlice(self.nightDir, spec)
-        fetch.addExposureToCache(cacheDir, dataId)
+        fetch.addExposureToCache(cacheDir, dataId, instrument)
         fetch.markCacheViewed(cacheDir)
         return cacheDir
 
@@ -213,6 +213,19 @@ class StagedCorpus:
 
     def podFiles(self) -> list[Path]:
         return sorted((self.nightDir / fetch.PODS_DIR_NAME).glob("*.jsonl"))
+
+
+def holdsExposure(window: dict, dataId: int, instrument: str = "lsstcam") -> bool:
+    """Whether an ``/api/cache`` row records this exposure as a trigger.
+
+    Matches on the pair rather than the bare id: a row that names the
+    id under the *other* instrument is a different exposure's window,
+    which is the confusion the pin exists to prevent.
+    """
+    return any(
+        e.get("dataId") == dataId and e.get("instrument") == instrument
+        for e in (window.get("exposures") or [])
+    )
 
 
 def unpackCorpus(target: Path) -> Path:
