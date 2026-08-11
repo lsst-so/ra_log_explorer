@@ -423,6 +423,15 @@ one, typically).
   over-cap states during a fetch are acceptable.
 - Empty per-cluster, per-namespace, and (for night mode) per-window
   parent directories are pruned as their child windows go away.
+- **Not everything on the volume is evictable.** The total is measured
+  over the whole tree, but only directories carrying a `_meta.json` are
+  candidates — so the in-progress live night (which has none until
+  finalisation) and `exposure-times/` count against the cap without
+  ever being reclaimable. Eviction makes one pass and stops, so a cap
+  set below that floor doesn't spin; it just evicts every *other*
+  window and stays over. With live mode on, leave the cap comfortably
+  above one night's ~9 GiB, which is what deriving it from the volume
+  size already does.
 
 ## What's stable across reruns
 

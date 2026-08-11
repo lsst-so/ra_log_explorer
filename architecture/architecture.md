@@ -1283,9 +1283,19 @@ that `/api/live` returns without copying. Request threads meet the
 poller's output purely through the filesystem: the night-slice path in
 `fetchAll` reads the sidecar and byte ranges the sidecar vouches for,
 so a slice can run concurrently with an *append* and never see a torn
-line. Nothing else may *write* a live night dir — `fetchAll` refuses to
-fetch into one, and serves the night's own window by handing over the
-directory rather than copying it onto itself.
+line. Nothing else may write the *files the sidecar vouches for* —
+`fetchAll` refuses to fetch into a live night dir, and serves the
+night's own window by handing over the directory rather than copying it
+onto itself.
+
+One thing does write *inside* it, harmlessly: a night-mode request for
+the night's own span materialises its AOS slice at
+`<night dir>/pods=<slug>`, because that is where `windowCachePath` puts
+a filtered view of that window. It is an ordinary cache dir that the
+poller never looks at — recovery and re-open touch only `pods/` and
+`pods_events/`, the listing and LRU eviction treat it as the separate
+window it is, and parent pruning stops at the non-empty night dir. The
+invariant that matters is about the pod files, not the directory.
 
 The sidecar's byte counts are enough for appends because an append only
 ever extends a file. One operation is not an append: end-of-night
