@@ -55,6 +55,30 @@ def test_each_row_links_back_to_the_run_it_holds(app: Any, corpus: StagedCorpus)
     assert f"rangeStart={RANGE_START}" in joined and f"rangeStop={RANGE_STOP}" in joined
 
 
+def test_the_two_instruments_twins_each_get_their_own_link(app: Any, corpus: StagedCorpus) -> None:
+    """Both instruments' exposure of one id can be cached at once — two
+    windows an hour apart sharing 13 digits. The listing has to say which
+    is which and link each to its own run; a bare id would render two
+    identical-looking rows whose links both open the same exposure."""
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    corpus.stageExposure(SHARED_ID, "latiss")
+    openAdmin(app)
+    links = app.page.locator("#cache-tbody a.cache-key-link")
+    expect(links).to_have_count(2)
+    hrefs = [a.get_attribute("href") or "" for a in links.all()]
+    assert any(f"dataId={SHARED_ID}&instrument=lsstcam" in h for h in hrefs), hrefs
+    assert any(f"dataId={SHARED_ID}&instrument=latiss" in h for h in hrefs), hrefs
+    # And visibly, not just in the href — the two rows are otherwise
+    # indistinguishable to anyone reading the page.
+    labels = sorted(t.strip() for t in links.all_inner_texts())
+    assert labels == [f"{SHARED_ID} (latiss)", f"{SHARED_ID} (lsstcam)"], labels
+    # Following one lands on that instrument's exposure, not the twin.
+    latissHref = next(h for h in hrefs if "latiss" in h)
+    app.page.goto(app.origin + latissHref)
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#exposure-info")).to_contain_text("latiss")
+
+
 def test_deleting_one_window_removes_it_from_disk(app: Any, corpus: StagedCorpus) -> None:
     cacheDir = corpus.stageExposure(SHARED_ID, "lsstcam")
     corpus.stageNight()

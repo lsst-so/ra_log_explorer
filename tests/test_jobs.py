@@ -79,7 +79,7 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
     monkeypatch.setattr(jobs, "fetchAll", fakeFetchAll)
 
     mgr = jobs.JobManager()
-    job = mgr.createJob(_spec(), 2026051900722, _tZero())
+    job = mgr.createJob(_spec(), 2026051900722, _tZero(), instrument="latiss")
     # Capture both the job-id and the event-log length *as onComplete
     # fires*. The length snapshot is how we verify the ordering
     # contract: if onComplete ran before the `done` event was pushed,
@@ -106,6 +106,14 @@ def test_runJob_pushes_events_in_order(monkeypatch: pytest.MonkeyPatch, tmp_path
     # event count, and the very next event pushed is the `done`.
     assert eventCountAtCompleteTime[0] < len(job.events)
     assert job.events[eventCountAtCompleteTime[0]]["type"] == "done"
+    # The terminal event carries the pin this fetch ran under. The client
+    # asks `/api/summary` for it by name straight afterwards; without it
+    # the bare expId's slot may by then hold the other instrument's
+    # exposure of the same id, and the wrong view is opened and then
+    # stamped into the URL as if it were this one.
+    done = job.events[-1]
+    assert done["expId"] == 2026051900722
+    assert done["instrument"] == "latiss"
 
 
 def test_runJob_propagates_fetchAll_error(

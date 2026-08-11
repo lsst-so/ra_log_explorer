@@ -48,6 +48,23 @@ def _envVarsThisCodeReads() -> set[str]:
     return names
 
 
+def _numericEnvVars() -> dict[str, type]:
+    """The variables `config.py` parses as a number, and with which parser.
+
+    Read out of the source rather than listed here, because a hand-written
+    list is the thing that goes stale: a knob added to `config.py` and to
+    the chart but not to the list is exactly the one that never gets
+    checked. `RA_LOG_EXPLORER_LIVE_POLL_S` and `..._LIVE_LAG_S` were
+    already in that position.
+    """
+    source = Path(config.__file__).read_text()
+    found: dict[str, type] = {}
+    for fn, name in re.findall(r'_env(Int|Float)\(\s*"(RA_LOG_EXPLORER_[A-Z_]+)"', source):
+        found[name] = int if fn == "Int" else float
+    assert found, "no numeric settings found — the pattern above has drifted from config.py"
+    return found
+
+
 def _findPhalanx() -> Path | None:
     """Locate a Phalanx checkout containing this chart, or ``None``."""
     candidates = []
@@ -272,14 +289,21 @@ def test_a_writable_temp_dir_is_mounted(baseDocs: list[dict]) -> None:
 
 
 def test_numeric_settings_are_values_this_code_will_accept(baseDocs: list[dict]) -> None:
-    """`_envInt` / `_envFloat` raise rather than falling back, so a chart
-    value of the wrong shape is a crash-looping pod. Parse them the same
-    way the application will."""
+    """`_envInt` / `_envFloat` raise rather than falling back — and a
+    *blank* value counts as malformed, which is exactly what a mistyped
+    Helm reference (`value: {{ .Values.typo }}`) renders to. So a chart
+    value of the wrong shape is a crash-looping pod, and every numeric
+    knob has to be parsed here the way the application will parse it, not
+    just the ones somebody remembered to list."""
     env = _env(baseDocs)
-    for name in ("RA_LOG_EXPLORER_WORKERS", "RA_LOG_EXPLORER_MAX_CACHE_BYTES"):
-        assert int(env[name]["value"]) > 0, name
-    for name in ("RA_LOG_EXPLORER_WINDOW_BEFORE_S", "RA_LOG_EXPLORER_WINDOW_AFTER_S"):
-        assert float(env[name]["value"]) >= 0, name
+    for name, parse in sorted(_numericEnvVars().items()):
+        raw = env[name]["value"]
+        assert raw and raw.strip() == raw, f"{name} renders to {raw!r}; the app rejects blank"
+        assert parse(raw) >= 0, name
+    # The two with a floor as well as a shape: zero workers fetches
+    # nothing, and a zero ceiling evicts the cache as fast as it is built.
+    assert int(env["RA_LOG_EXPLORER_WORKERS"]["value"]) > 0
+    assert int(env["RA_LOG_EXPLORER_MAX_CACHE_BYTES"]["value"]) > 0
 
 
 # ----- the image contract --------------------------------------------------

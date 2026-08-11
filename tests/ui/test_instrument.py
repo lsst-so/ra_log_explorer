@@ -17,11 +17,22 @@ assertion to pass.
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
-from playwright.sync_api import expect
+from playwright.sync_api import Route, expect
 
-from .corpus import CAM_T_ZERO_UTC, DAY_OBS, LATISS_T_ZERO_UTC, SHARED_ID, StagedCorpus
+from .corpus import (
+    CAM_T_ZERO_UTC,
+    DAY_OBS,
+    LATISS_T_ZERO_UTC,
+    RANGE_START,
+    RANGE_STOP,
+    SHARED_ID,
+    UNKNOWN_ID,
+    StagedCorpus,
+)
 
 
 def switch(app: Any, instrument: str) -> None:
@@ -30,6 +41,18 @@ def switch(app: Any, instrument: str) -> None:
 
 def activeInstrument(app: Any) -> str:
     return str(app.page.locator("#instrument-switch button.active").get_attribute("data-instrument"))
+
+
+def _waitFor(app: Any, held: list[Route], n: int) -> None:
+    """Block until ``n`` intercepted lookups have arrived.
+
+    ``wait_for_timeout`` rather than a bare sleep: it pumps Playwright's
+    loop, which is what lets the route handler run at all.
+    """
+    deadline = time.time() + 5.0
+    while len(held) < n and time.time() < deadline:
+        app.page.wait_for_timeout(50)
+    assert len(held) >= n, f"expected {n} exposure-time lookups, saw {len(held)}"
 
 
 def test_lsstcam_is_the_default(app: Any) -> None:
@@ -237,6 +260,85 @@ def test_a_night_drilldown_link_carries_the_instrument(app: Any, corpus: StagedC
     # LATISS choice, so the auto-fetch resolves the right exposure.
     app.page.goto(app.origin + href)
     assert activeInstrument(app) == "lsstcam"
+
+
+def test_taking_the_wheel_drops_a_drilldown_autoFetch(app: Any) -> None:
+    """``autoFetch=1`` means "fetch the thing I clicked". Once the user
+    picks a different instrument, the thing they clicked is an exposure of
+    the *other* one — so the flag has to come off the URL, or a reload
+    (or a link copied out of the bar) fires a fetch nobody asked for."""
+    # An id ConsDB has no record for, so the armed auto-fetch never
+    # resolves and cannot navigate away mid-test.
+    app.goto(f"/?dataId={UNKNOWN_ID}&autoFetch=1&instrument=lsstcam")
+    expect(app.page.locator("#home-view")).to_be_visible()
+    assert "autoFetch=1" in app.page.url
+    switch(app, "latiss")
+    assert "autoFetch" not in app.page.url, app.page.url
+    assert "instrument=latiss" in app.page.url, app.page.url
+
+
+def test_switching_disarms_a_drilldown_auto_fetch(app: Any, corpus: StagedCorpus) -> None:
+    """Taking the wheel has to stop the auto-fetch, not redirect it.
+
+    The poller armed on arrival keeps running for 30 s, and it fires as
+    soon as the id resolves *under the current pin* — so a switch made to
+    avoid the auto-fetch would instead point it at the other
+    instrument's exposure of the same id and fetch that, within a second,
+    with nothing else touched. Stripping `autoFetch` from the URL only
+    covers the reload; this covers the click.
+    """
+    # Staged, so if the auto-fetch does fire it really reaches the
+    # explore view rather than failing on a cache miss.
+    corpus.stageExposure(SHARED_ID, "latiss")
+    held: list[Route] = []
+    app.page.route("**/api/exposure-time/**", lambda route: held.append(route))
+    app.goto(f"/?dataId={SHARED_ID}&autoFetch=1&instrument=lsstcam")
+    expect(app.page.locator("#home-view")).to_be_visible()
+    _waitFor(app, held, 1)  # the LSSTCam lookup the arrival fired
+
+    switch(app, "latiss")
+    _waitFor(app, held, 2)  # the switch's own lookup
+    held[0].fulfill(  # stale; discarded on sequence
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"tZero": "2026-07-12T04:21:59.502000", "instrument": "lsstcam"}),
+    )
+    held[1].fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"tZero": "2026-07-12T05:25:30.895000", "instrument": "latiss"}),
+    )
+    # The page is now fully able to fetch — resolved and submittable.
+    expect(app.page.locator("#tzero-status")).to_contain_text("05:25:30")
+    expect(app.page.locator("#fetch-submit")).to_be_enabled()
+    # It just must not do it by itself. Waited out rather than asserted
+    # instantly: the poll is every 200 ms, so an instant check would pass
+    # against a timer that fires a moment later.
+    app.page.wait_for_timeout(1_000)
+    expect(app.page.locator("#home-view")).to_be_visible()
+    expect(app.page.locator("#explore-view")).to_be_hidden()
+
+
+def test_a_range_deep_link_opens_the_span_of_its_own_instrument(app: Any, corpus: StagedCorpus) -> None:
+    """Each instrument counts from 1 each night, so one pair of bounds
+    names a real run on both — and both can be cached at once. Comparing
+    the same seq-number span across instruments is an ordinary thing to
+    do, so the pinned link must reopen *its* span rather than whichever
+    of the two was fetched most recently."""
+    corpus.stageRange(RANGE_START, RANGE_STOP, "lsstcam")
+    corpus.stageRange(RANGE_START, RANGE_STOP, "latiss")  # the newer fetch
+    app.goto(f"/?rangeStart={RANGE_START}&rangeStop={RANGE_STOP}&instrument=lsstcam")
+    expect(app.page.locator("#range-nav")).to_be_visible()
+    # The two runs' shutter closes are an hour apart; the reference
+    # readout is where that is visible.
+    expect(app.page.locator("#t0-info")).to_contain_text(CAM_T_ZERO_UTC.strftime("%H:%M:%S"))
+    expect(app.page.locator("#t0-info")).not_to_contain_text(LATISS_T_ZERO_UTC.strftime("%H:%M:%S"))
+    assert (
+        app.apiJson(f"/api/summary?rangeStart={RANGE_START}&rangeStop={RANGE_STOP}&instrument=lsstcam")[
+            "instrument"
+        ]
+        == "lsstcam"
+    )
 
 
 def test_the_tonight_panel_lists_only_the_pinned_instrument(app: Any) -> None:

@@ -8,9 +8,11 @@ below the browser is mocked out of it.
 
 from __future__ import annotations
 
+import json
+import time
 from typing import Any
 
-from playwright.sync_api import expect
+from playwright.sync_api import Route, expect
 
 from .corpus import (
     DAY_OBS,
@@ -41,6 +43,40 @@ def test_a_partial_dataId_is_not_looked_up(app: Any) -> None:
     app.page.locator("#fetch-form input[name=exposureId]").fill("202607110044512")
     expect(app.page.locator("#tzero-status")).to_contain_text("too long")
     assert calls == []
+
+
+def test_a_late_lookup_answer_cannot_resolve_a_field_that_moved_on(app: Any) -> None:
+    """The shutter-close lookup is debounced, not cancellable: the answer
+    to an id the user has since edited away still arrives.
+
+    It has to be discarded. Accepting it leaves the box reading "shutter
+    close (TAI): …" and the submit button live for an exposure that is no
+    longer in the field — and the fetch that follows is a window around
+    somebody else's t-zero, wearing whatever id is on screen.
+    """
+    held: list[Route] = []
+    app.page.route("**/api/exposure-time/**", lambda route: held.append(route))
+    app.goto("/")
+    field = app.page.locator("#fetch-form input[name=exposureId]")
+    field.fill(str(SHARED_ID))
+    deadline = time.time() + 5.0
+    while not held and time.time() < deadline:
+        app.page.wait_for_timeout(50)
+    assert held, "the 13-digit id should have fired a lookup"
+
+    # The user backspaces before the answer lands.
+    field.fill(str(SHARED_ID)[:-1])
+    expect(app.page.locator("#tzero-status")).to_contain_text("keep typing")
+    held[0].fulfill(
+        status=200,
+        content_type="application/json",
+        body=json.dumps({"tZero": "2026-07-12T04:21:59.502000", "instrument": "lsstcam"}),
+    )
+
+    # Whatever else happens, the stale answer is not adopted.
+    app.page.wait_for_timeout(300)
+    expect(app.page.locator("#tzero-status")).not_to_contain_text("04:21:59")
+    expect(app.page.locator("#fetch-submit")).to_be_disabled()
 
 
 def test_no_consdb_token_says_so_and_still_lets_you_proceed(app: Any) -> None:

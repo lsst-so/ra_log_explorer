@@ -69,11 +69,18 @@ function setInstrument(inst, opts) {
   const url = new URL(window.location);
   url.searchParams.set('instrument', inst);
   if (changed && !(opts && opts.initial)) {
-    // Drop a drilldown's autoFetch once the user takes the wheel. It
+    // Call off a drilldown's autoFetch once the user takes the wheel. It
     // means "fetch the thing I clicked", and the thing they clicked was
-    // an exposure of the *other* instrument; leaving it on the URL means
-    // a later reload silently fires a fetch nobody asked for.
+    // an exposure of the *other* instrument.
+    //
+    // Both halves are needed. Off the URL, or a later reload silently
+    // fires a fetch nobody asked for; and off the clock, because the
+    // poller armed on arrival is still running and re-resolving under
+    // the new pin is exactly what satisfies it — so the switch that was
+    // meant to stop the auto-fetch would instead redirect it onto the
+    // twin, within a second, with nothing else touched.
     url.searchParams.delete('autoFetch');
+    cancelAutoFetch();
   }
   history.replaceState(null, '', url);
   // AOS (night mode) runs on LSSTCam only — its wavefront sensors live
@@ -106,6 +113,9 @@ function setInstrument(inst, opts) {
 }
 
 function startHome() {
+  // Whatever was armed belongs to the visit we just left; this one
+  // re-arms below if its own URL asks for it.
+  cancelAutoFetch();
   if (!homeListenersWired) wireHomeListeners();
   prefillForm();
   loadSite();
@@ -295,24 +305,38 @@ function renderTonight(live) {
   }
 }
 
+// The armed drilldown auto-fetch, if any. Held at module scope because
+// it outlives the click that armed it — it polls for up to 30 seconds —
+// and anything that changes what the page is about in that window has
+// to be able to call it off.
+let autoFetchTimer = null;
+
+function cancelAutoFetch() {
+  if (autoFetchTimer !== null) {
+    clearInterval(autoFetchTimer);
+    autoFetchTimer = null;
+  }
+}
+
 function waitAndAutoFetch(expId) {
   // Wait for the shutter-close lookup to resolve, then submit the
   // exposure form on the user's behalf. We poll every 200ms with a
   // 30-second cap so a missing RSP token or an unknown dataId
   // surfaces normally rather than hanging silently.
+  cancelAutoFetch();  // never two armed at once
   let elapsed = 0;
   const maxMs = 30_000;
-  const tick = setInterval(() => {
+  autoFetchTimer = setInterval(() => {
     elapsed += 200;
     if (resolutionMatches(expId)) {
-      clearInterval(tick);
+      cancelAutoFetch();
       const form = document.getElementById('fetch-form');
       if (form && !document.getElementById('fetch-submit').disabled) {
         showMessage('Auto-fetching from night-view drilldown...');
         form.requestSubmit();
       }
     } else if (elapsed >= maxMs) {
-      clearInterval(tick);
+      cancelAutoFetch();
     }
   }, 200);
 }
