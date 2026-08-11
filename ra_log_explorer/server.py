@@ -2072,6 +2072,17 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
                 rangeStartRaw = qs.get("rangeStart", [""])[0] or None
                 rangeStopRaw = qs.get("rangeStop", [""])[0] or None
+                instrumentRaw = (qs.get("instrument", [""])[0] or "").strip().lower() or None
+                if (
+                    instrumentRaw is not None
+                    and instrumentRaw not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER
+                ):
+                    self._send_error_json(
+                        400,
+                        f"Unknown instrument {instrumentRaw!r}; known: "
+                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
+                    )
+                    return
                 pod = path[len("/api/pod/") :]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
                     self.send_error(400, "Invalid pod name")
@@ -2087,6 +2098,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     with ctx.jobs.stateLock:
                         state = ctx.getExposureState(dataId)
+                    if (
+                        state is not None
+                        and instrumentRaw is not None
+                        and state.instrument is not None
+                        and state.instrument != instrumentRaw
+                    ):
+                        # Same guard /api/summary applies: the bare id's
+                        # in-memory slot may hold the other instrument's
+                        # exposure (another tab opened its twin), and that
+                        # state's cache dir is a different window — its
+                        # lines are a different exposure's, an hour away.
+                        state = None
                     if state is None:
                         self._send_error_json(404, f"No exposure loaded for dataId {dataId}")
                         return

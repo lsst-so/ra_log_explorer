@@ -264,10 +264,12 @@ Sibling docs:
   dict, `_exposure_ids.txt` and the range key are still keyed by the
   bare id, so two colliding exposures share one in-memory slot —
   opening one evicts the other. Correctness is protected by a guard
-  rather than by the key: `/api/summary?dataId=&instrument=` refuses to
-  serve a state pinned to a different instrument (falling through to
-  the rebuild/fetch path, which re-pins), and the cache-rebuild path
-  verifies the window it found actually contains the pinned t₀.
+  rather than by the key: `/api/summary?dataId=&instrument=` and
+  `/api/pod/<pod>?dataId=&instrument=` both refuse to serve a state
+  pinned to a different instrument (the summary falls through to the
+  rebuild/fetch path, which re-pins; the pod detail 404s and the next
+  summary reload re-pins), and the cache-rebuild path verifies the
+  window it found actually contains the pinned t₀.
 
 - **dayObs** — 8-digit `YYYYMMDD` integer. The observatory rolls the
   calendar over at UTC-12, so dayObs 20260521 covers
@@ -760,13 +762,19 @@ the range's shared summaries with the dataId's own shutter close as
 so pod-detail lookups route back through the range state (and anchor
 their offsets at this dataId's shutter close).
 
-### `GET /api/pod/<podName>?dataId=<int>` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=`
+### `GET /api/pod/<podName>?dataId=<int>[&instrument=<name>]` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=`
 
 Returns every parsed `LogLine` from that pod's JSONL file. The query
 string routes to the right loaded state (`dataId` → exposure, `dayObs`
 → night, `rangeStart`+`rangeStop`+`dataId` → that dataId within a loaded
 range, with offsets anchored at its shutter close). 400 if no key, 404
 if the targeted state isn't loaded.
+
+`instrument` (dataId form; the explore view always sends its own) is
+the same guard `/api/summary` applies: the bare id's in-memory slot may
+hold the *other* instrument's exposure — another tab opened its twin —
+whose cache dir is a different window entirely. A mismatch is a 404,
+never the loaded state's lines; 400 for an unknown instrument name.
 
 ```jsonc
 {

@@ -1591,6 +1591,59 @@ def test_pod_endpoint_routes_by_dataId_query(runningServer: RunningServer, tmpCa
     assert body["pod"] == podName
 
 
+def test_pod_endpoint_refuses_a_state_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The same guard /api/summary applies. Two tabs can hold the same
+    bare id under different instruments; the id's in-memory slot then
+    belongs to whichever opened last, and its cache dir is a different
+    window — serving it would hand this tab another exposure's log
+    lines, offset against the wrong shutter close."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+
+    host, port, ctx = runningServer
+    cd = tmpCacheRoot / "cache-latiss"
+    (cd / "pods").mkdir(parents=True)
+    podName = "s-latiss-run-sfm-runner-workerset-0"
+    (cd / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-07-12T05:25:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "a latiss log line\n",
+            }
+        )
+        + "\n"
+    )
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=cd,
+                cacheBytes=0,
+                meta={},
+                summaries=_parse.summarizeAll(cd),
+                expId=445,
+                tZero=_dt.datetime(2026, 7, 12, 5, 24, tzinfo=_dt.timezone.utc),
+                instrument="latiss",
+            )
+        )
+    # The matching pin (and the unpinned legacy form) are served.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=latiss")
+    assert status == 200 and body["pod"] == podName
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445")
+    assert status == 200 and body["pod"] == podName
+    # The other instrument's pin: same bare id, different exposure — 404,
+    # never the loaded state's lines.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=lsstcam")
+    assert status == 404
+    # An unknown name is a 400, not a silent bare-id answer.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=hubble")
+    assert status == 400
+
+
 # ----- /api/summary error branches ---------------------------------------
 
 

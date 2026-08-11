@@ -629,9 +629,14 @@ async function selectPod(pod) {
   if (!podDetailCache[pod]) {
     // In range mode the timeline payload carries a podDetailQuery that
     // routes the lookup back through the range state (so offsets anchor
-    // at this dataId's shutter close); single-exposure mode just keys
-    // off the loaded dataId.
-    const q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
+    // at this dataId's shutter close); single-exposure mode keys off the
+    // loaded dataId — plus the view's instrument, so a same-id state
+    // loaded by another tab under the other instrument 404s instead of
+    // answering with a different exposure's log lines.
+    let q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
+    if (!summary.podDetailQuery && summary.instrument) {
+      q += `&instrument=${encodeURIComponent(summary.instrument)}`;
+    }
     const r = await fetch(apiUrl(`/api/pod/${pod}?${q}`));
     podDetailCache[pod] = await r.json();
   }
