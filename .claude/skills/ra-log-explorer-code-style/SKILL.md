@@ -122,6 +122,17 @@ Request handlers must not read configuration out of the request body.
 nothing else; a body carrying `site`, `username`, `password` or `workers`
 is ignored, and there are tests pinning that.
 
+## No backwards compatibility, ever
+
+A permanent policy, not a phase: this is app code, not a library, and
+the caches are a temporary convenience — deploys invalidate everything
+intentionally. Never write a tolerant reader for an old on-disk shape,
+a deprecation shim, or migration code. Rename across every call site in
+one commit; when a cache format changes, bump `CACHE_SCHEMA_VERSION` in
+the same commit and delete the old reader (see *No backwards
+compatibility* in `architecture/caching.md`). A "graceful" legacy path
+is dead code that nothing exercises — the flush is the upgrade.
+
 ## When in doubt, match the existing files
 
 `parse.py`, `fetch.py`, and `server.py` are the canonical style examples.

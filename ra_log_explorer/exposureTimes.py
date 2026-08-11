@@ -140,8 +140,8 @@ def obsEnd(record: ExposureRecord | None) -> str | None:
 def recordInstrument(record: ExposureRecord | None) -> str | None:
     """The ``cdb_<instrument>`` table a record came from, or ``None``.
 
-    ``None`` for a legacy cache entry or a manual stand-in, both of which
-    predate instrument stamping — those are bare-id values by definition.
+    ``None`` only when the record genuinely carries no instrument — a
+    manual stand-in typed without one.
     """
     if not record:
         return None
@@ -447,11 +447,11 @@ def cacheKey(dataId: int, instrument: str | None = None) -> str:
     """The per-site cache key for a dataId, optionally scoped to an instrument.
 
     Bare ``"<id>"`` is the probe-order view — what a lookup that doesn't
-    know (or care about) the instrument resolves to, and what every
-    pre-instrument caller already used. ``"<instrument>:<id>"`` is the
-    unambiguous one, and is the only key an instrument-scoped lookup will
-    accept: falling back to the bare key there could hand back a
-    different instrument's exposure with the same id.
+    know (or care about) the instrument resolves to.
+    ``"<instrument>:<id>"`` is the unambiguous one, and is the only key
+    an instrument-scoped lookup will accept: falling back to the bare
+    key there could hand back a different instrument's exposure with the
+    same id.
     """
     return f"{instrument}:{dataId}" if instrument else str(dataId)
 
@@ -467,10 +467,10 @@ def lookupCachedRecord(dataId: int, *, siteName: str, instrument: str | None = N
 
     The cache is best-effort: any read error (missing file, invalid
     JSON, unexpected schema) is swallowed and we return ``None`` so the
-    caller falls through to a fresh ConsDB query. A legacy entry stored
-    as a bare ``obs_end`` string (the pre-record cache format) is read
-    back as ``{"obs_end": <str>}`` so the t-zero still resolves; the
-    richer columns simply fill in on the next fetch.
+    caller falls through to a fresh ConsDB query. There is exactly one
+    on-disk shape — a record object; anything else (including entries an
+    older build wrote) is a miss, not something to interpret. Caches are
+    a convenience, and the schema flush is the upgrade path.
     """
     p = cachedExposureTimesPath(siteName)
     if not p.exists():
@@ -482,11 +482,7 @@ def lookupCachedRecord(dataId: int, *, siteName: str, instrument: str | None = N
     if not isinstance(d, dict):
         return None
     val = d.get(cacheKey(dataId, instrument))
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        return {"obs_end": val}
-    return None
+    return val if isinstance(val, dict) else None
 
 
 def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str, bareKey: bool = True) -> None:

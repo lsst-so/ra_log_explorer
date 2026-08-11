@@ -815,7 +815,6 @@ def _recoverNight(nightDir: Path, sidecar: dict[str, Any]) -> None:
     for f in nightDir.iterdir():
         if f.is_file() and f.name.startswith(_TEMP_PREFIXES):
             f.unlink(missing_ok=True)
-    _migrateEventOnlyPods(sidecar)
     pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
     eventPods: dict[str, dict[str, Any]] = sidecar.get("eventPods") or {}
     for sub, key, tables in (
@@ -831,27 +830,6 @@ def _recoverNight(nightDir: Path, sidecar: dict[str, Any]) -> None:
             elif f.stat().st_size > recorded:
                 with open(f, "ab") as fh:
                     fh.truncate(recorded)
-
-
-def _migrateEventOnlyPods(sidecar: dict[str, Any]) -> None:
-    """Move pre-``eventPods`` event-only names out of ``pods``.
-
-    Sidecars written before event-only names had their own section put
-    them in ``pods`` anchored at night start, where they pinned the
-    global watermark there. Nothing distinguishes them after the fact
-    except having no app-log bytes and some event bytes, which is exactly
-    what an event-only name looks like; an app-log pod misfiled this way
-    is simply re-created (and refetched from night start, over an empty
-    file) the next time it is listed.
-    """
-    pods: dict[str, dict[str, Any]] = sidecar.get("pods") or {}
-    eventPods: dict[str, dict[str, Any]] = sidecar.setdefault("eventPods", {})
-    for name in [n for n, r in pods.items() if not r.get("bytes") and r.get("eventBytes")]:
-        record = pods.pop(name)
-        eventPods[name] = {
-            "eventBytes": int(record.get("eventBytes") or 0),
-            "eventLines": int(record.get("eventLines") or 0),
-        }
 
 
 def _exposureKey(record: exposureTimes.ExposureRecord) -> tuple[str, int] | None:

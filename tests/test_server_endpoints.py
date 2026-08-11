@@ -566,7 +566,7 @@ def test_cache_list_includes_range_kind(runningServer: RunningServer, tmpCacheRo
             }
         )
     )
-    markCacheRange(d, 2026051900722, 2026051900750)
+    markCacheRange(d, 2026051900722, 2026051900750, instrument="lsstcam")
     status, body = _get(host, port, "/api/cache")
     assert status == 200
     rows = [w for w in body["windows"] if w["kind"] == "range"]
@@ -1630,7 +1630,8 @@ def test_pod_endpoint_refuses_a_state_pinned_to_another_instrument(
                 instrument="latiss",
             )
         )
-    # The matching pin (and the unpinned legacy form) are served.
+    # The matching pin — and the unpinned form, which stays a real
+    # feature (the bare-id view) — are both served.
     status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=latiss")
     assert status == 200 and body["pod"] == podName
     status, body = _get(host, port, f"/api/pod/{podName}?dataId=445")
@@ -2585,7 +2586,7 @@ def test_manual_tZero_for_lsstcam_still_claims_the_bare_key(
     runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """LSSTCam is what a bare probe reaches first, so its stand-in is
-    also the bare-id answer — the pre-instrument behaviour, preserved."""
+    also the bare-id answer and may claim the bare key."""
     host, port, _ctx = runningServer
     expId = 2026071100778
     _completeFetch(

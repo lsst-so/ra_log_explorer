@@ -127,9 +127,17 @@ between the two projects doesn't have to context-switch.
 - **Comments**: avoid restating *what* the code does. Add a comment when
   it captures *why* — a non-obvious constraint, a historical reason, a
   subtle ordering requirement.
-- **Backwards compatibility**: none required. This is an end-consumer
-  application, not a library. No deprecation shims, no re-exports —
-  rename across all call sites in the same commit and move on.
+- **Backwards compatibility**: none, ever — and this is a permanent
+  policy, not a phase. This is an end-consumer application, not a
+  library, and its caches are a temporary convenience, not a data store
+  anyone supports. No deprecation shims, no re-exports, no tolerant
+  readers for old on-disk formats, no migration code: rename across all
+  call sites in the same commit and move on, and when an on-disk shape
+  changes (`_meta.json`, `_live.json`, `_range.txt`, the exposure-time
+  records), bump `CACHE_SCHEMA_VERSION` in the same commit and delete
+  the old reader outright. Deploys invalidate everything intentionally;
+  the schema flush is the upgrade path. See *No backwards
+  compatibility* in [architecture/caching.md](architecture/caching.md).
 
 The [ra-log-explorer-code-style](.claude/skills/ra-log-explorer-code-style/SKILL.md)
 skill encodes these in agent-readable form.

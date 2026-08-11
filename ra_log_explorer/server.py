@@ -1533,9 +1533,8 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
     both the rebuilt state (so its per-exposure timelines exclude the
     other instrument's pods) and every per-id lookup here — a bare lookup
     on a colliding id would anchor that exposure to the *other*
-    instrument's shutter close. ``None`` only for a sidecar written
-    before the instrument was recorded; those rebuild unpinned, as they
-    always did.
+    instrument's shutter close. A sidecar without one isn't recognised
+    as a range at all, so a found range always carries its pin.
     """
     cacheDir = _findRangeCacheDir(startId, stopId)
     if cacheDir is None:
@@ -1745,6 +1744,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         if job.kind == "range":
             assert job.startId is not None and job.stopId is not None
             assert job.tZeroStart is not None and job.tZeroStop is not None
+            assert job.instrument is not None  # every range job is created with one
             newRange = RangeState(
                 cacheDir=job.cacheDir,
                 cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -2270,17 +2270,13 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             #
             # ``instrument`` is different: it is part of the *dataId's*
             # identity, not server configuration, so the caller does get
-            # to name it. Omitted, the answer is the probe-order one,
-            # which is what every pre-instrument caller already got.
+            # to name it. Omitted, the answer is the probe-order one.
             site = ctx.site()
             # Cache check first: exposure properties are immutable once
             # they exist, so a hit lets us skip the token + network call
             # entirely. This also means a user with no ConsDB token can
             # still resolve any dataId they (or anyone) previously
-            # looked up on this machine for *this* site. A legacy entry
-            # (obs_end-only string) is read back as a 1-field record, so
-            # the t-zero still resolves even before the richer columns
-            # backfill on the next fresh query.
+            # looked up on this machine for *this* site.
             cachedRec = exposureTimes.lookupCachedRecord(dataId, siteName=site.name, instrument=instrument)
             cachedIso = exposureTimes.obsEnd(cachedRec)
             cachedManual = exposureTimes.isManual(cachedRec)

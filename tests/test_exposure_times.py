@@ -520,19 +520,20 @@ def test_storeCachedRecord_then_lookup_round_trip(monkeypatch: pytest.MonkeyPatc
     assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
 
 
-def test_lookupCachedRecord_reads_legacy_obs_end_string(
+def test_lookupCachedRecord_ignores_a_non_record_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cache written by the pre-record format stored a bare obs_end
-    string per dataId. It must still resolve (wrapped as a 1-field
-    record) so an existing cache keeps working across the upgrade."""
+    """There is exactly one on-disk shape: a record object. A bare string
+    (what a pre-record build wrote) is a miss, not something to
+    interpret — this project keeps no backwards compatibility, and the
+    CACHE_SCHEMA_VERSION flush guarantees such entries never survive a
+    deploy anyway. A miss falls through to a fresh ConsDB query, which
+    overwrites the entry with the real shape."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
     p = exposureTimes.cachedExposureTimesPath("summit")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"2026051900722": "2026-05-20T08:46:16.267000"}))
-    got = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
-    assert got == {"obs_end": "2026-05-20T08:46:16.267000"}
-    assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
 
 
 def test_storeCachedRecords_batches_one_write(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -710,7 +711,8 @@ def test_probeOrderWinners_resolves_a_shared_id_the_bare_lookup_way() -> None:
     latiss = {"exposure_id": 1, "instrument": "latiss"}
     assert exposureTimes.probeOrderWinners([latiss, cam]) == {1: cam}
     assert exposureTimes.probeOrderWinners([cam, latiss]) == {1: cam}
-    # A record with no instrument (legacy / manual) never beats a real one.
+    # A record with no instrument (an unstamped manual stand-in) never
+    # beats a real one.
     assert exposureTimes.probeOrderWinners([{"exposure_id": 1}, latiss]) == {1: latiss}
 
 
@@ -764,7 +766,7 @@ def test_storeCachedRecord_can_skip_the_bare_key(monkeypatch: pytest.MonkeyPatch
 
 def test_manualRecord_instrument_stamp_round_trips(tmpCacheRoot: Path) -> None:
     """A stamped manual record answers instrument-pinned lookups; an
-    unstamped one only answers bare lookups (pre-instrument behaviour)."""
+    unstamped one only answers bare lookups."""
     stamped = exposureTimes.manualRecord("2026-07-12T05:00:37.000", instrument="latiss")
     assert exposureTimes.recordInstrument(stamped) == "latiss"
     exposureTimes.storeCachedRecord(101, stamped, siteName="summit")

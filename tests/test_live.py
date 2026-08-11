@@ -153,6 +153,7 @@ def _makeNightDir(
         "finalised": watermark is None,
         "updatedAt": dt.datetime.now(UTC).isoformat(),
         "pods": pods,
+        "eventPods": {},
         "errors": {},
         "incomplete_pods": {},
     }
@@ -1091,34 +1092,6 @@ def test_recoverNight_clears_stranded_temp_files(
     fresh.tick(now=_t(20))
     assert not (nightDir / "live-inc-xyz.jsonl").exists()
     assert not (nightDir / "live-events-xyz.jsonl").exists()
-
-
-def test_recoverNight_migrates_legacy_event_only_pods(
-    tmpCacheRoot: Path, manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A sidecar written before event-only names had their own section
-    put them in `pods` anchored at night start, where they pinned the
-    watermark there. Recovery files them where they belong."""
-    nightDir = _makeNightDir(tmpCacheRoot, watermark=_t(10), podTimes={"pod-a": [_t(3)]})
-    sidecar = fetch.readLiveSidecar(nightDir)
-    assert sidecar is not None
-    sidecar["pods"]["some-replicaset-abc12"] = {
-        "watermarkIso": sidecar["fromIso"],
-        "bytes": 0,
-        "lines": 0,
-        "eventBytes": 120,
-        "eventLines": 2,
-    }
-    sidecar.pop("eventPods", None)
-    fetch.writeLiveSidecar(nightDir, sidecar)
-
-    monkeypatch.setattr(live, "listPods", lambda spec: [])
-    manager.tick(now=_t(20))
-    after = fetch.readLiveSidecar(nightDir)
-    assert after is not None
-    assert "some-replicaset-abc12" not in after["pods"]
-    assert after["eventPods"]["some-replicaset-abc12"]["eventLines"] == 2
-    assert fetch._parseIso(manager.snapshot()["watermark"]) == _t(20)
 
 
 def test_openNight_adopts_a_finalised_night_without_fetching(

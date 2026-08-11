@@ -99,7 +99,24 @@ history: v1 (implicit) capped each pod at 50 000 lines; v2 used
 (grafana/loki#17270); v3 fetches in count-presized single-batch chunks
 (see *Completeness* below); v4 additionally fetches each pod's
 `k8s/events` lifecycle stream into `pods_events/` — a v3 cache has no such
-tree, so the bump forces a re-fetch to pick up the new markers.
+tree, so the bump forces a re-fetch to pick up the new markers; v5
+dropped every compatibility reader (see *No backwards compatibility*
+below) — the flush is what makes that safe.
+
+## No backwards compatibility
+
+**Nothing written by an older build is ever interpreted.** This is app
+code, not a library, and the cache is a temporary convenience, not a
+data store anyone supports: every on-disk shape here — `_meta.json`,
+`_live.json`, `_range.txt`, the exposure-time records — has exactly one
+current format, readers treat anything else as absent or malformed, and
+a deploy invalidates everything on purpose (that is what the
+schema-version flush is *for*). When a format changes, bump
+`CACHE_SCHEMA_VERSION` in the same commit and delete the old reader —
+never write a tolerant one, never migrate in place. The cost is one
+re-fetch per window after a deploy; the alternative is a permanent tax
+of dual-format readers whose legacy halves are exercised by nothing and
+rot silently.
 
 ## Live night dirs
 
@@ -350,8 +367,9 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
   recorded instrument re-pins the rebuilt state's shutter-close
   lookups — a range is a run of *one* instrument's exposures, and a
   bare lookup on a colliding id would anchor that exposure to the
-  other instrument's t₀. A two-line sidecar (written before the
-  instrument was recorded) rebuilds unpinned, as it always did.
+  other instrument's t₀. Three lines is the *only* format: a shorter
+  file is malformed and the dir simply isn't a range cache (see *No
+  backwards compatibility* below).
 
 ## LRU eviction (size cap)
 
@@ -454,19 +472,14 @@ LATISS share ids on any night both observe:
   `probeOrderWinners`), so the same dataId can't answer differently
   depending on who wrote last.
 
-A legacy (pre-instrument) entry has only the bare key and no
-`instrument` field; it keeps resolving unqualified lookups and is
-superseded by a stamped record on the next fresh query.
-
 The lookup is best-effort: a corrupt JSON file, an unexpected schema,
 or an unusable value all return `None` from `lookupCachedRecord` and
 fall through to a fresh ConsDB query (which then overwrites the bad
-record). A legacy entry written by the pre-record format (a bare
-`obs_end` string per dataId) is read back as a 1-field record, so an
-existing cache keeps resolving t-zeros across the upgrade — the richer
-columns just backfill on the next fresh query. The store path is the
-same on every cache hit, miss, and batch-resolve, so `rm -r
-<cache_root>/exposure-times/` is the nuclear reset.
+record). There is exactly one entry shape — a record object; anything
+else is a miss, never interpreted (see *No backwards compatibility*
+below). The store path is the same on every cache hit, miss, and
+batch-resolve, so `rm -r <cache_root>/exposure-times/` is the nuclear
+reset.
 
 ## Future: cleaner subset semantics
 

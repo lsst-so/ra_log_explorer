@@ -245,11 +245,6 @@ def test_getCacheRange_returns_None_when_no_sidecar(tmp_path: Path) -> None:
 
 
 def test_markCacheRange_then_get_roundtrips(tmp_path: Path) -> None:
-    fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750)
-    assert fetch.getCacheRange(tmp_path) == (2026051900722, 2026051900750)
-
-
-def test_markCacheRange_records_the_instrument(tmp_path: Path) -> None:
     """The pin the range was fetched under rides in the sidecar, so the
     rebuild path can resolve each in-range id against the right table."""
     fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750, instrument="latiss")
@@ -257,22 +252,25 @@ def test_markCacheRange_records_the_instrument(tmp_path: Path) -> None:
     assert fetch.getCacheRangeInstrument(tmp_path) == "latiss"
 
 
-def test_getCacheRangeInstrument_is_None_for_a_two_line_sidecar(tmp_path: Path) -> None:
-    """A sidecar written before the instrument line existed still names a
-    valid range; it just rebuilds unpinned, as it always did."""
-    fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750)
+def test_a_two_line_range_sidecar_is_not_a_range_cache(tmp_path: Path) -> None:
+    """There is exactly one sidecar format — three lines. A two-line file
+    (what an older build wrote) is malformed, not a degraded-but-usable
+    range: this project keeps no backwards compatibility, and the
+    CACHE_SCHEMA_VERSION flush means such files never survive a deploy."""
+    (tmp_path / "_range.txt").write_text("2026051900722\n2026051900750\n")
+    assert fetch.getCacheRange(tmp_path) is None
     assert fetch.getCacheRangeInstrument(tmp_path) is None
 
 
 def test_markCacheRange_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
-    fetch.markCacheRange(tmp_path / "does-not-exist", 1, 2)  # no raise
+    fetch.markCacheRange(tmp_path / "does-not-exist", 1, 2, instrument="lsstcam")  # no raise
     assert fetch.getCacheRange(tmp_path / "does-not-exist") is None
 
 
 def test_getCacheRange_returns_None_on_malformed_sidecar(tmp_path: Path) -> None:
     (tmp_path / fetch.RANGE_NAME).write_text("only-one-line\n")
     assert fetch.getCacheRange(tmp_path) is None
-    (tmp_path / fetch.RANGE_NAME).write_text("not-a-number\nalso-bad\n")
+    (tmp_path / fetch.RANGE_NAME).write_text("not-a-number\nalso-bad\nlsstcam\n")
     assert fetch.getCacheRange(tmp_path) is None
 
 

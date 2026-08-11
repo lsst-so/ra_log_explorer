@@ -104,10 +104,14 @@ from .parse import _parseTimestamp as _parseLokiTimestamp
 # verifies completeness structurally; v4 additionally fetches each pod's
 # k8s/events stream into a parallel pods_events/ tree (restart/kill/OOM
 # lifecycle markers) — a v3 cache has no such tree, so it must re-fetch to
-# pick those up. Bumping this value flushes the whole cache (see
+# pick those up; v5 dropped every compatibility reader (bare-string
+# exposure-time entries, two-line _range.txt sidecars, pre-eventPods live
+# sidecars) — nothing written by an older build is interpreted, per the
+# no-backwards-compatibility rule in caching.md, and this flush is what
+# makes that safe. Bumping this value flushes the whole cache (see
 # ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
 # individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 5
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so
@@ -730,8 +734,7 @@ def _parseIso(s: str) -> dt.datetime:
 # and the parser ignores what it can't use — but they make no claim about
 # app-log coverage, so they must not be able to hold the watermark back.
 # A name promotes from ``eventPods`` into ``pods``, carrying its counters,
-# the first time it appears in an app-log listing. (The key is optional:
-# a sidecar written before it existed simply has no event-only names.)
+# the first time it appears in an app-log listing.
 #
 # The sidecar is the coordination point between the poller (single
 # writer; atomic replace once per tick, only after the tick's bytes are
@@ -1604,14 +1607,16 @@ def getCacheExposureIds(cacheDir: Path) -> list[int]:
     return sorted(set(out))
 
 
-def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str | None = None) -> None:
+def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str) -> None:
     """Record that this cache is a range-mode fetch over ``[startId, stopId]``.
 
     ``instrument`` is the pin the range was fetched under — a range is a
     run of *one* instrument's exposures, and the rebuild path needs the
     pin back to resolve each in-range id against the right table (a bare
     lookup on a colliding id would anchor to the other instrument's
-    shutter close).
+    shutter close). It is required: there is exactly one sidecar format,
+    three lines, and no reader tolerates fewer (see caching.md's
+    no-backwards-compatibility rule).
 
     Best-effort, same contract as :func:`addExposureToCache`: a write
     failure does not interrupt the request — the cache just won't be
@@ -1619,11 +1624,8 @@ def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str | 
     """
     if not cacheDir.exists():
         return
-    body = f"{int(startId)}\n{int(stopId)}\n"
-    if instrument:
-        body += f"{instrument}\n"
     try:
-        (cacheDir / RANGE_NAME).write_text(body)
+        (cacheDir / RANGE_NAME).write_text(f"{int(startId)}\n{int(stopId)}\n{instrument}\n")
     except OSError:
         pass
 
@@ -1642,19 +1644,21 @@ def getCacheRange(cacheDir: Path) -> tuple[int, int] | None:
 
 
 def getCacheRangeInstrument(cacheDir: Path) -> str | None:
-    """The instrument recorded in a range cache's sidecar, or ``None``.
-
-    ``None`` for a sidecar written before the third line existed — the
-    rebuild path then resolves unpinned, exactly as it always did.
-    """
+    """The instrument recorded in a range cache's sidecar, or ``None``
+    when the sidecar is missing or malformed (in which case
+    :func:`getCacheRange` won't recognise the dir as a range either)."""
     lines = _readRangeSidecar(cacheDir)
-    if lines is None or len(lines) < 3:
-        return None
-    return lines[2]
+    return lines[2] if lines is not None else None
 
 
 def _readRangeSidecar(cacheDir: Path) -> list[str] | None:
-    """The non-blank lines of ``_range.txt``, or ``None`` if unusable."""
+    """The non-blank lines of ``_range.txt``, or ``None`` if unusable.
+
+    Exactly one format exists: startId, stopId, instrument — one per
+    line. Anything shorter (including what an older build wrote) is
+    malformed, so the dir simply isn't a range cache; the deploy-time
+    schema flush is the upgrade path, not a tolerant reader.
+    """
     p = cacheDir / RANGE_NAME
     if not p.exists():
         return None
@@ -1662,7 +1666,7 @@ def _readRangeSidecar(cacheDir: Path) -> list[str] | None:
         lines = [s.strip() for s in p.read_text().splitlines() if s.strip()]
     except OSError:
         return None
-    return lines if len(lines) >= 2 else None
+    return lines if len(lines) >= 3 else None
 
 
 def getCacheLastViewed(cacheDir: Path) -> dt.datetime | None:
