@@ -66,7 +66,7 @@ POD_GROUPS: dict[str, str] = {
 
 # Strip this stem off the front of a pod name before doing the prefix match.
 # The full set of instruments we expect in this repo's logs.
-_RUN_PREFIX_RE = re.compile(r"^s-(?:lsstcam|latiss|lsstcomcam|lsstcomcamsim|misc)-run-")
+_RUN_PREFIX_RE = re.compile(r"^s-(?:lsstcam|latiss|misc)-run-")
 
 
 def podGroup(pod: str) -> str:
@@ -103,15 +103,13 @@ def groupLabels() -> dict[str, str]:
 
 
 def podInstrument(pod: str) -> str | None:
-    """Return 'LSSTCam', 'LATISS', etc. from the pod name, or None.
+    """Return 'LSSTCam' or 'LATISS' from the pod name, or None.
 
-    Like ``POD_GROUPS``, order matters here because the match is "first
-    wins" — ``lsstcomcam`` is a substring of ``lsstcomcamsim``, so the
-    Sim variant must come first.
+    ``None`` means instrument-neutral (redis, cluster-manager, …) rather
+    than unknown, and such pods are attributed to whichever exposure is
+    being viewed.
     """
     for inst, needle in (
-        ("LSSTComCamSim", "lsstcomcamsim"),
-        ("LSSTComCam", "lsstcomcam"),
         ("LSSTCam", "lsstcam"),
         ("LATISS", "latiss"),
     ):

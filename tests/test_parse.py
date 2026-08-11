@@ -333,8 +333,6 @@ def test_podOrdinal(pod: str, expected: int | None) -> None:
     [
         ("s-lsstcam-run-head-node-x", "LSSTCam"),
         ("s-latiss-run-head-node-x", "LATISS"),
-        ("s-lsstcomcam-run-x-y", "LSSTComCam"),
-        ("s-lsstcomcamsim-run-x-y", "LSSTComCamSim"),
         ("unrelated-pod", None),
     ],
 )
@@ -741,9 +739,11 @@ def test_podInstrument_recognises_inst_prefixes() -> None:
     # Butler `instrument` field that the rest of the codebase compares
     # against).
     assert parse.podInstrument("s-lsstcam-run-aos-worker-0") == "LSSTCam"
-    # Longest-match wins over shorter substring: lsstcomcamsim must NOT
-    # be misclassified as lsstcomcam.
-    assert parse.podInstrument("s-lsstcomcamsim-run-sfm-runner-0") == "LSSTComCamSim"
+    assert parse.podInstrument("s-latiss-run-sfm-runner-0") == "LATISS"
+    # Instrument-neutral pods (redis, cluster-manager) return None, which
+    # attribution treats as "belongs to whichever exposure is in view"
+    # rather than as an unknown instrument.
+    assert parse.podInstrument("s-misc-run-redis-0") is None
 
 
 # ----- edge cases: traceback capture --------------------------------------
@@ -1236,6 +1236,24 @@ def test_classifyK8sEvent_drops_noise_and_non_pod() -> None:
     # not the pod. Both must classify to nothing.
     assert parse.classifyK8sEvent(_POD, _evObj(_EV_PULLED)) is None
     assert parse.classifyK8sEvent(_POD, _evObj(_EV_STATEFULSET)) is None
+
+
+def test_classifyK8sEvent_drops_taint_manager_eviction() -> None:
+    """``TaintManagerEviction`` reads like a pod death and is not one.
+
+    Its message is the taint manager *cancelling* a deletion, so
+    surfacing it would put a "pod died here" marker on a timeline where
+    nothing died — and it is common (143 occurrences across our
+    captures), so the timeline would be noisy as well as wrong. Pinned
+    because the obvious reading of the name invites exactly the broad
+    ``"Eviction" in reason`` branch that would resurrect it.
+    """
+    line = (
+        f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+        "reason=TaintManagerEviction type=Normal count=1 "
+        'msg="Cancelling deletion of Pod rapid-analysis/s-lsstcam-run-aos-worker-0"'
+    )
+    assert parse.classifyK8sEvent(_POD, _evObj(line)) is None
 
 
 def test_classifyK8sEvent_returns_None_without_timestamp() -> None:

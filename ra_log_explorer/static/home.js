@@ -32,6 +32,13 @@ let site = null;
 let homeListenersWired = false;
 let resolvedTZero = null;       // last looked-up ISOT string (TAI) for the current dataId
 let resolvedForExpId = null;    // the exposureId resolvedTZero corresponds to
+// The instrument resolvedTZero was resolved under. A shutter close is
+// only meaningful for one (instrument, dataId) pair — the same 13-digit
+// id names a different exposure on each instrument, an hour apart — so
+// every consumer checks this before using the value. Carrying it on the
+// resolution is what makes a stale t0 impossible to submit under a
+// different pin, no matter which path changed the pin.
+let resolvedForInstrument = null;
 let tZeroIsManual = false;      // true when resolvedTZero was hand-entered (ConsDB couldn't resolve it)
 let lookupTimer = null;         // debounce timer for the dataId input
 let lookupSeq = 0;              // sequence number to ignore stale lookup responses
@@ -61,21 +68,40 @@ function setInstrument(inst, opts) {
   // same instrument.
   const url = new URL(window.location);
   url.searchParams.set('instrument', inst);
+  if (changed && !(opts && opts.initial)) {
+    // Drop a drilldown's autoFetch once the user takes the wheel. It
+    // means "fetch the thing I clicked", and the thing they clicked was
+    // an exposure of the *other* instrument; leaving it on the URL means
+    // a later reload silently fires a fetch nobody asked for.
+    url.searchParams.delete('autoFetch');
+  }
   history.replaceState(null, '', url);
   // AOS (night mode) runs on LSSTCam only — its wavefront sensors live
   // in LSSTCam's corners — so the card has nothing to offer for LATISS.
   document.getElementById('night-card').hidden = inst !== 'lsstcam';
-  if (changed && !(opts && opts.initial)) {
+  if (changed) {
     // Same typed ids, different instrument => different exposures with
-    // different shutter closes: drop every resolved t0 and re-resolve
-    // under the new pin, and refilter the Tonight list.
+    // different shutter closes: drop every resolved t0 so nothing
+    // resolved under the old pin can be carried into the new one.
+    //
+    // This runs on the initial pin too. `startHome` re-runs whenever a
+    // view hands back to home, and the pin it reads can differ from the
+    // one this document last used (another tab wrote localStorage, or
+    // the URL carries a different instrument) — at which point the t0
+    // still sitting in `resolvedTZero` belongs to the other instrument's
+    // exposure.
     clearResolvedTZero();
     hideManualEntry();
     clearRangeSlot(rangeStartSlot);
     clearRangeSlot(rangeStopSlot);
-    triggerLookupIfReady();
-    triggerRangeLookupsIfReady();
-    if (tonightLastLive) renderTonight(tonightLastLive);
+    if (!(opts && opts.initial)) {
+      // A deliberate switch re-resolves right away. The initial pin
+      // doesn't: startHome fires the same triggers immediately after,
+      // and doing it here as well would double every lookup on load.
+      triggerLookupIfReady();
+      triggerRangeLookupsIfReady();
+      if (tonightLastLive) renderTonight(tonightLastLive);
+    }
   }
 }
 
@@ -278,7 +304,7 @@ function waitAndAutoFetch(expId) {
   const maxMs = 30_000;
   const tick = setInterval(() => {
     elapsed += 200;
-    if (resolvedForExpId === expId && resolvedTZero) {
+    if (resolutionMatches(expId)) {
       clearInterval(tick);
       const form = document.getElementById('fetch-form');
       if (form && !document.getElementById('fetch-submit').disabled) {
@@ -336,6 +362,12 @@ function readFormValues() {
   // Which exposure this id names depends on the page's instrument; the
   // server keys the resulting view (and its pod attribution) off it.
   out.instrument = getInstrument();
+  // Refuse to pair a shutter close with an exposure it wasn't resolved
+  // for. Every path that changes the id or the pin clears the
+  // resolution, so reaching here with a mismatch means one of them
+  // leaked — and submitting anyway would fetch a window around another
+  // exposure's shutter close and label it with this one's identity.
+  if (!resolutionMatches(out.exposureId)) return null;
   // Always TAI; the server applies the -37 s conversion. We deliberately
   // never expose a UTC opt-out in the UI now that timings come from a
   // service that's TAI by construction (and a manual entry is, by the
@@ -362,7 +394,18 @@ function setTZeroStatus(text, kind /* 'info' | 'ok' | 'error' */) {
 function clearResolvedTZero() {
   resolvedTZero = null;
   resolvedForExpId = null;
+  resolvedForInstrument = null;
   tZeroIsManual = false;
+}
+
+// True when the resolved shutter close belongs to this exact
+// (dataId, instrument) pair. Anything else is another exposure's t0.
+function resolutionMatches(expId) {
+  return (
+    !!resolvedTZero
+    && resolvedForExpId === expId
+    && resolvedForInstrument === getInstrument()
+  );
 }
 
 function updateSubmitButton() {
@@ -433,6 +476,7 @@ function applyManualTZero() {
   }
   resolvedTZero = raw;
   resolvedForExpId = expId;
+  resolvedForInstrument = getInstrument();
   tZeroIsManual = true;
   setManualStatus('this manual shutter close overrides ConsDB for this dataId', 'ok');
   // Flip the main status green too — it's the affordance the user already
@@ -457,6 +501,12 @@ const DATAID_LENGTH = 13;
 function triggerLookupIfReady() {
   const form = document.getElementById('fetch-form');
   const raw = form.elements.exposureId.value.trim();
+  // Invalidate any in-flight lookup *before* the validation branches
+  // below can return early. Bumping only on the path that starts a new
+  // request would let a response for the previously-typed id land after
+  // the user had edited the field or switched instrument, and be
+  // accepted as the answer to a question nobody asked.
+  lookupSeq += 1;
   if (!raw) {
     clearResolvedTZero();
     setTZeroStatus('enter a 13-digit dataId to resolve its shutter close time', 'info');
@@ -478,17 +528,23 @@ function triggerLookupIfReady() {
     setTZeroStatus('dataId must be an integer', 'error');
     return;
   }
-  // If we already resolved this exact dataId, don't re-request.
-  if (resolvedForExpId === expId && resolvedTZero) {
+  // If we already resolved this exact dataId *under this instrument*,
+  // don't re-request. A resolution from the other pin is a different
+  // exposure's shutter close and has to be looked up again.
+  if (resolutionMatches(expId)) {
     const prefix = tZeroIsManual ? 'manual shutter close (TAI)' : 'shutter close (TAI)';
     setTZeroStatus(`${prefix}: ${resolvedTZero}`, 'ok');
     return;
   }
   setTZeroStatus(`looking up shutter close for ${expId}...`, 'info');
-  const mySeq = ++lookupSeq;
   // Always pinned: the page's instrument decides which exposure this
-  // bare id names, and therefore which shutter close comes back.
-  const suffix = `?instrument=${encodeURIComponent(getInstrument())}`;
+  // bare id names, and therefore which shutter close comes back. The
+  // pin is captured here and stamped onto the resolution below, so a
+  // response that lands after the user has switched is recognisably
+  // not about the exposure now being asked for.
+  const myInstrument = getInstrument();
+  const suffix = `?instrument=${encodeURIComponent(myInstrument)}`;
+  const mySeq = lookupSeq;
   fetch(apiUrl(`/api/exposure-time/${expId}${suffix}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
@@ -503,6 +559,7 @@ function triggerLookupIfReady() {
       } else if (r.ok && body.tZero) {
         resolvedTZero = body.tZero;
         resolvedForExpId = expId;
+        resolvedForInstrument = myInstrument;
         tZeroIsManual = false;
         setTZeroStatus(`shutter close (TAI): ${body.tZero}`, 'ok');
         hideManualEntry();
@@ -544,8 +601,8 @@ function scheduleLookup() {
 // close (TAI) independently, mirroring the single-exposure lookup but
 // driving the two range inputs. `seq` guards against stale responses;
 // `timer` is the per-field debounce.
-const rangeStartSlot = { tZero: null, forId: null, seq: 0, timer: null, input: 'rangeStart', status: 'range-start-status' };
-const rangeStopSlot = { tZero: null, forId: null, seq: 0, timer: null, input: 'rangeStop', status: 'range-stop-status' };
+const rangeStartSlot = { tZero: null, forId: null, forInstrument: null, seq: 0, timer: null, input: 'rangeStart', status: 'range-start-status' };
+const rangeStopSlot = { tZero: null, forId: null, forInstrument: null, seq: 0, timer: null, input: 'rangeStop', status: 'range-stop-status' };
 
 function setRangeStatus(statusId, text, kind) {
   const el = document.getElementById(statusId);
@@ -559,6 +616,13 @@ function setRangeStatus(statusId, text, kind) {
 function clearRangeSlot(slot) {
   slot.tZero = null;
   slot.forId = null;
+  slot.forInstrument = null;
+}
+
+// True when this slot's t0 belongs to the (dataId, instrument) pair the
+// form is currently asking about — see resolutionMatches().
+function rangeSlotMatches(slot, expId) {
+  return !!slot.tZero && slot.forId === expId && slot.forInstrument === getInstrument();
 }
 
 function updateRangeSubmit() {
@@ -568,6 +632,9 @@ function updateRangeSubmit() {
 
 function triggerRangeLookup(slot) {
   const raw = document.getElementById('range-form').elements[slot.input].value.trim();
+  // Bumped before the early returns below, for the reason spelled out
+  // in triggerLookupIfReady().
+  slot.seq += 1;
   if (!raw) {
     clearRangeSlot(slot);
     setRangeStatus(slot.status, `enter a ${DATAID_LENGTH}-digit dataId`, 'info');
@@ -585,19 +652,21 @@ function triggerRangeLookup(slot) {
     setRangeStatus(slot.status, 'dataId must be an integer', 'error');
     return;
   }
-  if (slot.forId === expId && slot.tZero) {
+  if (rangeSlotMatches(slot, expId)) {
     setRangeStatus(slot.status, `t₀ (TAI): ${slot.tZero}`, 'ok');
     return;
   }
   setRangeStatus(slot.status, `looking up ${expId}…`, 'info');
-  const mySeq = ++slot.seq;
-  fetch(apiUrl(`/api/exposure-time/${expId}?instrument=${encodeURIComponent(getInstrument())}`))
+  const mySeq = slot.seq;
+  const myInstrument = getInstrument();
+  fetch(apiUrl(`/api/exposure-time/${expId}?instrument=${encodeURIComponent(myInstrument)}`))
     .then(async (r) => {
       const body = await r.json().catch(() => ({}));
       if (mySeq !== slot.seq) return;  // stale; user typed something newer
       if (r.ok && body.tZero) {
         slot.tZero = body.tZero;
         slot.forId = expId;
+        slot.forInstrument = myInstrument;
         setRangeStatus(slot.status, `t₀ (TAI): ${body.tZero}`, 'ok');
       } else if (r.status === 404) {
         clearRangeSlot(slot);
@@ -862,6 +931,15 @@ async function startFetch(ev) {
   ev.preventDefault();
   if (activeJobId) return;
   const values = readFormValues();
+  if (!values) {
+    showMessage(
+      'That shutter close was resolved for a different exposure — re-resolving.',
+      true,
+    );
+    clearResolvedTZero();
+    triggerLookupIfReady();
+    return;
+  }
   if (!Number.isFinite(values.exposureId)) {
     showMessage('exposureId must be an integer.', true);
     return;
@@ -990,6 +1068,7 @@ function openProgressStream(jobId) {
       document.getElementById('range-submit').disabled = false;
       transitionToExplore({
         kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs, startId: ev.startId, stopId: ev.stopId,
+        instrument: ev.instrument,
       });
     } else if (ev.type === 'error') {
       setProgressText(`ERROR: ${ev.error.split('\n')[0]}`);
@@ -1018,15 +1097,26 @@ async function transitionToExplore(activeJob) {
   // /api/summary so we route to the right loaded state on the server.
   // Without this the request would be context-less and the server
   // couldn't tell us which exposure / night to summarise.
-  let params;
+  // The job's own instrument, not the topbar's: the user may have
+  // flipped the switch while the fetch ran, and this request has to ask
+  // for the exposure that was actually fetched. Without it the bare
+  // expId's slot could by then hold the other instrument's exposure —
+  // another tab's fetch, or a rebuild — and we would render that one
+  // and then stamp its instrument into the URL as if it were ours.
+  const jobInstrument = activeJob && activeJob.instrument;
+  const instQ = jobInstrument ? `&instrument=${encodeURIComponent(jobInstrument)}` : '';
+  let key;
   if (activeJob && activeJob.kind === 'night') {
-    params = `dayObs=${encodeURIComponent(activeJob.dayObs)}`;
+    key = `dayObs=${encodeURIComponent(activeJob.dayObs)}`;
   } else if (activeJob && activeJob.kind === 'range') {
-    params = `rangeStart=${encodeURIComponent(activeJob.startId)}`
+    key = `rangeStart=${encodeURIComponent(activeJob.startId)}`
       + `&rangeStop=${encodeURIComponent(activeJob.stopId)}`;
   } else {
-    params = `dataId=${encodeURIComponent(activeJob.expId)}`;
+    key = `dataId=${encodeURIComponent(activeJob.expId)}`;
   }
+  // Night mode needs no pin (AOS is LSSTCam by construction); the other
+  // two carry the job's.
+  const params = activeJob && activeJob.kind === 'night' ? key : key + instQ;
   try {
     const r = await fetch(apiUrl(`/api/summary?${params}`));
     const summary = await r.json();
@@ -1043,8 +1133,8 @@ async function transitionToExplore(activeJob) {
     // shutter close an hour away. The summary's own instrument is used
     // rather than the topbar's, in case the user flipped the switch
     // while the fetch was running.
-    let urlParams = params;
-    if (summary.instrument) {
+    let urlParams = key;
+    if (summary.instrument && (!activeJob || activeJob.kind !== 'night')) {
       urlParams += `&instrument=${encodeURIComponent(summary.instrument)}`;
     }
     const newUrl = `${window.location.pathname}?${urlParams}`;

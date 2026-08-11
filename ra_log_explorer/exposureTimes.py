@@ -85,13 +85,13 @@ EXPOSURE_RECORD_COLUMNS: tuple[str, ...] = (
 )
 
 # Instruments to probe in order — first match wins. LSSTCam first because
-# that's where ~all current rapid-analysis traffic comes from; the rest
-# are cheap to retry if the first table doesn't have the row.
+# that's where ~all current rapid-analysis traffic comes from; LATISS is
+# cheap to retry if that table doesn't have the row. These two are the
+# whole set the observatory runs today, and an instrument outside it is
+# rejected rather than probed.
 INSTRUMENTS_BY_PROBE_ORDER: tuple[str, ...] = (
     "lsstcam",
     "latiss",
-    "lsstcomcam",
-    "lsstcomcamsim",
 )
 
 # The instrument is part of an exposure's *identity*, not one of its

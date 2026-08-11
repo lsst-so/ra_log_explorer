@@ -64,7 +64,7 @@ jobs:
         # Bump it if/when we add a substantial well-tested surface.
         #
         # ``-n auto`` because the browser tests parallelise almost
-        # perfectly: measured locally, adding all 81 of them to a
+        # perfectly: measured locally, adding all ~89 of them to a
         # ``-n 8`` run costs 0.1 s. Serial they would double the suite.
         run: |
           pytest -n auto \

@@ -477,9 +477,8 @@ function shortenPod(pod, group) {
   // The role prefix is what's already in the badge to the left.
   let stem = pod
     .replace(/^s-lsstcam-run-/, '')
-    .replace(/^s-latiss-run-/, '')
-    .replace(/^s-lsstcomcamsim-run-/, '')
-    .replace(/^s-lsstcomcam-run-/, '');
+    .replace(/^s-latiss-run-/, '');
+
   const prefix = (summary && summary.groupLabels && summary.groupLabels[group]);
   if (prefix && stem.startsWith(prefix + '-')) {
     stem = stem.slice(prefix.length + 1);

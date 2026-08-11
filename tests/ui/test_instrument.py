@@ -21,7 +21,7 @@ from typing import Any
 
 from playwright.sync_api import expect
 
-from .corpus import CAM_T_ZERO_UTC, LATISS_T_ZERO_UTC, SHARED_ID, StagedCorpus
+from .corpus import CAM_T_ZERO_UTC, DAY_OBS, LATISS_T_ZERO_UTC, SHARED_ID, StagedCorpus
 
 
 def switch(app: Any, instrument: str) -> None:
@@ -185,6 +185,53 @@ def test_switching_clears_a_resolved_lookup_rather_than_carrying_it_over(app: An
     resolvedFirst = app.page.locator("#tzero-status").inner_text()
     switch(app, "latiss")
     expect(app.page.locator("#tzero-status")).not_to_have_text(resolvedFirst)
+
+
+def test_a_pin_that_changes_on_re_entry_also_clears_the_resolved_t0(app: Any) -> None:
+    """The invalidation must not depend on *how* the pin changed.
+
+    ``startHome`` re-runs on every return to home and re-reads the pin
+    from the URL or localStorage — which another tab may have rewritten,
+    since every instrument-carrying deep link stamps it. That path used
+    to skip the invalidation, so the t0 resolved under the old pin
+    survived, was re-blessed as "resolved", and could be submitted
+    against the new instrument: a LATISS-labelled timeline anchored at
+    LSSTCam's shutter close, an hour out.
+    """
+    app.goto("/")
+    field = app.page.locator("#fetch-form input[name=exposureId]")
+    field.fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("04:21:59")
+    # Another tab flips the remembered instrument, then this page
+    # re-enters home the way a "← home" click does: that drops the query
+    # string (so the URL no longer pins anything) and re-runs startHome,
+    # which falls back to the freshly-rewritten localStorage.
+    app.page.evaluate("() => localStorage.setItem('ra_log_explorer.instrument', 'latiss')")
+    app.page.evaluate("() => history.replaceState({}, '', location.pathname)")
+    app.page.evaluate("() => window.startHome()")
+    assert activeInstrument(app) == "latiss"
+    # The LSSTCam t0 is gone. Whatever is shown now, it is not the other
+    # exposure's shutter close being passed off as this one's.
+    expect(app.page.locator("#tzero-status")).not_to_contain_text("04:21:59")
+
+
+def test_a_night_drilldown_link_carries_the_instrument(app: Any, corpus: StagedCorpus) -> None:
+    """Night mode is LSSTCam-only, but its links land on a *fresh* home
+    page that otherwise adopts whatever instrument this browser last
+    used. On a browser left on LATISS, an unpinned link would resolve the
+    LATISS twin — a different exposure, an hour away — and ``autoFetch=1``
+    would fetch it with no further click."""
+    corpus.stageNight()
+    app.goto("/")
+    switch(app, "latiss")  # this browser is "on" LATISS
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-view")).to_be_visible()
+    href = app.page.locator("#night-gather-banner a[href*='dataId=']").first.get_attribute("href")
+    assert href is not None and "instrument=lsstcam" in href, href
+    # Following it pins the new page to LSSTCam despite the remembered
+    # LATISS choice, so the auto-fetch resolves the right exposure.
+    app.page.goto(app.origin + href)
+    assert activeInstrument(app) == "lsstcam"
 
 
 def test_the_tonight_panel_lists_only_the_pinned_instrument(app: Any) -> None:

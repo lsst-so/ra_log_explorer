@@ -254,9 +254,12 @@ names like `sfm-runner-workerset-094` or
 `aos-worker-aosworkerset-2`. Used to sort same-group rows
 numerically in the UI rather than lexicographically.
 
-`podInstrument(pod)` returns one of `"LSSTCam"`, `"LATISS"`,
-`"LSSTComCam"`, `"LSSTComCamSim"`, or `None`. The list is order-
-sensitive (`LSSTComCamSim` must be checked before `LSSTComCam`).
+`podInstrument(pod)` returns `"LSSTCam"`, `"LATISS"`, or `None`. Those
+two are the whole set this repo covers, so the needles no longer
+collide as substrings of one another and the match order carries no
+meaning. `None` means *instrument-neutral* (redis, cluster-manager, …)
+rather than unknown, and such pods are attributed to whichever exposure
+is being viewed.
 
 ## When to add a new event kind
 

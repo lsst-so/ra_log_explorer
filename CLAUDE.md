@@ -48,15 +48,23 @@ ra_log_explorer/
     build.yaml                   ← builds + pushes ghcr.io/lsst-so/ra_log_explorer
     ci.yaml, mypy-coverage.yaml
   ra_log_explorer/             ← Python package (runtime is stdlib-only)
-    config.py                    cache paths, FetchSpec, defaults
+    config.py                    cache paths, FetchSpec, env-read defaults
     fetch.py                     logcli wrapper, parallel per-pod fetch, cache
                                  + live-night slicing (timestamp bisect)
     parse.py                     log line parser + event classifier
+    night.py                     dayObs-wide rollups over PodSummary (no I/O)
+    exposureTimes.py             dataId → ConsDB exposure record (t-zero + the
+                                 info-box properties), per-site on-disk cache
+    sites.py, sites.toml         the site catalog: Loki cluster ⇄ its ConsDB
     live.py                      live-mode poller: keeps the current night
                                  fetched so views are served from disk
+    jobs.py                      FetchJob + JobManager: a thread per fetch,
+                                 the SSE event log, the shared stateLock
     server.py                    stdlib HTTP server + JSON API
-    cli.py                       argument parsing + composition
-    static/                      vanilla-JS UI (app.js, style.css)
+    cli.py                       argument parsing + composition; cache subcmds
+    static/                      vanilla-JS UI, no build step: app.js
+                                 (bootstrap/routing), home.js, explore.js,
+                                 night.js, range.js, style.css
     templates/                   timeline.html (single-page app shell)
   architecture/                Design docs — keep these in sync with code
     architecture.md              component layout, data flow, JSON API

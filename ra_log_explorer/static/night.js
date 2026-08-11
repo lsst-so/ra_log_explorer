@@ -15,6 +15,22 @@
 let nightSummary = null;
 let nightListenersWired = false;
 
+// Deep link from a night drilldown into one exposure's explore view.
+//
+// The instrument has to travel with the dataId. Night mode is AOS, so
+// it is always LSSTCam — but the link lands on a *fresh* home page,
+// which otherwise picks up whatever instrument this browser last used.
+// On a browser that had been looking at LATISS, an un-pinned link would
+// resolve the LATISS exposure sharing this 13-digit id — a different
+// exposure, an hour away — and `autoFetch=1` would fetch it without
+// anyone touching a control.
+function nightExposureHref(dataId) {
+  const inst = (nightSummary && nightSummary.instrument) || 'lsstcam';
+  return apiUrl(
+    `/?dataId=${encodeURIComponent(dataId)}&autoFetch=1&instrument=${encodeURIComponent(inst)}`,
+  );
+}
+
 function startNight(summary) {
   nightSummary = summary;
   if (window.renderFetchBanner) {
@@ -190,7 +206,7 @@ function renderGatherOnly(dataIds) {
   for (const id of shown) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = apiUrl(`/?dataId=${encodeURIComponent(id)}&autoFetch=1`);
+    a.href = nightExposureHref(id);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -359,7 +375,7 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
   for (const id of dataIds) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = apiUrl(`/?dataId=${encodeURIComponent(id)}&autoFetch=1`);
+    a.href = nightExposureHref(id);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -556,7 +572,7 @@ function renderRestarts(rows) {
     } else {
       const a = document.createElement('a');
       a.className = 'mono';
-      a.href = apiUrl(`/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`);
+      a.href = nightExposureHref(r.dataId);
       a.target = '_blank';
       a.rel = 'noopener';
       a.textContent = String(r.dataId);

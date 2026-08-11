@@ -81,8 +81,19 @@ def test_clicking_a_histogram_bin_lists_the_visits_in_it(app: Any, corpus: Stage
     expect(panel).not_to_be_empty()
     ids = panel.locator(".night-hist-bin-id")
     assert ids.count() >= 1
+    # The ids have to be *this bin's*. Asserting only that the panel
+    # filled would pass just as well if the click served some other
+    # bin's dataIds, which is the one thing this feature must not do:
+    # the whole point is "these are the visits that made this bar tall".
+    expected = app.apiJson(f"/api/summary?dayObs={DAY_OBS}")["histograms"]["firstTaskStart"]["dataIdsByBin"][
+        int(tallest)
+    ]
+    assert [t.strip() for t in ids.all_inner_texts()] == [str(i) for i in expected]
     href = ids.first.get_attribute("href")
     assert href is not None and "dataId=" in href
+    # And pinned: this link lands on a fresh home page, which otherwise
+    # takes its instrument from whatever this browser last looked at.
+    assert "instrument=lsstcam" in href
     expect(
         app.page.locator(f"#night-hist-first rect.night-hist-bar[data-bin-index='{tallest}']")
     ).to_have_class(re.compile(r"\bselected\b"))
@@ -134,6 +145,7 @@ def test_the_gather_only_banner_flags_visits_whose_step1a_is_missing(app: Any, c
     assert links.count() >= 1
     href = links.first.get_attribute("href")
     assert href is not None and "autoFetch=1" in href, href
+    assert "instrument=lsstcam" in href, href
 
 
 def test_a_complete_night_shows_no_incomplete_fetch_banner(app: Any, corpus: StagedCorpus) -> None:
@@ -188,3 +200,4 @@ def test_the_crash_is_attributed_to_what_the_pod_was_working_on(app: Any, corpus
     assert links.count() >= 1, "no restart was tied to a dataId"
     href = links.first.get_attribute("href")
     assert href is not None and "dataId=20260711" in href
+    assert "instrument=lsstcam" in href, href

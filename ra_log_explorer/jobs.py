@@ -213,6 +213,11 @@ class JobManager:
                     "type": "done",
                     "kind": job.kind,
                     "expId": job.expId,
+                    # The pin this fetch ran under. The client needs it
+                    # to ask for the right state afterwards: the bare
+                    # expId's slot may by then hold the other
+                    # instrument's exposure of the same id.
+                    "instrument": job.instrument,
                     "tZero": job.tZero.isoformat() if job.tZero else None,
                     "dayObs": job.dayObs,
                     "startId": job.startId,

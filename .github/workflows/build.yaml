@@ -46,14 +46,31 @@ jobs:
           cache: pip
 
       - name: "Install dev dependencies"
+        # The ui-test extra and Chromium are not optional here: the
+        # browser tests fail rather than skip when Playwright is absent
+        # (deliberately — a UI suite that skips itself reads exactly like
+        # a passing one), so without them `pytest` errors at collection
+        # and this gate never runs at all.
         run: |
           python -m pip install --upgrade pip
-          python -m pip install -e .
+          python -m pip install -e ".[ui-test]"
           python -m pip install mypy pytest
+
+      - uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('pyproject.toml') }}
+
+      - name: "Install Chromium"
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: python -m playwright install --with-deps chromium
 
       - run: mypy
 
-      - run: pytest -q
+      # -n auto because the browser tests parallelise well: serially they
+      # roughly double the suite, in parallel they cost ~0.1 s.
+      - run: pytest -q -n auto
 
 
   # The unit suite runs the Python; it does not run the *image*, under a
@@ -230,8 +247,12 @@ jobs:
       - name: "Render the chart and check it against this code"
         env:
           PHALANX_REPO: ${{ github.workspace }}/phalanx
-        # -rs reports skips with their reason, so a job that skipped
-        # everything is visibly different from one that verified anything.
+          # Here, "no chart found" is the breakage these tests exist to
+          # catch — a chart that moved, or a clone that landed on a ref
+          # without it. The variable turns that skip into a failure, so
+          # this job cannot go green without actually rendering the
+          # chart. -rs still reports any remaining skip with its reason.
+          RA_LOG_EXPLORER_REQUIRE_CHART: "1"
         run: |
           echo "::notice::Phalanx ref: ${PHALANX_CHART_REF}"
           pytest -rs -v tests/test_phalanx_chart.py

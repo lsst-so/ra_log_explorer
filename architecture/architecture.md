@@ -161,11 +161,11 @@ Sibling docs:
 
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
-| `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
+| `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value — blank included — rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
-| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first, falls through to LATISS/LSSTComCam/LSSTComCamSim. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
@@ -193,6 +193,15 @@ Sibling docs:
   link in `static/*.js` goes through. Substituting per-request rather
   than at build time keeps the container image environment-agnostic
   and keeps the no-build-step edit-and-reload loop working locally.
+
+  What survives `_routePath` as `/static/<rel>` is then resolved by
+  `_resolveStaticFile`, which joins and *then* checks containment:
+  `rel` must be relative, and the resolved path must sit inside
+  `STATIC_DIR` or the request 404s. Screening the request text for
+  `..` is not sufficient, because `Path("static") / "/etc/passwd"`
+  discards the left operand entirely — `/static//proc/self/environ`
+  read an absolute path that way and handed back the process
+  environment, `LOKI_PASSWORD` included.
 
 - **Site** — a (Loki cluster, ConsDB endpoint, optional bearer-token
   file) bundle that pairs the *log source* with the *truth source* for
@@ -264,12 +273,19 @@ Sibling docs:
   dict, `_exposure_ids.txt` and the range key are still keyed by the
   bare id, so two colliding exposures share one in-memory slot —
   opening one evicts the other. Correctness is protected by a guard
-  rather than by the key: `/api/summary?dataId=&instrument=` and
-  `/api/pod/<pod>?dataId=&instrument=` both refuse to serve a state
-  pinned to a different instrument (the summary falls through to the
-  rebuild/fetch path, which re-pins; the pod detail 404s and the next
-  summary reload re-pins), and the cache-rebuild path verifies the
-  window it found actually contains the pinned t₀.
+  rather than by the key, and the guard covers **both** keyed forms.
+  `/api/summary` and `/api/pod/<pod>` refuse to serve a loaded state
+  pinned to a different instrument, whether the key is `dataId=` or
+  `rangeStart=&rangeStop=`: the summary treats the mismatch as
+  not-loaded and falls through to the rebuild/fetch path, which
+  re-pins; the pod detail 404s and the next summary reload re-pins.
+  The rebuild paths carry the pin too — `_loadExposureFromCache`
+  verifies the window it found actually contains the pinned t₀, and
+  `_findRangeCacheDir` only matches a cache whose `_range.txt` records
+  the same instrument. A range needs this as much as an exposure does:
+  `[startId, stopId]` names a different run of exposures on every
+  instrument that observed that many, so an unpinned lookup hands a
+  LATISS tab whichever twin span was fetched most recently.
 
 - **dayObs** — 8-digit `YYYYMMDD` integer. The observatory rolls the
   calendar over at UTC-12, so dayObs 20260521 covers
@@ -365,6 +381,16 @@ Each tick (every `LIVE_POLL_S` seconds):
    recovers by truncating files back to the recorded counts (and
    deleting the stranded temps).
 
+   An append that fails part-way is rolled back to the pre-append size
+   — app logs and the events stream alike. It has to be: the watermark
+   is left alone on failure, so the same span is fetched again next
+   tick and appended *after* whatever landed, and the byte count
+   (advanced only on success) would later be extended over the
+   stranded bytes. That yields a range the sidecar vouches for holding
+   duplicated, torn, non-ascending lines, which the slicer's bisect
+   silently mis-answers and the finalisation audit cannot see, because
+   the line counter was never advanced either.
+
    The k8s/events stream is fetched **namespace-wide** once per tick and
    demuxed by the `name` label. That is deliberately broader than "the
    pods we know about": the stream also carries ReplicaSet, Job and
@@ -443,7 +469,21 @@ the oracle's dedup slack (metric queries count duplicate storage-chunk
 entries the log path deduplicates; measured ~0.03%, so the bar is
 `max(100, 0.2%)` — see `live.VERIFY_TOLERANCE_*`) is refetched whole,
 catching e.g. lines ingested later than `LIVE_LAG_S` allowed for — and
-a normal `_meta.json` is written. From then on the dir is a
+a normal `_meta.json` is written.
+
+While a pod is being swapped out that way the sidecar carries
+`rewritingPod: "<pod>"`, and `_tryNightSlice` declines to slice the
+night at all, falling back to an ordinary fetch for the minutes the
+refetch takes. Zeroing the pod's byte count is not protection on its
+own: a slicer reading a zeroed record doesn't wait, it *omits the
+pod*, and since finalisation has already cleared that pod's
+fall-short flags the resulting slice is written `fetchComplete: true`,
+missing a pod entirely, and then exact-hits every later identical
+request forever. The window is wide and badly timed — a whole-night
+refetch takes minutes, and it runs exactly when people open the night
+that just ended.
+
+From then on the dir is a
 complete, trustworthy all-pods night window (still sliced, never
 superset-parsed), subject to ordinary LRU eviction; the poller moves on
 to the new night. On the deployments, one busy night is ~9 GiB of JSONL
@@ -491,6 +531,17 @@ A malformed numeric value raises `ConfigError` at import rather than
 falling back to the default: a container that refuses to start is much
 easier to notice than a setting that quietly never took effect.
 
+**A present-but-blank value counts as malformed.** Only an *absent*
+variable asks for the default. Blank is what a mistyped Helm reference
+renders to (`value: {{ .Values.typo }}`), which is precisely the
+never-took-effect case the loud failure exists to prevent.
+`LOKI_PASSWORD` follows the same rule for the same reason: its
+VaultSecret is marked optional, so the variable can exist and be empty
+while the secret is still missing, and `fetch._run_logcli` treats a
+blank or whitespace value as unset — otherwise the operator gets a
+bare auth failure out of `logcli` instead of the sentence naming the
+variable.
+
 The two window values are the *starting* values of editable form fields,
 not fixed limits — widening a window to catch a neighbouring exposure is
 a real investigative move, so the deployment chooses where the fields
@@ -519,7 +570,7 @@ the above. Its shape, and the reasons behind it:
 | `GafaelfawrIngress`, `loginRedirect: true` | A browser app, so anonymous users get sent to log in rather than a 401 they cannot act on. Scope `read:image`, matching rubintv on the same environments. |
 | `proxy-buffering: "off"` | `/api/fetch/<id>/progress` is Server-Sent Events for the length of a fetch. nginx buffers proxied responses by default, which would hold the whole stream until the fetch had already finished. |
 | Readiness probe on `<base>/healthz` | With headroom over the defaults: parsing is CPU-bound pure Python contending with the fetch threads, so latency spikes mid-fetch — the worst moment to drop the only pod out of the Service. |
-| `LOKI_PASSWORD` from a VaultSecret | Marked `optional` so the pod still starts before the secret exists, which is safe rather than silent: the app refuses to run logcli without a password and says so. |
+| `LOKI_PASSWORD` from a VaultSecret | Marked `optional` so the pod still starts before the secret exists, which is safe rather than silent: the app refuses to run logcli without a password — blank counts as without — and says so. |
 
 **A change to the configuration surface here needs a matching change
 there, in the same breath.** Adding an environment variable this code
@@ -557,12 +608,20 @@ return:
   pin. 400 for an unknown instrument name.
 - `?dayObs=<int>` — return that night's payload, or `{loaded: false,
   cache}` if not loaded.
-- `?rangeStart=<int>&rangeStop=<int>` — return that range's **index**
-  payload (`mode: "range"`), or `{loaded: false, cache}` if not loaded.
-- `?rangeStart=<int>&rangeStop=<int>&dataId=<int>` — return one
-  in-range exposure's timeline (`mode: "range-exposure"`, the same shape
-  as the exposure payload plus a `podDetailQuery`). 404 if the dataId
-  has no resolved shutter close (a skipped integer).
+- `?rangeStart=<int>&rangeStop=<int>[&instrument=<name>]` — return that
+  range's **index** payload (`mode: "range"`), or `{loaded: false,
+  cache}` if not loaded.
+- `?rangeStart=<int>&rangeStop=<int>&dataId=<int>[&instrument=<name>]` —
+  return one in-range exposure's timeline (`mode: "range-exposure"`, the
+  same shape as the exposure payload plus a `podDetailQuery`). 404 if
+  the dataId has no resolved shutter close (a skipped integer).
+
+  `instrument` guards the range key exactly as it guards the bare
+  dataId: `[startId, stopId]` is the whole key, and every instrument
+  that observed that many exposures has a span with those bounds, so a
+  loaded state pinned elsewhere is treated as not loaded and the
+  rebuild re-pins (`_findRangeCacheDir` matching on the instrument
+  `_range.txt` records). 400 for an unknown instrument name.
 - no params — home view shape (`{loaded: false, cache}`).
 
 If the requested key isn't in the in-memory state dict, the server
@@ -572,7 +631,7 @@ for a matching window (an exposure-mode cache whose
 window starts at noon UTC of the dayObs; or a range cache whose
 `_range.txt` records the `[startId, stopId]` bounds), reparses it with
 `parser.summarizeAll`, and returns the rebuilt payload. This lets a
-deep-linked tab (e.g. opening the dataId column in the home page's
+deep-linked tab (e.g. opening the dataId column in the admin view's
 cache table) land directly on its explore/night view without an
 intervening home → fetch click — the cache is the source of truth, so
 no re-fetch is needed. For exposure caches the shutter close must
@@ -753,16 +812,18 @@ the range's shared summaries with the dataId's own shutter close as
 {
   "mode": "range-exposure",
   "startId": 2026051900722, "stopId": 2026051900750,
-  "podDetailQuery": "rangeStart=2026051900722&rangeStop=2026051900750&dataId=2026051900725",
+  "podDetailQuery": "rangeStart=2026051900722&rangeStop=2026051900750&dataId=2026051900725&instrument=lsstcam",
   // ...all the exposure-payload fields (pods, podsAll, taskColors, ...)
 }
 ```
 
 `podDetailQuery` is what the explore renderer appends to `/api/pod/<pod>`
 so pod-detail lookups route back through the range state (and anchor
-their offsets at this dataId's shutter close).
+their offsets at this dataId's shutter close). It carries the range's
+`instrument` so the pod lookup runs under the same pin the summary was
+served under.
 
-### `GET /api/pod/<podName>?dataId=<int>[&instrument=<name>]` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=`
+### `GET /api/pod/<podName>?dataId=<int>[&instrument=<name>]` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=[&instrument=<name>]`
 
 Returns every parsed `LogLine` from that pod's JSONL file. The query
 string routes to the right loaded state (`dataId` → exposure, `dayObs`
@@ -770,11 +831,13 @@ string routes to the right loaded state (`dataId` → exposure, `dayObs`
 range, with offsets anchored at its shutter close). 400 if no key, 404
 if the targeted state isn't loaded.
 
-`instrument` (dataId form; the explore view always sends its own) is
-the same guard `/api/summary` applies: the bare id's in-memory slot may
-hold the *other* instrument's exposure — another tab opened its twin —
-whose cache dir is a different window entirely. A mismatch is a 404,
-never the loaded state's lines; 400 for an unknown instrument name.
+`instrument` (the explore view always sends its own, on both the dataId
+and the range form) is the same guard `/api/summary` applies: the bare
+id's — or the bare span's — in-memory slot may hold the *other*
+instrument's exposures, another tab having opened the twin, out of a
+different window entirely. A mismatch is a 404, never the loaded
+state's lines; the next summary reload re-pins. 400 for an unknown
+instrument name.
 
 ```jsonc
 {
@@ -800,8 +863,10 @@ can't break out of `pods/`.
 
 Drilldown for a single failure row. Returns the pod's log lines
 spanning the dataId's full processing block when the traceback's expId
-is carryover-attributable, or a ±N-second window around the traceback
-itself otherwise. `contextSource` is `"dataId-block"` or
+is carryover-attributable, or otherwise a window around the traceback
+itself — deliberately lopsided, `_TB_NO_EXPID_LOOKBACK_S` (30 s) before
+and `_TB_NO_EXPID_LOOKAHEAD_S` (5 s) after, because what explains a
+traceback is what led up to it. `contextSource` is `"dataId-block"` or
 `"time-window"` accordingly.
 
 ```jsonc
@@ -847,7 +912,6 @@ hand back a *different exposure* that happens to share the id.
   (see below) rather than a ConsDB value.
 - 400 `"Unknown instrument '<x>'; known: [...]"` — not one of
   `INSTRUMENTS_BY_PROBE_ORDER`.
-- 400 `"No site named '<x>'; known: [...]"` — unknown site.
 - 404 `"No exposure-time record for dataId=N"` — every instrument
   table searched, no row with an `obs_end` anywhere. With an
   `?instrument=`, `"... for dataId=N on <instrument>"` — only that one
@@ -855,8 +919,15 @@ hand back a *different exposure* that happens to share the id.
 - 502 `"ConsDB query failed: ..."` — typed ConsDB error (5xx, etc.).
 - 503 `"ConsDB token file for site '<name>' not found at <path>. Get a
   token from the relevant RSP and drop it there."` — token missing.
+- 503 `"Could not read ConsDB token file: ..."` — the file is there but
+  unreadable.
 - 503 `"ConsDB token file is empty: <path>"` — token file present but
   blank.
+- 503 `"Could not reach ConsDB: ..."` — the request never got an
+  answer (DNS, connection refused, timeout).
+
+There is no site-related error, because there is no site parameter to
+get wrong: one process serves one site, and a `?site=` is ignored.
 
 The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
 is checked first; a *ConsDB-sourced* cache hit returns immediately with
@@ -960,6 +1031,9 @@ of them — see *dataId / expId* in Key Concepts.
                                                      // from the window start
       "rangeStart": null, "rangeStop": null,         // range caches: the [start, stop]
                                                      // bounds from _range.txt
+      "rangeInstrument": null,                       // and the instrument it recorded, so
+                                                     // the row's link reopens this run and
+                                                     // not the other instrument's twin span
       "exposureIds": [2026051900722, 2026051900723], // (exposure caches) dataIds that
                                                      // triggered fetches landing here
       "fromIso":      "...", "toIso":       "...",
@@ -983,6 +1057,17 @@ they all reference the now-gone cache). Returns the same shape as
 `GET /api/cache`. The root itself is recreated empty so subsequent
 fetches still work.
 
+Every `_live.json` under the target is unlinked *before* the tree goes
+(`_dropLiveSidecars`), and only then is `shutil.rmtree` called — with
+one `ignore_errors` retry at the root, since the poller may legitimately
+regrow a file into a directory mid-delete. The ordering is what matters:
+a partial delete that took the pod files but left the sidecar would pass
+the poller's intactness check, so it would resume appending to files
+that now start mid-night, and every slice cut from them would be short
+while claiming to be complete. Sidecar-first makes a partial delete
+indistinguishable from a complete one — no sidecar, so the poller opens
+the night afresh.
+
 ### `DELETE /api/cache/<cluster>/<namespace>/<slug>[/<pods=…>]`
 
 Remove one cached window. The optional 4th segment targets the
@@ -990,8 +1075,9 @@ nested night-mode `pods=<regex-slug>` subdir; it must start with
 `pods=`. Each component is validated against `[A-Za-z0-9._=-]+` so
 the URL can't escape `cache_root()`. If any loaded state's `cacheDir`
 matches the directory being deleted, that state is evicted first
-(the UI gets booted back to the home view on next summary fetch).
-Empty per-cluster / per-namespace parent directories are pruned.
+(the UI gets booted back to the home view on next summary fetch), and
+any `_live.json` beneath it is unlinked before the tree, for the reason
+above. Empty per-cluster / per-namespace parent directories are pruned.
 Returns the same shape as `GET /api/cache`. 404 on a path mismatch.
 
 ### `POST /api/fetch`  (exposure)
@@ -1088,6 +1174,7 @@ JSON snapshot of one job:
   "kind":   "exposure" | "night" | "range",
   "site":   "summit",                  // the named site this job fetched against
   "expId":  2026051900722,             // null for night / range jobs
+  "instrument": "lsstcam",             // the pin this fetch ran under
   "tZero":  "...",                     // null for night / range jobs
   "dayObs": null,                      // 20260521 for night jobs
   "startId": null, "stopId": null,     // set for range jobs
@@ -1128,12 +1215,16 @@ is one JSON event (`{"type": ...}`):
   `remaining` / `stillMissing` count only dataIds left with **no** t₀ at
   all; a manual stand-in that ConsDB still couldn't supersede is anchored,
   so it is not counted as missing.
-- `done`: `{ kind, expId, tZero, dayObs, startId, stopId, cacheDir,
-  cacheReuse, podCount, totalBytes, elapsedS }` — after the server's
-  keyed `ServerState` / `NightState` / `RangeState` slot has been
-  populated (`startId`/`stopId` set for range jobs). **Always** fired
-  after `onComplete` so SSE consumers can rely on the summary being
-  ready when they see `done`.
+- `done`: `{ kind, expId, instrument, tZero, dayObs, startId, stopId,
+  cacheDir, cacheReuse, podCount, totalBytes, elapsedS }` — after the
+  server's keyed `ServerState` / `NightState` / `RangeState` slot has
+  been populated (`startId`/`stopId` set for range jobs). **Always**
+  fired after `onComplete` so SSE consumers can rely on the summary
+  being ready when they see `done`. `instrument` is the pin the fetch
+  ran under, and the client needs it rather than the topbar's current
+  value: the user may have flipped the switch while the fetch ran, and
+  by then the bare expId's slot may hold the other instrument's
+  exposure.
 - `error`: `{ error }` — terminal; the job failed.
 
 History is replayable: the SSE handler emits every event already in
@@ -1182,10 +1273,22 @@ tick's bytes are on disk), and its one cross-thread surface is
 that `/api/live` returns without copying. Request threads meet the
 poller's output purely through the filesystem: the night-slice path in
 `fetchAll` reads the sidecar and byte ranges the sidecar vouches for,
-so a slice can run concurrently with an append and never see a torn
+so a slice can run concurrently with an *append* and never see a torn
 line. Nothing else may *write* a live night dir — `fetchAll` refuses to
 fetch into one, and serves the night's own window by handing over the
 directory rather than copying it onto itself.
+
+The sidecar's byte counts are enough for appends because an append only
+ever extends a file. One operation is not an append: end-of-night
+verification replaces a whole pod file
+(`live._refetchWholePod`), and during it the pod's recorded length
+describes a file that is about to stop existing. So that operation
+announces itself — `rewritingPod: "<pod>"` on the sidecar — and
+`_tryNightSlice` declines to slice a night carrying it, falling back to
+a real fetch until the swap completes. The flag is cleared even when the
+refetch fails, since the pod's record then honestly reads zero and the
+caller has recorded the error: slicing resumes against a night that is
+*visibly* short rather than silently so.
 
 The poller also notices when the directory disappears underneath it —
 `DELETE /api/cache` is one button on the home page — and re-opens the

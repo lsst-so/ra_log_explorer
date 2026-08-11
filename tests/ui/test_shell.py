@@ -122,6 +122,40 @@ def test_paths_outside_the_base_path_are_not_served(appFactory: Any) -> None:
     assert resp is not None and resp.status == 404
 
 
+def test_a_whole_fetch_runs_under_a_base_path(
+    appFactory: Any, corpus: StagedCorpus, fakeLogcli: list[str]
+) -> None:
+    """The fetch flow — POST /api/fetch, the SSE progress stream, the
+    summary that follows — has to be prefixed too.
+
+    The static test above only covers a view that was staged in advance.
+    Every URL in the submit path goes through ``apiUrl()`` today, but a
+    hand-built ``/api/fetch`` or ``new EventSource('/api/…')`` added
+    later would pass the entire suite and break only in the deployment,
+    which is the only place anyone runs this.
+    """
+    corpus.dropLiveSidecar()
+    app = appFactory(basePath="/log-explorer")
+    failed: list[str] = []
+    app.page.on(
+        "response",
+        lambda r: (
+            failed.append(f"{r.status} {r.url}") if r.url.startswith(app.origin) and r.status >= 400 else None
+        ),
+    )
+    app.goto("/")
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("shutter close")
+    app.page.locator("#fetch-submit").click()
+    # The progress stream is the part that only exists during a fetch.
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+    assert failed == [], f"requests failed under the base path: {failed}"
+    assert "/log-explorer/?" in app.page.url or app.page.url.startswith(
+        f"{app.origin}/log-explorer"
+    ), app.page.url
+
+
 # ----- the "what is this?" overlay ------------------------------------------
 
 

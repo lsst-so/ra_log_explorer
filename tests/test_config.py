@@ -204,11 +204,28 @@ def test_envInt_and_envFloat_return_the_default_when_unset(monkeypatch: pytest.M
     monkeypatch.delenv("RA_LOG_EXPLORER_TEST_KNOB", raising=False)
     assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 7
     assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 1.5
-    # An empty or whitespace-only value is what an unset Helm value renders
-    # as; it must mean "unset", not "malformed".
-    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "   ")
-    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 7
-    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 1.5
+    # Surrounding whitespace on a real value is tolerated — YAML block
+    # scalars pick it up and it means nothing.
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", " 9 ")
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 9
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 9.0
+
+
+def test_envInt_and_envFloat_reject_a_blank_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present-but-blank variable is malformed, not a request for the
+    default.
+
+    It is exactly what a mistyped Helm reference renders to
+    (``value: {{ .Values.typo }}``), which is the silent
+    never-took-effect failure the ConfigError design exists to prevent.
+    Only an *absent* variable means "use the default".
+    """
+    for blank in ("", "   "):
+        monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", blank)
+        with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+            config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+        with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+            config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5)
 
 
 def test_envInt_and_envFloat_read_the_value(monkeypatch: pytest.MonkeyPatch) -> None:

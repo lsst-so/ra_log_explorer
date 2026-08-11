@@ -26,12 +26,18 @@ def _envInt(name: str, default: int) -> int:
     the built-in default would stay invisible until someone eventually
     wondered why the setting never took effect — whereas a container that
     refuses to start says so immediately.
+
+    A *present but blank* value is malformed too, not a request for the
+    default. It is what a mistyped Helm reference renders to
+    (``value: {{ .Values.typo }}``), which is precisely the silent
+    never-took-effect case this function exists to prevent. Only an
+    absent variable means "use the default".
     """
     raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+    if raw is None:
         return default
     try:
-        return int(raw)
+        return int(raw.strip())
     except ValueError as e:
         raise ConfigError(f"{name} must be an integer; got {raw!r}") from e
 
@@ -39,13 +45,14 @@ def _envInt(name: str, default: int) -> int:
 def _envFloat(name: str, default: float) -> float:
     """Read a float from the environment, or return ``default``.
 
-    Fails loudly on a malformed value, for the reasons in :func:`_envInt`.
+    Fails loudly on a malformed or blank value, for the reasons in
+    :func:`_envInt`.
     """
     raw = os.environ.get(name)
-    if raw is None or not raw.strip():
+    if raw is None:
         return default
     try:
-        return float(raw)
+        return float(raw.strip())
     except ValueError as e:
         raise ConfigError(f"{name} must be a number; got {raw!r}") from e
 

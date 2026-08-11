@@ -66,16 +66,32 @@ def _findPhalanx() -> Path | None:
     return None
 
 
+# CI sets this in the job that clones Phalanx and installs helm. There,
+# "the chart wasn't found" is the failure these tests exist to catch —
+# a chart that moved or a clone that silently landed on the wrong branch
+# would otherwise skip every assertion and report a green job, which is
+# indistinguishable from having checked the contract. Locally the
+# variable is unset and skipping stays the right behaviour.
+_REQUIRE_ENV = "RA_LOG_EXPLORER_REQUIRE_CHART"
+
+
+def _missingChart(reason: str) -> None:
+    if os.environ.get(_REQUIRE_ENV):
+        pytest.fail(f"{reason} (with {_REQUIRE_ENV} set, this is a failure rather than a skip)")
+    pytest.skip(reason)
+
+
 @pytest.fixture(scope="module")
 def phalanx() -> Path:
     repo = _findPhalanx()
     if repo is None:
-        pytest.skip(
+        _missingChart(
             f"no Phalanx checkout with {CHART_PATH} found; "
             "set $PHALANX_REPO to run the cross-repo chart tests"
         )
     if shutil.which("helm") is None:
-        pytest.skip("helm is not on PATH; cannot render the chart")
+        _missingChart("helm is not on PATH; cannot render the chart")
+    assert repo is not None
     return repo
 
 

@@ -2262,6 +2262,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         "kind": job.kind,
                         "site": job.siteName,
                         "expId": job.expId,
+                        "instrument": job.instrument,
                         "tZero": job.tZero.isoformat() if job.tZero else None,
                         "dayObs": job.dayObs,
                         "startId": job.startId,

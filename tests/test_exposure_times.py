@@ -390,9 +390,9 @@ def test_queryExposureRecordBatch_chunks_oversized_in_lists(monkeypatch: pytest.
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     ids = list(range(2026051900000, 2026051901500))  # 1500 dataIds
     exposureTimes.queryExposureRecordBatch(ids, "TOKEN", consdbUrl=URL, chunkSize=500)
-    # 1500 / 500 = 3 chunks per instrument; loop short-circuits since
-    # we never resolve anything, so all 4 instruments are tried.
-    assert len(seenQueries) == 3 * 4
+    # 1500 / 500 = 3 chunks per instrument, and nothing resolves, so
+    # every instrument is tried rather than the loop short-circuiting.
+    assert len(seenQueries) == 3 * len(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)
 
 
 def test_queryExposureRecordBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.MonkeyPatch) -> None:

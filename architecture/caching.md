@@ -23,8 +23,9 @@ repeat runs into instant loads.
         │                                            fetchComplete + errors + incomplete_pods +
         │                                            pod_event_lines + event_errors
         ├── _live.json                             ← (live night dirs only) watermark + per-pod
-        │                                            byte counts + event-only names; marks the dir
-        │                                            as poller-built — sliced on demand, never
+        │                                            byte counts + event-only names + any
+        │                                            in-flight pod rewrite; marks the dir as
+        │                                            poller-built — sliced on demand, never
         │                                            superset-parsed, never fetched into
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
@@ -130,16 +131,32 @@ disk — per-pod byte/line counts, and the cumulative fall-short maps.
 The sidecar is the coordination point between the poller (single
 writer, atomic replace once per tick, only after the tick's bytes hit
 disk) and readers; bytes beyond the recorded counts are treated as not
-yet there.
+yet there. That contract holds because an append only ever *extends* a
+file, and because appends are all-or-nothing: a partial one — app log
+or events stream alike — is truncated back to the pre-append size, so
+the span the poller retries next tick lands after clean bytes rather
+than after a torn line the counts will later be extended over.
+
+One operation is not an append, and so has to announce itself:
+finalisation's whole-pod refetch swaps the file wholesale, and while it
+does the sidecar carries `rewritingPod: "<pod>"`. `_tryNightSlice`
+refuses to slice a night carrying it and falls back to a real fetch.
+Zeroing the pod's counts is not enough on its own — a slicer reading a
+zeroed record doesn't wait, it omits the pod, and the resulting slice
+would be written `fetchComplete: true` with a pod missing and then
+exact-hit forever. The key is cleared on failure as well as success, so
+a failed refetch leaves a night that is visibly short rather than
+unsliceable.
 
 Three rules keep it coherent with everything else here:
 
 - While active it has **no `_meta.json`**, so nothing mistakes it for a
   completed fetch and LRU eviction leaves it alone. Finalisation (at
-  noon-UTC rollover: final top-up, per-pod `count_over_time`
-  verification with whole-pod refetch on mismatch) writes a normal
-  `_meta.json`, after which it is listed, evictable, and deletable like
-  any window.
+  noon-UTC rollover: final top-up, then a per-pod `count_over_time`
+  audit that refetches any pod falling short by more than the oracle's
+  dedup slack — `max(100, 0.2%)`, `live.VERIFY_TOLERANCE_*`; a pod
+  within tolerance is left alone) writes a normal `_meta.json`, after
+  which it is listed, evictable, and deletable like any window.
 - It is **excluded from superset reuse** forever (the sidecar stays
   after finalisation as the marker): handing a whole night to the
   parser to answer a five-minute window takes minutes.
@@ -174,10 +191,16 @@ duplicated. It then decides in order:
    produce new logs inside the window, so the cache would be stale.)
    This is the safety net for an in-progress dayObs in night mode.
 
-2. **Exact hit** if `<requestedDir>/_meta.json` exists, carries the
-   current `fetchSchemaVersion`, and there's no `.partial` flag.
+2. **Exact hit** if `<requestedDir>/_meta.json` exists, parses, carries
+   the current `fetchSchemaVersion`, and there's no `.partial` flag.
    Returns the requested directory and the saved meta with
-   `cacheReuse = "exact"`.
+   `cacheReuse = "exact"`. A meta that won't parse means exactly what a
+   missing one means — no usable cache, fall through — rather than an
+   exception: one truncated file (a full disk, a killed writer) would
+   otherwise 500 every future request for that window, with no way out
+   but finding and deleting the directory by hand. The superset step
+   below reads the same way, since the directory it picked can be
+   deleted or rewritten between the search and the read.
 
 2½. **Night slice** if the request falls inside a live/finalised night
    dir. Two windows qualify: one the watermark fully covers (its `to`
@@ -283,10 +306,17 @@ of *single-batch* queries:
   the count being right (if the count is unavailable the chunker falls
   back to blind time-bisection and is still correct).
 - **Split and retry.** A chunk that comes back *full* (`got ≥` the cap)
-  is discarded untrusted and re-fetched as two half-open time halves
-  (`[a, mid) ∪ [mid, b)` tiles exactly — no gap, no dup). This recurses
-  until every piece fits one batch, keeping the output globally
-  time-ascending so the parser's ordering assumption holds.
+  is discarded untrusted and re-fetched as equal-time half-open
+  sub-windows, which tile it exactly — no gap, no dup. How many is
+  again the oracle's call: `min(MAX_SPLIT_PARTS, max(2,
+  ceil(expected / CHUNK_TARGET_LINES)))`, i.e. enough parts to aim at
+  `CHUNK_TARGET_LINES` each, capped at `MAX_SPLIT_PARTS` (60) so a
+  pathological count can't fan out into hundreds of children at once.
+  Two halves is the floor, and what a dark oracle always gives. This
+  recurses until every piece fits one batch, keeping the output
+  globally time-ascending so the parser's ordering assumption holds.
+  (A count that already predicts an overflow skips the doomed fetch and
+  splits up front.)
 - **Floor.** If a window is already `≤ MIN_SPLIT_S` wide and *still*
   overflows a batch (an implausible >5000-line burst in ≤1 s), it can't
   be fetched losslessly; we keep what we got and flag the pod rather than
@@ -428,9 +458,19 @@ one, typically).
   pods for dayObs 20260711).
 
 Cache management lives in both the CLI (`python3 -m
-ra_log_explorer.cli cache info|flush`) and the home page in the
-browser (cache table with per-row ✕ delete, plus a "delete all"
-button).
+ra_log_explorer.cli cache info|flush`) and the browser's admin view at
+`/?admin=1` (the cached-windows table, with a per-row ✕ delete and a
+"flush entire cache" button).
+
+Either browser delete unlinks every `_live.json` under the target
+*before* removing the tree. A partial delete is a real possibility —
+the poller may be creating files in there as `rmtree` walks it — and
+one that took the pod files but left the sidecar is worse than either
+clean outcome: the poller's intactness check would pass, it would
+resume appending to files that now begin mid-night, and every slice cut
+from them would be short while claiming to be whole. Without the
+sidecar a half-deleted night is simply not a live night dir, and the
+poller opens it again from scratch.
 
 ## The exposure-time cache
 

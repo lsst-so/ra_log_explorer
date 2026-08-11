@@ -43,7 +43,7 @@ convenience, not how the tool is meant to be used.
 ## Quickstart (local development)
 
 ```sh
-# Prerequisites: Python ≥ 3.11, git, and logcli on $PATH.
+# Prerequisites: Python ≥ 3.13, git, and logcli on $PATH.
 # (`brew install grafana/grafana/logcli` on macOS.)
 
 # Loki password — ask Merlin for the value.
@@ -162,7 +162,7 @@ summit ConsDB.)
 
 | Requirement                       | Notes                                                                                |
 |-----------------------------------|---------------------------------------------------------------------------------------|
-| Python ≥ 3.11                     | 3.13 recommended; the runtime itself is stdlib-only.                                  |
+| Python ≥ 3.13                     | What `pyproject.toml` requires; the runtime itself is stdlib-only.                     |
 | `logcli` on your `$PATH`          | `brew install grafana/grafana/logcli` on macOS, or grab a binary from Grafana releases. |
 | `git`                              | There is no PyPI package; you run from a checkout.                                  |
 | A browser                         | The tool opens `http://127.0.0.1:8780/` for you.                                      |
@@ -225,15 +225,17 @@ In the browser:
    (Server-Sent Events). When it's done the URL updates to
    `/?dataId=<id>` and the page switches to the timeline view.
 
-The home page also lists every cached window on disk in the *Recent
-runs* table. Each row carries a **key** column showing the dataId(s)
-that triggered fetches landing on that cache (the `dayObs` for night
-caches, or the seq-number span for range caches); the keys are
-clickable links that open the cached view in a new tab. The ✕ button on each row deletes that one
-window; the "delete all" button under the table wipes the whole
-cache. The server also LRU-evicts the least-recently-viewed windows
-automatically once the on-disk total exceeds the sidebar's *max
-cache space* setting (5 GiB by default).
+Caching is invisible in day-to-day use, but the **admin** link in the
+topbar (or `/?admin=1` directly) opens a *Cached windows* table listing
+every window on disk. Each row carries a **key** column showing the
+dataId(s) that triggered fetches landing on that cache — the `dayObs`
+for night caches, the seq-number span for range caches — as clickable
+links that open the cached view in a new tab. The ✕ button on a row
+deletes that one window; *flush entire cache* above the table wipes the
+lot. Nothing here needs tending: the server LRU-evicts the
+least-recently-viewed windows on its own once the on-disk total exceeds
+`RA_LOG_EXPLORER_MAX_CACHE_BYTES` (5 GiB by default, and not something
+the browser can set — see [Configuration](#configuration)).
 
 ## Eager mode (CLI-driven, useful for scripting)
 
@@ -455,14 +457,15 @@ cleanly.
 
 ### Flush the cache
 
-Easiest: open the home page in the browser, hit the **delete all**
-button under the recent-runs table (or the **✕** on a single row to
-remove just one window).
+Easiest: open the admin view (`/?admin=1`) and hit **flush entire
+cache** above the table (or the **✕** on a single row to remove just
+one window).
 
 From the CLI:
 
 ```
-python3 -m ra_log_explorer.cli cache flush
+python3 -m ra_log_explorer.cli cache flush         # prompts first
+python3 -m ra_log_explorer.cli cache flush --yes   # don't
 ```
 
 Or just `rm -rf ~/.cache/ra_log_explorer`. The cache is purely a
@@ -476,10 +479,23 @@ The first loads after such an upgrade re-fetch and so are slower.
 
 ## All CLI options
 
+There are two subcommands, `run` and `cache`:
+
+```
+run                      start the server (the default; the flags below can
+                         also be given with no subcommand at all)
+cache info               summarize what's on disk
+cache flush [--yes]      delete the whole cache; --yes skips the prompt
+```
+
+The `run` flags:
+
 ```
 --exposure-id ID         13-digit dataId (optional; pair with --t-zero)
 --t-zero ISO             shutter-close timestamp (optional; pair with --exposure-id)
 --t-zero-utc             treat --t-zero as already-UTC instead of TAI
+--instrument NAME        lsstcam | latiss (default lsstcam); which instrument
+                         --exposure-id belongs to
 --window-before SECONDS  pre-shutter pad (default 5)
 --window-after  SECONDS  post-shutter pad (default 300)
 --workers N              parallel log fetch threads (default 8)
@@ -507,7 +523,8 @@ outside it are 404ed rather than answered.
 Omit `--exposure-id` / `--t-zero` for **home mode** (server starts at the
 landing page; pick your exposure in the browser).
 
-Run `python3 -m ra_log_explorer.cli --help` for the same list.
+Run `python3 -m ra_log_explorer.cli --help` (and `... run --help` /
+`... cache --help`) for the authoritative list.
 
 ## Configuration
 
@@ -537,7 +554,10 @@ Most have a matching CLI flag (`--workers`, `--window-after`, `--site`,
 
 A malformed numeric value stops the server with a clear error rather
 than falling back to the default — a setting that quietly never took
-effect is much harder to notice than one that refuses to start.
+effect is much harder to notice than one that refuses to start. **An
+empty value counts as malformed**; only leaving the variable out asks
+for the default. (Deployed, blank is what a mistyped Helm reference
+renders to, which is exactly the case worth failing on.)
 
 The two window values are the *starting* values of editable form fields,
 not fixed limits: widening a window to catch a neighbouring exposure is
@@ -602,7 +622,8 @@ will not auto-install or fall back to a different client.
 `~/.zshenv` (or your bash equivalent). Don't pass passwords on the
 command line, and don't drop the export in `~/.zshrc` — that's only
 sourced for interactive shells, so non-interactive child processes
-won't see it.
+won't see it. An *empty* export raises the same error rather than
+letting `logcli` fail with a bare 401.
 
 **"ConsDB token file for site '<name>' not found at <path>"** — this
 server's site needs a token that isn't on this machine. Either drop the

@@ -2689,6 +2689,35 @@ def test_fetch_instrument_lands_on_the_state_and_summary_guard_enforces_it(
     assert status == 400
 
 
+def test_the_job_status_and_done_event_carry_the_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The client's post-fetch summary request has to be pinned, and the
+    only place it can learn the pin is the job it just watched.
+
+    Between the fetch finishing and that request arriving, the bare
+    expId's slot can be taken over by the twin — another tab's fetch, or
+    a rebuild — and an unpinned request would then render the other
+    exposure and stamp *its* instrument into the URL, making the wrong
+    exposure stick across a refresh.
+    """
+    host, port, _ctx = runningServer
+    expId = 2026071100408
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-07-12T04:58:03.354", "instrument": "latiss"},
+        tmpCacheRoot,
+        monkeypatch,
+        "latiss-instrument-echo",
+    )
+    job = next(j for j in _ctx.jobs._jobs.values() if j.expId == expId)
+    _s, status = _get(host, port, f"/api/fetch/{job.jobId}/status")
+    assert status["instrument"] == "latiss"
+    done = [e for e in job.events if e.get("type") == "done"]
+    assert done and done[0]["instrument"] == "latiss"
+
+
 def test_fetch_defaults_the_instrument_to_lsstcam(
     runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
