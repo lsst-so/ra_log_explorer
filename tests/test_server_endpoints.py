@@ -2515,3 +2515,32 @@ def test_manual_tZero_is_stamped_with_the_fetches_instrument(
     rec = exposureTimes.lookupCachedRecord(expId, siteName="summit", instrument="latiss")
     assert rec is not None and exposureTimes.isManual(rec)
     assert exposureTimes.recordInstrument(rec) == "latiss"
+    # A LATISS stand-in is not the probe-order answer, so the bare key is
+    # left alone — otherwise one hand-typed t₀ would redefine what the
+    # shared id means for every unqualified lookup on this site.
+    assert exposureTimes.lookupCachedRecord(expId, siteName="summit") is None
+
+
+def test_manual_tZero_for_lsstcam_still_claims_the_bare_key(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LSSTCam is what a bare probe reaches first, so its stand-in is
+    also the bare-id answer — the pre-instrument behaviour, preserved."""
+    host, port, _ctx = runningServer
+    expId = 2026071100778
+    _completeFetch(
+        host,
+        port,
+        {
+            "exposureId": expId,
+            "tZero": "2026-07-12T05:00:00.000",
+            "instrument": "lsstcam",
+            "tZeroManual": True,
+        },
+        tmpCacheRoot,
+        monkeypatch,
+        "manual-lsstcam",
+    )
+    bare = exposureTimes.lookupCachedRecord(expId, siteName="summit")
+    assert bare is not None and exposureTimes.isManual(bare)
+    assert exposureTimes.recordInstrument(bare) == "lsstcam"

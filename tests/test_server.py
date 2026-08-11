@@ -1623,6 +1623,86 @@ def test_resolveShutterCloses_pin_reaches_cache_and_batch(
     assert batchPins == ["latiss"]
 
 
+def test_resolveShutterCloses_pinned_batch_never_claims_the_bare_key(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bare cache key is defined as the probe-order winner, and only
+    writers that resolved the id that way may write it. A LATISS-pinned
+    range prefetch resolving a colliding id must therefore store only the
+    instrument key — clobbering the bare one would hand every later
+    unqualified lookup (the night view's rebuild path included) the wrong
+    exposure's shutter close."""
+    collidingId = 2026071100408
+    # The probe-order winner is already cached, as the poller would leave it.
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T03:58:52.091000",
+                "instrument": "lsstcam",
+            }
+        },
+        siteName="summit",
+    )
+    latissRec = {"exposure_id": collidingId, "obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {collidingId: latissRec}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    job, site = _prefetchJob(siteCatalog)
+    # Nothing cached under latiss:<id>, so the id goes to the batch.
+    server._resolveShutterClosesInto({collidingId}, target, info, job, site, instrument="latiss")
+
+    # The LATISS answer landed under its own key…
+    stored = exposureTimes.lookupCachedRecord(collidingId, siteName="summit", instrument="latiss")
+    assert stored is not None and stored["instrument"] == "latiss"
+    # …and the bare key still holds the probe-order winner.
+    bare = exposureTimes.lookupCachedRecord(collidingId, siteName="summit")
+    assert bare is not None and bare["instrument"] == "lsstcam"
+
+
+def test_resolveShutterCloses_lsstcam_pin_still_writes_the_bare_key(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converse: an LSSTCam pin IS the probe-order answer, so the
+    night prefetch keeps seeding bare keys for the home form."""
+    missId = 2026071100999
+    camRec = {"exposure_id": missId, "obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {missId: camRec}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({missId}, target, info, job, site, instrument="lsstcam")
+
+    bare = exposureTimes.lookupCachedRecord(missId, siteName="summit")
+    assert bare is not None and bare["instrument"] == "lsstcam"
+
+
 # ----- instrument on the cache-rebuild path ---------------------------------
 
 

@@ -830,7 +830,13 @@ def _resolveShutterClosesInto(
         job.push({"type": "shutter-close", "phase": "consdb-error", "error": str(e)})
         return
     # Overwrites any `_manual` stand-in for these ids, on disk and in memory.
-    exposureTimes.storeCachedRecords(resolved, siteName=site.name)
+    # The bare key is only claimed when the pinned instrument is what a
+    # bare-id probe would reach first: a LATISS-pinned batch writing bare
+    # keys would hand every colliding id's unqualified lookup — including
+    # the night view's rebuild path — the wrong exposure's shutter close.
+    exposureTimes.storeCachedRecords(
+        resolved, siteName=site.name, bareKey=exposureTimes.isProbeOrderFirst(instrument)
+    )
     consdbHits = 0
     for expId, rec in resolved.items():
         iso = exposureTimes.obsEnd(rec)
@@ -2387,10 +2393,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 # follow (the job's info-box read, later /api/exposure-time
                 # calls) can actually find it.
                 if body.get("tZeroManual"):
+                    # Bare key only when the pin is the probe-order first
+                    # instrument — a LATISS stand-in must not become what an
+                    # unqualified lookup of the shared id resolves to.
                     exposureTimes.storeCachedRecord(
                         expId,
                         exposureTimes.manualRecord(_utcToTaiIso(tZero), instrument=instrument),
                         siteName=site.name,
+                        bareKey=exposureTimes.isProbeOrderFirst(instrument),
                     )
                 job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name, instrument=instrument)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
