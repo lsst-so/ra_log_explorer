@@ -1031,8 +1031,18 @@ async function transitionToExplore(activeJob) {
     }
     // Reflect the loaded state in the URL so a refresh / bookmark
     // lands on the same view, and so opening this URL in a new tab
-    // independently routes to it.
-    const newUrl = `${window.location.pathname}?${params}`;
+    // independently routes to it. The instrument rides along: a dataId
+    // alone does not name an exposure, so a bare ?dataId=… URL reopened
+    // tomorrow (or pasted to a colleague) would resolve to the
+    // probe-order twin — the same 13 digits, the other instrument, a
+    // shutter close an hour away. The summary's own instrument is used
+    // rather than the topbar's, in case the user flipped the switch
+    // while the fetch was running.
+    let urlParams = params;
+    if (summary.instrument) {
+      urlParams += `&instrument=${encodeURIComponent(summary.instrument)}`;
+    }
+    const newUrl = `${window.location.pathname}?${urlParams}`;
     window.history.replaceState({}, '', newUrl);
     if (summary.mode === 'night' && window.showNight) {
       window.showNight(summary);

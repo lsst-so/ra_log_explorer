@@ -134,6 +134,37 @@ def test_an_instrument_pinned_view_shows_no_other_instruments_pods(app: Any, cor
     assert not any("lsstcam" in p for p in pods), pods
 
 
+def test_a_fetch_keeps_the_instrument_in_the_url(
+    app: Any, appFactory: Any, corpus: StagedCorpus, fakeLogcli: list[str]
+) -> None:
+    """The URL is what a reload or a pasted link replays, and a dataId
+    alone does not name an exposure. Finishing a fetch rewrites the URL
+    to the loaded state — it must keep the pin, or a LATISS view
+    reopened tomorrow resolves to its LSSTCam twin: same 13 digits,
+    different exposure, a shutter close an hour away, and nothing on
+    screen to say so."""
+    # Stage the LSSTCam twin first: it is what a bare ?dataId=… reopen
+    # would find, so its presence is what makes this test able to fail.
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    corpus.dropLiveSidecar()
+    app.goto("/")
+    switch(app, "latiss")
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("05:25:30")
+    app.page.locator("#fetch-submit").click()
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
+    assert f"dataId={SHARED_ID}" in app.page.url
+    assert "instrument=latiss" in app.page.url
+
+    # And the round trip: a fresh process (same cache volume — another
+    # visitor to the deployment) opening that URL lands on the LATISS
+    # exposure, not the twin.
+    other = appFactory()
+    app.page.goto(app.page.url.replace(app.origin, other.origin))
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#exposure-info")).to_contain_text("latiss")
+
+
 def test_switching_clears_a_resolved_lookup_rather_than_carrying_it_over(app: Any) -> None:
     """A stale t0 from the other instrument is the exact failure this
     control exists to prevent, so the switch must invalidate it."""
