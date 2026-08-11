@@ -809,7 +809,12 @@ function cacheRowUrl(w) {
     return apiUrl(`/?dayObs=${encodeURIComponent(w.dayObs)}`);
   }
   if (w.kind === 'range' && w.rangeStart != null && w.rangeStop != null) {
-    return apiUrl(`/?rangeStart=${encodeURIComponent(w.rangeStart)}&rangeStop=${encodeURIComponent(w.rangeStop)}`);
+    // Pin the run's own instrument: the same bounds exist on the other
+    // instrument as a different set of exposures.
+    const instQ = w.rangeInstrument ? `&instrument=${encodeURIComponent(w.rangeInstrument)}` : '';
+    return apiUrl(
+      `/?rangeStart=${encodeURIComponent(w.rangeStart)}&rangeStop=${encodeURIComponent(w.rangeStop)}${instQ}`,
+    );
   }
   return null;
 }

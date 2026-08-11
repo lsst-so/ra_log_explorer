@@ -83,10 +83,16 @@ async function loadRangeExposure(expId) {
   rangeSelectedExpId = expId;
   markSelectedChip();
   const idx = rangeIndex;
+  // The run's instrument travels with every request and stays in the
+  // URL: the [startId, stopId] key is shared with the other
+  // instrument's span, so dropping it here would let a refresh — or the
+  // server's loaded slot — answer with the twin's exposures.
+  const instQ = idx.instrument ? `&instrument=${encodeURIComponent(idx.instrument)}` : '';
   const qs =
     `rangeStart=${encodeURIComponent(idx.startId)}`
     + `&rangeStop=${encodeURIComponent(idx.stopId)}`
-    + `&dataId=${encodeURIComponent(expId)}`;
+    + `&dataId=${encodeURIComponent(expId)}`
+    + instQ;
   let payload;
   try {
     const r = await fetch(apiUrl(`/api/summary?${qs}`));

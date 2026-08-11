@@ -1066,7 +1066,13 @@ def _buildRangeExposurePayload(state: RangeState, dataId: int) -> dict | None:
         return None
     payload = _buildSummaryPayload(transient)
     payload["mode"] = "range-exposure"
-    payload["podDetailQuery"] = f"rangeStart={state.startId}&rangeStop={state.stopId}&dataId={dataId}"
+    # The instrument rides along so pod-detail lookups carry the same pin
+    # the summary was served under — the range key alone is shared with
+    # the other instrument's span.
+    podDetailQuery = f"rangeStart={state.startId}&rangeStop={state.stopId}&dataId={dataId}"
+    if state.instrument:
+        podDetailQuery += f"&instrument={state.instrument}"
+    payload["podDetailQuery"] = podDetailQuery
     payload["startId"] = state.startId
     payload["stopId"] = state.stopId
     return payload
@@ -1250,6 +1256,10 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             "dayObs": dayObs,
             "rangeStart": rangeBounds[0] if rangeBounds else None,
             "rangeStop": rangeBounds[1] if rangeBounds else None,
+            # Range rows carry their pin so the admin table's link can
+            # reopen *this* run rather than the twin span the other
+            # instrument fetched over the same bounds.
+            "rangeInstrument": (getCacheRangeInstrument(window) if rangeBounds else None),
             "exposureIds": exposureIds,
             "fromIso": spec.get("fromIso"),
             "toIso": spec.get("toIso"),
@@ -1486,12 +1496,19 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
     return state
 
 
-def _findRangeCacheDir(startId: int, stopId: int) -> Path | None:
+def _findRangeCacheDir(startId: int, stopId: int, instrument: str | None = None) -> Path | None:
     """Return the most-recently-fetched range cache for ``[startId, stopId]``.
 
     Range caches are exposure-style (top-level, all pods) and identified
     by the ``_range.txt`` sidecar, so we walk the same depth as
     :func:`_findExposureCacheDirs` and match on the recorded bounds.
+
+    ``instrument`` narrows the match to caches fetched under that pin.
+    The bounds alone do not identify a range: the same
+    ``[startId, stopId]`` span exists on every instrument that observed
+    that many exposures, and they are different exposures. Without the
+    pin the newest fetch wins, which is how a LATISS tab ends up looking
+    at LSSTCam's span.
     """
     root = cache_root()
     if not root.exists():
@@ -1511,6 +1528,8 @@ def _findRangeCacheDir(startId: int, stopId: int) -> Path | None:
                     continue
                 if getCacheRange(window) != (startId, stopId):
                     continue
+                if instrument is not None and getCacheRangeInstrument(window) != instrument:
+                    continue
                 try:
                     meta = json.loads(metaPath.read_text())
                 except (OSError, json.JSONDecodeError):
@@ -1521,7 +1540,9 @@ def _findRangeCacheDir(startId: int, stopId: int) -> Path | None:
     return best[1] if best else None
 
 
-def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeState | None:
+def _loadRangeFromCache(
+    ctx: ServerContext, startId: int, stopId: int, instrument: str | None = None
+) -> RangeState | None:
     """Reconstruct a :class:`RangeState` from disk, if possible.
 
     Mirrors :func:`_loadNightFromCache`: shutter closes are read from the
@@ -1535,8 +1556,12 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
     on a colliding id would anchor that exposure to the *other*
     instrument's shutter close. A sidecar without one isn't recognised
     as a range at all, so a found range always carries its pin.
+
+    A caller-supplied ``instrument`` additionally narrows *which* cache
+    is eligible, so a pinned tab rebuilds its own range rather than the
+    twin span another tab fetched more recently.
     """
-    cacheDir = _findRangeCacheDir(startId, stopId)
+    cacheDir = _findRangeCacheDir(startId, stopId, instrument)
     if cacheDir is None:
         return None
     site = _siteForCacheDir(ctx, cacheDir)
@@ -2015,7 +2040,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     )
                     return
                 if rangeStartRaw is not None and rangeStopRaw is not None:
-                    self._handle_range_summary(rangeStartRaw, rangeStopRaw, dataIdRaw)
+                    self._handle_range_summary(rangeStartRaw, rangeStopRaw, dataIdRaw, instrumentRaw)
                     return
                 if dataIdRaw is not None:
                     try:
@@ -2115,7 +2140,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self.send_error(400, "Invalid pod name")
                     return
                 if rangeStartRaw is not None and rangeStopRaw is not None and dataIdRaw is not None:
-                    self._handle_range_pod(rangeStartRaw, rangeStopRaw, dataIdRaw, pod)
+                    self._handle_range_pod(rangeStartRaw, rangeStopRaw, dataIdRaw, pod, instrumentRaw)
                     return
                 if dataIdRaw is not None:
                     try:
@@ -2232,9 +2257,23 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
         # ----- handler bodies (kept out of do_GET so they don't bloat it) -----
 
-        def _handle_range_summary(self, rangeStartRaw: str, rangeStopRaw: str, dataIdRaw: str | None) -> None:
+        def _handle_range_summary(
+            self,
+            rangeStartRaw: str,
+            rangeStopRaw: str,
+            dataIdRaw: str | None,
+            instrument: str | None = None,
+        ) -> None:
             """Serve the range index payload, or one dataId's timeline
-            within it when ``dataId`` is also supplied."""
+            within it when ``dataId`` is also supplied.
+
+            ``instrument`` is the same guard the exposure form applies:
+            the range key is the bare ``[startId, stopId]`` span, which
+            every instrument that observed that many exposures shares, so
+            the loaded slot may hold the twin span. A mismatch is treated
+            as not-loaded and falls through to the rebuild path, which
+            re-pins.
+            """
             try:
                 startId = int(rangeStartRaw)
                 stopId = int(rangeStopRaw)
@@ -2243,8 +2282,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             with ctx.jobs.stateLock:
                 state = ctx.getRangeState(rangeKey(startId, stopId))
+            if state is not None and instrument is not None and state.instrument != instrument:
+                state = None
             if state is None:
-                state = _loadRangeFromCache(ctx, startId, stopId)
+                state = _loadRangeFromCache(ctx, startId, stopId, instrument)
             if state is None:
                 self._send_json({"loaded": False, "cache": _cacheRootInfo()})
                 return
@@ -2263,7 +2304,14 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             self._send_json(_buildRangePayload(state))
 
-        def _handle_range_pod(self, rangeStartRaw: str, rangeStopRaw: str, dataIdRaw: str, pod: str) -> None:
+        def _handle_range_pod(
+            self,
+            rangeStartRaw: str,
+            rangeStopRaw: str,
+            dataIdRaw: str,
+            pod: str,
+            instrument: str | None = None,
+        ) -> None:
             try:
                 startId = int(rangeStartRaw)
                 stopId = int(rangeStopRaw)
@@ -2273,6 +2321,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             with ctx.jobs.stateLock:
                 state = ctx.getRangeState(rangeKey(startId, stopId))
+            if state is not None and instrument is not None and state.instrument != instrument:
+                # The slot holds the twin span — a different set of
+                # exposures out of a different window. Never serve its
+                # lines to a tab pinned elsewhere; the next summary
+                # reload re-pins.
+                state = None
             if state is None:
                 self._send_error_json(404, f"No range loaded for [{startId}, {stopId}]")
                 return

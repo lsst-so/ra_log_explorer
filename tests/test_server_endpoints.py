@@ -10,6 +10,7 @@ These tests exist because the routing + body parsing + SSE handler in
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import json
 import socket
@@ -475,6 +476,107 @@ def test_range_summary_index_and_per_dataId(runningServer: RunningServer, tmpCac
         host, port, "/api/summary?rangeStart=2026051900722&rangeStop=2026051900724&dataId=2026051900723"
     )
     assert status == 404
+
+
+def _seedRange(ctx: ServerContext, cacheDir: Path, instrument: str, base: dt.datetime) -> None:
+    """Put a two-exposure range state in the context under ``instrument``."""
+    import datetime as _dt
+
+    from ra_log_explorer.server import RangeState
+
+    (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026051900010,
+        stopId=2026051900012,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+        instrument=instrument,
+    )
+    state.shutterCloseByExpId = {2026051900010: base, 2026051900012: base + _dt.timedelta(seconds=20)}
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+
+
+def test_range_summary_refuses_a_span_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The range key is the bare [startId, stopId] span, which both
+    instruments share — comparing the same seq-number span across
+    instruments is a normal thing to do, and the second tab's fetch
+    overwrites the first's slot. Serving it would hand back a different
+    set of exposures anchored at shutter closes an hour away, with
+    nothing on the page to say so."""
+    import datetime as _dt
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    _seedRange(ctx, tmpCacheRoot / "range-lsstcam", "lsstcam", base)
+
+    qs = "rangeStart=2026051900010&rangeStop=2026051900012"
+    # Matching pin: served.
+    status, body = _get(host, port, f"/api/summary?{qs}&instrument=lsstcam")
+    assert status == 200 and body["loaded"] is True and body["instrument"] == "lsstcam"
+    # Other instrument's pin: not this range. Nothing on disk to rebuild
+    # from either, so the honest answer is "not loaded" — never the
+    # LSSTCam span dressed up as LATISS.
+    status, body = _get(host, port, f"/api/summary?{qs}&instrument=latiss")
+    assert status == 200 and body["loaded"] is False
+    # Unknown name is rejected outright rather than silently unpinned.
+    assert _get(host, port, f"/api/summary?{qs}&instrument=hubble")[0] == 400
+
+
+def test_range_pod_refuses_a_span_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Same guard on the pod-detail route: a mismatch 404s rather than
+    returning the twin span's log lines."""
+    import datetime as _dt
+    import json as _json
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    cacheDir = tmpCacheRoot / "range-lsstcam-pod"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-sfm-runner-workerset-0"
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "an lsstcam log line\n",
+            }
+        )
+        + "\n"
+    )
+    _seedRange(ctx, cacheDir, "lsstcam", base)
+    qs = "rangeStart=2026051900010&rangeStop=2026051900012&dataId=2026051900010"
+    assert _get(host, port, f"/api/pod/{podName}?{qs}&instrument=lsstcam")[0] == 200
+    assert _get(host, port, f"/api/pod/{podName}?{qs}&instrument=latiss")[0] == 404
+
+
+def test_range_exposure_payload_carries_its_instrument_into_podDetailQuery(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The client appends podDetailQuery verbatim to /api/pod/<pod>, so
+    the pin has to be in it — otherwise every pod-detail click in a range
+    view is an unpinned request against a shared key."""
+    import datetime as _dt
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    _seedRange(ctx, tmpCacheRoot / "range-latiss", "latiss", base)
+    status, body = _get(
+        host,
+        port,
+        "/api/summary?rangeStart=2026051900010&rangeStop=2026051900012"
+        "&dataId=2026051900010&instrument=latiss",
+    )
+    assert status == 200, body
+    assert "instrument=latiss" in body["podDetailQuery"]
 
 
 def test_range_summary_unloaded_when_unknown(runningServer: RunningServer) -> None:

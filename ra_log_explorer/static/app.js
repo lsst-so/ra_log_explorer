@@ -34,8 +34,13 @@ async function bootstrap() {
   if (urlRangeStart && urlRangeStop) {
     let summary;
     try {
+      // Same pin the dataId form carries: [startId, stopId] names a
+      // different run of exposures on each instrument, so a bare span
+      // would resolve to whichever twin was fetched last.
+      const rangeInstrument = urlParams.get('instrument');
+      const rangeInstQ = rangeInstrument ? `&instrument=${encodeURIComponent(rangeInstrument)}` : '';
       const qs = `rangeStart=${encodeURIComponent(urlRangeStart)}&rangeStop=${encodeURIComponent(urlRangeStop)}`;
-      const r = await fetch(apiUrl(`/api/summary?${qs}`));
+      const r = await fetch(apiUrl(`/api/summary?${qs}${rangeInstQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {
