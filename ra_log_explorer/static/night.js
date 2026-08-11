@@ -529,6 +529,7 @@ const LIFECYCLE_LABELS = {
   POD_OOMKILLED: ['OOM-killed', 'oom'],
   POD_FAILED: ['failed', 'podfail'],
   POD_UNHEALTHY: ['unhealthy', 'podunhealthy'],
+  POD_MOUNT_FAILED: ['mount failed', 'mountfail'],
 };
 
 function renderRestarts(rows) {

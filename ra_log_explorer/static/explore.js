@@ -73,6 +73,7 @@ function kindClass(kind, level) {
   if (kind === 'POD_KILLED') return 'kind-killed';
   if (kind === 'POD_RESTARTED') return 'kind-restart';
   if (kind === 'POD_UNHEALTHY') return 'kind-podunhealthy';
+  if (kind === 'POD_MOUNT_FAILED') return 'kind-mountfail';
   if (kind === 'POD_STARTED') return 'kind-podstart';
   if (level === 'error') return 'kind-error';
   if (kind === 'WORKER_PICKUP') return 'kind-pickup';

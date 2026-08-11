@@ -1145,6 +1145,16 @@ _EV_UNHEALTHY = (
     f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
     'reason=Unhealthy type=Warning count=1 msg="Liveness probe failed"'
 )
+# A real FailedMount from the summit (dayObs 20260711): a cluster-wide
+# secret-sync hiccup hit five running pods at one moment. Only the pod
+# name is edited (onto this file's fixture pod).
+_EV_FAILEDMOUNT = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 objectRV=827044507 eventRV=828082659 "
+    "reportinginstance=yagan02 reportingcontroller=kubelet sourcecomponent=kubelet "
+    "sourcehost=yagan02 reason=FailedMount type=Warning count=1 "
+    'msg="MountVolume.SetUp failed for volume \\"rapid-analysis-secrets\\" : '
+    'failed to sync secret cache: timed out waiting for the condition"'
+)
 # Noise we drop: an image-pull event, and a StatefulSet (non-Pod) event.
 _EV_PULLED = (
     f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
@@ -1201,6 +1211,24 @@ def test_classifyK8sEvent_killing_oom_backoff_unhealthy() -> None:
         assert ev is not None, line
         assert ev.kind == kind
         assert ev.flavor == reason
+
+
+def test_classifyK8sEvent_failedmount_is_a_pod_down_marker() -> None:
+    """A pod that can't mount a volume is down (or wedged restarting)
+    until it can — it explains a mid-work gap the same way a restart
+    does, and it happened for real: a cluster-wide secret-sync hiccup
+    interrupted five running pods at one moment on the summit."""
+    ev = parse.classifyK8sEvent(_POD, _evObj(_EV_FAILEDMOUNT))
+    assert ev is not None
+    assert ev.kind == "POD_MOUNT_FAILED"
+    assert ev.kind in parse.LIFECYCLE_EVENT_KINDS
+    assert ev.level == "warn"
+    assert ev.flavor == "FailedMount"
+    assert ev.expId is None
+    # The volume name is the whole diagnosis; it must survive into the
+    # tooltip text.
+    assert "rapid-analysis-secrets" in ev.message
+    assert "yagan02" in ev.message
 
 
 def test_classifyK8sEvent_drops_noise_and_non_pod() -> None:

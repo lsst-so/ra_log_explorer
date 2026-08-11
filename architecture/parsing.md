@@ -124,17 +124,21 @@ pod) are dropped too.
 | `POD_OOMKILLED` | reason containing `OOM` (e.g. `OOMKilling`)             | error   | Node-pressure OOM. Note: a *container-limit* OOM emits no k8s event on this cluster (and the kernel line isn't shipped to Loki) — that case shows up only as `POD_RESTARTED`. |
 | `POD_FAILED`    | `Failed`/`BackOff`/`Evicted`/`Preempted`/`NodeNotReady`/`FailedKillPod` | error | Container failed / crash-looping / evicted. |
 | `POD_UNHEALTHY` | `Unhealthy`                                              | warn    | Liveness/readiness probe failed (often precedes a `Killing`). |
+| `POD_MOUNT_FAILED` | `FailedMount`                                         | warn    | The kubelet couldn't mount one of the pod's volumes — the pod is down (or wedged restarting) until it can, so this explains a gap the way a restart does. The kubelet retries on a backoff and emits one event per attempt, so a single incident shows as a small burst of markers. |
 
 **What real data exists behind these.** The nights we have captured are
 mostly healthy: their lifecycle streams hold `Started`, `Killing`,
-`Pulling`/`Pulled`/`Created`, `Scheduled` and little else. Two reasons
-show up that we deliberately drop — `FailedMount`, and
-`TaintManagerEviction`, whose message is *"Cancelling deletion of Pod …"*
-(the controller calling an eviction off, not a pod dying). One real crash
-is captured: a step1b-AOS worker on BTS that restarted in place five
-times and then wedged in `ImagePullBackOff`, kept as
-`tests/data/pod_crash_events.jsonl` and used by both the parser tests and
-the browser tests.
+`Pulling`/`Pulled`/`Created`, `Scheduled` and little else. One reason
+shows up that we deliberately drop — `TaintManagerEviction`, whose
+message is *"Cancelling deletion of Pod …"* (the controller calling an
+eviction off, not a pod dying). `POD_MOUNT_FAILED` has a real capture
+behind it: a cluster-wide secret-sync hiccup on the summit (dayObs
+20260711) interrupted five running pods at one moment, ~1h40m into
+their app logs — pinned by a fixture line in `tests/test_parse.py`. One
+real crash is captured too: a step1b-AOS worker on BTS that restarted
+in place five times and then wedged in `ImagePullBackOff`, kept as
+`tests/data/pod_crash_events.jsonl` and used by both the parser tests
+and the browser tests.
 
 `POD_OOMKILLED` and `POD_UNHEALTHY` have **no** real capture behind them
 and are covered by hand-written event lines only. That is not an

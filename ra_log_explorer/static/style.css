@@ -791,6 +791,7 @@ button.ghost.mini.delete:disabled {
 .lg-killed       { color: #c0392b; }
 .lg-oom          { color: #b00020; }
 .lg-podunhealthy { color: #b15a00; }
+.lg-mountfail    { color: #8a5ec2; }
 
 /* Task chips (rendered by populateTaskLegend). The chips are appended as
    direct children of #task-legend with no separator, so make the
@@ -1183,6 +1184,7 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .tl-event.kind-oom           { background: #b00020; }
 .tl-event.kind-podfail       { background: #b00020; }
 .tl-event.kind-podunhealthy  { background: #e7a200; }
+.tl-event.kind-mountfail     { background: #8a5ec2; }
 .tl-event.kind-podstart      { background: #2f9e44; opacity: .5; }
 
 /* Pod-lifecycle pill badges in the night-view "Pod restarts & deaths"
@@ -1201,6 +1203,7 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
 .life-oom          { background: #b00020; }
 .life-podfail      { background: #b00020; }
 .life-podunhealthy { background: #b15a00; }
+.life-mountfail    { background: #8a5ec2; }
 
 .tl-t0-marker {
   position: absolute;

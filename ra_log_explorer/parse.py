@@ -685,7 +685,15 @@ _POD_DOWN_REASONS: frozenset[str] = frozenset(
 # family without string-prefix sniffing. Kept in sync with the kinds
 # emitted by :func:`classifyK8sEvent`.
 LIFECYCLE_EVENT_KINDS: frozenset[str] = frozenset(
-    {"POD_OOMKILLED", "POD_KILLED", "POD_FAILED", "POD_UNHEALTHY", "POD_RESTARTED", "POD_STARTED"}
+    {
+        "POD_OOMKILLED",
+        "POD_KILLED",
+        "POD_FAILED",
+        "POD_UNHEALTHY",
+        "POD_RESTARTED",
+        "POD_STARTED",
+        "POD_MOUNT_FAILED",
+    }
 )
 
 
@@ -747,6 +755,14 @@ def classifyK8sEvent(pod: str, jsonObj: dict) -> Event | None:
         kind, level = "POD_FAILED", "error"
     elif reason == "Unhealthy":  # liveness/readiness probe failed
         kind, level = "POD_UNHEALTHY", "warn"
+    elif reason == "FailedMount":
+        # The kubelet couldn't mount one of the pod's volumes — the pod is
+        # down (or being restarted) until it can, so this explains a gap
+        # the same way a restart does. Seen for real as a cluster-wide
+        # secret-sync hiccup hitting several running pods at one moment.
+        # The kubelet retries on a backoff and emits one event per attempt,
+        # so a single incident shows up as a small burst of these markers.
+        kind, level = "POD_MOUNT_FAILED", "warn"
     elif reason == "Killing":  # container stopping (graceful rollout, or pre-restart)
         kind, level = "POD_KILLED", "warn"
     elif reason == "Started":

@@ -318,8 +318,9 @@ Sibling docs:
   `taskLabel`, `durationS`, `flavor`. Events also come from the
   `k8s/events` stream as pod-lifecycle facts (`kind` of `POD_RESTARTED`,
   `POD_KILLED`, `POD_OOMKILLED`, `POD_FAILED`, `POD_UNHEALTHY`,
-  `POD_STARTED`) — these carry no dataId and put the k8s `reason` in
-  `flavor`. See [parsing.md](parsing.md) for the full taxonomy.
+  `POD_MOUNT_FAILED`, `POD_STARTED`) — these carry no dataId and put the
+  k8s `reason` in `flavor`. See [parsing.md](parsing.md) for the full
+  taxonomy.
 
 - **Pod group** — coarse classification of a pod by name prefix
   (`head`, `sfm`, `aos`, `step1b`, `step1b-aos`, `mosaic`, `psf-plot`,
@@ -653,8 +654,8 @@ fetch window ended before the pod did.
 
 Each pod's `events` array also carries any **pod-lifecycle markers**
 (`kind` of `POD_RESTARTED` / `POD_KILLED` / `POD_OOMKILLED` / `POD_FAILED`
-/ `POD_UNHEALTHY` / `POD_STARTED`, with `expId: null` and the k8s `reason`
-in `flavor`). Unlike dataId-keyed events, these are kept whenever they fall
+/ `POD_UNHEALTHY` / `POD_MOUNT_FAILED` / `POD_STARTED`, with `expId: null`
+and the k8s `reason` in `flavor`). Unlike dataId-keyed events, these are kept whenever they fall
 in the broad exposure window (`tZero - 5 s … tZero + 5 min`), not the tight
 per-dataId window — a pod usually dies a few seconds *after* its last work
 line, so the loose window is what keeps "the pod died here" visible.
