@@ -121,17 +121,27 @@ def test_fetching_the_same_id_under_each_instrument_gives_different_exposures(
 
 def test_an_instrument_pinned_view_shows_no_other_instruments_pods(app: Any, corpus: StagedCorpus) -> None:
     """The window is fetched namespace-wide, so it genuinely contains the
-    other instrument's pods — they were busy at the same moment. They
-    must not be attributed to this exposure: a same-numbered id on the
-    other instrument would otherwise pull its pods into this timeline."""
-    corpus.stageExposure(SHARED_ID, "latiss")
-    app.goto(f"/?dataId={SHARED_ID}&instrument=latiss")
+    other instrument's pods — and the direction matters: the corpus's
+    LSSTCam window really holds six LATISS pods (busy an hour before
+    their own same-numbered exposure), where the LATISS window holds no
+    LSSTCam lines at all. Asserting on the LATISS side passed even with
+    the filter deleted; this side cannot."""
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
     expect(app.page.locator("#explore-view")).to_be_visible()
     pods = app.page.locator("#timeline .tl-podname").all_inner_texts()
-    assert pods, "the LATISS exposure should have pods of its own"
+    assert pods, "the LSSTCam exposure should have pods of its own"
     # Pod names carry their instrument; the pinned view keeps only its own
     # (plus instrument-neutral ones, which carry neither name).
-    assert not any("lsstcam" in p for p in pods), pods
+    assert not any("latiss" in p for p in pods), pods
+    # The timeline only lists pods attributed to the exposure, so the
+    # exclusion is fully observable in podsAll — the whole-window pod
+    # inventory, where the LATISS pods would otherwise appear.
+    payload = app.apiJson(f"/api/summary?dataId={SHARED_ID}&instrument=lsstcam")
+    assert payload["loaded"] is True
+    allPods = [p["pod"] for p in payload["podsAll"]]
+    assert any("lsstcam" in p for p in allPods)
+    assert not [p for p in allPods if "latiss" in p], allPods
 
 
 def test_a_fetch_keeps_the_instrument_in_the_url(

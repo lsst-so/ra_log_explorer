@@ -242,6 +242,8 @@ def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_BEFORE_S", "12.5")
     monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_AFTER_S", "600")
     monkeypatch.setenv("RA_LOG_EXPLORER_MAX_CACHE_BYTES", "1234567")
+    monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_POLL_S", "123")
+    monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_LAG_S", "45")
     monkeypatch.setenv("LOKI_USERNAME", "omega")
     try:
         reloaded = importlib.reload(config)
@@ -249,6 +251,9 @@ def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPa
         assert reloaded.DEFAULT_WINDOW_BEFORE_S == 12.5
         assert reloaded.DEFAULT_WINDOW_AFTER_S == 600.0
         assert reloaded.MAX_CACHE_BYTES == 1234567
+        # Distinct values so swapping the two live names would be caught.
+        assert reloaded.LIVE_POLL_S == 123.0
+        assert reloaded.LIVE_LAG_S == 45.0
         assert reloaded.DEFAULT_USERNAME == "omega"
     finally:
         # Other modules hold references to this module object; leaving it

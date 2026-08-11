@@ -191,6 +191,31 @@ def test_summaryToDict_keeps_untagged_warn_only_in_work_window() -> None:
     assert kinds == ["WORKER_PICKUP", "WARN", "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE"]
 
 
+def test_summaryToDict_keeps_a_pod_death_after_the_last_work_line() -> None:
+    """Lifecycle markers are windowed on the broad exposure window, not
+    the tight per-dataId one: a pod usually dies a few seconds AFTER its
+    last work line — which is precisely when 'the pod died here' needs
+    to stay visible. Narrowing them to the work window would silently
+    drop the one marker that explains a truncated lane."""
+    tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    expId = 2026051900722
+    events = [
+        _ev(tZero + dt.timedelta(seconds=5), "WORKER_PICKUP", expId=expId),
+        _ev(tZero + dt.timedelta(seconds=10), "QUANTUM_DONE", expId=expId),
+        # The death lands two minutes after the last work line — far
+        # outside the [first-3s, last+3s] work window, well inside the
+        # broad exposure window.
+        _ev(tZero + dt.timedelta(seconds=120), "POD_RESTARTED", level="warn"),
+        # And one outside even the broad window (the next exposure's
+        # trouble) — that one stays off this lane.
+        _ev(tZero + dt.timedelta(seconds=400), "POD_KILLED", level="warn"),
+    ]
+    out = server._summaryToDict(_stubSummary(events), tZero, expId)
+    kinds = [e["kind"] for e in out["events"]]
+    assert "POD_RESTARTED" in kinds
+    assert "POD_KILLED" not in kinds
+
+
 def test_summaryToDict_anchors_untagged_window_on_tZero_when_no_targeted_events() -> None:
     # A pod with no explicitly-tagged events for this dataId still surfaces
     # its untagged warnings, but scoped to a t₀-anchored window rather than

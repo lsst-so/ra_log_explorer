@@ -96,7 +96,11 @@ slicing code, so a test that opens an exposure is looking at exactly the
 bytes a user would. A ~30-line fake `logcli` reads the same corpus for
 the tests that drive a real fetch, deliberately re-implementing the
 window filter so a bug in slicing cannot hide behind a fixture that
-shares it.
+shares it. One deliberate gap: the fake answers `instant-query` with
+nothing, so the count oracle is always dark and browser-driven fetches
+exercise only the blind-bisection path of the chunker — the
+count-presized path is covered by the unit tests' `_FakeLoki`, not
+here.
 
 Being real data pays off in places a synthetic fixture would not reach.
 The night's AOS workers fail often enough to populate the failures table

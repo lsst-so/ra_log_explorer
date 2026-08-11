@@ -243,6 +243,18 @@ def test_the_sites_file_env_var_points_at_the_mounted_configmap(baseDocs: list[d
     assert sitesFile.startswith(mounts["sites"] + "/")
 
 
+def test_a_writable_temp_dir_is_mounted(baseDocs: list[dict]) -> None:
+    """Chunk fetches stage through the *system* temp dir (deliberately —
+    a crash must not strand a chunk file beside the real pod files), and
+    the root filesystem is read-only. This is a contract no env var
+    carries, so the env-name pin can't see it: drop the /tmp volume from
+    the chart and the pod comes up healthy and then fails on the first
+    fetch."""
+    mounts = {m["mountPath"] for m in _container(baseDocs)["volumeMounts"]}
+    assert "/tmp" in mounts
+    assert _container(baseDocs)["securityContext"]["readOnlyRootFilesystem"] is True
+
+
 def test_numeric_settings_are_values_this_code_will_accept(baseDocs: list[dict]) -> None:
     """`_envInt` / `_envFloat` raise rather than falling back, so a chart
     value of the wrong shape is a crash-looping pod. Parse them the same

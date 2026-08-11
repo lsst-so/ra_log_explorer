@@ -216,32 +216,33 @@ class StagedCorpus:
 
 
 def unpackCorpus(target: Path) -> Path:
-    """Unpack the archive into ``target`` (once), returning the tree root.
+    """Unpack the archive (once), returning the tree root.
 
-    Safe under ``pytest-xdist``: every worker builds its own copy under a
-    unique name and then atomically renames it into place, so whichever
-    gets there first wins and the rest reuse it. No lock file, nothing to
-    clean up if a worker dies mid-unpack.
-
-    The stamp file makes a rebuilt archive replace a previously-unpacked
-    one. pytest keeps the last few base temp dirs, so without it a corpus
-    unpacked by an older archive would quietly outlive it.
+    The unpack dir is **content-addressed** — the archive's size + mtime
+    are part of its name — which is what makes this genuinely safe under
+    ``pytest-xdist``: nothing ever deletes an existing tree (the earlier
+    delete-then-rebuild dance could rmtree a corpus another worker was
+    mid-way through hard-linking out of). Racing workers each stage
+    under a unique name and atomically rename into place; whoever gets
+    there first wins and the rest reuse it. A rebuilt archive simply
+    lands beside the old dir under a new name — the stale one is ~20 MB
+    of temp-dir litter, not a correctness problem.
     """
-    stamp = target / ".corpus-stamp"
     want = f"{ARCHIVE.stat().st_size}-{int(ARCHIVE.stat().st_mtime)}"
-    if stamp.exists() and stamp.read_text() == want:
+    target = target.with_name(f"{target.name}-{want}")
+    if target.exists():
         return target
-    shutil.rmtree(target, ignore_errors=True)
     staging = target.with_name(f"{target.name}.{os.getpid()}")
     shutil.rmtree(staging, ignore_errors=True)
     staging.mkdir(parents=True)
-    with tarfile.open(ARCHIVE, "r:gz") as tf:
-        tf.extractall(staging, filter="data")
-    (staging / "july11" / ".corpus-stamp").write_text(want)
     try:
-        os.replace(staging / "july11", target)
-    except OSError:
-        # Another worker got there first; theirs is as good as ours.
+        with tarfile.open(ARCHIVE, "r:gz") as tf:
+            tf.extractall(staging, filter="data")
+        try:
+            os.replace(staging / "july11", target)
+        except OSError:
+            pass  # another worker got there first; theirs is as good as ours
+    finally:
         shutil.rmtree(staging, ignore_errors=True)
     return target
 
