@@ -627,14 +627,20 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
             }
         )
     )
-    markCacheRange(window, startId, stopId)
+    markCacheRange(window, startId, stopId, instrument="lsstcam")
     # Only start + stop were ever resolved into the per-site cache (the
-    # original fetch had no token for the middle id, say).
+    # original fetch had no token for the middle id, say). Stamped with
+    # their instrument, as the pinned prefetch stores them — the rebuild's
+    # pinned lookups accept only the instrument-scoped key.
     exposureTimes.storeCachedRecord(
-        startId, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+        startId,
+        {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science", "instrument": "lsstcam"},
+        siteName="summit",
     )
     exposureTimes.storeCachedRecord(
-        stopId, {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science"}, siteName="summit"
+        stopId,
+        {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science", "instrument": "lsstcam"},
+        siteName="summit",
     )
 
     # Fresh server: nothing loaded in memory, so this must rebuild from disk.
@@ -644,6 +650,7 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     assert body["loaded"] is True
     assert body["mode"] == "range"
     assert body["site"] == "summit"  # derived from the yagan cluster path component
+    assert body["instrument"] == "lsstcam"  # read back from _range.txt
     assert body["nMissing"] == 1  # 723 had no cached shutter close
     assert [d["expId"] for d in body["dataIds"]] == [startId, stopId]
     # The curated record stored in the per-site cache rode through the

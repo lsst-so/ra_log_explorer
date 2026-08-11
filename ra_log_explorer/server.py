@@ -65,6 +65,7 @@ from .fetch import (
     getCacheExposureIds,
     getCacheLastViewed,
     getCacheRange,
+    getCacheRangeInstrument,
     loadCacheMeta,
     loadPodLogPath,
     markCacheRange,
@@ -1365,7 +1366,11 @@ def _pickExposureCache(
         record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
         tZeroIso = exposureTimes.obsEnd(record)
         if record is None or tZeroIso is None:
-            return None  # nothing to anchor on; another window won't help
+            # This candidate's site has no record to anchor on. Deployed
+            # there is one site and every candidate shares it, but a
+            # laptop's cache can hold windows from both clusters — a
+            # later candidate on the other site may still resolve.
+            continue
         try:
             meta = loadCacheMeta(cacheDir)
         except (OSError, json.JSONDecodeError, FileNotFoundError):
@@ -1460,8 +1465,12 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         endTime=dayObsEndUtc(dayObs),
         siteName=site.name,
     )
+    # Pinned to LSSTCam, exactly like _prefetchNightShutterCloses: AOS
+    # runs on LSSTCam only, and on a night where LATISS also observed a
+    # bare lookup for a colliding id could anchor an AOS histogram bar
+    # to the LATISS shutter close.
     for needId in _neededDataIdsForNight(summaries):
-        record = exposureTimes.lookupCachedRecord(needId, siteName=site.name)
+        record = exposureTimes.lookupCachedRecord(needId, siteName=site.name, instrument="lsstcam")
         iso = exposureTimes.obsEnd(record)
         if record is not None and iso is not None:
             state.shutterCloseByExpId[needId] = _taiIsoToUtc(iso)
@@ -1514,6 +1523,14 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
     on-disk per-site cache only (no ConsDB call — there's no SSE channel
     on a sync /api/summary request), so any dataId not already cached
     locally stays absent until a real fetch fills it in.
+
+    The instrument comes back from the ``_range.txt`` sidecar and pins
+    both the rebuilt state (so its per-exposure timelines exclude the
+    other instrument's pods) and every per-id lookup here — a bare lookup
+    on a colliding id would anchor that exposure to the *other*
+    instrument's shutter close. ``None`` only for a sidecar written
+    before the instrument was recorded; those rebuild unpinned, as they
+    always did.
     """
     cacheDir = _findRangeCacheDir(startId, stopId)
     if cacheDir is None:
@@ -1531,6 +1548,7 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
         toTime = dt.datetime.fromisoformat(str(spec.get("toIso")).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+    instrument = getCacheRangeInstrument(cacheDir)
     summaries = parser.summarizeAll(cacheDir)
     state = RangeState(
         cacheDir=cacheDir,
@@ -1542,9 +1560,10 @@ def _loadRangeFromCache(ctx: ServerContext, startId: int, stopId: int) -> RangeS
         fromTime=fromTime,
         toTime=toTime,
         siteName=site.name,
+        instrument=instrument,
     )
     for expId in range(startId, stopId + 1):
-        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name)
+        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
         iso = exposureTimes.obsEnd(record)
         if record is not None and iso is not None:
             state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
@@ -1739,7 +1758,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             newRange.shutterCloseByExpId[job.startId] = job.tZeroStart
             newRange.shutterCloseByExpId[job.stopId] = job.tZeroStop
             _prefetchRangeShutterCloses(newRange, job, site)
-            markCacheRange(job.cacheDir, job.startId, job.stopId)
+            markCacheRange(job.cacheDir, job.startId, job.stopId, instrument=job.instrument)
             with ctx.jobs.stateLock:
                 ctx.putRangeState(newRange)
             return

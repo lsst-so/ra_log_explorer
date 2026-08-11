@@ -30,7 +30,8 @@ repeat runs into instant loads.
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
         ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
         │                                            that triggered fetches landing here
-        ├── _range.txt                             ← (range caches only) two lines: startId, stopId
+        ├── _range.txt                             ← (range caches only) startId, stopId,
+        │                                            instrument — one per line
         ├── pods/<pod>.jsonl                       ← raw Loki JSONL (app logs), --forward order
         ├── pods_events/<pod>.jsonl                ← raw Loki JSONL (k8s/events lifecycle
         │                                            stream); auxiliary, never gates
@@ -335,12 +336,18 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
   (see *dataId / expId* in
   [architecture.md](architecture.md#key-concepts)).
 
-- **`_range.txt`** — range caches only. Two lines, `startId` then
-  `stopId`. Written by `markCacheRange` when a range fetch completes.
-  This is the sole marker that tells the `/api/cache` listing to label
-  the window `kind: "range"` (rather than `"exposure"`) and deep-link
-  it back to `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it
-  to rehydrate a `RangeState` from disk on a reload / deep link.
+- **`_range.txt`** — range caches only. Three lines: `startId`,
+  `stopId`, then the `instrument` the range was fetched under. Written
+  by `markCacheRange` when a range fetch completes. This is the sole
+  marker that tells the `/api/cache` listing to label the window
+  `kind: "range"` (rather than `"exposure"`) and deep-link it back to
+  `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it to
+  rehydrate a `RangeState` from disk on a reload / deep link, and the
+  recorded instrument re-pins the rebuilt state's shutter-close
+  lookups — a range is a run of *one* instrument's exposures, and a
+  bare lookup on a colliding id would anchor that exposure to the
+  other instrument's t₀. A two-line sidecar (written before the
+  instrument was recorded) rebuilds unpinned, as it always did.
 
 ## LRU eviction (size cap)
 

@@ -1706,7 +1706,14 @@ def test_resolveShutterCloses_lsstcam_pin_still_writes_the_bare_key(
 # ----- instrument on the cache-rebuild path ---------------------------------
 
 
-def _plantExposureCache(root: Path, expId: int, fromIso: str, toIso: str, cluster: str = "yagan") -> Path:
+def _plantExposureCache(
+    root: Path,
+    expId: int,
+    fromIso: str,
+    toIso: str,
+    cluster: str = "yagan",
+    fetchedAt: str = "2026-07-12T06:00:00+00:00",
+) -> Path:
     import json as _json
 
     windowDir = root / cluster / "rapid-analysis" / "window-a"
@@ -1715,7 +1722,7 @@ def _plantExposureCache(root: Path, expId: int, fromIso: str, toIso: str, cluste
         _json.dumps(
             {
                 "spec": {"fromIso": fromIso, "toIso": toIso},
-                "fetched_at": "2026-07-12T06:00:00+00:00",
+                "fetched_at": fetchedAt,
                 "pod_count": 0,
             }
         )
@@ -1832,3 +1839,117 @@ def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
         assert state is not None, f"{instrument} deep link fell back to a re-fetch"
         assert state.cacheDir.name.startswith(fromIso.replace(":", "")[:17])
         assert state.instrument == instrument
+
+
+def test_exposure_cache_lookup_tries_the_next_sites_window(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """A laptop's cache can hold windows from both clusters, and only one
+    site's exposure-time cache may know the id. The candidate with no
+    record must be skipped, not treated as proof that none will resolve —
+    giving up on the first miss broke the resolvable window behind it."""
+    ctx = _ctxWithSites(siteCatalog)
+    expId = 2026071100445
+    # The manke window is the more recently fetched, so it is probed
+    # first — and the bts exposure-time cache has no record at all.
+    _plantExposureCache(
+        tmpCacheRoot,
+        expId,
+        "2026-07-12T04:21:17.502000Z",
+        "2026-07-12T04:26:22.502000Z",
+        cluster="manke",
+        fetchedAt="2026-07-12T07:00:00+00:00",
+    )
+    _plantExposureCache(
+        tmpCacheRoot,
+        expId,
+        "2026-07-12T04:21:17.502000Z",
+        "2026-07-12T04:26:22.502000Z",
+        cluster="yagan",
+        fetchedAt="2026-07-12T06:00:00+00:00",
+    )
+    exposureTimes.storeCachedRecord(
+        expId,
+        {"exposure_id": expId, "obs_end": "2026-07-12T04:21:59.502000", "instrument": "lsstcam"},
+        siteName="summit",
+    )
+
+    state = _loadExposureFromCache(ctx, expId, instrument="lsstcam")
+    assert state is not None, "the resolvable yagan window was abandoned"
+    assert state.siteName == "summit"
+
+
+def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """The rebuild path resolves the same lookups _prefetchNightShutterCloses
+    does, and must pin them the same way: AOS is LSSTCam-only, and the bare
+    key can legitimately hold the other instrument's record for a colliding
+    id (probe order is evaluated at query time, and the LSSTCam row can
+    land later). An unpinned rebuild would anchor the histograms an hour
+    off."""
+    dayObs = 20260711
+    collidingId = 2026071100408
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "win" / "pods=__aos__"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "fromIso": "2026-07-11T12:00:00Z",
+                    "toIso": "2026-07-12T12:00:00Z",
+                    "podRegex": ".*aos.*",
+                },
+                "fetched_at": "2026-07-12T06:00:00+00:00",
+                "pod_count": 1,
+            }
+        )
+    )
+    # One AOS worker whose traceback puts the colliding id into the set
+    # of dataIds the night view needs a shutter close for.
+    lines = [
+        (
+            "2026-07-12T03:59:00.000+00:00",
+            "info",
+            f"2026-07-12 03:59:00,000 worker fn INFO   Running pipeline for {collidingId} detector 191",
+        ),
+        ("2026-07-12T03:59:10.000+00:00", "error", "Traceback (most recent call last):"),
+        ("2026-07-12T03:59:10.001+00:00", "error", "RuntimeError: bang"),
+    ]
+    with open(podsDir / "s-lsstcam-run-aos-worker-aosworkerset-2.jsonl", "w") as fh:
+        for ts, level, raw in lines:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": level}, "line": raw + "\n"}) + "\n"
+            )
+    # The bare key holds the LATISS record; the LSSTCam one is only under
+    # its instrument key.
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T04:58:03.354000",
+                "instrument": "latiss",
+            }
+        },
+        siteName="summit",
+    )
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T03:58:52.091000",
+                "instrument": "lsstcam",
+            }
+        },
+        siteName="summit",
+        bareKey=False,
+    )
+
+    ctx = _ctxWithSites(siteCatalog)
+    state = server._loadNightFromCache(ctx, dayObs)
+    assert state is not None
+    # Anchored to the LSSTCam shutter close (TAI -37 s), not the bare key's.
+    assert state.shutterCloseByExpId[collidingId] == dt.datetime(
+        2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc
+    )

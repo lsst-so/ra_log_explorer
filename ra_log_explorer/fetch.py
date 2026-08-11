@@ -1596,8 +1596,14 @@ def getCacheExposureIds(cacheDir: Path) -> list[int]:
     return sorted(set(out))
 
 
-def markCacheRange(cacheDir: Path, startId: int, stopId: int) -> None:
+def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str | None = None) -> None:
     """Record that this cache is a range-mode fetch over ``[startId, stopId]``.
+
+    ``instrument`` is the pin the range was fetched under — a range is a
+    run of *one* instrument's exposures, and the rebuild path needs the
+    pin back to resolve each in-range id against the right table (a bare
+    lookup on a colliding id would anchor to the other instrument's
+    shutter close).
 
     Best-effort, same contract as :func:`addExposureToCache`: a write
     failure does not interrupt the request — the cache just won't be
@@ -1605,8 +1611,11 @@ def markCacheRange(cacheDir: Path, startId: int, stopId: int) -> None:
     """
     if not cacheDir.exists():
         return
+    body = f"{int(startId)}\n{int(stopId)}\n"
+    if instrument:
+        body += f"{instrument}\n"
     try:
-        (cacheDir / RANGE_NAME).write_text(f"{int(startId)}\n{int(stopId)}\n")
+        (cacheDir / RANGE_NAME).write_text(body)
     except OSError:
         pass
 
@@ -1615,6 +1624,29 @@ def getCacheRange(cacheDir: Path) -> tuple[int, int] | None:
     """Return the ``(startId, stopId)`` recorded for a range cache, or
     ``None`` if the sidecar is missing or unparseable — same best-effort
     contract as the writer."""
+    lines = _readRangeSidecar(cacheDir)
+    if lines is None:
+        return None
+    try:
+        return int(lines[0]), int(lines[1])
+    except ValueError:
+        return None
+
+
+def getCacheRangeInstrument(cacheDir: Path) -> str | None:
+    """The instrument recorded in a range cache's sidecar, or ``None``.
+
+    ``None`` for a sidecar written before the third line existed — the
+    rebuild path then resolves unpinned, exactly as it always did.
+    """
+    lines = _readRangeSidecar(cacheDir)
+    if lines is None or len(lines) < 3:
+        return None
+    return lines[2]
+
+
+def _readRangeSidecar(cacheDir: Path) -> list[str] | None:
+    """The non-blank lines of ``_range.txt``, or ``None`` if unusable."""
     p = cacheDir / RANGE_NAME
     if not p.exists():
         return None
@@ -1622,12 +1654,7 @@ def getCacheRange(cacheDir: Path) -> tuple[int, int] | None:
         lines = [s.strip() for s in p.read_text().splitlines() if s.strip()]
     except OSError:
         return None
-    if len(lines) < 2:
-        return None
-    try:
-        return int(lines[0]), int(lines[1])
-    except ValueError:
-        return None
+    return lines if len(lines) >= 2 else None
 
 
 def getCacheLastViewed(cacheDir: Path) -> dt.datetime | None:

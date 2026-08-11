@@ -141,7 +141,7 @@ class StagedCorpus:
         fromT = self.tZero(startId, instrument) - dt.timedelta(seconds=DEFAULT_WINDOW_BEFORE_S)
         toT = self.tZero(stopId, instrument) + dt.timedelta(seconds=DEFAULT_WINDOW_AFTER_S)
         cacheDir, _ = fetch.materializeNightSlice(self.nightDir, self.spec(fromT, toT))
-        fetch.markCacheRange(cacheDir, startId, stopId)
+        fetch.markCacheRange(cacheDir, startId, stopId, instrument=instrument)
         fetch.markCacheViewed(cacheDir)
         return cacheDir
 
