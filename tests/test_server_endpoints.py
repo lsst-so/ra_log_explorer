@@ -2294,6 +2294,33 @@ def test_static_assets_are_served_under_the_base_path(mountedServer: RunningServ
     assert _get(host, port, "/static/app.js")[0] == 404
 
 
+def test_the_static_route_cannot_be_talked_into_serving_an_absolute_path(
+    mountedServer: RunningServer, tmp_path: Path
+) -> None:
+    """``/static//etc/passwd`` must 404, not read the filesystem.
+
+    ``Path("static") / "/etc/passwd"`` discards the left operand, so a
+    guard that only rejects ``..`` segments leaves every readable file
+    exposed. Deployed, the worst of them is ``/proc/self/environ``: the
+    process holds ``LOKI_PASSWORD``, so this would hand the Loki service
+    account's password to anyone who got through Gafaelfawr.
+    """
+    host, port, _ctx = mountedServer
+    secret = tmp_path / "token.txt"
+    secret.write_text("super-secret-loki-password")
+    for path in (
+        f"/log-explorer/static/{secret}",  # absolute -> "/static//tmp/..."
+        "/log-explorer/static//etc/hosts",
+        "/log-explorer/static/../ra_log_explorer/config.py",
+        "/log-explorer/static/%2e%2e/config.py",
+    ):
+        status, body = _get(host, port, path)
+        assert status == 404, path
+        assert "secret" not in body.get("_raw", ""), path
+    # The ordinary case still works.
+    assert _get(host, port, "/log-explorer/static/app.js")[0] == 200
+
+
 def test_base_path_survives_a_query_string(mountedServer: RunningServer) -> None:
     """The prefix is stripped from the path only. Stripping it off the
     whole request line would take the query with it and silently turn a

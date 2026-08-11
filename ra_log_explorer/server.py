@@ -1614,6 +1614,28 @@ def _safePathComponent(s: str) -> bool:
     return bool(_PATH_COMPONENT_RE.match(s)) and s not in (".", "..")
 
 
+def _resolveStaticFile(rel: str) -> Path | None:
+    """Return the static file ``rel`` names, or ``None`` if it escapes.
+
+    Containment is checked *after* joining, not by pattern-matching the
+    request. Rejecting ``..`` segments alone is not enough: ``Path("a") /
+    "/etc/passwd"`` discards the left operand entirely, so a request for
+    ``/static//etc/passwd`` would otherwise read an absolute path — and
+    the deployed process holds ``LOKI_PASSWORD`` in an environment
+    ``/proc/self/environ`` would hand over.
+    """
+    if not rel or rel.startswith("/"):
+        return None
+    path = (STATIC_DIR / rel).resolve()
+    try:
+        path.relative_to(STATIC_DIR.resolve())
+    except ValueError:
+        return None
+    if not path.is_file():
+        return None
+    return path
+
+
 def _resolveCacheWindow(cluster: str, namespace: str, slug: str, podsSub: str | None = None) -> Path | None:
     """Return the cache directory for ``(cluster, namespace, slug[, podsSub])``.
 
@@ -1954,11 +1976,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 self._send_index()
                 return
             if path.startswith("/static/"):
-                rel = path[len("/static/") :]
-                if ".." in rel.split("/"):
-                    self.send_error(400)
+                target = _resolveStaticFile(path[len("/static/") :])
+                if target is None:
+                    self.send_error(404)
                     return
-                self._send_file(STATIC_DIR / rel)
+                self._send_file(target)
                 return
             if path == "/api/live":
                 # Snapshot of the live night poller: watermark, tonight's
