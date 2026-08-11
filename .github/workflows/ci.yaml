@@ -23,7 +23,9 @@ jobs:
   pytest:
     name: "Run pytest with coverage"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Same headroom as build.yaml's gate: a cold Playwright cache makes
+    # the browser download the long pole on a first run.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

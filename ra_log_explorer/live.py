@@ -660,14 +660,28 @@ class LiveNightManager:
                 sidecar["eventsError"] = str(e)
                 return
             perName: dict[str, list[bytes]] = {}
+            unfiled = 0
             with open(tmpPath, "rb") as fh:
                 for raw in fh:
                     try:
                         name = json.loads(raw).get("labels", {}).get("name")
                     except json.JSONDecodeError:
+                        unfiled += 1
                         continue
                     if name:
                         perName.setdefault(name, []).append(raw)
+                    else:
+                        unfiled += 1
+            # A line with no ``name`` label can't be filed under a pod, so
+            # it is dropped — but the watermark still advances past it, and
+            # a dropped Pod event is a missing POD_* marker on somebody's
+            # timeline. Whether live Loki ever emits one is not something
+            # this repo can answer: the captured corpus is already demuxed,
+            # so every line in it lost the label on the way in. Counting
+            # them cumulatively makes the question answerable from the
+            # deployment's own /api/live instead of by assumption.
+            if unfiled:
+                sidecar["eventsUnfiled"] = int(sidecar.get("eventsUnfiled") or 0) + unfiled
             try:
                 self._appendEventLines(night, perName)
             except OSError as e:
@@ -825,6 +839,10 @@ class LiveNightManager:
             "errors": dict(sidecar.get("errors") or {}),
             "incompletePods": dict(sidecar.get("incomplete_pods") or {}),
             "eventsError": sidecar.get("eventsError"),
+            # Cumulative k8s/events lines that carried no ``name`` label
+            # and so could not be filed under a pod. Expected to stay 0;
+            # a non-zero value means POD_* markers are going missing.
+            "eventsUnfiled": int(sidecar.get("eventsUnfiled") or 0),
             "consdbError": self._consdbError,
             "orphanError": self._orphanError,
             "lastTick": self._lastTick,

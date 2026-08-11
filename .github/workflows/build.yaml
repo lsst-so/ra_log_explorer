@@ -32,7 +32,10 @@ jobs:
   checks:
     name: "Verify before building"
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Headroom for a cold Playwright cache: the browser download is the
+    # long pole on a first run, and a timeout here reads like a broken
+    # gate rather than a slow one.
+    timeout-minutes: 20
 
     permissions:
       contents: "read"

@@ -361,8 +361,11 @@ the whole tree is flushed once at startup (see *Schema-version flush*).
 `.partial` is written before pods are enumerated and removed after
 the last pod file is on disk. A crashed/Ctrl-C'd fetch leaves the
 flag in place, and `fetchAll` then refuses to treat the directory as
-a cache hit even if `_meta.json` is somehow present. There's no
-automatic recovery — re-run with `--force-refresh` to overwrite.
+a cache hit even if `_meta.json` is somehow present. Nothing sweeps
+stale flags, but nothing needs to: the next request for that same
+window finds no usable cache and re-fetches over it, clearing the flag.
+`--force-refresh` is only needed when a *superset* window would be
+reused instead, so the flagged directory is never revisited.
 
 ## Per-cache sidecars
 

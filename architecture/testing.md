@@ -3,9 +3,10 @@
 The project has four test layers:
 
 1. **Unit tests** under [tests/](../tests/) — pure-Python, no network
-   or persistent filesystem state. Each test gets a per-test cache
-   root via the `tmpCacheRoot` fixture so on-disk side effects don't
-   leak between tests. Run with `pytest`.
+   or persistent filesystem state. Any test that touches the cache
+   asks for the `tmpCacheRoot` fixture, which points `cache_root()` at
+   a per-test directory so on-disk side effects don't leak between
+   tests. Run with `pytest`.
 2. **Browser tests** under [tests/ui/](../tests/ui/) — Playwright
    driving Chromium against the real server, the real cache on disk, and
    a real (cut-down) night of captured logs. They cover the UI *and* the

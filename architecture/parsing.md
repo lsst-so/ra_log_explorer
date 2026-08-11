@@ -129,7 +129,8 @@ pod) are dropped too.
 **What real data exists behind these.** The nights we have captured are
 mostly healthy: their lifecycle streams hold `Started`, `Killing`,
 `Pulling`/`Pulled`/`Created`, `Scheduled` and little else. One reason
-shows up that we deliberately drop — `TaintManagerEviction`, whose
+shows up in the full captures that we deliberately drop (the cut-down
+corpus in this repo has no example) — `TaintManagerEviction`, whose
 message is *"Cancelling deletion of Pod …"* (the controller calling an
 eviction off, not a pod dying). `POD_MOUNT_FAILED` has a real capture
 behind it: a cluster-wide secret-sync hiccup on the summit (dayObs

@@ -1152,6 +1152,48 @@ def test_a_pod_being_refetched_suspends_slicing(
     assert fetch._tryNightSlice(spec) is not None
 
 
+def test_unfilable_event_lines_are_counted_rather_than_silently_dropped(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An events line with no ``name`` label can't be filed under a pod,
+    so it is dropped — and the watermark advances past it, so nothing
+    ever comes back for it. A dropped *Pod* event is a missing POD_*
+    marker on somebody's timeline.
+
+    Whether live Loki emits such a line is not answerable from this
+    repo: the captured corpus is already demuxed, so every line in it
+    lost the label on the way in. The count makes it answerable from the
+    deployment's own /api/live rather than by assumption.
+    """
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3)]))
+    nameless = (
+        json.dumps(
+            {
+                "labels": {},
+                "line": "reason=Started kind=Pod count=1",
+                "timestamp": "2026-07-11T12:15:00.000000000+00:00",
+            }
+        )
+        + "\n"
+    ).encode()
+    monkeypatch.setattr(live, "fetchEventsWindowInto", _eventsStub([_eventLine(_t(14), "pod-a"), nameless]))
+    manager.tick(now=_t(20))
+    snap = manager.snapshot()
+    assert snap["eventsUnfiled"] == 1
+    # The filable line still landed, and the watermark still advanced —
+    # the count is a report, not a brake.
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+    assert (nightDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").exists()
+    assert snap["eventsError"] is None
+
+    # A clean tick doesn't reset it: it is cumulative for the night.
+    monkeypatch.setattr(live, "fetchEventsWindowInto", _eventsStub([_eventLine(_t(25), "pod-a")]))
+    manager.tick(now=_t(30))
+    assert manager.snapshot()["eventsUnfiled"] == 1
+
+
 def test_non_pod_events_are_inert_to_the_parser(tmp_path: Path) -> None:
     """Keeping ReplicaSet events is only safe because nothing downstream
     trips over them: summarizeAll enumerates pods from pods/, so a

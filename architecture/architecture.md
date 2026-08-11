@@ -516,11 +516,15 @@ panel stays hidden, and every fetch path behaves as before.
 ## Configuration
 
 Everything that varies between deployments is an environment variable,
-read once at import in `config.py`. Nothing is configurable from the
-browser: the UI asks questions about exposures, it does not reconfigure
-the service that answers them. That is not tidiness — a shared deployment
-has many users and one process, so a settings field would let whoever
-touched it last change how everyone else's fetches behave.
+read in `config.py` — the numeric ones once at import, so a bad value
+stops the container rather than surfacing hours later; the paths
+(`RA_LOG_EXPLORER_CACHE`, `_BASE_PATH`, `_SITES_FILE`) and
+`LOKI_PASSWORD` per call, so those fail at first use instead. Nothing
+is configurable from the browser: the UI asks questions about
+exposures, it does not reconfigure the service that answers them. That
+is not tidiness — a shared deployment has many users and one process,
+so a settings field would let whoever touched it last change how
+everyone else's fetches behave.
 
 | Variable | Drives | Default |
 |----------|--------|---------|
