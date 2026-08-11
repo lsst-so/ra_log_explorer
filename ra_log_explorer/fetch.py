@@ -178,8 +178,10 @@ LAST_VIEWED_NAME = "_last_viewed.txt"
 # table surfaces all of them as clickable shortcuts back to each
 # exposure's per-visit view. See ``addExposureToCache`` for the writer.
 EXPOSURE_IDS_NAME = "_exposure_ids.txt"
-# Per-cache sidecar marking a range-mode fetch: two lines, ``startId``
-# then ``stopId``. A range cache is structurally an ordinary exposure
+# Per-cache sidecar marking a range-mode fetch: three lines, ``startId``,
+# ``stopId``, then the instrument the run was fetched under — the bounds
+# alone don't identify a range, since every instrument that observed that
+# many exposures has a span with them. A range cache is structurally an ordinary exposure
 # cache (all pods, one wide window) — this sidecar is what lets the
 # cache listing label it "range" and deep-link back to /?rangeStart=…&
 # rangeStop=… instead of the single-exposure view. See ``markCacheRange``.
@@ -267,7 +269,11 @@ def _run_logcli(
         *extraArgs,
     ]
     env = os.environ.copy()
-    if "LOKI_PASSWORD" not in env:
+    # Blank counts as unset. Deployed, LOKI_PASSWORD comes from a
+    # VaultSecret marked optional, so the variable can exist and be empty
+    # while the secret is still missing — and an empty password reaches
+    # logcli as a bare auth failure rather than as the sentence below.
+    if not (env.get("LOKI_PASSWORD") or "").strip():
         raise FetchError(
             "LOKI_PASSWORD is not set in the environment. "
             "Export it (or source the shell rc that does) before running."
@@ -1187,6 +1193,13 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
     if found is None:
         return None
     nightDir, sidecar = found
+    if sidecar.get("rewritingPod"):
+        # End-of-night verification is replacing a pod's file wholesale
+        # (see live._refetchWholePod). Its record currently claims zero
+        # bytes, which a slice would honour by omitting the pod — and
+        # that slice would be written as complete and reused forever.
+        # Fall back to an ordinary fetch for the minutes this takes.
+        return None
     try:
         watermark = _parseIso(sidecar["watermarkIso"])
     except (KeyError, ValueError):
@@ -1357,8 +1370,17 @@ def _fetchAllLocked(
         # the current fetch schema — an older (v1) cache may be truncated,
         # so we fall through and re-fetch rather than re-serve it.
         if requestedDir.exists() and metaPath.exists() and not partialPath.exists():
-            meta = json.loads(metaPath.read_text())
-            if meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
+            # A meta we can't parse means the same thing as one that
+            # isn't there: no usable cache. Every other reader treats it
+            # that way; raising out of here instead would turn a
+            # truncated file (a full disk, a killed writer) into a 500 on
+            # every future request for that window, with no way back
+            # except finding and deleting the directory by hand.
+            try:
+                meta = json.loads(metaPath.read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = None
+            if meta is not None and meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
                 meta["fromCache"] = True
                 meta["cacheReuse"] = "exact"
                 return requestedDir, meta
@@ -1379,11 +1401,18 @@ def _fetchAllLocked(
         # though their on-disk contents differ.
         superset = findSupersetCache(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
         if superset is not None:
-            meta = loadCacheMeta(superset)
-            meta["fromCache"] = True
-            meta["cacheReuse"] = "superset"
-            meta["cacheReusePath"] = str(superset)
-            return superset, meta
+            # findSupersetCache already parsed this meta, but it can be
+            # deleted or rewritten between then and here; an unreadable
+            # one just means "no superset after all", not a 500.
+            try:
+                meta = loadCacheMeta(superset)
+            except (OSError, json.JSONDecodeError, FileNotFoundError):
+                meta = None
+            if meta is not None:
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "superset"
+                meta["cacheReusePath"] = str(superset)
+                return superset, meta
 
     # No usable cache — fetch fresh into the requested dir. Unless the
     # poller owns it: a fresh fetch opens every pods/<pod>.jsonl "wb",

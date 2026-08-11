@@ -482,6 +482,20 @@ def test_run_logcli_raises_when_LOKI_PASSWORD_missing(monkeypatch: pytest.Monkey
         fetch._run_logcli(_stubSpec(), ["series"])
 
 
+def test_run_logcli_treats_a_blank_LOKI_PASSWORD_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deployed, the password comes from a VaultSecret marked optional so
+    the pod starts before the secret exists — which means the variable
+    can be present and empty. That has to produce the same actionable
+    sentence as an absent one, not a bare logcli auth failure that reads
+    like a Loki outage."""
+    for blank in ("", "   "):
+        monkeypatch.setenv("LOKI_PASSWORD", blank)
+        with pytest.raises(fetch.FetchError, match="LOKI_PASSWORD"):
+            fetch._run_logcli(_stubSpec(), ["series"])
+
+
 def test_run_logcli_raises_FetchError_when_binary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1067,6 +1081,34 @@ def test_fetchAll_refetches_when_cache_schema_outdated(
     monkeypatch.setattr(fetch, "listPods", fakeListPods)
     _, meta = fetch.fetchAll(spec)
     assert refetched == [True], "outdated cache must be re-fetched, not re-served"
+    assert meta["cacheReuse"] == "none"
+    assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
+
+
+def test_fetchAll_refetches_when_the_cached_meta_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """An unparseable ``_meta.json`` means "no usable cache", exactly as
+    a missing one does.
+
+    Every other reader already treats it that way. Letting the exact-hit
+    path raise instead would turn one truncated file — a full disk, a
+    killed writer — into a 500 on every future request for that window,
+    recoverable only by finding and deleting the directory by hand.
+    """
+    spec = _stubSpec()
+    cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (cacheDir / "_meta.json").write_text('{"spec": {"fromIso": "2026-')  # truncated mid-write
+
+    refetched: list[bool] = []
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        refetched.append(True)
+        return []
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    _, meta = fetch.fetchAll(spec)
+    assert refetched == [True]
     assert meta["cacheReuse"] == "none"
     assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
 

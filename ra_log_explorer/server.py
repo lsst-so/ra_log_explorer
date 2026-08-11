@@ -62,6 +62,7 @@ from .config import (
     dayObsStartUtc,
 )
 from .fetch import (
+    LIVE_SIDECAR_NAME,
     META_NAME,
     PARTIAL_FLAG,
     addExposureToCache,
@@ -1689,6 +1690,28 @@ def _resolveCacheWindow(cluster: str, namespace: str, slug: str, podsSub: str | 
     return path
 
 
+def _dropLiveSidecars(target: Path) -> None:
+    """Unlink every ``_live.json`` under ``target`` before it is removed.
+
+    A live night dir is only trustworthy because its sidecar vouches for
+    the byte ranges of the files beside it. Deleting the tree can fail
+    part-way — the poller is concurrently creating files in it, so
+    ``rmtree`` can hit ``ENOTEMPTY`` — and a tree that lost pod files but
+    kept its sidecar is worse than either outcome: the poller's
+    intactness check passes, it resumes appending to files that now start
+    mid-night, and every slice taken from them is short while claiming to
+    be complete.
+
+    Removing the sidecar first makes a partial delete indistinguishable
+    from a full one: no sidecar, so the poller opens the night afresh.
+    """
+    for sidecar in [target / LIVE_SIDECAR_NAME, *target.rglob(LIVE_SIDECAR_NAME)]:
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     """Remove a single cache directory, evicting any loaded state that
     used it.
@@ -1699,6 +1722,7 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     """
     with ctx.jobs.stateLock:
         ctx.evictByCacheDir(target)
+    _dropLiveSidecars(target)
     shutil.rmtree(target)
     # Tidy up empty parents.
     parent = target.parent
@@ -1716,7 +1740,15 @@ def _deleteCacheRoot(ctx: "ServerContext") -> None:
         ctx.rangeStates.clear()
     root = cache_root()
     if root.exists():
-        shutil.rmtree(root)
+        # Sidecars first (see _dropLiveSidecars), then the tree. The
+        # poller may be writing into it as we go, so a single rmtree can
+        # legitimately fail on a directory that regrew a file; one retry
+        # settles it, and the poller re-opens the night either way.
+        _dropLiveSidecars(root)
+        try:
+            shutil.rmtree(root)
+        except OSError:
+            shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
 
 

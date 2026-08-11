@@ -1281,6 +1281,50 @@ def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> N
     assert tmpCacheRoot.exists()
 
 
+def test_deleting_the_cache_drops_live_sidecars_first(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """A live night dir must never survive a delete with its sidecar but
+    without its pod files.
+
+    The sidecar is what vouches for each pod file's byte range, and the
+    poller's intactness check is "dir and sidecar exist". A tree that
+    lost pod files but kept the sidecar therefore passes that check: the
+    poller resumes appending to files that now start mid-night, the
+    recorded counts exceed the content, and every slice taken from them
+    is short while reporting itself complete. Removing sidecars first
+    makes a partial delete look like a full one, which the poller
+    already handles by re-opening the night.
+    """
+    from ra_log_explorer.fetch import LIVE_SIDECAR_NAME
+
+    host, port, _ctx = runningServer
+    nightDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night__win"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "pods" / "pod-a.jsonl").write_text("{}\n")
+    (nightDir / LIVE_SIDECAR_NAME).write_text('{"version": 1}')
+
+    # Wedge the tree removal so it fails after _dropLiveSidecars has run
+    # — the partial-delete case this ordering exists for.
+    import shutil as _shutil
+
+    def boom(*_a: object, ignore_errors: bool = False, **_kw: object) -> None:
+        if ignore_errors:
+            return  # real rmtree swallows it; the retry does the same
+        raise OSError(39, "Directory not empty")
+
+    original = _shutil.rmtree
+    _shutil.rmtree = boom  # type: ignore[assignment]
+    try:
+        _delete(host, port, "/api/cache")
+    finally:
+        _shutil.rmtree = original  # type: ignore[assignment]
+
+    # Whatever else survived, the sidecar did not: no half-deleted night
+    # can be mistaken for a resumable one.
+    assert not (nightDir / LIVE_SIDECAR_NAME).exists()
+
+
 def test_night_traceback_endpoint_returns_dataId_block(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:

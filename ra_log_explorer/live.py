@@ -136,9 +136,39 @@ def _emptyEventRecord() -> dict[str, Any]:
 
 
 def _appendFile(src: Path, dst: Path) -> None:
-    """Append ``src``'s bytes to ``dst`` (creating it if needed)."""
-    with open(src, "rb") as fromFh, open(dst, "ab") as toFh:
-        shutil.copyfileobj(fromFh, toFh)
+    """Append ``src``'s bytes to ``dst``, all-or-nothing.
+
+    A partial append must not survive. The caller leaves the pod's
+    watermark alone when this raises, so the same span is fetched again
+    next tick and appended *after* whatever landed — and the sidecar's
+    byte count, advanced only on success, would then be extended over
+    the stranded bytes on that later tick. The result is a durable range
+    the sidecar vouches for that contains duplicated and torn lines, in
+    non-ascending time order, which the slicer's bisect quietly
+    mis-answers. Finalisation can't catch it either: the line counter is
+    advanced only on success too, so the count still matches the oracle.
+
+    Truncating back to the pre-append size makes the span cleanly
+    retryable, exactly as :meth:`LiveNightManager._appendEventLines`
+    does for the events stream.
+    """
+    before = dst.stat().st_size if dst.exists() else 0
+    try:
+        with open(src, "rb") as fromFh, open(dst, "ab") as toFh:
+            shutil.copyfileobj(fromFh, toFh)
+    except BaseException:
+        try:
+            if before:
+                with open(dst, "ab") as fh:
+                    fh.truncate(before)
+            else:
+                dst.unlink(missing_ok=True)
+        except OSError:
+            # Nothing better to do than let the original error out; the
+            # recorded byte count still points at the last good line, so
+            # a restart's recovery truncation reaches the same place.
+            pass
+        raise
 
 
 class LiveNightManager:
@@ -425,7 +455,18 @@ class LiveNightManager:
     def _refetchWholePod(
         self, night: _Night, spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime
     ) -> None:
-        """Replace one pod's file with a fresh full-window fetch."""
+        """Replace one pod's file with a fresh full-window fetch.
+
+        Slicing is suspended for the duration. Zeroing the record alone
+        is not enough: a slicer that reads a zeroed record doesn't wait,
+        it *skips the pod* — and since finalisation has already cleared
+        that pod's error flags, the resulting slice is written with
+        ``fetchComplete: true``, misses a pod entirely, and then serves
+        every later identical request as an exact hit. The refetch takes
+        minutes over a whole night, and it runs exactly when people are
+        opening the night that just ended, so this is a wide window to
+        leave open.
+        """
         sidecar = night.sidecar
         podFile = night.dir / PODS_DIR_NAME / f"{pod}.jsonl"
         record = sidecar["pods"].setdefault(pod, _emptyPodRecord(spec.toIso))
@@ -434,21 +475,29 @@ class LiveNightManager:
         # byte count with the new inode and copy a prefix of the refetch.
         record["bytes"] = 0
         record["lines"] = 0
+        sidecar["rewritingPod"] = pod
         writeLiveSidecar(night.dir, sidecar)
-        fd, tmpName = tempfile.mkstemp(prefix="live-refetch-", suffix=".jsonl", dir=night.dir)
-        tmpPath = Path(tmpName)
         try:
-            with os.fdopen(fd, "wb") as fh:
-                lines, complete, reason = fetchPodWindowInto(spec, pod, fromT, toT, fh)
-            os.replace(tmpPath, podFile)
+            fd, tmpName = tempfile.mkstemp(prefix="live-refetch-", suffix=".jsonl", dir=night.dir)
+            tmpPath = Path(tmpName)
+            try:
+                with os.fdopen(fd, "wb") as fh:
+                    lines, complete, reason = fetchPodWindowInto(spec, pod, fromT, toT, fh)
+                os.replace(tmpPath, podFile)
+            finally:
+                tmpPath.unlink(missing_ok=True)
+            record["bytes"] = podFile.stat().st_size
+            record["lines"] = lines
+            record["watermarkIso"] = spec.toIso
+            if not complete:
+                sidecar["incomplete_pods"][pod] = reason
         finally:
-            tmpPath.unlink(missing_ok=True)
-        record["bytes"] = podFile.stat().st_size
-        record["lines"] = lines
-        record["watermarkIso"] = spec.toIso
-        if not complete:
-            sidecar["incomplete_pods"][pod] = reason
-        writeLiveSidecar(night.dir, sidecar)
+            # Cleared even when the refetch failed: the pod's record then
+            # honestly reads zero bytes, and the caller records the
+            # error, so slicing may resume against a night that is
+            # visibly short rather than silently so.
+            sidecar.pop("rewritingPod", None)
+            writeLiveSidecar(night.dir, sidecar)
 
     # ----- increment fetching -----------------------------------------------
 

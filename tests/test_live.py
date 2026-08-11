@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shutil
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -1026,6 +1027,100 @@ def test_events_append_failure_rolls_back(
     assert (eventsDir / "aaa-pod.jsonl").read_bytes() == _eventLine(_t(15), "aaa-pod")
     assert (eventsDir / "zzz-pod.jsonl").read_bytes() == _eventLine(_t(16), "zzz-pod")
     assert manager.snapshot()["eventsError"] is None
+
+
+def test_app_log_append_failure_rolls_back(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial app-log append must leave nothing behind.
+
+    The pod's watermark is deliberately not advanced when a fetch raises,
+    so the same span is retried next tick and appended *after* whatever
+    landed — and the sidecar's byte count, advanced only on success, then
+    covers the stranded bytes too. The window would be durably
+    duplicated, torn and out of time order while the line count still
+    matched the oracle, so finalisation's verification would pass it as
+    trustworthy. Nothing later ever revisits it.
+    """
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3)]))
+    manager.tick(now=_t(10))
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+    podFile = nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl"
+    good = podFile.read_bytes()
+    assert good == _lokiLine(_t(3))
+
+    # Second tick: the staged bytes are fine, but the copy into the pod
+    # file dies part-way (a full cache volume is the realistic cause —
+    # the poller never evicts, and a busy night is ~9 GiB). Failing the
+    # copy rather than stubbing _appendFile is the point: the rollback
+    # under test lives inside it.
+    realCopy = shutil.copyfileobj
+
+    def partialThenFail(fromFh: Any, toFh: Any, *args: Any, **kwargs: Any) -> None:
+        toFh.write(fromFh.read(20))  # a torn prefix of the increment
+        toFh.flush()
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(shutil, "copyfileobj", partialThenFail)
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(15), _t(16)]))
+    manager.tick(now=_t(20))
+
+    # Nothing of the failed span survived, and the record still describes
+    # exactly the bytes on disk.
+    assert podFile.read_bytes() == good
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    assert sidecar["pods"]["pod-a"]["bytes"] == len(good)
+    assert sidecar["pods"]["pod-a"]["lines"] == 1
+    assert fetch._parseIso(sidecar["pods"]["pod-a"]["watermarkIso"]) == _t(10)
+
+    # The retry replays the whole span exactly once, in order.
+    monkeypatch.setattr(shutil, "copyfileobj", realCopy)
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(15), _t(16)]))
+    manager.tick(now=_t(30))
+    assert podFile.read_bytes() == good + _lokiLine(_t(15)) + _lokiLine(_t(16))
+    assert sidecar is not None
+    after = fetch.readLiveSidecar(nightDir)
+    assert after is not None
+    assert after["pods"]["pod-a"]["bytes"] == podFile.stat().st_size
+    assert after["pods"]["pod-a"]["lines"] == 3
+
+
+def test_a_pod_being_refetched_suspends_slicing(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While finalisation swaps a pod's file wholesale, no slice may be
+    taken from the night.
+
+    The pod's record reads zero bytes for the minutes the refetch takes,
+    and a slicer honours that by *omitting the pod* — not by waiting.
+    Finalisation has already cleared that pod's error flags, so the slice
+    is written with fetchComplete: true, and every later identical
+    request exact-hits it. That is a permanently wrong cache, produced
+    exactly when people are opening the night that just ended.
+    """
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3), _t(5)]))
+    manager.tick(now=_t(10))
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+    spec = _sliceSpec(_t(2), _t(6))
+    # Ordinarily this window slices straight out of the night.
+    assert fetch._tryNightSlice(spec) is not None
+
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    sidecar["rewritingPod"] = "pod-a"
+    fetch.writeLiveSidecar(nightDir, sidecar)
+    # Now it declines, so the caller does a real fetch rather than
+    # materialising a silently pod-less window.
+    assert fetch._tryNightSlice(spec) is None
+
+    sidecar.pop("rewritingPod")
+    fetch.writeLiveSidecar(nightDir, sidecar)
+    assert fetch._tryNightSlice(spec) is not None
 
 
 def test_non_pod_events_are_inert_to_the_parser(tmp_path: Path) -> None:
