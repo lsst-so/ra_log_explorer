@@ -5,7 +5,15 @@
   <title>Rapid Analysis Log Explorer</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <!-- Loaded without blocking the first paint. A stylesheet link blocks
+       rendering until it resolves, and this one points off-site: on an
+       observatory network that cannot reach Google the page would sit
+       blank until the request timed out. `media="print"` makes it
+       non-blocking; the onload swap applies it once it arrives. The
+       webfonts are a nicety — style.css names full system fallback
+       stacks, so never getting them costs only the typeface. -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+        rel="stylesheet" media="print" onload="this.media='all'">
   <link rel="stylesheet" href="__BASE_PATH__/static/style.css" />
   <script>
     /* The server substitutes __BASE_PATH__ for the URL prefix it is served

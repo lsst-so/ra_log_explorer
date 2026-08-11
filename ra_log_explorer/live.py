@@ -424,9 +424,29 @@ class LiveNightManager:
         # seams — most plausibly ingestion lag beyond LIVE_LAG_S. Those
         # pods are re-fetched whole: the night is about to become a
         # permanent cache, so this is the last chance to be right.
+        # The count queries are independent and each is a Loki round
+        # trip, so they go out in parallel — the same width the tick's
+        # own fetching uses. Sequentially this is ~600 round trips for a
+        # busy night, minutes of wall clock, and it is not only paid at
+        # the noon rollover: the orphan sweep re-runs finalisation for a
+        # night it could not finish, once per tick, and a pass that
+        # outlasts the poll interval would hold the *current* night's
+        # watermark back while it ran.
         podExpected: dict[str, int] = {}
+        with ThreadPoolExecutor(max_workers=self._workers) as ex:
+            counted = dict(
+                zip(
+                    sorted(pods),
+                    ex.map(
+                        lambda pod: countPodWindow(spec, pod, nightStart, nightEnd),
+                        sorted(pods),
+                    ),
+                )
+            )
+        # The refetches stay sequential and in pod order: each one rewrites
+        # a file the slicer may be reading, and they are rare.
         for pod in sorted(pods):
-            expected = countPodWindow(spec, pod, nightStart, nightEnd)
+            expected = counted.get(pod)
             if expected is None:
                 continue
             podExpected[pod] = expected

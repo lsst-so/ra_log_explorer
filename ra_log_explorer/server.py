@@ -1369,11 +1369,19 @@ def _pickExposureCache(
 ) -> tuple[Path, Site, dict, dict, dt.datetime] | None:
     """The cached window that really holds this exposure, or ``None``.
 
-    A window qualifies only if it spans the exposure's own shutter close.
-    That is what separates the two instruments' windows for a colliding
-    bare id: they are an hour apart, so at most one of them can contain
-    a given t₀. Newest-first among the ones that do, so a re-fetch still
-    wins over an older window of the same exposure.
+    A window qualifies only if it spans the exposure's own shutter close,
+    resolved under the caller's instrument. That is what usually
+    separates the two instruments' windows for a colliding bare id —
+    though not always: sequence numbers converge early in the night and
+    the window pads are the user's to widen, so both windows can span
+    the pinned t₀. Newest-first among the ones that do, which also means
+    a re-fetch wins over an older window of the same exposure.
+
+    Being wrong here is bounded rather than dangerous: any window that
+    spans this t₀ does contain this exposure's logs, at worst
+    edge-truncated (which `looksTruncatedEnd` flags). The pin has
+    already decided *which* exposure is being asked about, by the time
+    the record was looked up.
     """
     for cacheDir in _findExposureCacheDirs(expId):
         site = _siteForCacheDir(ctx, cacheDir)
@@ -2140,6 +2148,13 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         return
                     with ctx.jobs.stateLock:
                         nightState = ctx.getNightState(dayObs)
+                    if nightState is None:
+                        # Same rebuild-from-disk attempt the summary and
+                        # pod routes make. Without it, opening a ninth
+                        # night evicts the first and every failure row
+                        # already on that page 404s until the user
+                        # happens to reload the summary.
+                        nightState = _loadNightFromCache(ctx, dayObs)
                 if nightState is None:
                     self._send_error_json(404, "No night loaded for the requested dayObs")
                     return

@@ -252,9 +252,18 @@ Sibling docs:
   under `<instrument>:<id>`, and `/api/exposure-time/<id>` accepts an
   `?instrument=`. The **bare id** is still a meaningful question with a
   defined answer — "whichever instrument `INSTRUMENTS_BY_PROBE_ORDER`
-  reaches first" — and that is what an unqualified lookup and the bare
+  reaches first" — and that is what an unqualified *lookup* and the bare
   cache key resolve to; every writer agrees on that rule so the answer
   can't depend on who wrote last.
+
+  That rule governs the data layer, not the in-memory slots. An
+  unpinned `/api/summary?dataId=` is answered from whichever instrument's
+  state currently occupies the bare key, which need not be the
+  probe-order one — the guard below only refuses a *mismatch*, and with
+  no pin there is nothing to mismatch. Every link the UI emits carries
+  its instrument, so this is reachable only by hand-typing a URL or
+  following a bookmark predating the pin; the payload names the
+  instrument it is describing.
 
   The **serving layer** is pinned per page. The home topbar carries an
   instrument switch (LSSTCam default — always the default when one must

@@ -1088,6 +1088,35 @@ def test_app_log_append_failure_rolls_back(
     assert after["pods"]["pod-a"]["lines"] == 3
 
 
+def test_slicing_a_night_counts_as_using_the_night(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LRU has to see the source, not only the slice.
+
+    Eviction ranks windows by `_last_viewed.txt`, and a slice serve used
+    to touch only the slice's own. A finalised night whose slices are in
+    daily use therefore looked untouched and was reclaimed first — the
+    9 GiB thing nobody can cheaply rebuild, evicted to keep the cheap
+    derivatives that came out of it.
+    """
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3), _t(5)]))
+    manager.tick(now=_t(10))
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+
+    stale = dt.datetime(2020, 1, 1, tzinfo=dt.timezone.utc)
+    fetch.markCacheViewed(nightDir, when=stale)
+    assert fetch.getCacheLastViewed(nightDir) == stale
+
+    result = fetch._tryNightSlice(_sliceSpec(_t(2), _t(6)))
+    assert result is not None
+    sliceDir, _meta = result
+    assert sliceDir != nightDir
+    bumped = fetch.getCacheLastViewed(nightDir)
+    assert bumped is not None and bumped > stale
+
+
 def test_a_pod_being_refetched_suspends_slicing(
     manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:

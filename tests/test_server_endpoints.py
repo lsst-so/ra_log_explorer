@@ -1422,6 +1422,77 @@ def test_night_traceback_endpoint_returns_dataId_block(
     assert not any("2026052100013" in r for r in rawTexts)
 
 
+def test_night_traceback_rebuilds_the_night_from_disk(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The drilldown survives its night being evicted.
+
+    Failure rows are the whole point of the night view, and the state
+    behind them is an LRU slot capped at 8. Opening a ninth night — or
+    any window — evicted the first, and every row already on that page
+    then 404'd until the user happened to reload the summary, which is
+    not a connection anyone would make. Every other keyed route already
+    rebuilt from the cache; this one just never tried.
+    """
+    from ra_log_explorer import parse as _parse
+
+    host, port, ctx = runningServer
+    dayObs = 20260521
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night-win" / "pods=__aos__"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    with open(podsDir / f"{podName}.jsonl", "w") as fh:
+        for ts, level, raw in [
+            (
+                "2026-05-21T22:47:00.000+00:00",
+                "info",
+                "2026-05-21 22:47:00,000 worker fn INFO   Running pipeline for 2026052100012 detector 5",
+            ),
+            ("2026-05-21T22:47:10.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T22:47:10.002+00:00", "error", "RuntimeError: bang"),
+        ]:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": level}, "line": raw + "\n"}) + "\n"
+            )
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-21T12:00:00.000000Z",
+                    "toIso": "2026-05-22T12:00:00.000000Z",
+                    "podRegex": ".*aos.*",
+                    "workers": 8,
+                },
+                "fetched_at": "2026-05-22T15:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "errors": {},
+                "fetchSchemaVersion": 5,
+            }
+        )
+    )
+    summary = _parse.summarizeAll(cacheDir)[0]
+    bodyKey = f"{summary.pod}@{summary.tracebacks[0].t.isoformat()}"
+
+    # Nothing loaded: exactly the post-eviction state.
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is None
+
+    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}")
+    assert status == 200, body
+    assert body["expId"] == 2026052100012
+    assert body["excClass"] == "RuntimeError"
+    # And the rebuilt night is resident, so the rest of the page's rows
+    # do not each pay for their own reparse.
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is not None
+
+
 def test_delete_cache_window_clears_loaded_state_if_match(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:

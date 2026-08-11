@@ -1225,6 +1225,13 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
     # same pod files. Re-entrant, so the common (unclamped) case, where
     # target IS the already-locked requested dir, costs nothing.
     with windowWriteLock(target):
+        # Serving anything out of this night counts as using the night
+        # itself. Without this only the slice's own sidecar is touched,
+        # so a finalised night whose slices are in daily use looks
+        # untouched to LRU eviction and is reclaimed before them — the
+        # expensive thing evicted to keep the cheap derivatives that
+        # cannot be rebuilt without it.
+        markCacheViewed(nightDir)
         if (target / META_NAME).exists() and not (target / PARTIAL_FLAG).exists():
             try:
                 meta = json.loads((target / META_NAME).read_text())
