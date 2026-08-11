@@ -141,7 +141,11 @@ Three rules keep it coherent with everything else here:
 
 `fetchAll(spec, ...)` runs the whole of the following under a
 **per-window write lock** (`windowWriteLock`, keyed on the requested
-window directory). A cache window is a directory of files plus a
+window directory). The clamped night slice (step 2½) additionally
+locks the slice's *destination* — the clamped `[nightStart, watermark]`
+window is not the requested path, and a direct fetch of that same
+window locks it as its own; the locks are re-entrant so the common
+target-is-the-requested-dir case costs nothing. A cache window is a directory of files plus a
 `_meta.json` vouching for them; two threads asking for the same window
 would otherwise both find no cache and both write the same
 `pods/<pod>.jsonl`. The second caller waits and then takes the first's

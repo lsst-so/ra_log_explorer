@@ -1201,29 +1201,37 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
     target = windowCachePath(
         sliceSpec.cluster, sliceSpec.namespace, sliceSpec.fromIso, sliceSpec.toIso, sliceSpec.podRegex
     )
-    if (target / META_NAME).exists() and not (target / PARTIAL_FLAG).exists():
+    # fetchAll's lock is on the *requested* window path. In the clamped
+    # branch the slice lands somewhere else — [nightStart, watermark] —
+    # which a direct request for that same window locks as its own
+    # requested path, so without this a clamped night-mode open and a
+    # direct fetch of "the night so far" could interleave bytes in the
+    # same pod files. Re-entrant, so the common (unclamped) case, where
+    # target IS the already-locked requested dir, costs nothing.
+    with windowWriteLock(target):
+        if (target / META_NAME).exists() and not (target / PARTIAL_FLAG).exists():
+            try:
+                meta = json.loads((target / META_NAME).read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = None
+            if meta and meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "exact"
+                return target, meta
+        if target.resolve() == nightDir.resolve():
+            # The request *is* the night's own window, and the night dir
+            # already holds exactly that — hand it over rather than copying
+            # it onto itself (which would truncate every pod file as it read
+            # it). A finalised night takes the exact-hit branch above; this
+            # covers the gap between the watermark reaching night end and
+            # finalisation writing _meta.json, which is where the
+            # --live-day-obs staging mode parks permanently.
+            return nightDir, liveNightMeta(sidecar, sliceSpec)
         try:
-            meta = json.loads((target / META_NAME).read_text())
-        except (OSError, json.JSONDecodeError):
-            meta = None
-        if meta and meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
-            meta["fromCache"] = True
-            meta["cacheReuse"] = "exact"
-            return target, meta
-    if target.resolve() == nightDir.resolve():
-        # The request *is* the night's own window, and the night dir
-        # already holds exactly that — hand it over rather than copying
-        # it onto itself (which would truncate every pod file as it read
-        # it). A finalised night takes the exact-hit branch above; this
-        # covers the gap between the watermark reaching night end and
-        # finalisation writing _meta.json, which is where the
-        # --live-day-obs staging mode parks permanently.
-        return nightDir, liveNightMeta(sidecar, sliceSpec)
-    try:
-        return materializeNightSlice(nightDir, sliceSpec)
-    except Exception as e:  # noqa: BLE001 — slice is an optimisation
-        print(f"night-slice from {nightDir} failed ({e}); falling back", file=sys.stderr)
-        return None
+            return materializeNightSlice(nightDir, sliceSpec)
+        except Exception as e:  # noqa: BLE001 — slice is an optimisation
+            print(f"night-slice from {nightDir} failed ({e}); falling back", file=sys.stderr)
+            return None
 
 
 def findSupersetCache(

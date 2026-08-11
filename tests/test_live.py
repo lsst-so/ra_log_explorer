@@ -524,6 +524,63 @@ def test_concurrent_fetchAll_for_one_window_is_serialised(
     )
 
 
+def test_clamped_slice_and_direct_window_fetch_are_serialised(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """fetchAll's lock is on the *requested* window path, and the clamped
+    branch writes somewhere else: night mode on the current dayObs asks
+    for the night's own window but slices into [nightStart, watermark].
+    A direct request for exactly that window locks it as its own
+    requested path — so the two used to be able to interleave bytes in
+    the same pod files. _tryNightSlice now locks the slice's real
+    destination too."""
+    import threading
+
+    _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"pod-a": [_t(6), _t(7), _t(8)]})
+    nightOwn = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))  # clamps to the watermark
+    direct = _sliceSpec(dayObsStartUtc(20260711), _t(30))  # the clamped target, asked for directly
+    inFlight = {"n": 0, "maxConcurrent": 0}
+    guard = threading.Lock()
+    realSlice = fetch._sliceNightInto
+
+    def observedSlice(*a: Any, **k: Any) -> Any:
+        with guard:
+            inFlight["n"] += 1
+            inFlight["maxConcurrent"] = max(inFlight["maxConcurrent"], inFlight["n"])
+        try:
+            time.sleep(0.05)
+            return realSlice(*a, **k)
+        finally:
+            with guard:
+                inFlight["n"] -= 1
+
+    monkeypatch.setattr(fetch, "_sliceNightInto", observedSlice)
+    monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no net")))
+
+    results: list[tuple[Path, dict]] = []
+    errors: list[Exception] = []
+
+    def run(spec: FetchSpec) -> None:
+        try:
+            results.append(fetch.fetchAll(spec))
+        except Exception as e:  # noqa: BLE001 — collected, then asserted on below
+            errors.append(e)
+
+    threads = [threading.Thread(target=run, args=(s,)) for s in (nightOwn, direct, nightOwn, direct)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(10)
+    assert not errors
+    assert inFlight["maxConcurrent"] == 1
+    # Both request shapes land on the one materialized window, whole.
+    assert len({str(d) for d, _ in results}) == 1
+    sliceDir = results[0][0]
+    assert (sliceDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_t(6), _t(7), _t(8))
+    )
+
+
 # ----- LiveNightManager -----------------------------------------------------
 
 
