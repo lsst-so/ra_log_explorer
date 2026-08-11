@@ -2,27 +2,32 @@
 
 The server runs against a long-lived :class:`ServerContext` that holds:
 
-  * two LRU-ordered dicts of loaded states (one per exposure / night),
+  * three LRU-ordered dicts of loaded states (exposure / night / range),
   * a :class:`~ra_log_explorer.jobs.JobManager` for fetch jobs the user
     kicks off from the home page,
-  * the single ``stateLock`` that guards both keyed-state dicts.
+  * the single ``stateLock`` that guards the keyed-state dicts.
 
-HTTP surface (see ``architecture/architecture.md`` for the full schema):
+HTTP surface (see ``architecture/architecture.md`` for the full schema;
+every route is mounted under ``ServerContext.basePath``):
 
-  GET    /                                       timeline.html (home + explore + night SPA)
+  GET    /healthz                                 readiness probe; touches no state
+  GET    /                                        timeline.html (home/admin/explore/night SPA)
   GET    /static/*                                static assets
-  GET    /api/summary?dataId=<>|?dayObs=<>        view-state lookup by exposure or dayObs
-  GET    /api/pod/<pod>?dataId=<>|?dayObs=<>      full parsed log for one pod
+  GET    /api/summary?dataId=<>[&instrument=<>]   view-state lookup by exposure…
+                     |?dayObs=<>                  …by dayObs…
+                     |?rangeStart=&rangeStop=[&dataId=]  …or by range (+ one exposure in it)
+  GET    /api/pod/<pod>?dataId=<>[&instrument=<>] full parsed log for one pod
+                       |?dayObs=<>|?rangeStart=&rangeStop=&dataId=
   GET    /api/night/traceback/<bodyKey>?dayObs=<> per-failure drilldown
   GET    /api/cache                               list of cached windows on disk
   DELETE /api/cache                               delete the entire cache
   DELETE /api/cache/<cluster>/<ns>/<slug>[/<pods=…>]  delete one cached window
-  GET    /api/exposure-time/<dataId>?site=<name>  dataId -> shutter-close (TAI) lookup
-  GET    /api/sites                               site catalog (cluster + ConsDB pairings)
-  GET    /api/settings                            current persisted server-side settings
-  PUT    /api/settings                            update server-side settings
+  GET    /api/exposure-time/<dataId>[?instrument=<>]  dataId -> ConsDB exposure record (TAI t-zero)
+  GET    /api/site                                the one site this server serves (read-only)
+  GET    /api/live                                live poller snapshot ({enabled: false} when off)
   POST   /api/fetch                               start an exposure fetch; returns {jobId}
   POST   /api/fetch-night                         start a night fetch; returns {jobId}
+  POST   /api/fetch-range                         start a range fetch; returns {jobId}
   GET    /api/fetch/<id>/status                   JSON snapshot of a fetch job
   GET    /api/fetch/<id>/progress                 SSE stream of fetch progress events
 """

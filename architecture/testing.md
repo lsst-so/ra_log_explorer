@@ -75,10 +75,10 @@ naming the install command. Both exit non-zero. CI installs both and
 runs the whole suite in one job for the same reason.
 
 `-n auto` is worth the habit: measured on an 8-core laptop, the unit
-tests take 75 s serially and 31 s in parallel, and adding all 81 browser
-tests to the parallel run costs **0.1 s** — they parallelise almost
-perfectly, where the unit suite does not. Serially they would double
-the suite.
+tests take 75 s serially and 31 s in parallel, and adding all ~86
+browser tests to the parallel run costs **0.1 s** — they parallelise
+almost perfectly, where the unit suite does not. Serially they would
+double the suite.
 
 ### What they run against
 
