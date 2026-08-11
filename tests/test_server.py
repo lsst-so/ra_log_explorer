@@ -618,7 +618,7 @@ def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
     assert ctx.getNightState(20260521) is None  # matched, evicted
 
 
-# ----- _taiIsoToUtc --------------------------------------------------------
+# ----- taiIsoToUtc ---------------------------------------------------------
 
 
 def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
@@ -627,7 +627,7 @@ def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
     halves matter — getting either wrong silently shifts every
     histogram bar.
     """
-    out = server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    out = exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     expected = dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
     assert out == expected
 
@@ -638,8 +638,8 @@ def test_utcToTaiIso_inverts_taiIsoToUtc() -> None:
     came from, so the manual value round-trips through the per-site cache.
     """
     taiIso = "2026-06-24T14:38:41.380663"
-    utc = server._taiIsoToUtc(taiIso)
-    assert server._utcToTaiIso(utc) == taiIso
+    utc = exposureTimes.taiIsoToUtc(taiIso)
+    assert exposureTimes.utcToTaiIso(utc) == taiIso
 
 
 # ----- _buildNightPayload --------------------------------------------------
@@ -1308,7 +1308,7 @@ def test_resolveShutterCloses_requeries_manual_standins(
 
     assert queried == [[2026052000001]]  # the stand-in was re-queried
     # ConsDB's value won, in memory and on disk.
-    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     assert info[2026052000001]["physical_filter"] == "r"
     stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
     assert exposureTimes.isManual(stored) is False
@@ -1344,7 +1344,7 @@ def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-06-24T14:38:41.380663")
     stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
     assert exposureTimes.isManual(stored) is True
     assert _phase(job, "done")["stillMissing"] == 0
@@ -1364,7 +1364,7 @@ def test_resolveShutterCloses_manual_survives_a_missing_token(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-06-24T14:38:41.380663")
     assert 2026052000002 not in target
     assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
 
@@ -1390,7 +1390,7 @@ def test_resolveShutterCloses_real_cache_hit_skips_consdb(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     checked = _phase(job, "cache-checked")
     assert checked["cacheHits"] == 1 and checked["manualStandins"] == 0
 
@@ -1978,3 +1978,53 @@ def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
     assert state.shutterCloseByExpId[collidingId] == dt.datetime(
         2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc
     )
+
+
+# ----- LRU eviction vs loaded states ---------------------------------------
+
+
+def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window LRU eviction removes must take its loaded state with it.
+
+    Without this, a state held in memory over a deleted directory keeps
+    serving its summary while every pod drilldown quietly comes back
+    empty — iterPodLines treats the missing file as an empty one.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    oldDir = tmpCacheRoot / "summit-cluster" / "ra" / "old-window"
+    oldDir.mkdir(parents=True)
+    staleState = server.ServerState(
+        cacheDir=oldDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026052000001,
+        tZero=dt.datetime(2026, 5, 20, 8, 46, tzinfo=dt.timezone.utc),
+    )
+    ctx.putExposureState(staleState)
+
+    newDir = tmpCacheRoot / "summit-cluster" / "ra" / "new-window"
+    (newDir / "pods").mkdir(parents=True)
+    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): [oldDir])
+    job = FetchJob(
+        jobId="j1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="summit-cluster",
+            namespace="ra",
+            fromIso="2026-05-20T08:45:00Z",
+            toIso="2026-05-20T08:50:00Z",
+        ),
+        siteName=siteCatalog.defaultName,
+        instrument="lsstcam",
+        expId=2026052000002,
+        tZero=dt.datetime(2026, 5, 20, 8, 47, tzinfo=dt.timezone.utc),
+    )
+    job.cacheDir = newDir
+    server._onFetchComplete(ctx)(job)
+    # The evicted window's state is gone; the fresh fetch's state is in.
+    assert ctx.getExposureState(2026052000001) is None
+    assert ctx.getExposureState(2026052000002) is not None

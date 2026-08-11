@@ -36,6 +36,7 @@ than an id-keyed map so a shared id can't silently drop an exposure.
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 from collections.abc import Iterable
 from pathlib import Path
@@ -47,6 +48,31 @@ from .config import cache_root
 from .sites import Site
 
 TAI_MINUS_UTC_S = 37.0
+
+
+def taiIsoToUtc(taiIso: str) -> dt.datetime:
+    """Parse a ConsDB ``obs_end`` (TAI ISO, no zone suffix) into aware UTC.
+
+    The one conversion every consumer of a record's t-zero needs, kept
+    beside :data:`TAI_MINUS_UTC_S` so the offset and its application
+    can't drift apart.
+    """
+    t = dt.datetime.fromisoformat(taiIso.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc) - dt.timedelta(seconds=TAI_MINUS_UTC_S)
+
+
+def utcToTaiIso(t: dt.datetime) -> str:
+    """Inverse of :func:`taiIsoToUtc`: a UTC datetime → the ConsDB-style
+    TAI ``obs_end`` string (no timezone, microsecond precision).
+
+    Used to persist a hand-entered shutter close into the per-site
+    exposure-time cache in the same TAI form a real ConsDB row carries.
+    """
+    tai = t.astimezone(dt.timezone.utc) + dt.timedelta(seconds=TAI_MINUS_UTC_S)
+    return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
 
 # On-disk cache: per-site JSON file mapping ``dataId (as string) ->
 # exposure record (a JSON object of the columns below, including

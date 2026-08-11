@@ -535,6 +535,17 @@ class LiveNightManager:
         nightStart = dayObsStartUtc(night.dayObs)
         globalW = _parseIso(sidecar["watermarkIso"])
         if target <= globalW:
+            # The app-log frontier is already at the target — but the
+            # events stream may still be behind it: a failed events fetch
+            # leaves its own watermark back, and once the app-log
+            # watermark reaches night end every later tick (and
+            # finalisation itself) lands here. Without this retry that
+            # failure would be permanent, and the night would finalise
+            # missing the tail's lifecycle markers.
+            before = (sidecar.get("eventsWatermarkIso"), sidecar.get("eventsError"))
+            self._appendEventsIncrement(night, spec, target)
+            if (sidecar.get("eventsWatermarkIso"), sidecar.get("eventsError")) != before:
+                writeLiveSidecar(night.dir, sidecar)
             return 0, 0
         targetIso = _fmtLogcliTime(target)
         listSpec = replace(spec, fromIso=_fmtLogcliTime(globalW), toIso=targetIso)
@@ -788,7 +799,7 @@ class LiveNightManager:
             obsEndUtc: dt.datetime | None = None
             if obsEndTai is not None:
                 try:
-                    obsEndUtc = _taiIsoToUtc(obsEndTai)
+                    obsEndUtc = exposureTimes.taiIsoToUtc(obsEndTai)
                 except ValueError:
                     obsEndUtc = None
             readyAt = obsEndUtc + dt.timedelta(seconds=self._windowAfterS) if obsEndUtc is not None else None
@@ -926,11 +937,3 @@ def _exposureKey(record: exposureTimes.ExposureRecord) -> tuple[str, int] | None
     if instrument is None or dataId is None:
         return None
     return instrument, dataId
-
-
-def _taiIsoToUtc(taiIso: str) -> dt.datetime:
-    """Parse a ConsDB ``obs_end`` (TAI, no zone suffix) into aware UTC."""
-    t = dt.datetime.fromisoformat(taiIso.replace("Z", "+00:00"))
-    if t.tzinfo is None:
-        t = t.replace(tzinfo=dt.timezone.utc)
-    return t.astimezone(dt.timezone.utc) - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)

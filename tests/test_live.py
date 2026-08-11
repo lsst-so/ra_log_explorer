@@ -987,6 +987,78 @@ def test_events_fetch_failure_leaves_span_retryable(
     assert manager.snapshot()["eventsError"] is None
 
 
+def test_events_failure_is_retried_even_when_the_app_watermark_is_current(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The events retry must not depend on the app-log frontier moving.
+
+    Once the app-log watermark reaches the tick's target — which is
+    permanent at night end, where every later tick and finalisation
+    itself land on the early-return path — an events failure from an
+    earlier tick would otherwise never be retried, and the night would
+    finalise missing the tail's lifecycle markers."""
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3)]))
+
+    def boom(*a: Any, **k: Any) -> tuple[int, bool, str]:
+        raise fetch.FetchError("logcli timed out")
+
+    monkeypatch.setattr(live, "fetchEventsWindowInto", boom)
+    manager.tick(now=_t(10))
+    assert "logcli timed out" in (manager.snapshot()["eventsError"] or "")
+
+    # Same now again: target == watermark, so the app-log side has
+    # nothing to do — the events span must still be retried.
+    seen: list[tuple[dt.datetime, dt.datetime]] = []
+
+    def record(spec: FetchSpec, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO) -> tuple[int, bool, str]:
+        seen.append((fromT, toT))
+        fh.write(_eventLine(_t(5), "pod-a"))
+        return 1, True, ""
+
+    monkeypatch.setattr(live, "fetchEventsWindowInto", record)
+    manager.tick(now=_t(10))
+    assert seen == [(dayObsStartUtc(20260711), _t(10))]
+    assert manager.snapshot()["eventsError"] is None
+    # The catch-up is durable: the sidecar on disk carries the advanced
+    # events watermark, not just the in-memory copy.
+    nightDir = fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9))
+    assert nightDir is not None
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    assert fetch._parseIso(sidecar["eventsWatermarkIso"]) == _t(10)
+    assert (nightDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").read_bytes() == _eventLine(_t(5), "pod-a")
+
+
+def test_evictToFit_drops_the_live_sidecar_before_removing_a_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A finalised night is an ordinary evictable window, but its rmtree
+    can fail part-way — and a tree that lost pod files while keeping its
+    sidecar would still be offered up by findNightDirCovering, serving
+    short slices that claim to be complete. The delete endpoints already
+    unlink sidecars first; eviction must too."""
+    nightDir = _makeNightDir(tmpCacheRoot, watermark=None, podTimes={"pod-a": [_t(3)]})
+    (nightDir / fetch.META_NAME).write_text(json.dumps({"fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION}))
+    fetch.markCacheViewed(nightDir, when=dt.datetime(2020, 1, 1, tzinfo=UTC))
+
+    realRmtree = shutil.rmtree
+
+    def wedgedRmtree(path: Any, *a: Any, **k: Any) -> None:
+        if Path(path) == nightDir:
+            raise OSError(39, "Directory not empty")
+        realRmtree(path, *a, **k)
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", wedgedRmtree)
+    removed = fetch.evictToFit(maxBytes=0)
+    assert removed == []  # the rmtree failed...
+    assert nightDir.exists()
+    # ...but the sidecar went first, so the survivor can't pass for a
+    # usable night dir.
+    assert fetch.readLiveSidecar(nightDir) is None
+    assert fetch.findNightDirCovering("yagan", "rapid-analysis", _t(1), _t(9)) is None
+
+
 def test_events_append_failure_rolls_back(
     manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch
 ) -> None:

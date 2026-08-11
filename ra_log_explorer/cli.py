@@ -67,6 +67,7 @@ from .fetch import (
     stderrProgress,
 )
 from .jobs import JobManager
+from .live import LiveNightManager
 from .server import ServerContext, ServerState, serve
 from .sites import Site, loadSites, siteByName
 
@@ -139,11 +140,11 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
     )
 
 
-def _resolveSite(args: argparse.Namespace) -> Site:
-    """Look up the site named by --site (or the catalog default)."""
+def _resolveSite(args: argparse.Namespace) -> tuple[Site, list[Site]]:
+    """The site named by --site (or the catalog default), plus the catalog."""
     sites, defaultName = loadSites()
     name = args.site or defaultName
-    return siteByName(sites, name)
+    return siteByName(sites, name), sites
 
 
 def _warnIfIncompleteFetch(meta: dict, cacheDir: object) -> None:
@@ -270,8 +271,7 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
         return 2
 
-    site = _resolveSite(args)
-    sites, _ = loadSites()
+    site, sites = _resolveSite(args)
     state: ServerState | None = None
     if eager:
         state = _eagerFetchAndBuildState(args, site)
@@ -293,8 +293,6 @@ def cmdRun(args: argparse.Namespace) -> int:
         # views are served by slicing. Deployment-only in practice (the
         # chart sets RA_LOG_EXPLORER_LIVE_POLL_S); the flag exists so a
         # laptop can exercise the same path against a real cluster.
-        from .live import LiveNightManager
-
         ctx.live = LiveNightManager(
             site=site,
             username=args.username,

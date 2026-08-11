@@ -40,7 +40,7 @@ import mimetypes
 import re
 import shutil
 from collections import OrderedDict
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -55,6 +55,7 @@ from .config import (
     DEFAULT_WINDOW_BEFORE_S,
     DEFAULT_WORKERS,
     MAX_CACHE_BYTES,
+    MAX_RANGE_SPAN,
     NIGHT_AOS_POD_REGEX,
     FetchSpec,
     cache_root,
@@ -62,11 +63,11 @@ from .config import (
     dayObsStartUtc,
 )
 from .fetch import (
-    LIVE_SIDECAR_NAME,
     META_NAME,
     PARTIAL_FLAG,
     addExposureToCache,
     cacheDuSizeBytes,
+    dropLiveSidecarsUnder,
     evictToFit,
     getCacheExposureIds,
     getCacheLastViewed,
@@ -582,10 +583,10 @@ def _buildSummaryPayload(state: ServerState) -> dict:
     }
 
 
-def _podDetail(state: ServerState, pod: str) -> dict:
-    logPath = loadPodLogPath(state.cacheDir, pod)
-    group = parser.podGroup(pod)
-    isCarryover = group in parser.carryoverGroups()
+def _podLinesPayload(cacheDir: Path, pod: str, anchor: dt.datetime) -> dict:
+    """The line-by-line payload for one pod, with ``offsetS`` from ``anchor``."""
+    logPath = loadPodLogPath(cacheDir, pod)
+    isCarryover = parser.podGroup(pod) in parser.carryoverGroups()
     currentExpId: int | None = None
     lines: list[dict] = []
     for ln in parser.iterPodLines(logPath):
@@ -599,7 +600,7 @@ def _podDetail(state: ServerState, pod: str) -> dict:
         lines.append(
             {
                 "t": ln.timestamp.isoformat(),
-                "offsetS": (ln.timestamp - state.tZero).total_seconds(),
+                "offsetS": (ln.timestamp - anchor).total_seconds(),
                 "level": ln.level,
                 "logger": ln.logger,
                 "function": ln.function,
@@ -609,36 +610,18 @@ def _podDetail(state: ServerState, pod: str) -> dict:
             }
         )
     return {"pod": pod, "lines": lines}
+
+
+def _podDetail(state: ServerState, pod: str) -> dict:
+    return _podLinesPayload(state.cacheDir, pod, state.tZero)
 
 
 def _podDetailForNight(state: NightState, pod: str) -> dict:
-    """Same line-by-line shape as :func:`_podDetail`, but ``offsetS`` is
-    measured from the dayObs start (noon UTC) rather than from a single
-    shutter close — there is no per-pod shutter close in night mode.
+    """Same shape as :func:`_podDetail`, but ``offsetS`` is measured from
+    the dayObs start (noon UTC) rather than from a single shutter close —
+    there is no per-pod shutter close in night mode.
     """
-    logPath = loadPodLogPath(state.cacheDir, pod)
-    group = parser.podGroup(pod)
-    isCarryover = group in parser.carryoverGroups()
-    currentExpId: int | None = None
-    lines: list[dict] = []
-    for ln in parser.iterPodLines(logPath):
-        found = parser.extractExpId(ln.raw)
-        if found is not None:
-            currentExpId = found
-        inferred = currentExpId if isCarryover else found
-        lines.append(
-            {
-                "t": ln.timestamp.isoformat(),
-                "offsetS": (ln.timestamp - state.startTime).total_seconds(),
-                "level": ln.level,
-                "logger": ln.logger,
-                "function": ln.function,
-                "message": ln.message,
-                "raw": ln.raw,
-                "expId": inferred,
-            }
-        )
-    return {"pod": pod, "lines": lines}
+    return _podLinesPayload(state.cacheDir, pod, state.startTime)
 
 
 # ----- night payload --------------------------------------------------------
@@ -776,7 +759,7 @@ def _resolveShutterClosesInto(
         if rec is None or iso is None:
             misses.append(expId)
             continue
-        target[expId] = _taiIsoToUtc(iso)
+        target[expId] = exposureTimes.taiIsoToUtc(iso)
         infoTarget[expId] = rec
         if exposureTimes.isManual(rec):
             misses.append(expId)  # anchored provisionally; ConsDB may supersede
@@ -849,7 +832,7 @@ def _resolveShutterClosesInto(
         iso = exposureTimes.obsEnd(rec)
         if iso is None:
             continue  # row exists but no obs_end — can't anchor a t₀
-        target[expId] = _taiIsoToUtc(iso)
+        target[expId] = exposureTimes.taiIsoToUtc(iso)
         infoTarget[expId] = rec
         consdbHits += 1
     job.push(
@@ -860,22 +843,6 @@ def _resolveShutterClosesInto(
             "stillMissing": unanchored(),
         }
     )
-
-
-def _taiIsoToUtc(taiIso: str) -> dt.datetime:
-    """Parse a ConsDB ``obs_end`` (TAI ISO, no tz) into a UTC datetime."""
-    return parser._parseTimestamp(taiIso + "Z") - dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
-
-
-def _utcToTaiIso(t: dt.datetime) -> str:
-    """Inverse of :func:`_taiIsoToUtc`: a UTC datetime → the ConsDB-style
-    TAI ``obs_end`` string (no timezone, microsecond precision).
-
-    Used to persist a hand-entered shutter close into the per-site
-    exposure-time cache in the same TAI form a real ConsDB row carries.
-    """
-    tai = t.astimezone(dt.timezone.utc) + dt.timedelta(seconds=exposureTimes.TAI_MINUS_UTC_S)
-    return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
 def _shutterCloseLabel(record: exposureTimes.ExposureRecord | None) -> str:
@@ -1171,6 +1138,52 @@ def _tracebackContextForNight(state: NightState, bodyKey: str) -> dict | None:
 # ----- cache listing --------------------------------------------------------
 
 
+def _completedCacheMeta(window: Path) -> dict | None:
+    """Parsed ``_meta.json`` for a completed cache window, else ``None``.
+
+    "Completed" means the meta is present, parseable, and no ``.partial``
+    flag — the one eligibility test every cache-walking reader shares.
+    """
+    metaPath = window / META_NAME
+    if not metaPath.exists() or (window / PARTIAL_FLAG).exists():
+        return None
+    try:
+        return json.loads(metaPath.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _iterCompletedCaches(nightMode: bool) -> Iterator[tuple[Path, dict]]:
+    """Yield ``(dir, meta)`` for every completed cache window on disk.
+
+    ``nightMode`` picks the layout depth: night-mode (pod-filtered)
+    caches nest one level deeper, at ``<cluster>/<ns>/<window>/pods=<slug>/``;
+    everything else — exposure and range caches — lives at
+    ``<cluster>/<ns>/<window>/``. One walker, so the rebuild-path finders
+    can't disagree about what counts as a usable cache.
+    """
+    root = cache_root()
+    if not root.exists():
+        return
+    for cluster in root.iterdir():
+        if not cluster.is_dir():
+            continue
+        for ns in cluster.iterdir():
+            if not ns.is_dir():
+                continue
+            for window in ns.iterdir():
+                if not window.is_dir():
+                    continue
+                if nightMode:
+                    candidates = [d for d in window.iterdir() if d.is_dir() and d.name.startswith("pods=")]
+                else:
+                    candidates = [window]
+                for candidate in candidates:
+                    meta = _completedCacheMeta(candidate)
+                    if meta is not None:
+                        yield candidate, meta
+
+
 def _listCacheWindows() -> list[dict]:
     """Inspect the cache root and summarise each completed window.
 
@@ -1209,12 +1222,8 @@ def _listCacheWindows() -> list[dict]:
 
 
 def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, relPath: str) -> None:
-    metaPath = window / "_meta.json"
-    if not metaPath.exists() or (window / ".partial").exists():
-        return
-    try:
-        meta = json.loads(metaPath.read_text())
-    except (OSError, json.JSONDecodeError):
+    meta = _completedCacheMeta(window)
+    if meta is None:
         return
     spec = meta.get("spec") or {}
     # A range cache is exposure-style (no podRegex) but carries a
@@ -1292,75 +1301,32 @@ def _findExposureCacheDirs(expId: int) -> list[Path]:
     it just swaps which one is broken. The caller picks the window that
     actually holds the t₀ it is after.
     """
-    root = cache_root()
-    if not root.exists():
-        return []
-    found: list[tuple[str, Path]] = []
-    for cluster in root.iterdir():
-        if not cluster.is_dir():
-            continue
-        for ns in cluster.iterdir():
-            if not ns.is_dir():
-                continue
-            for window in ns.iterdir():
-                if not window.is_dir():
-                    continue
-                metaPath = window / META_NAME
-                if not metaPath.exists() or (window / PARTIAL_FLAG).exists():
-                    continue
-                try:
-                    meta = json.loads(metaPath.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                spec = meta.get("spec") or {}
-                if spec.get("podRegex"):
-                    continue  # night-mode cache; lives one level deeper
-                if expId not in getCacheExposureIds(window):
-                    continue
-                found.append((str(meta.get("fetched_at") or ""), window))
-    return [window for _, window in sorted(found, key=lambda pair: pair[0], reverse=True)]
+    found = [
+        (str(meta.get("fetched_at") or ""), window)
+        for window, meta in _iterCompletedCaches(nightMode=False)
+        if not (meta.get("spec") or {}).get("podRegex")  # night caches live one level deeper
+        and expId in getCacheExposureIds(window)
+    ]
+    return [window for _, window in sorted(found, reverse=True)]
 
 
 def _findNightCacheDir(dayObs: int) -> Path | None:
     """Return the most-recently-fetched night cache for ``dayObs``."""
-    root = cache_root()
-    if not root.exists():
-        return None
     best: tuple[str, Path] | None = None
-    for cluster in root.iterdir():
-        if not cluster.is_dir():
+    for inner, meta in _iterCompletedCaches(nightMode=True):
+        spec = meta.get("spec") or {}
+        fromIso = spec.get("fromIso")
+        if not spec.get("podRegex") or not isinstance(fromIso, str):
             continue
-        for ns in cluster.iterdir():
-            if not ns.is_dir():
-                continue
-            for window in ns.iterdir():
-                if not window.is_dir():
-                    continue
-                for inner in window.iterdir():
-                    if not inner.is_dir() or not inner.name.startswith("pods="):
-                        continue
-                    metaPath = inner / META_NAME
-                    if not metaPath.exists() or (inner / PARTIAL_FLAG).exists():
-                        continue
-                    try:
-                        meta = json.loads(metaPath.read_text())
-                    except (OSError, json.JSONDecodeError):
-                        continue
-                    spec = meta.get("spec") or {}
-                    if not spec.get("podRegex"):
-                        continue
-                    fromIso = spec.get("fromIso")
-                    if not isinstance(fromIso, str):
-                        continue
-                    try:
-                        f = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
-                    except (TypeError, ValueError):
-                        continue
-                    if int(f.strftime("%Y%m%d")) != dayObs:
-                        continue
-                    fetchedAt = str(meta.get("fetched_at") or "")
-                    if best is None or fetchedAt > best[0]:
-                        best = (fetchedAt, inner)
+        try:
+            windowFrom = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if int(windowFrom.strftime("%Y%m%d")) != dayObs:
+            continue
+        fetchedAt = str(meta.get("fetched_at") or "")
+        if best is None or fetchedAt > best[0]:
+            best = (fetchedAt, inner)
     return best[1] if best else None
 
 
@@ -1399,7 +1365,7 @@ def _pickExposureCache(
             meta = loadCacheMeta(cacheDir)
         except (OSError, json.JSONDecodeError, FileNotFoundError):
             continue
-        tZero = _taiIsoToUtc(tZeroIso)
+        tZero = exposureTimes.taiIsoToUtc(tZeroIso)
         specMeta = meta.get("spec") or {}
         try:
             windowFrom = _parseClientIso(str(specMeta.get("fromIso")))
@@ -1497,7 +1463,7 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         record = exposureTimes.lookupCachedRecord(needId, siteName=site.name, instrument="lsstcam")
         iso = exposureTimes.obsEnd(record)
         if record is not None and iso is not None:
-            state.shutterCloseByExpId[needId] = _taiIsoToUtc(iso)
+            state.shutterCloseByExpId[needId] = exposureTimes.taiIsoToUtc(iso)
             state.exposureInfoByExpId[needId] = record
     with ctx.jobs.stateLock:
         ctx.putNightState(state)
@@ -1519,33 +1485,15 @@ def _findRangeCacheDir(startId: int, stopId: int, instrument: str | None = None)
     pin the newest fetch wins, which is how a LATISS tab ends up looking
     at LSSTCam's span.
     """
-    root = cache_root()
-    if not root.exists():
-        return None
     best: tuple[str, Path] | None = None
-    for cluster in root.iterdir():
-        if not cluster.is_dir():
+    for window, meta in _iterCompletedCaches(nightMode=False):
+        if getCacheRange(window) != (startId, stopId):
             continue
-        for ns in cluster.iterdir():
-            if not ns.is_dir():
-                continue
-            for window in ns.iterdir():
-                if not window.is_dir():
-                    continue
-                metaPath = window / META_NAME
-                if not metaPath.exists() or (window / PARTIAL_FLAG).exists():
-                    continue
-                if getCacheRange(window) != (startId, stopId):
-                    continue
-                if instrument is not None and getCacheRangeInstrument(window) != instrument:
-                    continue
-                try:
-                    meta = json.loads(metaPath.read_text())
-                except (OSError, json.JSONDecodeError):
-                    continue
-                fetchedAt = str(meta.get("fetched_at") or "")
-                if best is None or fetchedAt > best[0]:
-                    best = (fetchedAt, window)
+        if instrument is not None and getCacheRangeInstrument(window) != instrument:
+            continue
+        fetchedAt = str(meta.get("fetched_at") or "")
+        if best is None or fetchedAt > best[0]:
+            best = (fetchedAt, window)
     return best[1] if best else None
 
 
@@ -1604,7 +1552,7 @@ def _loadRangeFromCache(
         record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
         iso = exposureTimes.obsEnd(record)
         if record is not None and iso is not None:
-            state.shutterCloseByExpId[expId] = _taiIsoToUtc(iso)
+            state.shutterCloseByExpId[expId] = exposureTimes.taiIsoToUtc(iso)
             state.exposureInfoByExpId[expId] = record
     with ctx.jobs.stateLock:
         ctx.putRangeState(state)
@@ -1698,28 +1646,6 @@ def _resolveCacheWindow(cluster: str, namespace: str, slug: str, podsSub: str | 
     return path
 
 
-def _dropLiveSidecars(target: Path) -> None:
-    """Unlink every ``_live.json`` under ``target`` before it is removed.
-
-    A live night dir is only trustworthy because its sidecar vouches for
-    the byte ranges of the files beside it. Deleting the tree can fail
-    part-way — the poller is concurrently creating files in it, so
-    ``rmtree`` can hit ``ENOTEMPTY`` — and a tree that lost pod files but
-    kept its sidecar is worse than either outcome: the poller's
-    intactness check passes, it resumes appending to files that now start
-    mid-night, and every slice taken from them is short while claiming to
-    be complete.
-
-    Removing the sidecar first makes a partial delete indistinguishable
-    from a full one: no sidecar, so the poller opens the night afresh.
-    """
-    for sidecar in [target / LIVE_SIDECAR_NAME, *target.rglob(LIVE_SIDECAR_NAME)]:
-        try:
-            sidecar.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
 def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     """Remove a single cache directory, evicting any loaded state that
     used it.
@@ -1730,7 +1656,7 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
     """
     with ctx.jobs.stateLock:
         ctx.evictByCacheDir(target)
-    _dropLiveSidecars(target)
+    dropLiveSidecarsUnder(target)
     shutil.rmtree(target)
     # Tidy up empty parents.
     parent = target.parent
@@ -1748,11 +1674,12 @@ def _deleteCacheRoot(ctx: "ServerContext") -> None:
         ctx.rangeStates.clear()
     root = cache_root()
     if root.exists():
-        # Sidecars first (see _dropLiveSidecars), then the tree. The
-        # poller may be writing into it as we go, so a single rmtree can
-        # legitimately fail on a directory that regrew a file; one retry
-        # settles it, and the poller re-opens the night either way.
-        _dropLiveSidecars(root)
+        # Sidecars first (see fetch.dropLiveSidecarsUnder), then the
+        # tree. The poller may be writing into it as we go, so a single
+        # rmtree can legitimately fail on a directory that regrew a
+        # file; one retry settles it, and the poller re-opens the night
+        # either way.
+        dropLiveSidecarsUnder(root)
         try:
             shutil.rmtree(root)
         except OSError:
@@ -1795,8 +1722,15 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         # Run LRU eviction so the on-disk total stays at or under the
         # configured cap. The just-fetched cache is exempted; we
         # accept a brief over-cap state during the fetch itself and
-        # only sweep at the end.
-        evictToFit(MAX_CACHE_BYTES, exempt=[job.cacheDir])
+        # only sweep at the end. Any loaded state whose window was
+        # evicted is dropped with it — a state held in memory over a
+        # deleted directory would keep serving its summary while every
+        # pod drilldown came back silently empty.
+        evicted = evictToFit(MAX_CACHE_BYTES, exempt=[job.cacheDir])
+        if evicted:
+            with ctx.jobs.stateLock:
+                for gone in evicted:
+                    ctx.evictByCacheDir(gone)
         summaries = parser.summarizeAll(job.cacheDir)
         # Sites are validated when the request comes in, so this should
         # always succeed for a job we actually started. Bail out on the
@@ -1981,6 +1915,24 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
             return  # silence default access logs
 
+        def _instrumentParam(self, qs: dict[str, list[str]]) -> tuple[str | None, bool]:
+            """Read and validate the optional ``instrument`` query param.
+
+            Returns ``(instrument, ok)``. On an unknown name the 400 has
+            already been sent and ``ok`` is ``False`` — the caller just
+            returns. One validator for every GET route that accepts the
+            pin, so they can't drift on what counts as a known instrument.
+            """
+            raw = (qs.get("instrument", [""])[0] or "").strip().lower() or None
+            if raw is not None and raw not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER:
+                self._send_error_json(
+                    400,
+                    f"Unknown instrument {raw!r}; known: "
+                    f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
+                )
+                return None, False
+            return raw, True
+
         # ----- SSE helper -----
 
         def _send_sse(self, job: FetchJob) -> None:
@@ -2068,16 +2020,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
                 rangeStartRaw = qs.get("rangeStart", [""])[0] or None
                 rangeStopRaw = qs.get("rangeStop", [""])[0] or None
-                instrumentRaw = (qs.get("instrument", [""])[0] or "").strip().lower() or None
-                if (
-                    instrumentRaw is not None
-                    and instrumentRaw not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER
-                ):
-                    self._send_error_json(
-                        400,
-                        f"Unknown instrument {instrumentRaw!r}; known: "
-                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
-                    )
+                instrumentRaw, ok = self._instrumentParam(qs)
+                if not ok:
                     return
                 if rangeStartRaw is not None and rangeStopRaw is not None:
                     self._handle_range_summary(rangeStartRaw, rangeStopRaw, dataIdRaw, instrumentRaw)
@@ -2171,16 +2115,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 dayObsRaw = qs.get("dayObs", [""])[0] or None
                 rangeStartRaw = qs.get("rangeStart", [""])[0] or None
                 rangeStopRaw = qs.get("rangeStop", [""])[0] or None
-                instrumentRaw = (qs.get("instrument", [""])[0] or "").strip().lower() or None
-                if (
-                    instrumentRaw is not None
-                    and instrumentRaw not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER
-                ):
-                    self._send_error_json(
-                        400,
-                        f"Unknown instrument {instrumentRaw!r}; known: "
-                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
-                    )
+                instrumentRaw, ok = self._instrumentParam(qs)
+                if not ok:
                     return
                 pod = path[len("/api/pod/") :]
                 if not re.match(r"^[A-Za-z0-9._-]+$", pod):
@@ -2253,14 +2189,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if m:
                 # An exposure id is only unique within one instrument
                 # (see exposureTimes), so the caller may name one.
-                params = parse_qs(url.query)
-                instrument = (params.get("instrument") or [""])[0].strip().lower() or None
-                if instrument is not None and instrument not in exposureTimes.INSTRUMENTS_BY_PROBE_ORDER:
-                    self._send_error_json(
-                        400,
-                        f"Unknown instrument {instrument!r}; known: "
-                        f"{list(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)}",
-                    )
+                instrument, ok = self._instrumentParam(parse_qs(url.query))
+                if not ok:
                     return
                 self._handle_exposure_time(int(m.group(1)), instrument)
                 return
@@ -2565,7 +2495,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     # unqualified lookup of the shared id resolves to.
                     exposureTimes.storeCachedRecord(
                         expId,
-                        exposureTimes.manualRecord(_utcToTaiIso(tZero), instrument=instrument),
+                        exposureTimes.manualRecord(exposureTimes.utcToTaiIso(tZero), instrument=instrument),
                         siteName=site.name,
                         bareKey=exposureTimes.isProbeOrderFirst(instrument),
                     )
@@ -2728,14 +2658,6 @@ def _buildRangeSpecFromRequest(
     exposure). The client resolves the two shutter-close anchors up front
     and passes them as ``tZeroStart`` / ``tZeroStop`` (TAI by default).
     """
-    from .config import (
-        DEFAULT_USERNAME,
-        DEFAULT_WINDOW_AFTER_S,
-        DEFAULT_WINDOW_BEFORE_S,
-        DEFAULT_WORKERS,
-        MAX_RANGE_SPAN,
-    )
-
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
 

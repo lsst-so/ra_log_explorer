@@ -1743,6 +1743,30 @@ def _iterCacheDirs(root: Path) -> list[Path]:
     return out
 
 
+def dropLiveSidecarsUnder(target: Path) -> None:
+    """Unlink every ``_live.json`` under ``target`` before it is removed.
+
+    A live night dir is only trustworthy because its sidecar vouches for
+    the byte ranges of the files beside it. Deleting the tree can fail
+    part-way — the poller or a request thread can be concurrently
+    creating files in it, so ``rmtree`` can hit ``ENOTEMPTY`` — and a
+    tree that lost pod files but kept its sidecar is worse than either
+    outcome: the poller's intactness check passes, it resumes appending
+    to files that now start mid-night, and every slice taken from them
+    is short while claiming to be complete.
+
+    Removing the sidecar first makes a partial delete indistinguishable
+    from a full one: no sidecar, so the poller opens the night afresh.
+    Every path that removes cache trees — the DELETE endpoints and LRU
+    eviction alike — goes through this first.
+    """
+    for sidecar in [target / LIVE_SIDECAR_NAME, *target.rglob(LIVE_SIDECAR_NAME)]:
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
     """Evict the least-recently-viewed cache windows until the on-disk
     total is at or below ``maxBytes``.
@@ -1778,6 +1802,11 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
         if total <= maxBytes:
             break
         sz = cacheDuSizeBytes(d)
+        # Sidecar first: a finalised live night is an ordinary evictable
+        # window, but if its rmtree fails part-way the surviving sidecar
+        # would vouch for files that are gone — and every slice taken
+        # from it would be short while claiming to be complete.
+        dropLiveSidecarsUnder(d)
         try:
             shutil.rmtree(d)
         except OSError:

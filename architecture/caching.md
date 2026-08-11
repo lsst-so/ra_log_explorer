@@ -474,8 +474,9 @@ ra_log_explorer.cli cache info|flush`) and the browser's admin view at
 `/?admin=1` (the cached-windows table, with a per-row ✕ delete and a
 "flush entire cache" button).
 
-Either browser delete unlinks every `_live.json` under the target
-*before* removing the tree. A partial delete is a real possibility —
+Every path that removes cache trees — both browser deletes *and* LRU
+eviction — unlinks every `_live.json` under the target *before*
+removing the tree. A partial delete is a real possibility —
 the poller may be creating files in there as `rmtree` walks it — and
 one that took the pod files but left the sidecar is worse than either
 clean outcome: the poller's intactness check would pass, it would

@@ -373,7 +373,7 @@ def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     # 08:46:16.267 TAI - 37s = 08:45:39.267 UTC.
     assert state.tZero.hour == 8 and state.tZero.minute == 45 and state.tZero.second == 39
     assert state.expId == 2026051900722
@@ -418,7 +418,7 @@ def test_eagerFetch_honours_the_instrument_flag(tmpCacheRoot: Path, monkeypatch:
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     assert state.instrument == "latiss"
 
     with pytest.raises(SystemExit):
@@ -457,7 +457,7 @@ def test_eagerFetch_utc_flag_skips_tai_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     # Same numeric value: no conversion applied.
     assert state.tZero.second == 39
 
@@ -514,7 +514,7 @@ def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: py
             "--no-browser",
         ]
     )
-    cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     assert captured["forceRefresh"] is True
 
 

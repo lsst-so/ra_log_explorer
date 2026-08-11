@@ -415,6 +415,14 @@ Each tick (every `LIVE_POLL_S` seconds):
    (Letting one in would drag the watermark back to night start every
    time a pod was rescheduled.) A name promotes into `pods`, carrying
    its event counters, the first time it appears in an app-log listing.
+
+   The events stream keeps its own watermark, and a failed events fetch
+   is retried even on a tick where the app-log frontier has nothing to
+   do — which is permanent at night end, where every later tick (and
+   finalisation itself) finds the app-log watermark already at its
+   target. Tying the retry to app-log progress would strand a
+   late-night events failure forever, and the night would finalise
+   missing the tail's lifecycle markers.
 2. **ConsDB.** One id-range query per instrument returns every exposure
    of the current dayObs (in-cluster, this is ~free). All instruments
    are queried, not just the first with rows, and the result is a *list*
