@@ -36,9 +36,16 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - id: mc
-        uses: mfisherlevine/mypy_coverage@v0.2.3
+        # v0.2.4 is the first tag whose composite runs the action on
+        # Node 24; v0.2.3 pulled in actions/setup-python@v5 and was the
+        # last thing here still raising the deprecation warning.
+        uses: mfisherlevine/mypy_coverage@v0.2.4
         with:
-          version: "0.2.3"
+          # Pinned rather than the action's `latest` default, and kept in
+          # step with the tag above: the tool decides what counts as
+          # covered, so a floating version could move the number under a
+          # PR that changed no code.
+          version: "0.2.4"
           format: github
           # Use the repo's mypy.ini directly so we pick up the same
           # exclude pattern, files=, and mypy_path= as the local mypy run.
