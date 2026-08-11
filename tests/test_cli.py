@@ -380,6 +380,49 @@ def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
     # Reference points carry a "TAI input" label so the UI can show
     # which scale the user typed in.
     assert state.referencePoints[0]["source"] == "shutter close"
+    # An unpinned state would attribute the other instrument's pods to
+    # this exposure, so the default pin (LSSTCam, matching the server's)
+    # must land on the state.
+    assert state.instrument == "lsstcam"
+
+
+def test_eagerFetch_honours_the_instrument_flag(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--instrument pins the eager state, exactly as the POST body's
+    field pins a browser-driven fetch; an unknown name is an argparse
+    error rather than a silently wrong table."""
+    from ra_log_explorer import cli
+    from ra_log_explorer import parse as _parse
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict[str, Any]]:
+        d = tmpCacheRoot / "fake"
+        (d / "pods").mkdir(parents=True, exist_ok=True)
+        return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
+
+    monkeypatch.setattr(cli, "fetchAll", fakeFetchAll)
+    monkeypatch.setattr(_parse, "summarizeAll", lambda _d: [])
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--exposure-id",
+            "2026071100445",
+            "--t-zero",
+            "2026-07-12T05:25:30.895",
+            "--instrument",
+            "latiss",
+            "--no-serve",
+            "--no-browser",
+        ]
+    )
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    assert state.instrument == "latiss"
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--instrument", "hubble"])
 
 
 def test_eagerFetch_utc_flag_skips_tai_conversion(

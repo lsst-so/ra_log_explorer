@@ -58,7 +58,7 @@ from .config import (
 # seconds have been added). Butler `DimensionRecord` timestamps are TAI,
 # so by default we subtract this when converting the user's t-zero into
 # UTC. Override with --t-zero-utc.
-from .exposureTimes import TAI_MINUS_UTC_S
+from .exposureTimes import INSTRUMENTS_BY_PROBE_ORDER, TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
     ensureCacheSchemaCurrent,
@@ -244,6 +244,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerStat
         summaries=summaries,
         expId=args.exposure_id,
         tZero=tZero,
+        # The pin scopes which pods the timeline attributes work to —
+        # the window is fetched namespace-wide, so it genuinely holds
+        # the other instrument's pods too.
+        instrument=args.instrument,
         referencePoints=[
             {
                 "label": f"shutter close (caller-supplied, {tZeroScale} input)",
@@ -397,6 +401,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat --t-zero as already-UTC instead of TAI (default off; "
         f"the default subtracts {int(TAI_MINUS_UTC_S)} s from the input).",
     )
+    runP.add_argument(
+        "--instrument",
+        choices=INSTRUMENTS_BY_PROBE_ORDER,
+        default="lsstcam",
+        help="The instrument --exposure-id belongs to (default lsstcam). "
+        "A dataId is only unique within one instrument, so this scopes "
+        "which pods the eager-fetched timeline attributes work to.",
+    )
     runP.add_argument("--host", default="127.0.0.1")
     runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     runP.add_argument(
@@ -427,6 +439,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exposure-id", type=int)
     p.add_argument("--t-zero")
     p.add_argument("--t-zero-utc", action="store_true")
+    p.add_argument("--instrument", choices=INSTRUMENTS_BY_PROBE_ORDER, default="lsstcam")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
     p.add_argument("--base-path", default=defaultBasePath())

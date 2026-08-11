@@ -251,6 +251,12 @@ you already have a shutter-close timestamp in hand.
 `DimensionRecord.timespan.end.isot` convention). Pass `--t-zero-utc` if
 you've already done the conversion.
 
+`--instrument` (default `lsstcam`) names the instrument the dataId
+belongs to. A dataId is only unique within one instrument — LSSTCam and
+LATISS both count from 1 each night — so the flag decides which
+instrument's pods the timeline attributes work to, exactly like the
+topbar switch in the browser.
+
 By default this fetches **5 s before to 5 min after** the shutter close.
 A rapid analysis exposure usually finishes within ~90 s; the longer
 default window gives you context on the next exposure's dispatch too.
