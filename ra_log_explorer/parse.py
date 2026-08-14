@@ -679,6 +679,31 @@ _POD_DOWN_REASONS: frozenset[str] = frozenset(
     {"Failed", "BackOff", "Evicted", "Preempted", "NodeNotReady", "FailedKillPod"}
 )
 
+# k8s reasons that mean "a *pod sandbox* was created here" — the pod
+# object itself is new, so any log lines before this point belong to its
+# predecessor (a StatefulSet pod keeps its name across a delete/recreate)
+# and any container start just after it is a first start, not a restart.
+_POD_SANDBOX_REASONS: frozenset[str] = frozenset({"Scheduled", "AddedInterface"})
+
+# How much of a pod instance's *own* logging must precede a "Container
+# started" event before we read that event as an in-place restart rather
+# than a first start. See :func:`_promoteInPlaceRestarts` for why the
+# rule is needed at all; this constant is the one judgement call in it,
+# and it was chosen from measurement rather than taste. Over four
+# captured nights (20260711 summit, 20260811-13 BTS) there were 1672
+# `Started` events, 846 of them with app logs on both sides:
+#
+#   * the 13 genuine restarts had between 4.8 minutes and 12.3 hours of
+#     the same pod instance's logging before them (median 87 minutes);
+#   * all 833 others had *zero* — their only preceding line is the
+#     `secret-perm-fixer` init container's one-line complaint, emitted
+#     in the same second.
+#
+# So the threshold sits in an empty band two orders of magnitude wide,
+# and anything from a few seconds to a few minutes would separate the
+# two populations identically.
+RESTART_MIN_WORK_S = 60.0
+
 # The lifecycle event kinds, for consumers that want to recognise the
 # family without string-prefix sniffing. Kept in sync with the kinds
 # emitted by :func:`classifyK8sEvent`.
@@ -803,6 +828,109 @@ def iterPodEvents(eventsLogPath: Path) -> Iterator[Event]:
             ev = classifyK8sEvent(pod, obj)
             if ev is not None:
                 yield ev
+
+
+def readPodLifecycle(eventsLogPath: Path) -> tuple[list[Event], list[dt.datetime]]:
+    """Read a pod's lifecycle file into (classified events, sandbox times).
+
+    The sandbox times are the ``Scheduled`` / ``AddedInterface`` moments,
+    which :func:`classifyK8sEvent` deliberately drops — they say nothing
+    about a pod that is merely running. They matter only to
+    :func:`_promoteInPlaceRestarts`, which needs to know when *this* pod
+    instance began in order to judge what came before a container start.
+    """
+    events: list[Event] = []
+    sandbox: list[dt.datetime] = []
+    if not eventsLogPath.exists():
+        return events, sandbox
+    pod = eventsLogPath.stem
+    with eventsLogPath.open("r", encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ev = classifyK8sEvent(pod, obj)
+            if ev is not None:
+                events.append(ev)
+                continue
+            fields = _parseK8sEventFields(obj.get("line", ""))
+            if fields.get("reason") in _POD_SANDBOX_REASONS and fields.get("kind", "Pod") == "Pod":
+                try:
+                    sandbox.append(_parseTimestamp(obj.get("timestamp", "")))
+                except ValueError:
+                    continue
+    sandbox.sort()
+    return events, sandbox
+
+
+@dataclass
+class _RestartEvidence:
+    """Evidence gathered about one ``POD_STARTED``, to judge if it's a restart.
+
+    ``lower`` is the moment this pod instance came into being (its most
+    recent sandbox creation) or ``None`` when that happened before the
+    window. Lines at or before it belong to a previous pod of the same
+    name and are ignored — which is what stops a rescheduled StatefulSet
+    pod from looking like a restart.
+    """
+
+    event: Event
+    lower: dt.datetime | None
+    first: dt.datetime | None = None  # first line of this instance before the start
+    last: dt.datetime | None = None  # last such line
+    after: bool = False  # did this pod log anything after the start?
+
+    def workBeforeS(self) -> float:
+        """Seconds of this pod instance's logging that precede the start."""
+        if self.first is None or self.last is None:
+            return 0.0
+        return (self.last - self.first).total_seconds()
+
+    def isRestart(self) -> bool:
+        """Whether the evidence says the container restarted in place.
+
+        Both halves are needed. Without ``after`` a pod that started and
+        then went quiet reads as a restart; without the work threshold a
+        pod's *first* start reads as one, since an init container's
+        preamble lands before it.
+        """
+        return self.after and self.workBeforeS() >= RESTART_MIN_WORK_S
+
+
+def _promoteInPlaceRestarts(tracked: list[_RestartEvidence]) -> None:
+    """Re-label the ``POD_STARTED`` events that were really restarts.
+
+    Kubernetes' own restart signal is the event's ``count``, and
+    :func:`classifyK8sEvent` uses it: ``Started`` with ``count ≥ 2`` is a
+    restart. But ``count`` is an aggregation counter on an Event object
+    with a one-hour TTL, so it only survives while the *previous* start's
+    event does. A crash loop keeps it alive — hence the ``restart #6``
+    the fixtures capture — but an isolated restart hours into a pod's
+    life gets a fresh Event object with ``count=1``, indistinguishable by
+    that rule alone from the pod's first start. That is exactly the shape
+    an OOM takes, and it is the shape we most need to see: on 20260813
+    the ``count`` rule found 3 of the night's 7 restarts.
+
+    So we settle it with the app log instead, which the events stream
+    can't see: a container that was producing output for a sustained
+    period, and produces more afterwards, has restarted. The pod's *own*
+    logging is what counts — anything before its sandbox was created
+    belongs to a predecessor of the same name.
+    """
+    for tr in tracked:
+        if not tr.isRestart():
+            continue
+        tr.event.kind = "POD_RESTARTED"
+        tr.event.level = "warn"
+        mins = tr.workBeforeS() / 60.0
+        shown = f"{mins / 60:.1f} h" if mins >= 90 else f"{mins:.0f} min"
+        # Say what the label rests on: this one is inferred from the log,
+        # not read off the event, and a reader deserves to know which.
+        tr.event.message = f"{tr.event.message} (restart inferred: {shown} of work before it)"
 
 
 # ----- per-pod summary ------------------------------------------------------
@@ -958,8 +1086,32 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
     currentExpId: int | None = None
     activeTb: TracebackRecord | None = None
     tbLines: list[str] = []
+    # Read the lifecycle stream *before* the log, not after: judging
+    # whether a "Container started" is really a restart needs to know
+    # what the pod was doing either side of it, and the log is streamed
+    # once (a night's worth is far too big to hold).
+    lifecycle: list[Event] = []
+    sandboxTimes: list[dt.datetime] = []
+    if eventsLogPath is not None:
+        lifecycle, sandboxTimes = readPodLifecycle(eventsLogPath)
+    tracked = [
+        _RestartEvidence(event=ev, lower=_lastSandboxBefore(sandboxTimes, ev.t))
+        for ev in lifecycle
+        if ev.kind == "POD_STARTED"
+    ]
     for ln in iterPodLines(podLogPath):
         summary.nLines += 1
+        # Empty for all but a handful of pods in any window, so this
+        # costs one loop-setup per line and nothing else.
+        for tr in tracked:
+            if tr.lower is not None and ln.timestamp <= tr.lower:
+                continue
+            if ln.timestamp < tr.event.t:
+                if tr.first is None:
+                    tr.first = ln.timestamp
+                tr.last = ln.timestamp
+            else:
+                tr.after = True
         if summary.firstTs is None:
             summary.firstTs = ln.timestamp
         summary.lastTs = ln.timestamp
@@ -1035,12 +1187,17 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
     # from the parallel events stream, if it was fetched. They carry their
     # own timestamps, so re-sort the combined list to keep the per-pod
     # event stream time-ascending for the timeline.
-    if eventsLogPath is not None:
-        lifecycle = list(iterPodEvents(eventsLogPath))
-        if lifecycle:
-            summary.events.extend(lifecycle)
-            summary.events.sort(key=lambda e: e.t)
+    if lifecycle:
+        _promoteInPlaceRestarts(tracked)
+        summary.events.extend(lifecycle)
+        summary.events.sort(key=lambda e: e.t)
     return summary
+
+
+def _lastSandboxBefore(sandboxTimes: list[dt.datetime], t: dt.datetime) -> dt.datetime | None:
+    """The most recent pod-sandbox creation before ``t``, if any."""
+    earlier = [s for s in sandboxTimes if s < t]
+    return earlier[-1] if earlier else None
 
 
 def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:

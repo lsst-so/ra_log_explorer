@@ -37,6 +37,38 @@ def tracebackJsonl() -> Path:
 
 
 @pytest.fixture
+def inplaceRestartEventsJsonl() -> Path:
+    """The `k8s/events` stream of a real, isolated in-place restart.
+
+    `s-lsstcam-run-sfm-runner-workerset-134` on BTS, dayObs 20260813:
+    Pulling → Pulled → Created → Started at 16:47:13-15 UTC, all with
+    `count=1` and with no `Scheduled` / `AddedInterface` — the pod object
+    was never recreated, only its container. Verbatim, timestamps
+    included.
+
+    Kept distinct from `podCrashEventsJsonl` because the two are the
+    opposite halves of the problem: a crash loop keeps k8s's own `count`
+    alive and so is visible from the events alone, while this one is not
+    — `count=1` is all the events can say. See `inplaceRestartLogJsonl`.
+    """
+    return DATA_DIR / "pod_inplace_restart_events.jsonl"
+
+
+@pytest.fixture
+def inplaceRestartLogJsonl() -> Path:
+    """The same pod's app log around that restart, cut to five real lines.
+
+    First line of the night, one from the middle, then the last line
+    before the kill (`lsst.isr.crosstalk … Applying crosstalk
+    correction.`) and the first two after it (`drp_pipe:` — the EUPS
+    banner a freshly started container prints). That is the whole story:
+    46 minutes of work, stopped mid-quantum with no traceback, and a new
+    process where the old one was.
+    """
+    return DATA_DIR / "pod_inplace_restart_log.jsonl"
+
+
+@pytest.fixture
 def podCrashEventsJsonl() -> Path:
     """One pod's whole `k8s/events` stream through a real crash loop.
 

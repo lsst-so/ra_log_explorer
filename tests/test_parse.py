@@ -1554,3 +1554,151 @@ def test_summarizePod_carries_crash_markers_onto_the_timeline(
     # And they stay in time order alongside the app-log events.
     stamps = [e.t for e in summary.events]
     assert stamps == sorted(stamps)
+
+
+# ----- an isolated in-place restart, inferred from the log ------------------
+#
+# k8s's own restart signal is the event `count`, and it only survives while
+# the previous start's Event object does (a one-hour TTL). A crash loop keeps
+# it alive; a single restart hours into a pod's life does not, and arrives
+# as `count=1` — indistinguishable from a first start by the event alone.
+# `summarizePod` settles those against the app log. The threshold that
+# separates the two populations is `parse.RESTART_MIN_WORK_S`, whose
+# docstring records the measurement it came from.
+
+
+def _writePod(tmp_path: Path, name: str, logLines: list[str], eventLines: list[str]) -> tuple[Path, Path]:
+    """Write a pod's app-log and lifecycle files; return both paths."""
+    logPath = tmp_path / f"{name}.jsonl"
+    evPath = tmp_path / f"{name}.events.jsonl"
+    logPath.write_text("".join(f"{ln}\n" for ln in logLines))
+    evPath.write_text("".join(f"{ln}\n" for ln in eventLines))
+    return logPath, evPath
+
+
+def _logLine(ts: str, text: str = "lsst.isr run  INFO   working") -> str:
+    return json.dumps({"timestamp": ts, "labels": {"detected_level": "info"}, "line": text})
+
+
+def _evLine(ts: str, reason: str, count: int = 1) -> str:
+    return json.dumps(
+        {
+            "timestamp": ts,
+            "labels": {},
+            "line": (
+                f"name=p kind=Pod objectAPIversion=v1 sourcehost=manke01 "
+                f'reason={reason} type=Normal count={count} msg="Container started"'
+            ),
+        }
+    )
+
+
+def test_summarizePod_infers_an_isolated_restart_from_the_log(
+    inplaceRestartLogJsonl: Path, inplaceRestartEventsJsonl: Path
+) -> None:
+    """The real 20260813 SFM-worker restart, which `count` alone misses.
+
+    The pod worked for 47 minutes, stopped mid-`isr` with no traceback,
+    and a `Started` (`count=1`) landed 3 s later followed by a fresh
+    container's EUPS banner. That is a restart, and before this rule it
+    was reported as a first start — invisible in the night view, which
+    excludes those.
+    """
+    summary = parse.summarizePod(inplaceRestartLogJsonl, inplaceRestartEventsJsonl)
+    restarts = [e for e in summary.events if e.kind == "POD_RESTARTED"]
+    assert len(restarts) == 1
+    ev = restarts[0]
+    assert ev.level == "warn"
+    assert ev.flavor == "Started"  # the k8s reason still rides along
+    assert ev.t == dt.datetime(2026, 8, 13, 16, 47, 15, tzinfo=dt.timezone.utc)
+    # The message says the label was inferred, and from what — the same
+    # event read off `count` says "restart #N" instead.
+    assert "restart inferred" in ev.message
+    assert "46 min of work" in ev.message
+    assert "manke01" in ev.message
+    # No POD_STARTED survives for it: promotion re-labels, never duplicates.
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_RESTARTED"]
+
+
+def test_summarizePod_leaves_a_first_start_alone_after_an_init_container(tmp_path: Path) -> None:
+    """A pod's own first start is preceded by its init container's preamble.
+
+    This is the shape that would flood the night view if "any log line
+    before the start" were the rule: 833 of the 846 candidate starts
+    across four captured nights look exactly like this — a single
+    `secret-perm-fixer` line complaining about a missing secret, emitted
+    in the same second the sandbox was created.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "s-lsstcam-run-plotter-7f8bcbcd8c-4t4th",
+        [_logLine("2026-08-11T23:38:16.889+01:00", "cat: can't open '/secrets/gcs.json'")]
+        + [_logLine(f"2026-08-11T23:44:{s:02d}.000+01:00") for s in (10, 20, 30)],
+        [
+            _evLine("2026-08-11T23:38:16+01:00", "Scheduled"),
+            _evLine("2026-08-11T23:44:06+01:00", "Started"),
+        ],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    kinds = [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS]
+    assert kinds == ["POD_STARTED"]
+
+
+def test_summarizePod_leaves_a_rescheduled_pod_alone(tmp_path: Path) -> None:
+    """A StatefulSet pod keeps its name across a delete/recreate.
+
+    So its log file holds the *previous* pod's lines too, and those must
+    not count as work this instance was doing — otherwise every rollout
+    reads as a fleet-wide restart. `redis-0` on 20260811 is the real
+    case: 3.9 h of a predecessor's logging before a `Started` whose
+    sandbox was created 8 s earlier.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "redis-0",
+        [_logLine(f"2026-08-11T{h:02d}:00:00.000+01:00") for h in (18, 19, 20, 21, 22)]
+        + [_logLine("2026-08-11T22:38:50.000+01:00")],
+        [
+            _evLine("2026-08-11T22:38:34+01:00", "Scheduled"),
+            _evLine("2026-08-11T22:38:42+01:00", "Started"),
+        ],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_STARTED"]
+
+
+def test_summarizePod_needs_activity_on_both_sides_of_the_start(tmp_path: Path) -> None:
+    """A pod that logged and then went silent has not demonstrably restarted.
+
+    Without the after-side requirement, a window that happens to end at
+    a container start would relabel it on the strength of what came
+    before — the one thing that cannot distinguish a restart from a
+    pod being shut down for good.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "s-lsstcam-run-sfm-runner-workerset-1",
+        [_logLine(f"2026-08-13T17:{m:02d}:00.000+01:00") for m in (0, 20, 40)],
+        [_evLine("2026-08-13T17:47:15+01:00", "Started")],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_STARTED"]
+
+
+def test_readPodLifecycle_returns_sandbox_times_classify_drops(
+    inplaceRestartEventsJsonl: Path, podCrashEventsJsonl: Path
+) -> None:
+    """Sandbox events are chatter to the timeline but load-bearing here."""
+    events, sandbox = parse.readPodLifecycle(inplaceRestartEventsJsonl)
+    assert [e.kind for e in events] == ["POD_STARTED"]
+    assert sandbox == []  # the restart's whole point: no new pod sandbox
+    _, crashSandbox = parse.readPodLifecycle(podCrashEventsJsonl)
+    # The crash-loop capture *does* contain a reschedule, so it has one.
+    assert len(crashSandbox) >= 1
+    assert crashSandbox == sorted(crashSandbox)
+
+
+def test_readPodLifecycle_on_a_missing_file_is_empty(tmp_path: Path) -> None:
+    events, sandbox = parse.readPodLifecycle(tmp_path / "nope.jsonl")
+    assert events == []
+    assert sandbox == []

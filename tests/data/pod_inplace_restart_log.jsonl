@@ -1,0 +1,5 @@
+{"labels":{"detected_level":"warn"},"line":"2026-08-13 16:00:44,059 py.warnings _showwarnmsg         WARNING /repos/rubintv_production/python/lsst/rubintv/production/redisUtils.py:682: DeprecationWarning: Call to deprecated setex. (Use 'set' instead.) -- Deprecated since version 2.6.12.\n","timestamp":"2026-08-13T17:00:44.059344498+01:00"}
+{"labels":{"detected_level":"info"},"line":"2026-08-13 16:23:21,093 lsst.calibrateImage.star_deblend deblend              INFO   Deblending 1100 sources\n","timestamp":"2026-08-13T17:23:21.093717807+01:00"}
+{"labels":{"detected_level":"info"},"line":"2026-08-13 16:47:12,830 lsst.isr.crosstalk run                  INFO   Applying crosstalk correction.\n","timestamp":"2026-08-13T17:47:12.830923759+01:00"}
+{"labels":{"detected_level":"unknown"},"line":"drp_pipe:\n","timestamp":"2026-08-13T17:47:19.555511264+01:00"}
+{"labels":{"detected_level":"unknown"},"line":"summit_utils:\n","timestamp":"2026-08-13T17:47:20.019725574+01:00"}

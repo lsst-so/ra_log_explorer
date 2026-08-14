@@ -118,13 +118,64 @@ pod) are dropped too.
 
 | Kind            | k8s `reason`                                            | level   | Notes |
 |-----------------|----------------------------------------------------------|---------|-------|
-| `POD_RESTARTED` | `Started` with `count ≥ 2`                               | warn    | The container has started before in this pod → it died and was restarted **in place**. The key "explains an abrupt mid-work gap" signal (e.g. an OOM the kernel didn't ship a message for). |
-| `POD_STARTED`   | `Started` with `count == 1`                              | info    | First start of the container; mostly relevant in night-wide windows. |
+| `POD_RESTARTED` | `Started` with `count ≥ 2`, **or** `count == 1` promoted by the log (below) | warn    | The container died and was restarted **in place**. The key "explains an abrupt mid-work gap" signal (e.g. an OOM the kernel didn't ship a message for). |
+| `POD_STARTED`   | `Started` with `count == 1`, not promoted                | info    | First start of the container; mostly relevant in night-wide windows. |
 | `POD_KILLED`    | `Killing`                                                | warn    | Container being stopped — graceful (rollout/scale-down) or pre-restart. |
 | `POD_OOMKILLED` | reason containing `OOM` (e.g. `OOMKilling`)             | error   | Node-pressure OOM. Note: a *container-limit* OOM emits no k8s event on this cluster (and the kernel line isn't shipped to Loki) — that case shows up only as `POD_RESTARTED`. |
 | `POD_FAILED`    | `Failed`/`BackOff`/`Evicted`/`Preempted`/`NodeNotReady`/`FailedKillPod` | error | Container failed / crash-looping / evicted. |
 | `POD_UNHEALTHY` | `Unhealthy`                                              | warn    | Liveness/readiness probe failed (often precedes a `Killing`). |
 | `POD_MOUNT_FAILED` | `FailedMount`                                         | warn    | The kubelet couldn't mount one of the pod's volumes — the pod is down (or wedged restarting) until it can, so this explains a gap the way a restart does. The kubelet retries on a backoff and emits one event per attempt, so a single incident shows as a small burst of markers. |
+
+### Promoting an isolated restart (`POD_STARTED` → `POD_RESTARTED`)
+
+Kubernetes' own restart signal is the event's `count`, and it is only
+half a signal. `count` is an aggregation counter on an Event object with
+a one-hour TTL, so it survives only while the *previous* start's event
+does. A crash loop keeps it alive — that is the `restart #6` in the
+capture above — but a single restart hours into a pod's life gets a
+fresh Event object with `count=1`, which by the events alone is
+indistinguishable from the pod's first start. That is precisely the
+shape an OOM kill takes here, and it is the case the whole lifecycle
+lane exists to explain: on dayObs 20260813 the `count` rule found 3 of
+the night's 7 restarts.
+
+So `summarizePod` settles the `count == 1` cases against something the
+events stream cannot see — the app log. A `Started` becomes a
+`POD_RESTARTED` when, and only when:
+
+1. the pod logged **after** it (something is running now), **and**
+2. the pod's *own* logging **before** it spans at least
+   `parse.RESTART_MIN_WORK_S` (60 s).
+
+"Own" is load-bearing: lines at or before the pod's most recent
+`Scheduled` / `AddedInterface` belong to a *predecessor*, because a
+StatefulSet pod keeps its name across a delete-and-recreate. Without
+that clause every rollout would read as a fleet-wide restart.
+
+Both clauses were chosen from measurement, not taste. Across four
+captured nights (20260711 summit, 20260811-13 BTS) there are 1672
+`Started` events, 846 of them with app logs on both sides:
+
+| | count | logging before the start |
+|---|---|---|
+| genuine in-place restarts | 13 | 4.8 min – 12.3 h (median 87 min) |
+| everything else | 833 | **0 s** — a single `secret-perm-fixer` init-container line, in the same second |
+
+The threshold therefore sits in an empty band two orders of magnitude
+wide. Applied to those nights the rule promotes 4 events, all on
+20260813, all corroborated by hand (log stops mid-quantum with no
+traceback; a fresh container's EUPS banner 4–7 s later), and promotes
+nothing on the other three nights.
+
+**What it still cannot do.** It cannot see a restart in the first 60 s
+of a window (there is no prior work to measure), and it would be fooled
+by a genuine long-lived *sidecar* — a second container logging
+continuously while the main one starts late. Neither exists in this
+deployment today; the only second container is `secret-perm-fixer`,
+which writes one line and exits. And none of this makes an OOM
+*confirmed* — a segfault looks identical from outside. `POD_RESTARTED`
+means "the container died and came back", which is as much as these
+logs can support.
 
 **What real data exists behind these.** The nights we have captured are
 mostly healthy: their lifecycle streams hold `Started`, `Killing`,
