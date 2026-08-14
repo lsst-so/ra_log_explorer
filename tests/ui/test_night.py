@@ -270,3 +270,28 @@ def test_the_calcZernikes_histogram_is_absent_from_the_sfm_half(app: Any, corpus
     expect(app.page.locator("#night-hist-cz-card")).to_be_hidden()
     # The first-task histogram means the same thing in both halves.
     expect(app.page.locator("#night-hist-first")).to_be_visible()
+
+
+def test_a_night_that_found_no_pods_says_so(app: Any, corpus: StagedCorpus) -> None:
+    """A fetch over an empty window reports itself perfectly complete,
+    because it completed — over nothing. On screen that is
+    indistinguishable from a quiet night, and the usual cause is a dayObs
+    belonging to the *other* site: one server serves one cluster and
+    cannot see the other, so it answers with an empty page and no error
+    anywhere. Found for real while smoke-testing a BTS night against a
+    summit server.
+    """
+    import json
+
+    cacheDir = corpus.stageNight()
+    metaPath = cacheDir / "_meta.json"
+    meta = json.loads(metaPath.read_text())
+    meta["pod_count"] = 0
+    metaPath.write_text(json.dumps(meta))
+
+    app.goto(f"/?dayObs={DAY_OBS}")
+    banner = app.page.locator("#night-fetch-banner")
+    expect(banner).to_be_visible()
+    expect(banner).to_contain_text("No pods found")
+    # It names the likely cause rather than just the symptom.
+    expect(banner).to_contain_text("other site")
