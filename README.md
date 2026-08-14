@@ -285,8 +285,9 @@ The browser app has three views:
   exactly one instrument at a time. Two side-by-side mode cards on top:
   **All RA processing** (one exposure,
   with a single *advanced options* disclosure holding the shared window
-  pads and the range-of-exposures form) and **AOS processing**
-  (investigate a whole night), each with its own inline progress bar.
+  pads and the range-of-exposures form) and **Night processing**
+  (investigate a whole night, AOS pods or everything else), each with
+  its own inline progress bar.
   Below them, on a deployment running live mode, sits the **Tonight**
   panel: every exposure taken so far tonight, newest first, with a
   ready/wait status chip, refreshing itself every 30 s while the page
@@ -317,6 +318,21 @@ The browser app has three views:
   visit. A `restart` is an in-place container restart, usually an OOM,
   so it's the fastest way to spot "which exposures had a worker die on
   them tonight".
+
+  The night comes in **two tabs**, which between them cover every pod:
+
+    - **AOS view** — the AOS pods (anything with `aos` in its name).
+      This is the default, and it is the quick one: the pod filter is
+      applied at the Loki end, so it fetches a few tens of pods.
+    - **SFM + misc view** — everything else: the SFM workers, head node,
+      plotters, one-offs, redis. Much bigger — a summit night here is
+      ~9 GiB against the AOS half's few hundred MB, so expect minutes
+      rather than seconds (on a deployment running live mode it is
+      usually instant, because the night is already on disk).
+
+  Each tab is its own fetch and its own link, so you can have both open
+  side by side. Pick the half you want on the home page's night card
+  before fetching; the tab strip switches between them afterwards.
 
 Inside the explore view:
 

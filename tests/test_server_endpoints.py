@@ -23,8 +23,9 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import exposureTimes
+from ra_log_explorer import config, exposureTimes
 from ra_log_explorer import jobs as jobsModule
+from ra_log_explorer import parse
 from ra_log_explorer import server as serverModule
 from ra_log_explorer import sites as sitesModule
 from ra_log_explorer.config import FetchSpec
@@ -2913,3 +2914,100 @@ def test_manual_tZero_for_lsstcam_still_claims_the_bare_key(
     bare = exposureTimes.lookupCachedRecord(expId, siteName="summit")
     assert bare is not None and exposureTimes.isManual(bare)
     assert exposureTimes.recordInstrument(bare) == "lsstcam"
+
+
+# ----- the night's two views, over the wire --------------------------------
+
+
+def test_night_fetch_rejects_an_unknown_view(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 20260813, "view": "everything"})
+    assert status == 400
+    assert "view must be one of" in body["error"]
+
+
+def test_the_sfm_night_fetch_asks_loki_for_every_pod(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the finished job says which half it was, so the client can ask
+    for the right state — a dayObs alone no longer names one."""
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+    seen: list[str | None] = []
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        seen.append(spec.podRegex)
+        cacheDir = tmpCacheRoot / "fake-night-sfm"
+        (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 20260813, "view": "sfm"})
+    assert status == 202, body
+    jobId = body["jobId"]
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    assert body["nightView"] == "sfm"
+    assert seen == [None]  # no pod filter pushed down — see config.NIGHT_VIEWS
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(20260813, "sfm") is not None
+        # And the AOS half of the same night is untouched by it.
+        assert ctx.getNightState(20260813, "aos") is None
+
+
+def test_summary_serves_the_night_view_it_is_asked_for(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Two states, one dayObs. Asking for one must never serve the other:
+    they are different pods, and the difference is silent on screen."""
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    for view, pod in (("aos", "s-lsstcam-run-aos-worker-aosworkerset-1"), ("sfm", "s-x-run-sfm-1")):
+        podDir = tmpCacheRoot / f"night-{view}" / "pods"
+        podDir.mkdir(parents=True, exist_ok=True)
+        summary = parse.PodSummary(
+            pod=pod,
+            group=parse.podGroup(pod),
+            instrument=parse.podInstrument(pod),
+            ordinal=None,
+            nLines=1,
+            nWarn=0,
+            nError=0,
+            nTraceback=0,
+            firstTs=None,
+            lastTs=None,
+        )
+        with ctx.jobs.stateLock:
+            ctx.putNightState(
+                NightState(
+                    cacheDir=tmpCacheRoot / f"night-{view}",
+                    cacheBytes=0,
+                    meta={},
+                    summaries=[summary],
+                    dayObs=20260813,
+                    startTime=config.dayObsStartUtc(20260813),
+                    endTime=config.dayObsEndUtc(20260813),
+                    view=view,
+                )
+            )
+    status, body = _get(host, port, "/api/summary?dayObs=20260813&nightView=sfm")
+    assert status == 200
+    assert body["view"] == "sfm"
+    assert body["stats"]["nPods"] == 1
+    # A bare dayObs still means the AOS half, which is what every link
+    # written before there were two of them says.
+    status, body = _get(host, port, "/api/summary?dayObs=20260813")
+    assert body["view"] == "aos"
+    # And a nonsense view falls back to it rather than erroring.
+    status, body = _get(host, port, "/api/summary?dayObs=20260813&nightView=wat")
+    assert body["view"] == "aos"

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from ra_log_explorer import parse
+from ra_log_explorer.config import NIGHT_AOS_POD_REGEX
 
 # ----- LogLine ------------------------------------------------------------
 
@@ -1702,3 +1704,55 @@ def test_readPodLifecycle_on_a_missing_file_is_empty(tmp_path: Path) -> None:
     events, sandbox = parse.readPodLifecycle(tmp_path / "nope.jsonl")
     assert events == []
     assert sandbox == []
+
+
+# ----- the two night halves partition the pods ------------------------------
+
+
+def test_isAosPod_is_the_exact_complement_of_the_loki_filter() -> None:
+    """The night's two views must divide the pods, not overlap or leak.
+
+    The AOS half pushes `NIGHT_AOS_POD_REGEX` down to Loki, so its window
+    holds exactly the pods that regex matched. The SFM half fetches
+    everything and subtracts `isAosPod` in Python. If the two rules ever
+    part company a pod appears twice or — worse, because it is silent —
+    in neither view. So they are pinned against each other here, over the
+    real pod names the group fixture already carries.
+    """
+    pattern = re.compile(NIGHT_AOS_POD_REGEX)
+    pods = [
+        "s-lsstcam-run-head-node-684d89d6bb-44ctd",
+        "s-lsstcam-run-sfm-runner-workerset-0",
+        "s-lsstcam-run-aos-worker-aosworkerset-3",
+        "s-lsstcam-run-step-1b-aos-worker-gather1baosset-0",
+        "s-lsstcam-run-metadata-server-aos-6f778fc678-lqsd9",
+        "s-lsstcam-run-zernike-prediction-plotting-x",
+        "s-lsstcam-run-backlog-worker-backlogset-18",
+        "s-latiss-run-butler-watcher-9855795b8-g42sd",
+        "redis-0",
+        "rapid-analysis-squid-55c7c86f5-hp9d8",
+    ]
+    for pod in pods:
+        # fullmatch: LogQL anchors a label regex, so ".*aos.*" is a
+        # whole-value match — which for this pattern is the same as a
+        # substring test, and that equivalence is the thing being pinned.
+        assert parse.isAosPod(pod) == bool(pattern.fullmatch(pod)), pod
+    # And the split is non-trivial in both directions, so a rule that
+    # said "everything" or "nothing" could not pass this test.
+    assert any(parse.isAosPod(p) for p in pods)
+    assert any(not parse.isAosPod(p) for p in pods)
+
+
+def test_summarizeAll_keep_filters_before_parsing(tmp_path: Path) -> None:
+    """`keep` selects pods by name; without it every pod is summarized."""
+    podsDir = tmp_path / "pods"
+    podsDir.mkdir()
+    for pod in ("s-lsstcam-run-aos-worker-aosworkerset-1", "s-lsstcam-run-sfm-runner-workerset-1"):
+        (podsDir / f"{pod}.jsonl").write_text(
+            json.dumps({"timestamp": "2026-08-13T13:00:00+01:00", "labels": {}, "line": "hello"}) + "\n"
+        )
+    assert len(parse.summarizeAll(tmp_path)) == 2
+    aos = parse.summarizeAll(tmp_path, keep=parse.isAosPod)
+    assert [s.pod for s in aos] == ["s-lsstcam-run-aos-worker-aosworkerset-1"]
+    rest = parse.summarizeAll(tmp_path, keep=lambda p: not parse.isAosPod(p))
+    assert [s.pod for s in rest] == ["s-lsstcam-run-sfm-runner-workerset-1"]

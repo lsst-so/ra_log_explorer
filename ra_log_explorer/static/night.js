@@ -17,8 +17,10 @@ let nightListenersWired = false;
 
 // Deep link from a night drilldown into one exposure's explore view.
 //
-// The instrument has to travel with the dataId. Night mode is AOS, so
-// it is always LSSTCam — but the link lands on a *fresh* home page,
+// The instrument has to travel with the dataId. Both night views are
+// pinned to LSSTCam (the AOS half by construction; the SFM half because
+// its shutter closes are resolved under that pin) — but the link lands
+// on a *fresh* home page,
 // which otherwise picks up whatever instrument this browser last used.
 // On a browser that had been looking at LATISS, an un-pinned link would
 // resolve the LATISS exposure sharing this 13-digit id — a different
@@ -31,8 +33,42 @@ function nightExposureHref(dataId) {
   );
 }
 
+// The night is two views over the same dayObs — AOS pods, and everything
+// else. They are separate server-side states over separate fetches (the
+// AOS half pushes its pod filter down to Loki; the other half cannot, see
+// config.NIGHT_VIEWS), so switching tabs is a navigation, not a filter
+// applied to something already on the page.
+function renderNightTabs(summary) {
+  const strip = document.getElementById('night-tabs');
+  if (!strip) return;
+  const hint = document.getElementById('night-tab-hint');
+  for (const el of strip.querySelectorAll('.tab')) {
+    const isCurrent = el.dataset.view === summary.view;
+    el.classList.toggle('current', isCurrent);
+    if (isCurrent) {
+      el.setAttribute('aria-current', 'page');
+      el.removeAttribute('href');
+    } else {
+      el.removeAttribute('aria-current');
+      // A real href, so the other half is middle-clickable into its own
+      // browser tab and survives a reload. If it isn't loaded yet the
+      // landing page offers the fetch.
+      el.href = apiUrl(
+        `/?dayObs=${encodeURIComponent(summary.dayObs)}&nightView=${encodeURIComponent(el.dataset.view)}`,
+      );
+    }
+  }
+  if (hint) {
+    hint.textContent =
+      summary.view === 'sfm'
+        ? `${(summary.stats && summary.stats.nPods) || 0} pods — SFM workers, head node, plotters, one-offs`
+        : `${(summary.stats && summary.stats.nPods) || 0} AOS pods`;
+  }
+}
+
 function startNight(summary) {
   nightSummary = summary;
+  renderNightTabs(summary);
   if (window.renderFetchBanner) {
     window.renderFetchBanner(document.getElementById('night-fetch-banner'), summary);
   }
@@ -65,8 +101,9 @@ function startNight(summary) {
   renderRestarts(summary.restarts);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
-      // Drop the dayObs key out of the URL bar so a subsequent refresh
-      // lands on home — not back on whatever night we just left.
+      // Drop the dayObs key (and the half it named) out of the URL bar so
+      // a subsequent refresh lands on home — not back on whatever night we
+      // just left.
       history.replaceState({}, '', window.location.pathname);
       if (window.showHome) window.showHome();
     });
@@ -447,7 +484,8 @@ async function toggleFailureExpansion(tr, row) {
   try {
     const r = await fetch(
       apiUrl(`/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
-        + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`),
+        + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`
+        + `&nightView=${encodeURIComponent(nightSummary.view || 'aos')}`),
     );
     if (!r.ok) {
       td.firstChild.textContent = `(failed to load: HTTP ${r.status})`;

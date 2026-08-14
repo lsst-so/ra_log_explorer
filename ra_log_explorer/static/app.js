@@ -16,6 +16,8 @@ async function bootstrap() {
   //   /?dataId=X&autoFetch=1 -> home with the form pre-submitted (deep-link
   //                            from a night-view bar drilldown)
   //   /?dayObs=Y           -> night view for night Y (or home if not loaded)
+  //   /?dayObs=Y&nightView=sfm -> the SFM+misc half of that night, which is
+  //                            a separate fetch and a separate server state
   //
   // Each tab carries its own URL, so opening / refreshing different
   // tabs hits the server state for *that tab's* key without disturbing
@@ -75,8 +77,12 @@ async function bootstrap() {
   }
   if (urlDayObs) {
     let summary;
+    const urlNightView = urlParams.get('nightView') || 'aos';
     try {
-      const r = await fetch(apiUrl(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`));
+      const r = await fetch(
+        apiUrl(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`
+          + `&nightView=${encodeURIComponent(urlNightView)}`),
+      );
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
     if (summary && summary.loaded) {

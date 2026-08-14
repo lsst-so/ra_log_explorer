@@ -44,12 +44,13 @@ from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
 from . import exposureTimes, night
 from . import parse as parser
 from .config import (
+    DEFAULT_NIGHT_VIEW,
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
@@ -57,6 +58,8 @@ from .config import (
     MAX_CACHE_BYTES,
     MAX_RANGE_SPAN,
     NIGHT_AOS_POD_REGEX,
+    NIGHT_VIEW_AOS,
+    NIGHT_VIEWS,
     FetchSpec,
     cache_root,
     dayObsEndUtc,
@@ -182,7 +185,7 @@ class ServerState:
 
 @dataclass
 class NightState:
-    """A loaded dayObs's worth of parsed AOS-pod data."""
+    """A loaded dayObs's worth of parsed pod data, for one night view."""
 
     cacheDir: Path
     cacheBytes: int
@@ -191,6 +194,11 @@ class NightState:
     dayObs: int
     startTime: dt.datetime  # noon UTC of dayObs (start of dayObs)
     endTime: dt.datetime  # noon UTC of dayObs + 1
+    # Which half of the night this state holds — see config.NIGHT_VIEWS.
+    # Part of the key it is stored under: the two views of one dayObs are
+    # different pods, parsed from different windows, and both can be open
+    # at once in two tabs.
+    view: str = DEFAULT_NIGHT_VIEW
     # See ``ServerState.siteName``.
     siteName: str = ""
     # Lazily populated dataId -> shutter-close UTC datetime, used to
@@ -272,7 +280,7 @@ class ServerContext:
     # HTML so the browser asks for the prefixed URLs back.
     basePath: str = ""
     exposureStates: "OrderedDict[int, ServerState]" = field(default_factory=OrderedDict)
-    nightStates: "OrderedDict[int, NightState]" = field(default_factory=OrderedDict)
+    nightStates: "OrderedDict[tuple[int, str], NightState]" = field(default_factory=OrderedDict)
     # Keyed by ``rangeKey(startId, stopId)``.
     rangeStates: "OrderedDict[str, RangeState]" = field(default_factory=OrderedDict)
 
@@ -294,10 +302,10 @@ class ServerContext:
             self.exposureStates.move_to_end(expId)
         return s
 
-    def getNightState(self, dayObs: int) -> NightState | None:
-        s = self.nightStates.get(dayObs)
+    def getNightState(self, dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> NightState | None:
+        s = self.nightStates.get((dayObs, view))
         if s is not None:
-            self.nightStates.move_to_end(dayObs)
+            self.nightStates.move_to_end((dayObs, view))
         return s
 
     def putExposureState(self, state: ServerState) -> None:
@@ -307,8 +315,8 @@ class ServerContext:
             self.exposureStates.popitem(last=False)
 
     def putNightState(self, state: NightState) -> None:
-        self.nightStates[state.dayObs] = state
-        self.nightStates.move_to_end(state.dayObs)
+        self.nightStates[(state.dayObs, state.view)] = state
+        self.nightStates.move_to_end((state.dayObs, state.view))
         while len(self.nightStates) > _MAX_LOADED_STATES:
             self.nightStates.popitem(last=False)
 
@@ -336,9 +344,9 @@ class ServerContext:
         staleExp = [k for k, v in self.exposureStates.items() if v.cacheDir.resolve() == targetR]
         for k in staleExp:
             del self.exposureStates[k]
-        staleNight = [k for k, v in self.nightStates.items() if v.cacheDir.resolve() == targetR]
-        for k in staleNight:
-            del self.nightStates[k]
+        staleNight = [nk for nk, v in self.nightStates.items() if v.cacheDir.resolve() == targetR]
+        for nk in staleNight:
+            del self.nightStates[nk]
         staleRange = [rk for rk, v in self.rangeStates.items() if v.cacheDir.resolve() == targetR]
         for rk in staleRange:
             del self.rangeStates[rk]
@@ -905,6 +913,9 @@ def _buildNightPayload(state: NightState) -> dict:
         # against the LSSTCam table.
         "instrument": "lsstcam",
         "dayObs": state.dayObs,
+        # Which half of the night this payload is; the UI keys its tabs
+        # on it and refuses to render one tab's data under the other.
+        "view": state.view,
         "startTime": state.startTime.isoformat(),
         "endTime": state.endTime.isoformat(),
         "cacheDir": str(state.cacheDir),
@@ -1387,20 +1398,74 @@ def _findExposureCacheDirs(expId: int, instrument: str | None = None) -> list[Pa
     return [window for _, window in sorted(found, reverse=True)]
 
 
-def _findNightCacheDir(dayObs: int) -> Path | None:
-    """Return the most-recently-fetched night cache for ``dayObs``."""
+def _nightPodFilter(view: str) -> Callable[[str], bool] | None:
+    """The pod-name predicate selecting one half of the night.
+
+    ``None`` for the AOS half, where Loki already applied the filter: its
+    window contains nothing else, so re-testing every pod would only
+    create a second place for the two halves to disagree.
+    """
+    if view == NIGHT_VIEW_AOS:
+        return None
+    return lambda pod: not parser.isAosPod(pod)
+
+
+def _nightViewFromBody(body: dict) -> str:
+    """Read and validate the night view out of a request body."""
+    raw = body.get("view", DEFAULT_NIGHT_VIEW)
+    if raw is None:
+        return DEFAULT_NIGHT_VIEW
+    view = str(raw).strip().lower()
+    if view not in NIGHT_VIEWS:
+        raise ValueError(f"view must be one of {list(NIGHT_VIEWS)}; got {raw!r}")
+    return view
+
+
+def _nightViewFromQuery(params: dict[str, list[str]]) -> str:
+    """Read the night view off a query string, defaulting to AOS.
+
+    Unknown values fall back rather than 400: this rides along on
+    ``/api/summary`` and friends beside the dayObs, and a typo there
+    should show the night people usually want, not an error page.
+    """
+    raw = (params.get("nightView") or [DEFAULT_NIGHT_VIEW])[0].strip().lower()
+    return raw if raw in NIGHT_VIEWS else DEFAULT_NIGHT_VIEW
+
+
+def _findNightCacheDir(dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> Path | None:
+    """Return the most-recently-fetched night cache for ``dayObs``.
+
+    The two views live at different depths, because they are fetched
+    differently (see :data:`config.NIGHT_VIEWS`). The AOS half pushes a
+    pod filter down to Loki and so lands in the nested ``pods=<slug>/``
+    dir; the SFM half fetches the night unfiltered and so *is* the window
+    dir — the same one live mode maintains and a whole-night capture
+    produces, which is why that half is usually free on a live instance.
+    """
+    aos = view == NIGHT_VIEW_AOS
+    want = (_isoForLogcli(dayObsStartUtc(dayObs)), _isoForLogcli(dayObsEndUtc(dayObs)))
     best: tuple[str, Path] | None = None
-    for inner, meta in _iterCompletedCaches(nightMode=True):
+    for inner, meta in _iterCompletedCaches(nightMode=aos):
         spec = meta.get("spec") or {}
         fromIso = spec.get("fromIso")
-        if not spec.get("podRegex") or not isinstance(fromIso, str):
+        if not isinstance(fromIso, str):
             continue
-        try:
-            windowFrom = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
-        except ValueError:
-            continue
-        if int(windowFrom.strftime("%Y%m%d")) != dayObs:
-            continue
+        if aos:
+            if not spec.get("podRegex"):
+                continue
+            try:
+                windowFrom = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if int(windowFrom.strftime("%Y%m%d")) != dayObs:
+                continue
+        else:
+            # Unfiltered, and *exactly* this night: an exposure or range
+            # window that happens to start at noon must not stand in for
+            # a night, and a wider window would bring in a neighbouring
+            # night's pods with no way to tell them apart afterwards.
+            if spec.get("podRegex") or (fromIso, spec.get("toIso")) != want:
+                continue
         fetchedAt = str(meta.get("fetched_at") or "")
         if best is None or fetchedAt > best[0]:
             best = (fetchedAt, inner)
@@ -1500,7 +1565,7 @@ def _loadExposureFromCache(
     return state
 
 
-def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
+def _loadNightFromCache(ctx: ServerContext, dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> NightState | None:
     """Reconstruct a :class:`NightState` from disk for ``dayObs``, if possible.
 
     Mirrors :func:`_loadExposureFromCache` for the night-mode view. Shutter
@@ -1509,7 +1574,7 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
     here). Any dataId not already in the local cache stays absent until a
     real fetch fills it in.
     """
-    cacheDir = _findNightCacheDir(dayObs)
+    cacheDir = _findNightCacheDir(dayObs, view)
     if cacheDir is None:
         return None
     site = _siteForCacheDir(ctx, cacheDir)
@@ -1519,7 +1584,7 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         meta = loadCacheMeta(cacheDir)
     except (OSError, json.JSONDecodeError, FileNotFoundError):
         return None
-    summaries = parser.summarizeAll(cacheDir)
+    summaries = parser.summarizeAll(cacheDir, keep=_nightPodFilter(view))
     state = NightState(
         cacheDir=cacheDir,
         cacheBytes=cacheDuSizeBytes(cache_root()),
@@ -1529,6 +1594,7 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int) -> NightState | None:
         startTime=dayObsStartUtc(dayObs),
         endTime=dayObsEndUtc(dayObs),
         siteName=site.name,
+        view=view,
     )
     # Pinned to LSSTCam, exactly like _prefetchNightShutterCloses: AOS
     # runs on LSSTCam only, and on a night where LATISS also observed a
@@ -1830,7 +1896,9 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             with ctx.jobs.stateLock:
                 for gone in evicted:
                     ctx.evictByCacheDir(gone)
-        summaries = parser.summarizeAll(job.cacheDir)
+        summaries = parser.summarizeAll(
+            job.cacheDir, keep=_nightPodFilter(job.nightView) if job.kind == "night" else None
+        )
         # Sites are validated when the request comes in, so this should
         # always succeed for a job we actually started. Bail out on the
         # paranoid edge case (stale catalog reload) rather than crashing
@@ -1850,6 +1918,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 startTime=dayObsStartUtc(job.dayObs),
                 endTime=dayObsEndUtc(job.dayObs),
                 siteName=site.name,
+                view=job.nightView,
             )
             # Resolve shutter closes for every dataId we'll need before
             # publishing the state, so the /api/summary response is
@@ -2167,10 +2236,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     except ValueError:
                         self._send_error_json(400, "dayObs must be an integer")
                         return
+                    nightView = _nightViewFromQuery(qs)
                     with ctx.jobs.stateLock:
-                        nightState = ctx.getNightState(dayObs)
+                        nightState = ctx.getNightState(dayObs, nightView)
                     if nightState is None:
-                        nightState = _loadNightFromCache(ctx, dayObs)
+                        nightState = _loadNightFromCache(ctx, dayObs, nightView)
                     if nightState is not None:
                         markCacheViewed(nightState.cacheDir)
                         self._send_json(_buildNightPayload(nightState))
@@ -2189,15 +2259,16 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     except ValueError:
                         self._send_error_json(400, "dayObs must be an integer")
                         return
+                    nightView = _nightViewFromQuery(qs)
                     with ctx.jobs.stateLock:
-                        nightState = ctx.getNightState(dayObs)
+                        nightState = ctx.getNightState(dayObs, nightView)
                     if nightState is None:
                         # Same rebuild-from-disk attempt the summary and
                         # pod routes make. Without it, opening a ninth
                         # night evicts the first and every failure row
                         # already on that page 404s until the user
                         # happens to reload the summary.
-                        nightState = _loadNightFromCache(ctx, dayObs)
+                        nightState = _loadNightFromCache(ctx, dayObs, nightView)
                 if nightState is None:
                     self._send_error_json(404, "No night loaded for the requested dayObs")
                     return
@@ -2255,8 +2326,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     except ValueError:
                         self._send_error_json(400, "dayObs must be an integer")
                         return
+                    nightView = _nightViewFromQuery(qs)
                     with ctx.jobs.stateLock:
-                        nightState = ctx.getNightState(dayObs)
+                        nightState = ctx.getNightState(dayObs, nightView)
                     if nightState is None:
                         self._send_error_json(404, f"No night loaded for dayObs {dayObs}")
                         return
@@ -2309,6 +2381,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         "instrument": job.instrument,
                         "tZero": job.tZero.isoformat() if job.tZero else None,
                         "dayObs": job.dayObs,
+                        "nightView": job.nightView if job.kind == "night" else None,
                         "startId": job.startId,
                         "stopId": job.stopId,
                         "fromIso": job.spec.fromIso,
@@ -2609,11 +2682,11 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, f"Bad JSON body: {e}")
                     return
                 try:
-                    spec, site, dayObs = _buildNightSpecFromRequest(ctx, body)
+                    spec, site, dayObs, nightView = _buildNightSpecFromRequest(ctx, body)
                 except ValueError as e:
                     self._send_error_json(400, str(e))
                     return
-                job = ctx.jobs.createNightJob(spec, dayObs, siteName=site.name)
+                job = ctx.jobs.createNightJob(spec, dayObs, siteName=site.name, nightView=nightView)
                 ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
@@ -2715,8 +2788,8 @@ def _buildSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Si
     return spec, site, expId, tZero, _instrumentFromBody(body)
 
 
-def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int]:
-    """Translate a JSON night-fetch request body into (FetchSpec, Site, dayObs)."""
+def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpec, Site, int, str]:
+    """Translate a JSON night-fetch request body into (FetchSpec, Site, dayObs, view)."""
     if not isinstance(body, dict):
         raise ValueError("Request body must be a JSON object")
     dayObsRaw = body.get("dayObs")
@@ -2728,6 +2801,7 @@ def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpe
         raise ValueError("dayObs must be an integer YYYYMMDD") from e
     if dayObs < 19000000 or dayObs > 30000000:
         raise ValueError(f"dayObs {dayObs} doesn't look like a YYYYMMDD integer")
+    view = _nightViewFromBody(body)
 
     fromT = dayObsStartUtc(dayObs)
     toT = dayObsEndUtc(dayObs)
@@ -2741,9 +2815,10 @@ def _buildNightSpecFromRequest(ctx: ServerContext, body: dict) -> tuple[FetchSpe
         fromIso=_isoForLogcli(fromT),
         toIso=_isoForLogcli(toT),
         workers=DEFAULT_WORKERS,
-        podRegex=NIGHT_AOS_POD_REGEX,
+        # The SFM half has no pod filter to push down — see NIGHT_VIEWS.
+        podRegex=NIGHT_AOS_POD_REGEX if view == NIGHT_VIEW_AOS else None,
     )
-    return spec, site, dayObs
+    return spec, site, dayObs, view
 
 
 def _buildRangeSpecFromRequest(

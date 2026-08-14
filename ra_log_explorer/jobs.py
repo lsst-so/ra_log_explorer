@@ -68,6 +68,12 @@ class FetchJob:
     expId: int | None = None
     tZero: dt.datetime | None = None
     dayObs: int | None = None
+    # Night mode: which half of the night this fetch covers (see
+    # `config.NIGHT_VIEWS`). It has to ride on the job rather than be
+    # re-derived from the spec, because the client asks `/api/summary`
+    # for the finished night by name the moment the `done` event lands
+    # and would otherwise open the wrong tab's data.
+    nightView: str = "aos"
     # Range mode: the [startId, stopId] dataId span plus the two UTC
     # shutter-close anchors that define the fetch window.
     startId: int | None = None
@@ -134,10 +140,19 @@ class JobManager:
             self._jobs[jobId] = job
             return job
 
-    def createNightJob(self, spec: FetchSpec, dayObs: int, siteName: str = "") -> FetchJob:
+    def createNightJob(
+        self, spec: FetchSpec, dayObs: int, siteName: str = "", nightView: str = "aos"
+    ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
-            job = FetchJob(jobId=jobId, spec=spec, siteName=siteName, kind="night", dayObs=dayObs)
+            job = FetchJob(
+                jobId=jobId,
+                spec=spec,
+                siteName=siteName,
+                kind="night",
+                dayObs=dayObs,
+                nightView=nightView,
+            )
             self._jobs[jobId] = job
             return job
 
@@ -220,6 +235,9 @@ class JobManager:
                     "instrument": job.instrument,
                     "tZero": job.tZero.isoformat() if job.tZero else None,
                     "dayObs": job.dayObs,
+                    # Same reasoning as ``instrument`` above, for nights:
+                    # a dayObs alone no longer names one loaded state.
+                    "nightView": job.nightView if job.kind == "night" else None,
                     "startId": job.startId,
                     "stopId": job.stopId,
                     "cacheDir": str(cacheDir),

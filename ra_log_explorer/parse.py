@@ -23,7 +23,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 # ----- pod flavor classification -------------------------------------------
 
@@ -88,6 +88,20 @@ def podGroup(pod: str) -> str:
                 bestLabel = label
                 bestLen = len(prefix)
     return bestLabel or "other"
+
+
+def isAosPod(pod: str) -> bool:
+    """Whether this pod belongs to the AOS half of the night view.
+
+    Deliberately a substring test on the pod *name* rather than anything
+    derived from :func:`podGroup`, because it has to be the exact
+    complement of :data:`config.NIGHT_AOS_POD_REGEX` — the LogQL filter
+    the AOS night fetch pushes down to Loki. If the two ever disagree, a
+    pod falls into both halves of the night view or into neither, and the
+    "neither" case is silent. ``tests/test_parse.py`` pins them together
+    against the real pod list.
+    """
+    return "aos" in pod
 
 
 def groupLabels() -> dict[str, str]:
@@ -805,31 +819,6 @@ def classifyK8sEvent(pod: str, jsonObj: dict) -> Event | None:
     return Event(pod, t, kind, level, flavor=reason, message=detail, raw=raw)
 
 
-def iterPodEvents(eventsLogPath: Path) -> Iterator[Event]:
-    """Yield classified lifecycle Events from a pod's ``pods_events`` file.
-
-    Mirrors :func:`iterPodLines` but for the k8s/events stream: skips
-    unparseable lines and events that classify to nothing. Returns nothing
-    if the file is absent (the common case for a pod with no lifecycle
-    events in the window).
-    """
-    pod = eventsLogPath.stem
-    if not eventsLogPath.exists():
-        return
-    with eventsLogPath.open("r", encoding="utf-8", errors="replace") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            ev = classifyK8sEvent(pod, obj)
-            if ev is not None:
-                yield ev
-
-
 def readPodLifecycle(eventsLogPath: Path) -> tuple[list[Event], list[dt.datetime]]:
     """Read a pod's lifecycle file into (classified events, sandbox times).
 
@@ -1219,7 +1208,15 @@ def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSu
     summary.tracebacks.append(record)
 
 
-def summarizeAll(cacheDir: Path) -> list[PodSummary]:
+def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> list[PodSummary]:
+    """Summarize every pod in a window; ``keep`` filters by pod name.
+
+    The filter is applied before parsing, not after, because the caller
+    that uses it is the night view's SFM half: its window holds the whole
+    night unfiltered (see :data:`config.NIGHT_VIEWS`), and parsing the
+    AOS pods only to discard them would be most of a minute on a summit
+    night.
+    """
     podsDir = cacheDir / "pods"
     eventsDir = cacheDir / "pods_events"
     summaries: list[PodSummary] = []
@@ -1227,6 +1224,8 @@ def summarizeAll(cacheDir: Path) -> list[PodSummary]:
         return summaries
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
+            continue
+        if keep is not None and not keep(podFile.stem):
             continue
         # The sibling pods_events/<pod>.jsonl is optional: absent for a pod
         # that had no lifecycle events in the window. (Not for an older

@@ -1,4 +1,4 @@
-"""The night view: a whole dayObs of AOS processing, and its failures.
+"""The night view: a whole dayObs of processing, and its failures.
 
 The corpus is a real night, so the counts here are real counts. That is
 the point: a change that makes the parser attribute a traceback to the
@@ -201,3 +201,26 @@ def test_the_crash_is_attributed_to_what_the_pod_was_working_on(app: Any, corpus
     href = links.first.get_attribute("href")
     assert href is not None and "dataId=20260711" in href
     assert "instrument=lsstcam" in href, href
+
+
+def test_the_night_has_two_tabs_and_says_which_one_is_showing(app: Any, corpus: StagedCorpus) -> None:
+    """The night is served in two halves and the strip has to make that
+    visible — before this, the night view was the AOS pods and said so
+    nowhere, so an SFM worker's restart was missing with no hint that a
+    whole population of pods was out of frame."""
+    openNight(app, corpus)
+    tabs = app.page.locator("#night-tabs .tab")
+    expect(tabs).to_have_count(2)
+    expect(tabs.nth(0)).to_have_text("AOS view")
+    expect(tabs.nth(1)).to_have_text("SFM + misc view")
+    # The one being shown is marked, and is not a link to itself.
+    expect(tabs.nth(0)).to_have_class(re.compile(r"\bcurrent\b"))
+    expect(tabs.nth(0)).to_have_attribute("aria-current", "page")
+    assert app.page.locator("#night-tab-aos").get_attribute("href") is None
+    # The other is a real link carrying the dayObs *and* the half, so it
+    # can be middle-clicked into its own browser tab and survives a
+    # reload — the two halves are separate server states.
+    other = app.page.locator("#night-tab-sfm").get_attribute("href")
+    assert other is not None
+    assert f"dayObs={DAY_OBS}" in other
+    assert "nightView=sfm" in other

@@ -141,6 +141,13 @@ function startHome() {
   if (urlDayObs) {
     document.getElementById('night-form').elements.dayObs.value = urlDayObs;
   }
+  // Landing here from a night tab whose half isn't fetched yet: preselect
+  // it so the one-click fetch reproduces what the URL asked for.
+  const urlNightView = params.get('nightView');
+  if (urlNightView) {
+    const sel = document.getElementById('night-view-select');
+    if (sel && [...sel.options].some((o) => o.value === urlNightView)) sel.value = urlNightView;
+  }
   if (urlRangeStart) {
     document.getElementById('range-form').elements.rangeStart.value = urlRangeStart;
   }
@@ -1100,7 +1107,7 @@ function openProgressStream(jobId) {
       document.getElementById('range-submit').disabled = false;
       transitionToExplore({
         kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs, startId: ev.startId, stopId: ev.stopId,
-        instrument: ev.instrument,
+        instrument: ev.instrument, nightView: ev.nightView,
       });
     } else if (ev.type === 'error') {
       setProgressText(`ERROR: ${ev.error.split('\n')[0]}`);
@@ -1139,7 +1146,11 @@ async function transitionToExplore(activeJob) {
   const instQ = jobInstrument ? `&instrument=${encodeURIComponent(jobInstrument)}` : '';
   let key;
   if (activeJob && activeJob.kind === 'night') {
-    key = `dayObs=${encodeURIComponent(activeJob.dayObs)}`;
+    // The half this job fetched, not the form's current value: the two
+    // are separate states, and asking for the wrong one renders a night
+    // the user didn't just wait for.
+    key = `dayObs=${encodeURIComponent(activeJob.dayObs)}`
+      + `&nightView=${encodeURIComponent(activeJob.nightView || 'aos')}`;
   } else if (activeJob && activeJob.kind === 'range') {
     key = `rangeStart=${encodeURIComponent(activeJob.startId)}`
       + `&rangeStop=${encodeURIComponent(activeJob.stopId)}`;
@@ -1195,7 +1206,8 @@ async function startNightFetch(ev) {
     el.classList.add('error');
     return;
   }
-  const body = { dayObs };
+  const view = (form.elements.view && form.elements.view.value) || 'aos';
+  const body = { dayObs, view };
   const submit = document.getElementById('night-submit');
   submit.disabled = true;
   const msgEl = document.getElementById('night-message');

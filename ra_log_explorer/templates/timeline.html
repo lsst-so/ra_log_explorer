@@ -137,13 +137,14 @@
         </section>
 
         <section class="home-card" id="night-card">
-          <h2>AOS processing <span class="muted">investigate a whole night · LSSTCam only</span></h2>
+          <h2>Night processing <span class="muted">investigate a whole night · LSSTCam only</span></h2>
           <p class="hint">
-            Covers the full 24-hour night for the AOS-flavoured pods
-            (<code>*aos*</code>) for the given <code>dayObs</code> and
-            serves a failure breakdown — error counts by type and pod,
-            per-dataId tracebacks, and Δshutter histograms for the first
-            task pickup and the calcZernikes finish.
+            Covers the full 24-hour night for the given <code>dayObs</code>
+            and serves a failure breakdown — error counts by type and pod,
+            per-dataId tracebacks, pod restarts and deaths, and Δshutter
+            histograms for the first task pickup and the calcZernikes
+            finish. The AOS pods (<code>*aos*</code>) and everything else
+            are separate views; you can open both and switch with the tabs.
           </p>
           <form id="night-form">
             <div class="row">
@@ -151,6 +152,17 @@
                 <span class="lbl">dayObs (YYYYMMDD)</span>
                 <input type="number" name="dayObs" required placeholder="e.g. 20260521" />
                 <span id="night-status" class="hint">a dayObs covers UTC noon to UTC noon the next day</span>
+              </label>
+              <label>
+                <span class="lbl">pods</span>
+                <select name="view" id="night-view-select">
+                  <option value="aos">AOS</option>
+                  <option value="sfm">SFM + misc</option>
+                </select>
+                <span class="hint">
+                  AOS filters at the Loki end and is quick; SFM + misc fetches
+                  the whole night, so it is much bigger and slower
+                </span>
               </label>
             </div>
             <div class="row submit-row">
@@ -338,6 +350,16 @@
         <span id="night-cache-info"></span>
       </div>
     </header>
+
+    <!-- The night is served in two halves, which are separate fetches over
+         different pod sets (see config.NIGHT_VIEWS). Each tab is a link, so
+         a half can be deep-linked, opened in its own browser tab, and
+         reloaded — the URL carries `nightView`. -->
+    <nav id="night-tabs" class="tabstrip" aria-label="night view">
+      <a class="tab" id="night-tab-aos" href="#" data-view="aos">AOS view</a>
+      <a class="tab" id="night-tab-sfm" href="#" data-view="sfm">SFM + misc view</a>
+      <span class="muted" id="night-tab-hint"></span>
+    </nav>
 
     <!-- Loud warning when the night fetch did not get every pod's logs in
          full. Critical here: a truncated/incomplete night silently biases

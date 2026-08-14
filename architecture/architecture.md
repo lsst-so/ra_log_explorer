@@ -161,7 +161,7 @@ Sibling docs:
 
 | Module             | Responsibility                                                                |
 |--------------------|--------------------------------------------------------------------------------|
-| `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` constant, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value — blank included — rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
+| `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` / `NIGHT_VIEWS` constants, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value — blank included — rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
@@ -640,8 +640,12 @@ return:
   loaded rather than served — the same bare id names a different
   exposure per instrument — and the rebuild path resolves under the
   pin. 400 for an unknown instrument name.
-- `?dayObs=<int>` — return that night's payload, or `{loaded: false,
-  cache}` if not loaded.
+- `?dayObs=<int>[&nightView=aos|sfm]` — return that night's payload for
+  the named half, or `{loaded: false, cache}` if that half isn't loaded.
+  `nightView` defaults to `aos` and an unrecognised value falls back to
+  it rather than erroring: this is a query string a person can type, and
+  a 400 there helps nobody. The two halves are separate states, so the
+  same dayObs can have one loaded and not the other.
 - `?rangeStart=<int>&rangeStop=<int>[&instrument=<name>]` — return that
   range's **index** payload (`mode: "range"`), or `{loaded: false,
   cache}` if not loaded.
@@ -762,11 +766,13 @@ former says "no finish event", the latter says *why*.
   "loaded": true,
   "mode": "night",
   "site": "summit",
-  "instrument": "lsstcam",          // always: AOS runs on LSSTCam only
+  "instrument": "lsstcam",          // always: both views pin LSSTCam
   "dayObs": 20260521,
+  "view": "aos",                    // "aos" | "sfm" — which half this is
+                                    // (see POST /api/fetch-night below)
   "startTime": "2026-05-21T12:00:00+00:00",
   "endTime":   "2026-05-22T12:00:00+00:00",
-  "cacheDir":  ".../yagan/rapid-analysis/<window>/pods=__aos__",
+  "cacheDir":  ".../yagan/rapid-analysis/<window>/pods=__aos__",  // sfm: the <window> itself
   "cacheBytes": 1234567890,
   "meta":      { ...fetch metadata },
   "stats": {
@@ -858,7 +864,7 @@ their offsets at this dataId's shutter close). It carries the range's
 `instrument` so the pod lookup runs under the same pin the summary was
 served under.
 
-### `GET /api/pod/<podName>?dataId=<int>[&instrument=<name>]` / `?dayObs=<int>` / `?rangeStart=&rangeStop=&dataId=[&instrument=<name>]`
+### `GET /api/pod/<podName>?dataId=<int>[&instrument=<name>]` / `?dayObs=<int>[&nightView=]` / `?rangeStart=&rangeStop=&dataId=[&instrument=<name>]`
 
 Returns every parsed `LogLine` from that pod's JSONL file. The query
 string routes to the right loaded state (`dataId` → exposure, `dayObs`
@@ -894,7 +900,7 @@ instrument name.
 `podName` is checked against a `[A-Za-z0-9._-]+` allowlist so it
 can't break out of `pods/`.
 
-### `GET /api/night/traceback/<bodyKey>?dayObs=<int>`
+### `GET /api/night/traceback/<bodyKey>?dayObs=<int>[&nightView=aos|sfm]`
 
 Drilldown for a single failure row. Returns the pod's log lines
 spanning the dataId's full processing block when the traceback's expId
@@ -1166,16 +1172,51 @@ errors return `400` with `{"error": "..."}`.
 
 ```jsonc
 {
-  "dayObs": 20260521                   // required, YYYYMMDD integer
+  "dayObs": 20260521,                  // required, YYYYMMDD integer
+  "view": "aos"                        // optional: "aos" (default) | "sfm"
 }
 ```
 
 Same rule as `/api/fetch`: nothing about *how* to reach Loki is accepted
-from the body.
+from the body. An unknown `view` is a 400.
 
-The window is the full 24-hour dayObs (noon UTC → noon UTC) with the
-`pod=~".*aos.*"` filter applied at the Loki layer. Same response
-shape as `/api/fetch`.
+The window is the full 24-hour dayObs (noon UTC → noon UTC) either way.
+Same response shape as `/api/fetch`, plus `nightView` on the status and
+`done` payloads — a dayObs alone no longer names one loaded state, and
+the client asks `/api/summary` for the finished night by name the moment
+`done` lands.
+
+#### The two night views
+
+The night is served in two halves, which partition its pods:
+
+| view | pods | how it is fetched |
+|---|---|---|
+| `aos` (default) | pod name contains `aos` | `pod=~".*aos.*"` pushed down to Loki; lands in the nested `pods=<slug>/` cache dir |
+| `sfm` | everything else — SFM workers, head node, plotters, one-offs, redis … | **no** pod filter; the night is fetched whole and partitioned after parsing, so it lands in the window dir itself |
+
+They are fetched differently because they have to be. LogQL uses RE2,
+which has no negative lookahead, so there is no `pod=~"not aos"` to push
+down. Enumerating the SFM-side names positively was the alternative and
+is worse: "misc" is defined by exclusion, so a pod type nobody had
+thought of would fall out of both halves silently. Fetching the night
+whole costs a wider fetch and buys the guarantee that every pod is in
+exactly one view — `parse.isAosPod` is pinned against
+`NIGHT_AOS_POD_REGEX` by a test for exactly that reason.
+
+Two consequences worth knowing:
+
+- The SFM half is **much bigger**. On a summit night it is ~9 GiB and
+  ~35M lines against the AOS half's few hundred MB, so it is a minutes-
+  long fetch and parse where the AOS half is seconds. On a live instance
+  it is usually free, because the poller already holds the whole night
+  on disk and the request is served by handing that window over.
+- On a night that is still in progress, the SFM half can be *fetched*
+  but not *rebuilt from cache* on a reload: the live night dir has no
+  `_meta.json` until the noon rollover finalises it, and that file is
+  what the cache walkers use to decide a window is complete. Reloading
+  such a tab lands on home with the form prefilled. Finalised nights —
+  every past night — rebuild normally.
 
 ### `POST /api/fetch-range`  (start/stop)
 

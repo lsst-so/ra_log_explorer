@@ -1717,6 +1717,39 @@ body.col-resizing .tl-podcol-resize::after { opacity: 1; background: var(--accen
  * Loud, hard-to-miss strip shown only when a fetch did not retrieve every
  * pod's logs in full. Deliberately high-contrast (err palette, left rule)
  * so a partial night can't be mistaken for the whole night. */
+/* Night view: the AOS / SFM+misc tab strip. Each tab is an <a> so a half
+   can be middle-clicked into its own browser tab; the current one has its
+   href removed, hence the explicit cursor. */
+.tabstrip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 14px 0;
+  border-bottom: 1px solid var(--border);
+}
+.tabstrip .tab {
+  padding: 7px 14px;
+  border: 1px solid transparent;
+  border-bottom: none;
+  border-radius: var(--radius) var(--radius) 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-2);
+  text-decoration: none;
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.tabstrip .tab:hover { background: var(--accent-soft); color: var(--accent-2); }
+.tabstrip .tab.current {
+  background: var(--panel, #fff);
+  border-color: var(--border);
+  border-bottom: 1px solid var(--panel, #fff);
+  color: var(--accent);
+  cursor: default;
+}
+.tabstrip .tab.current:hover { background: var(--panel, #fff); }
+.tabstrip .muted { margin-left: auto; font-size: 12px; padding-right: 4px; }
+
 .fetch-banner {
   margin: 10px 14px 0;
   padding: 12px 14px;

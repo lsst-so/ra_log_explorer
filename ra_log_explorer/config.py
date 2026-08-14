@@ -217,6 +217,26 @@ def currentDayObs(now: dt.datetime) -> int:
 # is fine because the actual pod names are all lowercase.
 NIGHT_AOS_POD_REGEX = ".*aos.*"
 
+# The night view has two halves, and they partition the night's pods
+# between them: "aos" is everything the regex above selects, "sfm" is
+# everything else — the SFM workers plus the head node, plotters,
+# one-offs and the rest of the miscellany.
+#
+# They are fetched differently, and unavoidably so. AOS pushes its
+# filter down to Loki, which is what keeps a summit night's fetch to a
+# few tens of pods. The complement cannot be expressed that way at all:
+# LogQL uses RE2, which has no negative lookahead, so there is no
+# `pod=~"not aos"`. Enumerating the SFM-side names positively was the
+# obvious alternative and is worse — "misc" is defined by exclusion, so
+# a pod type nobody had thought of would vanish from both halves and
+# say nothing about it. So the SFM half fetches the night unfiltered
+# and partitions after parsing, which costs a wider fetch and buys the
+# guarantee that every pod lands in exactly one of the two views.
+NIGHT_VIEW_AOS = "aos"
+NIGHT_VIEW_SFM = "sfm"
+NIGHT_VIEWS: tuple[str, ...] = (NIGHT_VIEW_AOS, NIGHT_VIEW_SFM)
+DEFAULT_NIGHT_VIEW = NIGHT_VIEW_AOS
+
 
 @dataclass(frozen=True)
 class FetchSpec:

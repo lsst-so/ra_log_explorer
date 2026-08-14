@@ -915,9 +915,10 @@ def test_buildNightSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     """A minimal valid body produces a FetchSpec with the AOS pod-regex
     pinned and the window set to the dayObs's noon-UTC bounds."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, dayObs = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
+    spec, site, dayObs, view = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
     assert dayObs == 20260521
     assert site.name == "summit"  # the site this server serves
+    assert view == server.DEFAULT_NIGHT_VIEW == "aos"
     assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
     # Window: noon UTC dayObs → noon UTC dayObs+1.
     assert spec.fromIso.startswith("2026-05-21T12:00:00")
@@ -930,7 +931,7 @@ def test_buildNightSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeS
     summit deployment answering with BTS logs would be worse than an
     error, because it would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
+    spec, site, _, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
     assert site.name == "summit"
     assert spec.cluster == "yagan"
 
@@ -962,7 +963,7 @@ def test_buildNightSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: 
     env is shared, so one browser's wrong password would otherwise break
     fetches for everyone using the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, _, _ = server._buildNightSpecFromRequest(
+    spec, _, _, _ = server._buildNightSpecFromRequest(
         ctx, {"dayObs": 20260521, "password": "hunter2", "username": "someone-else", "workers": 999}
     )
     assert spec.username == server.DEFAULT_USERNAME
@@ -2243,3 +2244,113 @@ def test_night_fetch_keeps_windows_it_does_not_contain(
 
     for survivor in (wider, otherNight, otherSite, current, exposureWindow):
         assert survivor.exists(), survivor
+
+
+# ----- the night's two views -----------------------------------------------
+
+
+def test_nightViewFromBody_defaults_validates_and_normalises() -> None:
+    assert server._nightViewFromBody({}) == "aos"
+    assert server._nightViewFromBody({"view": None}) == "aos"
+    assert server._nightViewFromBody({"view": "  SFM "}) == "sfm"
+    with pytest.raises(ValueError, match="view must be one of"):
+        server._nightViewFromBody({"view": "everything"})
+
+
+def test_nightViewFromQuery_falls_back_rather_than_failing() -> None:
+    """This rides beside a dayObs on read paths, where a 400 helps nobody.
+
+    A body naming a bad view is a client bug worth reporting; a query
+    string is something a person can type, and showing them the night
+    they almost certainly meant beats an error page.
+    """
+    assert server._nightViewFromQuery({}) == "aos"
+    assert server._nightViewFromQuery({"nightView": ["sfm"]}) == "sfm"
+    assert server._nightViewFromQuery({"nightView": ["SFM"]}) == "sfm"
+    assert server._nightViewFromQuery({"nightView": ["nonsense"]}) == "aos"
+
+
+def test_nightPodFilter_is_None_for_aos_and_subtracts_for_sfm() -> None:
+    """The AOS half re-filters nothing: Loki already did it.
+
+    Testing every pod again would be a second implementation of the same
+    rule, and the failure mode of two implementations is that they
+    disagree without saying so.
+    """
+    assert server._nightPodFilter("aos") is None
+    keep = server._nightPodFilter("sfm")
+    assert keep is not None
+    assert keep("s-lsstcam-run-sfm-runner-workerset-1")
+    assert not keep("s-lsstcam-run-aos-worker-aosworkerset-1")
+
+
+def test_buildNightSpecFromRequest_sfm_view_pushes_no_filter_to_loki(
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """LogQL (RE2) has no negative lookahead, so "not aos" cannot be a
+    Loki filter at all — the SFM half fetches the night whole and
+    partitions afterwards."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, _, dayObs, view = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "view": "sfm"})
+    assert (view, dayObs) == ("sfm", 20260521)
+    assert spec.podRegex is None
+    # Same window either way: a dayObs is a dayObs.
+    assert spec.fromIso.startswith("2026-05-21T12:00:00")
+    assert spec.toIso.startswith("2026-05-22T12:00:00")
+
+
+def test_buildNightSpecFromRequest_rejects_an_unknown_view(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    with pytest.raises(ValueError, match="view must be one of"):
+        server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "view": "sfmm"})
+
+
+def test_both_night_views_of_one_dayObs_are_held_at_once(tmp_path: Path) -> None:
+    """The two halves are different pods parsed from different windows.
+
+    Keying the cache on dayObs alone — which is what it did before there
+    were two — would mean opening one tab silently replaced the other's
+    data with pods it never asked for.
+    """
+    ctx = server.ServerContext(jobs=JobManager())
+    for view in ("aos", "sfm"):
+        ctx.putNightState(
+            server.NightState(
+                cacheDir=tmp_path / view,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260813,
+                startTime=config.dayObsStartUtc(20260813),
+                endTime=config.dayObsEndUtc(20260813),
+                view=view,
+            )
+        )
+    assert len(ctx.nightStates) == 2
+    aos = ctx.getNightState(20260813, "aos")
+    sfm = ctx.getNightState(20260813, "sfm")
+    assert aos is not None and sfm is not None
+    assert aos.cacheDir != sfm.cacheDir
+    # The default is the AOS half, which is what a bare dayObs has always
+    # meant and what every existing deep link says.
+    assert ctx.getNightState(20260813) is aos
+    # Deleting one window drops only its own state.
+    ctx.evictByCacheDir(tmp_path / "aos")
+    assert ctx.getNightState(20260813, "aos") is None
+    assert ctx.getNightState(20260813, "sfm") is sfm
+
+
+def test_night_payload_carries_its_view(tmp_path: Path) -> None:
+    state = server.NightState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260813,
+        startTime=config.dayObsStartUtc(20260813),
+        endTime=config.dayObsEndUtc(20260813),
+        view="sfm",
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["view"] == "sfm"
+    assert payload["dayObs"] == 20260813
