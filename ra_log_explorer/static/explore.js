@@ -495,6 +495,14 @@ function groupDisplay(group) {
   return group;
 }
 
+// Lifecycle kinds worth shouting about, and the word to write on the
+// timeline next to each — so a death is legible without hovering.
+const ALARM_LIFECYCLE = {
+  POD_RESTARTED: 'restart',
+  POD_OOMKILLED: 'OOM kill',
+  POD_FAILED: 'pod failed',
+};
+
 function makeEventNode(e) {
   const n = document.createElement('div');
   n.className = 'tl-event ' + kindClass(e.kind, e.level);
@@ -502,6 +510,17 @@ function makeEventNode(e) {
   // ticks) so a restart/kill/OOM reads as "the whole pod" at that instant.
   if (e.kind && e.kind.startsWith('POD_')) {
     n.classList.add('lifecycle');
+    // The kinds that mean the pod *died*. A graceful `Killing` (rollout,
+    // scale-down) and a mount failure are ordinary enough that alarming
+    // on them would train people to ignore the alarm.
+    const label = ALARM_LIFECYCLE[e.kind];
+    if (label) {
+      n.classList.add('alarm');
+      const tag = document.createElement('span');
+      tag.className = 'tl-lifecycle-label';
+      tag.textContent = label;
+      n.appendChild(tag);
+    }
     n.style.left = xForOffset(e.offsetS) + 'px';
     n.addEventListener('mouseenter', (ev) => showTooltip(ev, e));
     n.addEventListener('mousemove', moveTooltip);

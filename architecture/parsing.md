@@ -177,6 +177,49 @@ which writes one line and exits. And none of this makes an OOM
 means "the container died and came back", which is as much as these
 logs can support.
 
+### Naming the exception (`_excClassFrom`)
+
+An exception line is recognised by *shape*, not by a list of known
+classes: an optional lowercase dotted module path, a Capital-led
+CamelCase name, then either `: message` or the end of the line. There is
+deliberately **no** `…Error` / `…Exception` suffix requirement. There
+used to be, and it was by far the biggest source of `<unclassified>`,
+because the pipeline names its exceptions for what went wrong rather
+than for the fact that something did:
+
+```
+lsst.meas.astrom.exceptions.BadAstrometryFit: Poor quality astrometric fit, 8.24" > 0.5"
+lsst.meas.astrom.exceptions.MatcherFailure: No matches found
+lsst.pipe.base...NoVisitWcs: No valid target WCSs were left after rejection.
+```
+
+A second rule was wrong in the same place and for a related reason: the
+module prefix had to be *all* lowercase, but LSST names a module after
+the camelCase task inside it. So
+`lsst.pipe.tasks.calibrateImage.NoPsfStarsToStarsMatchError` was
+declined too — despite carrying the `…Error` suffix the old rule
+demanded — purely because of the `I` in `calibrateImage`. Prefix
+components are now lowercase-*led* rather than all-lowercase.
+
+Between them the two fixes take `<unclassified>` to **zero** on every
+night we have captured: 20260711 (summit) from 5313 to 0 of 110003
+tracebacks, 20260813 from 1517 to 0 of 4768, 20260811 from 175 to 0 of
+648. The `<truncated>` count is untouched — those are genuinely
+cut-short bodies, and that label stays honest.
+
+What keeps that from being greedy is one extra rule: **the class token
+must contain a lowercase letter**. The shape alone would happily accept
+a bare `WARNING: …` or `ERROR: …` — column-0 words that do end a
+traceback but name nothing — and third-party output emits plenty of
+those. Every real class name has a lowercase letter; the log levels
+that would otherwise qualify do not.
+
+Lowercase-*named* classes exist too — `socket.gaierror`, `os.error` —
+and they get no free pass from shape, since a lowercase word is what
+most non-exception lines look like. They qualify only when they carry
+the canonical `…error` / `…Error` suffix, which is enough to separate
+`socket.gaierror` from a stray `custompkg.halt:` or `drp_pipe:`.
+
 **What real data exists behind these.** The nights we have captured are
 mostly healthy: their lifecycle streams hold `Started`, `Killing`,
 `Pulling`/`Pulled`/`Created`, `Scheduled` and little else. One reason
@@ -225,7 +268,7 @@ Each captured traceback becomes a `TracebackRecord`:
 | `pod`        | pod name                                                          |
 | `t`          | timestamp of the leader line                                       |
 | `expId`      | carryover-attributed dataId for worker pods; bare-id-on-the-line for control-plane pods; `None` if neither |
-| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. When no class is recognised, one of two sentinels is used, kept distinct: `<unclassified>` if the traceback reached its terminating exception line but the class wasn't in the classifier's suffix set (e.g. `StopIteration`, a custom `Halt: …`) — the record is complete, just unnamed; `<truncated>` if the body was cut short before any terminator (the log forwarder dropped the tail, or another logger interleaved a line mid-stack). |
+| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. When no class is recognised, one of two sentinels is used, kept distinct: `<unclassified>` if the traceback reached its terminating exception line but nothing on it could be read as a class name (an all-caps banner like `FAILURE: …`, or a lowercase `custompkg.halt: …`) — the record is complete, just unnamed; `<truncated>` if the body was cut short before any terminator (the log forwarder dropped the tail, or another logger interleaved a line mid-stack). |
 | `excMessage` | the rest of the exception line, capped at 200 chars                |
 | `body`       | the full traceback text, capped at `_TRACEBACK_MAX_LINES = 250` lines and `_TRACEBACK_MAX_CHARS = 32_000` chars |
 

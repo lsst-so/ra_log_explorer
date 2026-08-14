@@ -89,15 +89,23 @@ function startNight(summary) {
     'First task pickup',
     summary.histograms.firstTaskStart,
   );
-  renderHistogram(
-    'night-hist-cz',
-    'night-hist-cz-meta',
-    'night-hist-cz-title',
-    'night-hist-cz-bin',
-    'calcZernikes end',
-    summary.histograms.calcZernikesEnd,
-  );
-  renderFailures(summary.failures);
+  // calcZernikes is an AOS task. On the SFM half the server sends no
+  // histogram for it, and an empty chart there would read as "the task
+  // ran and produced nothing" rather than "this task isn't in this view".
+  const czCard = document.getElementById('night-hist-cz-card');
+  const cz = summary.histograms.calcZernikesEnd;
+  if (czCard) czCard.hidden = !cz;
+  if (cz) {
+    renderHistogram(
+      'night-hist-cz',
+      'night-hist-cz-meta',
+      'night-hist-cz-title',
+      'night-hist-cz-bin',
+      'calcZernikes end',
+      cz,
+    );
+  }
+  renderFailures(summary.failures, false);
   renderRestarts(summary.restarts);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
@@ -124,7 +132,7 @@ function renderTopStats(stats) {
     { label: 'pods w/ traceback', value: stats.nPodsWithTraceback },
     { label: 'distinct exception classes', value: stats.nDistinctExceptionClasses },
     {
-      label: 'pod restarts',
+      label: 'in-place restarts',
       value: stats.nPodRestarts || 0,
       accent: (stats.nPodRestarts || 0) > 0 ? 'warn' : null,
     },
@@ -425,16 +433,35 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
 
 // ----- failures table + drilldown -------------------------------------------
 
-function renderFailures(rows) {
+// How many failure rows to show before folding. A quiet night fits
+// entirely; a bad one runs to thousands, and every section below this
+// table used to be a very long scroll away.
+const FAILURES_FOLDED = 10;
+
+function renderFailures(rows, showAll) {
   const tbody = document.querySelector('#night-failures tbody');
   tbody.innerHTML = '';
   document.getElementById('night-failures-count').textContent =
     `(${rows.length} traceback${rows.length === 1 ? '' : 's'})`;
+  const expand = document.getElementById('night-failures-expand');
   if (rows.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="muted">No tracebacks 🎉</td></tr>';
+    if (expand) expand.hidden = true;
     return;
   }
-  for (const r of rows) {
+  const folded = !showAll && rows.length > FAILURES_FOLDED;
+  const shown = folded ? rows.slice(0, FAILURES_FOLDED) : rows;
+  if (expand) {
+    expand.hidden = rows.length <= FAILURES_FOLDED;
+    expand.textContent = folded
+      ? `show all ${rows.length} ▾`
+      : `show first ${FAILURES_FOLDED} only ▴`;
+    // Re-render rather than toggle row visibility: the drilldown inserts
+    // sibling rows, so "hidden rows" and "expanded rows" would have to
+    // agree about each other. Rebuilding has neither problem.
+    expand.onclick = () => renderFailures(rows, !showAll);
+  }
+  for (const r of shown) {
     const tr = document.createElement('tr');
     tr.className = 'night-failure-row';
     tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));

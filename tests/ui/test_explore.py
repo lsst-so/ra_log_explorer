@@ -8,6 +8,7 @@ the renderer had changed what the timeline says happened.
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from playwright.sync_api import expect
@@ -250,3 +251,44 @@ def test_lifecycle_markers_are_kept_across_the_whole_window(app: Any, corpus: St
     corpus.plantPodCrash()
     openExposure(app, corpus, dataId=CRASH_ID)
     assert app.page.locator("#timeline .tl-event.lifecycle").count() >= 1
+
+
+def test_a_pod_death_is_hard_to_miss(app: Any, corpus: StagedCorpus) -> None:
+    """A pod dying mid-night should never happen, so when it does the
+    marker is meant to be the loudest thing on the page rather than a
+    4px tick to go looking for: it pulses, it is wider, and it writes
+    what happened next to itself so the tooltip isn't the only way to
+    find out.
+
+    A graceful `Killing` — an ordinary rollout — deliberately gets none
+    of that; an alarm that fires on routine events is one people learn
+    to ignore.
+    """
+    corpus.plantPodCrash()
+    openExposure(app, corpus, dataId=CRASH_ID)
+    row = app.page.locator("#timeline .tl-row", has_text="gather1baosset-0").first
+    alarms = row.locator(".tl-event.lifecycle.alarm")
+    assert alarms.count() >= 1, "the crash left no alarming marker"
+    expect(alarms.first.locator(".tl-lifecycle-label")).to_have_text(
+        re.compile(r"restart|OOM kill|pod failed")
+    )
+    # The animation is real, not just a class name.
+    assert (
+        app.page.evaluate("() => getComputedStyle(document.querySelector('.tl-event.alarm')).animationName")
+        == "ra-alarm-pulse"
+    )
+    # The label is decoration: it must not swallow hovers meant for what
+    # is underneath it. (The marker's own hover → tooltip is covered by
+    # test_a_pod_death_shows_up_on_the_timeline; asserting it here as
+    # well would only be testing which of several coincident markers
+    # happens to be on top.)
+    assert (
+        app.page.evaluate(
+            "() => getComputedStyle(document.querySelector('.tl-lifecycle-label')).pointerEvents"
+        )
+        == "none"
+    )
+    # A graceful kill is not alarmed.
+    killed = row.locator(".tl-event.kind-killed")
+    if killed.count():
+        expect(killed.first).not_to_have_class(re.compile(r"\balarm\b"))

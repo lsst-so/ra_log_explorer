@@ -153,6 +153,23 @@ memory, then appended to the pod's `.jsonl` once trusted. The whole
 per-pod tree runs under `PER_POD_TIMEOUT_S` (1800 s); the oracle gets the
 shorter `COUNT_TIMEOUT_S`.
 
+### `-o jsonl` strips labels common to the response
+
+Each entry's `labels` object holds only the labels that **vary** within
+the response; logcli factors out the common ones (they are what
+`--quiet` suppresses from the preamble). So `container` appears on a
+pod's lines only when that response happened to span two containers, and
+its *absence* means "one container in this chunk", not "no container
+label". Presence is therefore an artefact of chunk boundaries.
+
+Consequence, learned the hard way: do not build logic on a label being
+there. A rule of the form "the lines before this event came from a
+different container" looked exact and was measured to work on four
+nights, but only because the init container's one line and the main
+container's lines happened to land in the same request every time. If
+you need per-container attribution, ask for it explicitly (a
+`{...} | container="x"` selector) rather than reading it off the entries.
+
 ### Timestamps
 
 - `--from` / `--to` / `--now` want RFC3339-ish strings; we format them as

@@ -934,11 +934,11 @@ def test_summarizePod_traceback_interleaved_log_line_marks_truncated(tmp_path: P
 
 def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_path: Path) -> None:
     """A traceback that reaches its terminating exception line but whose
-    class our classifier doesn't recognise (here ``StopIteration`` — no
-    canonical Error/Exception/… suffix) is *complete*, so it must label
-    ``"<unclassified>"`` — never ``"<truncated>"``, which is reserved for
-    genuinely cut-short bodies. The terminating line is still captured in
-    the body so the user can read the type by eye."""
+    class we decline to name (here a bare all-caps ``FAILURE:`` — the
+    shape of a third-party banner, not of a class) is *complete*, so it
+    must label ``"<unclassified>"`` — never ``"<truncated>"``, which is
+    reserved for genuinely cut-short bodies. The terminating line is
+    still captured in the body so the user can read the type by eye."""
     p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
     _writePodLog(
         p,
@@ -947,9 +947,9 @@ def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_pa
             ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
             ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
             ("2026-05-21T13:00:01.002+00:00", "error", "    next(it)"),
-            # Terminating exception line, but StopIteration isn't in the
-            # classifier's suffix set — complete, just unclassifiable.
-            ("2026-05-21T13:00:01.003+00:00", "error", "StopIteration: queue drained"),
+            # Terminating line: the right shape, but all-caps, so it is
+            # a banner rather than a class name. Complete, unnameable.
+            ("2026-05-21T13:00:01.003+00:00", "error", "FAILURE: queue drained"),
             # A following line so the traceback finalises via the normal
             # (non-EOF) terminator path.
             ("2026-05-21T13:00:02.000+00:00", "info", "moving on"),
@@ -959,20 +959,24 @@ def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_pa
     assert len(s.tracebacks) == 1
     tb = s.tracebacks[0]
     assert tb.excClass == "<unclassified>"
-    assert "StopIteration: queue drained" in tb.body
+    assert "FAILURE: queue drained" in tb.body
 
 
 def test_summarizePod_complete_traceback_unknown_class_at_eof_marks_unclassified(tmp_path: Path) -> None:
     """Same as above but the unclassified terminator line is the last
     line in the pod log: it still finalises as ``"<unclassified>"`` (the
-    terminator was seen before EOF), not ``"<truncated>"``."""
+    terminator was seen before EOF), not ``"<truncated>"``.
+
+    Here the final component is lowercase, so there is no class name to
+    read off it — the shape says "a traceback ended here" and nothing
+    more."""
     p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
     _writePodLog(
         p,
         [
             ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
             ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
-            ("2026-05-21T13:00:01.003+00:00", "error", "custompkg.Halt: shutting down"),
+            ("2026-05-21T13:00:01.003+00:00", "error", "custompkg.halt: shutting down"),
         ],
     )
     s = parse.summarizePod(p)
@@ -1756,3 +1760,84 @@ def test_summarizeAll_keep_filters_before_parsing(tmp_path: Path) -> None:
     assert [s.pod for s in aos] == ["s-lsstcam-run-aos-worker-aosworkerset-1"]
     rest = parse.summarizeAll(tmp_path, keep=lambda p: not parse.isAosPod(p))
     assert [s.pod for s in rest] == ["s-lsstcam-run-sfm-runner-workerset-1"]
+
+
+def test_summarizePod_names_a_pipeline_exception_with_no_Error_suffix(tmp_path: Path) -> None:
+    """The pipeline names its exceptions for what went wrong, not for the
+    fact that something did — `BadAstrometryFit`, `MatcherFailure`,
+    `NoVisitWcs`. Requiring an `…Error`/`…Exception` suffix binned every
+    one of them as `<unclassified>`: 1517 of 20260813's 4768 tracebacks,
+    which was *all* of that night's unclassified ones.
+
+    The lines here are verbatim from that night's `calibrateImage`
+    failures.
+    """
+    p = tmp_path / "s-lsstcam-run-sfm-runner-workerset-134.jsonl"
+    _writePodLog(
+        p,
+        [
+            ("2026-08-13T16:02:46.893+00:00", "error", "Running pipeline for 2026081300001 detector 144"),
+            ("2026-08-13T16:02:46.910+00:00", "error", "Traceback (most recent call last):"),
+            (
+                "2026-08-13T16:02:46.911+00:00",
+                "error",
+                '  File "/opt/lsst/.../pipe_tasks/calibrateImage.py", line 890, in runQuantum',
+            ),
+            ("2026-08-13T16:02:46.912+00:00", "error", "    raise exception"),
+            (
+                "2026-08-13T16:02:46.913+00:00",
+                "error",
+                "lsst.meas.astrom.exceptions.BadAstrometryFit: Poor quality astrometric fit, "
+                "8.245119905190442\" > 0.5\": {'nMatches': 383}",
+            ),
+            ("2026-08-13T16:02:47.000+00:00", "info", "moving on"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    tb = s.tracebacks[0]
+    # The dotted module path is dropped; the class alone is the label the
+    # errors-by-type table groups on.
+    assert tb.excClass == "BadAstrometryFit"
+    assert tb.excMessage.startswith("Poor quality astrometric fit")
+    assert tb.expId == 2026081300001
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        # Named: the module path is stripped, the class kept.
+        ("lsst.meas.astrom.exceptions.BadAstrometryFit: nope", "BadAstrometryFit"),
+        ("lsst.meas.astrom.exceptions.MatcherFailure", "MatcherFailure"),
+        ("NoVisitWcs: no wcs for visit 1", "NoVisitWcs"),
+        ("RuntimeError: still works", "RuntimeError"),
+        ("galsim.errors.GalSimRangeError: x", "GalSimRangeError"),
+        # camelCase module names: LSST names a module after the task it
+        # holds, and requiring an all-lowercase module path rejected
+        # these — even the ones already carrying an `…Error` suffix.
+        ("lsst.pipe.tasks.calibrateImage.NoPsfStarsToStarsMatchError: x", "NoPsfStarsToStarsMatchError"),
+        ("lsst.meas.algorithms.measureApCorr.MeasureApCorrError: x", "MeasureApCorrError"),
+        # Lowercase class names exist in the standard library, but only
+        # qualify when they carry the canonical suffix — a lowercase word
+        # is what most non-exception lines look like.
+        ("socket.gaierror: [Errno -2] Name or service not known", "gaierror"),
+        ("error: a bare word is not a class", None),
+        ("StopIteration", "StopIteration"),
+        ("Foo.SubError: nested", "SubError"),
+        # Declined: all-caps banners are the shape but not a class. These
+        # are why the suffix requirement could be dropped safely.
+        ("WARNING: AstropyDeprecationWarning is deprecated", None),
+        ("ERROR: something went wrong", None),
+        ("FAILURE", None),
+        # Declined: no Capital-led component at all.
+        ("drp_pipe:", None),
+        ("custompkg.halt: shutting down", None),
+        # Declined: prose, not an exception line — the class token has to
+        # be followed by `:` or the end of the line, nothing else.
+        ("Poor quality astrometric fit, 8.2 > 0.5", None),
+        ("Traceback (most recent call last):", None),
+    ],
+)
+def test_excClassFrom_names_classes_and_declines_banners(line: str, expected: str | None) -> None:
+    got = parse._excClassFrom(line)
+    assert (got[0] if got else None) == expected

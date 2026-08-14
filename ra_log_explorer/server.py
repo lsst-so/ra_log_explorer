@@ -894,12 +894,21 @@ def _buildNightPayload(state: NightState) -> dict:
         nDroppedNoTZero=firstNDropped,
         dataIds=firstIds,
     )
-    histCz = night.buildHistogram(
-        "calcZernikes end (Δshutter)",
-        "s",
-        czOffsets,
-        nDroppedNoTZero=czNDropped,
-        dataIds=czIds,
+    # calcZernikes is an AOS task, so its Δshutter distribution is
+    # meaningless on the SFM half — the pods there never run it, and an
+    # empty histogram would invite the reading "it ran and produced
+    # nothing" rather than "not applicable here". Omitted from the
+    # payload entirely; the UI drops the card when it is absent.
+    histCz = (
+        night.buildHistogram(
+            "calcZernikes end (Δshutter)",
+            "s",
+            czOffsets,
+            nDroppedNoTZero=czNDropped,
+            dataIds=czIds,
+        )
+        if state.view == NIGHT_VIEW_AOS
+        else None
     )
     failures = night.failureRows(state.summaries, shutterCloseByExpId)
     restarts = night.lifecycleRows(state.summaries, shutterCloseByExpId)
@@ -938,7 +947,7 @@ def _buildNightPayload(state: NightState) -> dict:
         "errorsByPod": [_toJsonable(r) for r in errPod],
         "histograms": {
             "firstTaskStart": _toJsonable(histFirst),
-            "calcZernikesEnd": _toJsonable(histCz),
+            "calcZernikesEnd": _toJsonable(histCz) if histCz is not None else None,
         },
         "failures": [_toJsonable(r) for r in failures],
         # dataIds with gather (step1b) activity but no step1a precursor —

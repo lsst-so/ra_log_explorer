@@ -2354,3 +2354,31 @@ def test_night_payload_carries_its_view(tmp_path: Path) -> None:
     payload = server._buildNightPayload(state)
     assert payload["view"] == "sfm"
     assert payload["dayObs"] == 20260813
+
+
+def test_the_sfm_night_omits_the_calcZernikes_histogram(tmp_path: Path) -> None:
+    """calcZernikes is an AOS task. Drawing an empty chart for it on the
+    SFM half would read as "it ran and produced nothing" rather than "not
+    applicable here", so the payload leaves it out and the UI drops the
+    card."""
+
+    def state(view: str) -> server.NightState:
+        return server.NightState(
+            cacheDir=tmp_path,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            dayObs=20260813,
+            startTime=config.dayObsStartUtc(20260813),
+            endTime=config.dayObsEndUtc(20260813),
+            view=view,
+        )
+
+    aos = server._buildNightPayload(state("aos"))
+    sfm = server._buildNightPayload(state("sfm"))
+    assert aos["histograms"]["calcZernikesEnd"] is not None
+    assert sfm["histograms"]["calcZernikesEnd"] is None
+    # The first-task histogram means the same thing in both halves and
+    # stays in both.
+    assert aos["histograms"]["firstTaskStart"] is not None
+    assert sfm["histograms"]["firstTaskStart"] is not None

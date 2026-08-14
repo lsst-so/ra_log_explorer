@@ -317,7 +317,10 @@ The browser app has three views:
   dataId the pod was processing at that moment — click it to open that
   visit. A `restart` is an in-place container restart, usually an OOM,
   so it's the fastest way to spot "which exposures had a worker die on
-  them tonight".
+  them tonight". (The *in-place restarts* stat counts only the restarts;
+  the table lists every lifecycle event, so its count is normally
+  larger.) The failures table is folded to the first ten rows — a bad
+  night runs to thousands — with the true total always in the heading.
 
   The night comes in **two tabs**, which between them cover every pod:
 
@@ -328,7 +331,9 @@ The browser app has three views:
       plotters, one-offs, redis. Much bigger — a summit night here is
       ~9 GiB against the AOS half's few hundred MB, so expect minutes
       rather than seconds (on a deployment running live mode it is
-      usually instant, because the night is already on disk).
+      usually instant, because the night is already on disk). The
+      calcZernikes histogram is absent here: it is an AOS task, and
+      these pods never run it.
 
   Each tab is its own fetch and its own link, so you can have both open
   side by side. Pick the half you want on the home page's night card
@@ -397,7 +402,12 @@ Inside the explore view:
     fetched next to the logs. An orange `restart` tick is the important
     one: it means the container died and was restarted **in place**, so
     if a pod's app log just stops mid-exposure with no traceback, the
-    restart tick a few seconds later is usually *why*. Red `killed` /
+    restart tick a few seconds later is usually *why*. A pod dying
+    should never happen, so those ticks are deliberately loud: a
+    restart, OOM kill or hard failure **pulses** and writes what it was
+    next to itself, rather than being a thin tick you have to go looking
+    for. (Under `prefers-reduced-motion` it goes striped instead of
+    pulsing.) An ordinary rollout `killed` is left quiet on purpose. Red `killed` /
     `OOM-killed` / `failed` and amber `unhealthy` ticks cover the
     explicit cases. Hover any tick for the k8s reason and message.
     (Caveat: a container that exceeds its own memory limit is killed by

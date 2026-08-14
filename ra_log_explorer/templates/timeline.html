@@ -406,7 +406,7 @@
             <div id="night-hist-first-meta" class="hint"></div>
             <div id="night-hist-first-bin" class="night-hist-bin"></div>
           </div>
-          <div class="night-hist">
+          <div class="night-hist" id="night-hist-cz-card">
             <h3 id="night-hist-cz-title">calcZernikes end</h3>
             <svg id="night-hist-cz" class="night-hist-svg"></svg>
             <div id="night-hist-cz-meta" class="hint"></div>
@@ -418,9 +418,10 @@
       <section class="home-card">
         <h2>Failed dataIds <span class="muted" id="night-failures-count"></span></h2>
         <p class="hint">
-          One row per traceback. Click a row to expand the captured
-          traceback body inline. The arrow on the right opens the
-          full per-pod log in the explore view.
+          One row per traceback, newest first. Click a row to expand the
+          captured traceback body inline. The arrow on the right opens the
+          full per-pod log in the explore view. Long lists are folded to
+          the first ten — the count in the heading is always the total.
         </p>
         <table id="night-failures">
           <thead>
@@ -436,13 +437,17 @@
           </thead>
           <tbody></tbody>
         </table>
+        <button type="button" id="night-failures-expand" class="ghost mini" hidden></button>
       </section>
 
       <section class="home-card">
         <h2>Pod restarts &amp; deaths <span class="muted" id="night-restarts-count"></span></h2>
         <p class="hint">
           Pod lifecycle events from Kubernetes (the <code>k8s/events</code>
-          stream). A <strong>restart</strong> is an in-place container
+          stream) — restarts, kills, evictions and mount failures alike,
+          so this count is normally larger than the <em>in-place
+          restarts</em> stat above, which counts only the restarts. A
+          <strong>restart</strong> is an in-place container
           restart — most often an out-of-memory kill the kernel didn't log
           to us — so a pod whose work stops mid-visit with no traceback
           usually has a restart here. Each row is attributed to the dataId

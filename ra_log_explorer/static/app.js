@@ -173,6 +173,27 @@ function renderFetchBanner(bannerEl, summary) {
   const problems = Object.assign({}, incomplete, errors);
   const pods = Object.keys(problems);
   const complete = meta ? (meta.fetchComplete !== false && pods.length === 0) : true;
+  // A fetch that found *no pods at all* reports itself perfectly
+  // complete, because it completed — it just completed over nothing.
+  // On screen that is indistinguishable from a quiet night, and the
+  // usual cause is asking the wrong cluster: this server serves one
+  // site, so a BTS dayObs opened on a summit instance renders an empty
+  // night with no error anywhere. Say so.
+  if (meta && meta.pod_count === 0) {
+    bannerEl.hidden = false;
+    const t = document.createElement('div');
+    t.className = 'fetch-banner-title';
+    t.textContent = '⚠ No pods found in this window';
+    bannerEl.appendChild(t);
+    const s2 = document.createElement('div');
+    s2.className = 'fetch-banner-sub';
+    s2.textContent =
+      `Nothing logged to ${(summary && summary.site) || 'this site'} in the requested window. `
+      + 'Most often that means the dataId or dayObs belongs to the other site — '
+      + 'this server serves one cluster and cannot see the other.';
+    bannerEl.appendChild(s2);
+    return;
+  }
   if (complete) {
     bannerEl.hidden = true;
     return;

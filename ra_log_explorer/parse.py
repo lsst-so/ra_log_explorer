@@ -705,18 +705,24 @@ _POD_SANDBOX_REASONS: frozenset[str] = frozenset({"Scheduled", "AddedInterface"}
 # rule is needed at all; this constant is the one judgement call in it,
 # and it was chosen from measurement rather than taste. Over four
 # captured nights (20260711 summit, 20260811-13 BTS) there were 1672
-# `Started` events, 846 of them with app logs on both sides:
+# `Started` events; 19 survive the sandbox guard in
+# :class:`_RestartEvidence`, and they split cleanly:
 #
-#   * the 13 genuine restarts had between 4.8 minutes and 12.3 hours of
-#     the same pod instance's logging before them (median 87 minutes);
-#   * all 833 others had *zero* — their only preceding line is the
-#     `secret-perm-fixer` init container's one-line complaint, emitted
-#     in the same second.
+#   * the 13 genuine restarts had 467-26175 lines of the same pod
+#     instance's logging before them, spanning 4.8 minutes to 12.3 hours;
+#   * the 6 others had a *single* line — the `secret-perm-fixer` init
+#     container's one-line complaint — i.e. a span of exactly zero.
 #
-# So the threshold sits in an empty band two orders of magnitude wide,
-# and anything from a few seconds to a few minutes would separate the
-# two populations identically.
-RESTART_MIN_WORK_S = 60.0
+# So any threshold above zero separates the two populations, and the
+# number's real job is deciding how short a *window* the rule still
+# works in. It runs over whatever window is loaded, not over the night:
+# in a 5-minute exposure window a pod that died 36 seconds in has only
+# 36 seconds of visible prior work, and at 60 s the same restart was
+# labelled `POD_RESTARTED` in the night view and `POD_STARTED` in the
+# explore view. Ten seconds keeps a wide margin over "an init container
+# that logged twice" while letting an exposure-width window agree with
+# the night about what happened.
+RESTART_MIN_WORK_S = 10.0
 
 # The lifecycle event kinds, for consumers that want to recognise the
 # family without string-prefix sniffing. Kept in sync with the kinds
@@ -1013,16 +1019,64 @@ _TRACEBACK_MAX_CHARS = 32_000
 # exceptions whose module path is all lowercase. The earlier regex
 # required the entire line to start with a capital, which silently
 # missed those — every such traceback got tagged "<unknown>".
+#
+# There is deliberately **no** ``…Error|Exception|…`` suffix requirement.
+# There used to be, and it was the single biggest source of
+# ``<unclassified>``: the pipeline's own exceptions are named for what
+# went wrong rather than for the fact that something did —
+# ``lsst.meas.astrom.exceptions.BadAstrometryFit``, ``MatcherFailure``,
+# ``NoVisitWcs`` — and every traceback ending in one was binned as
+# unnameable. On 20260813 that was 1517 of the night's 4768 tracebacks,
+# and on 20260811 175 of 648: in both cases *every* unclassified
+# traceback, so the bucket empties. What keeps this honest instead of
+# greedy is the shape either side of the class token: a column-0
+# lowercase dotted module path, a Capital-led CamelCase name, and then
+# only ``: message`` or end of line — plus the lowercase-letter rule in
+# :func:`_excClassFrom`, which is what stops a bare ``WARNING: …`` from
+# being read as a class.
 _EXC_CLASS_RE = re.compile(
-    # Optional dotted lowercase module prefix, e.g. `galsim.errors.`.
-    r"^(?:[a-z_][a-z0-9_]*\.)*"
+    # Optional dotted module prefix, e.g. `galsim.errors.` or
+    # `lsst.pipe.tasks.calibrateImage.`. Each component is *lowercase-led*
+    # rather than all-lowercase: LSST names a module after the camelCase
+    # task it holds, so `calibrateImage`, `measureApCorr` and
+    # `psfexPsfDeterminer` are all module names. Requiring the whole
+    # component to be lowercase quietly rejected those — including
+    # exceptions that did carry an `…Error` suffix and should always have
+    # been named (`NoPsfStarsToStarsMatchError`, `MeasureApCorrError`).
+    r"^(?:[a-z_]\w*\.)*"
+    r"(?P<cls>"
     # Capital-led class name, allowing nested dotted suffixes
-    # (`Foo.SubError`), ending with one of the canonical class suffixes.
-    r"(?P<cls>[A-Z][A-Za-z0-9_]*"
-    r"(?:\.[A-Za-z][A-Za-z0-9_]*)*"
-    r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
+    # (`Foo.SubError`). Recognised by shape alone.
+    r"[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*"
+    # …or a lowercase-named one, which the standard library still has a
+    # few of (`socket.gaierror`, `os.error`). Those get no free pass from
+    # shape — a lowercase word is what most non-exception lines look
+    # like — so they must carry the canonical suffix to qualify.
+    r"|[a-z_]\w*(?:Error|Exception|error|exception)"
+    r")"
     r"(?:\s*:\s*(?P<msg>.*))?$"
 )
+
+
+def _excClassFrom(raw: str) -> tuple[str, str] | None:
+    """``(class, message)`` if ``raw`` is a traceback's exception line.
+
+    The all-caps rejection is the guard that lets the suffix requirement
+    go. Without it the shape alone would accept a bare ``WARNING: …`` or
+    ``ERROR: …`` — column-0 words that end a traceback but name nothing —
+    and those are common enough in third-party output to poison the
+    errors-by-type table. Every real exception class has a lowercase
+    letter in it; the log levels that would otherwise qualify do not.
+    """
+    m = _EXC_CLASS_RE.match(raw)
+    if m is None:
+        return None
+    cls = m.group("cls")
+    if not any(c.islower() for c in cls):
+        return None
+    return cls.rsplit(".", 1)[-1], (m.group("msg") or "").strip()[:200]
+
+
 # Broader "this is the terminating exception line of a traceback" shape:
 # a column-0 dotted identifier, optionally followed by ``: message``,
 # WITHOUT requiring the canonical class suffix. A superset of
@@ -1045,7 +1099,7 @@ def _isTracebackBodyLine(raw: str) -> bool:
         return True
     if raw.startswith("During handling") or raw.startswith("The above exception"):
         return True
-    if _EXC_CLASS_RE.match(raw):
+    if _excClassFrom(raw) is not None:
         return True
     return False
 
@@ -1130,10 +1184,9 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
                 # otherwise overflow the body buffer.
                 if len(tbLines) < _TRACEBACK_MAX_LINES:
                     tbLines.append(ln.raw)
-                m = _EXC_CLASS_RE.match(ln.raw)
-                if m and activeTb.excClass == "<unknown>":
-                    activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]
-                    activeTb.excMessage = (m.group("msg") or "").strip()[:200]
+                named = _excClassFrom(ln.raw)
+                if named is not None and activeTb.excClass == "<unknown>":
+                    activeTb.excClass, activeTb.excMessage = named
                     activeTb.reachedTerminator = True
             else:
                 # A non-body line ends the traceback. If it's itself a

@@ -43,7 +43,7 @@ def test_the_top_stats_report_what_is_in_the_logs(app: Any, corpus: StagedCorpus
     assert statValue(app, "pods in fetch") >= 5
     assert statValue(app, "tracebacks") > 100, "this night's AOS workers fail a lot"
     assert statValue(app, "distinct exception classes") > 1
-    assert statValue(app, "pod restarts") >= 1
+    assert statValue(app, "in-place restarts") >= 1
 
 
 def test_errors_are_broken_down_by_type_and_by_pod(app: Any, corpus: StagedCorpus) -> None:
@@ -189,7 +189,7 @@ def test_a_crash_loop_is_spelled_out_in_the_restarts_table(app: Any, corpus: Sta
     assert "restart #6" in joined
     assert "ImagePullBackOff" in joined
     # And the stat tile counts them rather than leaving them to the table.
-    assert statValue(app, "pod restarts") >= 5
+    assert statValue(app, "in-place restarts") >= 5
 
 
 def test_the_crash_is_attributed_to_what_the_pod_was_working_on(app: Any, corpus: StagedCorpus) -> None:
@@ -224,3 +224,49 @@ def test_the_night_has_two_tabs_and_says_which_one_is_showing(app: Any, corpus: 
     assert other is not None
     assert f"dayObs={DAY_OBS}" in other
     assert "nightView=sfm" in other
+
+
+def test_the_failures_table_is_folded_until_asked(app: Any, corpus: StagedCorpus) -> None:
+    """A bad night runs to thousands of tracebacks, which put every
+    section below this table a very long scroll away. Ten rows, then an
+    expander — and the count in the heading still names the true total,
+    so the fold can't be mistaken for "that's all there was"."""
+    openNight(app, corpus)
+    rows = app.page.locator("#night-failures .night-failure-row")
+    countText = app.page.locator("#night-failures-count").inner_text()
+    match = re.search(r"\((\d+) traceback", countText)
+    assert match is not None, countText
+    total = int(match.group(1))
+    assert total > 10, "the corpus needs more failures than the fold shows for this to mean anything"
+    assert rows.count() == 10
+    expand = app.page.locator("#night-failures-expand")
+    expect(expand).to_be_visible()
+    expect(expand).to_contain_text(f"show all {total}")
+    expand.click()
+    assert rows.count() == total
+    expect(expand).to_contain_text("show first 10 only")
+    # And it folds back up.
+    expand.click()
+    assert rows.count() == 10
+    # A row still drills down after being re-rendered by the fold.
+    rows.first.click()
+    expect(app.page.locator("#night-failures tr.night-failure-detail")).to_contain_text("Traceback")
+
+
+def test_the_calcZernikes_histogram_is_absent_from_the_sfm_half(app: Any, corpus: StagedCorpus) -> None:
+    """It is an AOS task; on the SFM half the card would be an empty
+    chart that reads as "it ran and produced nothing"."""
+    openNight(app, corpus)
+    expect(app.page.locator("#night-hist-cz-card")).to_be_visible()
+    # Stub the SFM half rather than staging it: the corpus's night dir is
+    # a live one, so its unfiltered window has no _meta.json to rebuild
+    # from, and the subject here is what the page does with the payload.
+    summary = app.page.evaluate(
+        "async (d) => (await (await fetch(`/api/summary?dayObs=${d}`)).json())", DAY_OBS
+    )
+    summary["view"] = "sfm"
+    summary["histograms"]["calcZernikesEnd"] = None
+    app.page.evaluate("(s) => window.startNight(s)", summary)
+    expect(app.page.locator("#night-hist-cz-card")).to_be_hidden()
+    # The first-task histogram means the same thing in both halves.
+    expect(app.page.locator("#night-hist-first")).to_be_visible()
