@@ -480,6 +480,29 @@ the whole cache automatically on the next start (printing a one-line
 notice), so a stale snapshot from an older version is never re-served.
 The first loads after such an upgrade re-fetch and so are slower.
 
+### Keep a night on the laptop to work offline
+
+Fetching needs the VPN and takes minutes for a whole night. If you are
+developing (or want to demo on a plane), capture a night once and serve
+it from disk afterwards:
+
+```
+# On the VPN, once. BTS nights are ~150 MB; summit nights are ~9 GB.
+python3 tools/captureNight.py --site bts --day-obs 20260811 --out ~/log-nights
+
+# Any time after that, no network needed.
+python3 tools/stageNight.py --master ~/log-nights/aug11-night-bts --cache ~/log-cache
+RA_LOG_EXPLORER_CACHE=~/log-cache python3 -m ra_log_explorer.cli run --site bts
+```
+
+Remember `--site` on the server too: it defaults to the site catalog's
+`default_site` (the summit), and a BTS night served under the summit
+site looks like an empty night rather than an error.
+
+See [architecture/testing.md](architecture/testing.md#capturing-a-night-to-work-against)
+for what a captured night contains and how to replay one as "tonight"
+for live-mode work.
+
 ## All CLI options
 
 There are two subcommands, `run` and `cache`:

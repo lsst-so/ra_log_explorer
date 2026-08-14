@@ -69,6 +69,13 @@ tar -czf tests/data/ui/july11.tar.gz -C tests/data/ui july11
 rm -rf tests/data/ui/july11
 ```
 
+`/path/to/a/fetched/night` is a **master** night directory —
+`tools/captureNight.py` makes one, and
+[*Capturing a night to work against*](../../../architecture/testing.md#capturing-a-night-to-work-against)
+explains what is in it. The 20260711 master this archive was cut from is
+9.25 GiB, so it lives outside the repo; re-capturing it takes about an
+hour.
+
 Adjust `POD_BUDGET` or the two windows at the top of the script to
 change what is included. It prints the resulting size, pod count and
 number of colliding ids.

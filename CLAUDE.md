@@ -75,6 +75,9 @@ ra_log_explorer/
     data/                        sample Loki JSONL files
     data/ui/july11.tar.gz        a real cut-down night; the browser tests' corpus
     ui/                          Playwright browser tests (see testing.md)
+  tools/                       Dev scripts that hit the real cluster (not shipped)
+    captureNight.py              fetch whole nights into master corpora
+    stageNight.py                clone masters into a cache root to serve
   .claude/skills/              Per-project agent skills
   pyproject.toml, setup.cfg,
   mypy.ini, .pre-commit-config.yaml   ← lint/type-check config
@@ -197,6 +200,9 @@ when their triggering context matches:
 - **ra-log-explorer-loki** — Loki / `logcli` conventions and gotchas
   when editing the fetch path in `fetch.py` or writing one-off scripts
   that hit the cluster's Loki.
+- **ra-log-explorer-test-data** — capturing whole nights from the
+  cluster into master corpora and staging them locally, when you need
+  real data at real scale to develop or demo against.
 
 ## Working on the UI
 

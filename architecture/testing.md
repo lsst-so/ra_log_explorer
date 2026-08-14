@@ -256,6 +256,106 @@ parser to recognise a new event kind, add the minimal triggering
 line to the relevant fixture and a test assertion that pins the
 parsed event.
 
+## Capturing a night to work against
+
+The fixtures above are lines; the browser corpus is a night with most of
+it cut away. Some work needs the opposite — a **whole real night**, every
+pod, at full scale: the night-summary rollups, the histograms, anything
+about lifecycle events or restarts, live mode, and any question of the
+form "how does this behave with 435 pods rather than 32".
+
+[`tools/captureNight.py`](../tools/README.md) is how you get one, and
+[`tools/stageNight.py`](../tools/README.md) is how you serve it:
+
+```sh
+export LOKI_PASSWORD=...      # VPN up, logcli on $PATH
+
+.venv/bin/python tools/captureNight.py \
+    --site bts --day-obs 20260811 20260812 --out ~/temp/log_explorer_data/master
+
+.venv/bin/python tools/stageNight.py \
+    --master ~/temp/log_explorer_data/master/aug11-night-bts \
+    --master ~/temp/log_explorer_data/master/aug12-night-bts \
+    --cache ~/temp/log_explorer_data/app-cache
+
+RA_LOG_EXPLORER_CACHE=~/temp/log_explorer_data/app-cache \
+RA_LOG_EXPLORER_MAX_CACHE_BYTES=32212254720 \
+    .venv/bin/python -m ra_log_explorer.cli run --no-browser
+```
+
+### Masters, and why they're separate from the cache
+
+A **master** is a finalised night directory kept somewhere the
+application never looks: `pods/`, `pods_events/`, `pods.txt`, a
+`_live.json` sidecar and a `_meta.json`, named for what it holds
+(`aug11-night-bts` — month, day, `night`, site, because the same dayObs
+exists on both clusters and they are different data). The ConsDB records
+for every captured night accumulate beside them in
+`<out>/exposure-times/<site>.json`, mirroring the cache root's own
+layout so staging is a straight copy — without them the Tonight panel
+has no shutter closes to resolve against.
+
+Masters are never served directly. Staging clones them with `cp -c`
+(APFS copy-on-write: instant, and the app cannot corrupt the master no
+matter what it evicts, slices or deletes), so restaging is how you throw
+away whatever a session did to the cache. Point the server at a master
+and one LRU pass or one *delete window* click takes hours of fetching
+with it.
+
+### Why capture goes through the live poller
+
+`captureNight.py` drives a real `LiveNightManager` pinned to the target
+dayObs (`fixedDayObs`) rather than calling `fetchAll`, for three
+reasons that all show up on a capture measured in hours:
+
+- **It produces what live mode produces.** Namespace-wide `k8s/events`
+  demuxed per name — including the ReplicaSet/StatefulSet/Deployment
+  names an all-pods batch fetch never asks for — plus the sidecar. A
+  master captured this way *is* a live night, so `--live-day-obs` can
+  replay it with no conversion.
+- **Resume is free.** The sidecar carries a per-pod watermark, so a
+  capture that dies half way through is resumed by re-running the same
+  command: `_recoverNight` truncates torn bytes and only the missing
+  spans are refetched. Before this tool existed, resuming meant a
+  bespoke script that recovered the pod list by parsing the previous
+  run's progress log.
+- **Verification is free.** Finalisation runs the `count_over_time`
+  oracle for every pod and refetches any that fall short beyond
+  `live.VERIFY_TOLERANCE_*` — the same audit the deployed poller applies
+  at the noon rollover, and the thing that turns "we fetched a night"
+  into "we fetched all of a night".
+
+One tick covers the whole 24 h, because a night that has already ended
+puts the increment target at night end. A night that *hasn't* ended is
+refused unless you pass `--allow-partial`: dayObs 20260813 runs to
+12:00 UTC on the 14th, and a capture started at 11:00 would silently be
+an hour short with a `_meta.json` claiming otherwise.
+
+### What it costs
+
+Measured, so you can size a capture before starting one. The summit and
+BTS differ by two orders of magnitude, and the difference is the whole
+reason the browser tests run against a cut-down corpus:
+
+| Night | Pods | Log lines | On disk | Wall clock |
+|---|---|---|---|---|
+| 20260711, summit (`yagan`) | 576 | 35.7M | 9.25 GiB | ~65 min |
+| 20260811, BTS (`manke`) | 265 | 185k | 49 MiB | 1.8 min |
+| 20260812, BTS (`manke`) | 182 | 598k | 135 MiB | 2.9 min |
+
+### Replaying a night as "tonight"
+
+`--unfinalise <dayObs>` stages one night as an in-progress live night:
+`_meta.json` removed and the sidecar's `finalised` flag cleared, which is
+the state the poller maintains while observing. Run the server with
+`--live-poll-s 60 --live-day-obs <dayObs>` and the historical night plays
+the part of tonight — the Tonight panel, readiness, slicing, the whole
+live path against real data, with the noon rollover never firing.
+
+Without the flag the night stages finalised, which is what you want for
+everything else: the poller adopts an already-finalised night without
+re-fetching it, and every view is served by slicing.
+
 ## Running the suite
 
 From the repo root, with the venv active or its tools on `$PATH`:
