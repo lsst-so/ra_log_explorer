@@ -175,9 +175,14 @@ def blockExternalRequests(page: Page) -> None:
     The template pulls webfonts from a CDN. Letting a test suite depend
     on that makes it slower, flakier, and untrue offline; the fonts have
     no bearing on anything asserted here.
+
+    Routed on the *context* rather than the page so that tabs opened
+    later — by a test, or by a ``target="_blank"`` link the test clicks —
+    are covered too. A page-level route would leave the second tab
+    reaching for the CDN.
     """
-    page.route("https://fonts.googleapis.com/**", lambda route: route.abort())
-    page.route("https://fonts.gstatic.com/**", lambda route: route.abort())
+    page.context.route("https://fonts.googleapis.com/**", lambda route: route.abort())
+    page.context.route("https://fonts.gstatic.com/**", lambda route: route.abort())
 
 
 @pytest.fixture
