@@ -103,8 +103,10 @@ async function loadRangeExposure(expId) {
   if (!payload || !payload.loaded) return;
   // Keep the URL pointed at the selected exposure so a refresh returns
   // here (bootstrap still routes ?rangeStart&rangeStop to the range view
-  // and startRange reads back the dataId).
-  window.history.replaceState({}, '', `${window.location.pathname}?${qs}`);
+  // and startRange reads back the dataId). A rewrite, not an entry:
+  // stepping the navigator is moving within one view, and a run of forty
+  // exposures would otherwise take forty Back presses to escape.
+  window.navigateTo(qs, { replace: true });
   window.startExplore(payload);
 }
 

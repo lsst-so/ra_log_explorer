@@ -223,7 +223,10 @@ In the browser:
    endpoint all come from the site the server serves.
 4. Click **Fetch & explore**. A progress bar follows the fetch live
    (Server-Sent Events). When it's done the URL updates to
-   `/?dataId=<id>` and the page switches to the timeline view.
+   `/?dataId=<id>` and the page switches to the timeline view. The
+   browser's **Back** button returns to the form you filled in, and
+   Forward comes back to the timeline — each view the app opens gets its
+   own history entry, so Back never drops you out of the app.
 
 Caching is invisible in day-to-day use, but the **admin** link in the
 topbar (or `/?admin=1` directly) opens a *Cached windows* table listing

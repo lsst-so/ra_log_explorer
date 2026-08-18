@@ -111,8 +111,9 @@ function startNight(summary) {
     document.getElementById('night-back-home').addEventListener('click', () => {
       // Drop the dayObs key (and the half it named) out of the URL bar so
       // a subsequent refresh lands on home — not back on whatever night we
-      // just left.
-      history.replaceState({}, '', window.location.pathname);
+      // just left. Its own history entry, because going home is a
+      // navigation: Back from here returns to the night.
+      window.navigateTo('');
       if (window.showHome) window.showHome();
     });
     nightListenersWired = true;

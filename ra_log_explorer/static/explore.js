@@ -728,8 +728,10 @@ function wireExploreListeners() {
   document.getElementById('groups-expand-all').addEventListener('click', expandAllGroups);
   document.getElementById('back-home').addEventListener('click', () => {
     // Drop the exposure key out of the URL bar so a subsequent refresh
-    // lands on home — not back on whatever exposure we just left.
-    history.replaceState({}, '', window.location.pathname);
+    // lands on home — not back on whatever exposure we just left. Its
+    // own history entry, because going home is a navigation: Back from
+    // here returns to the exposure.
+    window.navigateTo('');
     if (window.showHome) window.showHome();
   });
   window.addEventListener('keydown', (e) => {

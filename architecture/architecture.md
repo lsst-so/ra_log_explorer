@@ -171,7 +171,7 @@ Sibling docs:
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
-| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
 
 ## Key Concepts
 
@@ -202,6 +202,26 @@ Sibling docs:
   discards the left operand entirely — `/static//proc/self/environ`
   read an absolute path that way and handed back the process
   environment, `LOKI_PASSWORD` included.
+
+- **URL and history** — the query string *is* the router. `app.js`'s
+  `bootstrap()` reads `?dataId` / `?dayObs&nightView` /
+  `?rangeStart&rangeStop` / `?admin=1` off the URL and renders the
+  matching view, which is what makes every view a link that can be
+  pasted, reloaded, or opened in a second tab.
+
+  Because the views swap inside one document, the entries the browser's
+  Back button walks are the app's own to create — and until
+  `window.navigateTo(query, {replace})` existed it created none, leaving
+  the whole session on one entry so Back left the application entirely.
+  It pushes for a transition the user asked for (home → a view, a view →
+  home) and rewrites the current entry for anything that merely refines
+  the view already on screen: the instrument pin, the range navigator's
+  selected exposure, and the `?dataId=…&autoFetch=1` entry a night-view
+  drilldown lands on — Back onto that one would re-fire the fetch rather
+  than return anywhere. A `popstate` listener re-runs `bootstrap()`,
+  which is the whole of back/forward handling, and a `routeToken` guard
+  discards a routing pass whose `/api/summary` answer arrives after a
+  later one has overtaken it.
 
 - **Site** — a (Loki cluster, ConsDB endpoint, optional bearer-token
   file) bundle that pairs the *log source* with the *truth source* for

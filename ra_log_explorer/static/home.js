@@ -82,6 +82,10 @@ function setInstrument(inst, opts) {
     url.searchParams.delete('autoFetch');
     cancelAutoFetch();
   }
+  // A rewrite, not a history entry: the pin refines the page rather than
+  // navigating anywhere, and a Back press that silently flipped the
+  // instrument — re-resolving every lookup under the other one — would
+  // be worse than no Back at all.
   history.replaceState(null, '', url);
   // AOS (night mode) runs on LSSTCam only — its wavefront sensors live
   // in LSSTCam's corners — so the card has nothing to offer for LATISS.
@@ -1180,8 +1184,14 @@ async function transitionToExplore(activeJob) {
     if (summary.instrument && (!activeJob || activeJob.kind !== 'night')) {
       urlParams += `&instrument=${encodeURIComponent(summary.instrument)}`;
     }
-    const newUrl = `${window.location.pathname}?${urlParams}`;
-    window.history.replaceState({}, '', newUrl);
+    //
+    // A drilldown landed on ?dataId=…&autoFetch=1 and that entry has to
+    // be overwritten rather than added to: Back onto it would fire the
+    // fetch a second time. Every other route here is the user leaving
+    // home for a view, which earns an entry of its own so Back returns
+    // to the form they filled in.
+    const fromAutoFetch = new URLSearchParams(window.location.search).get('autoFetch') === '1';
+    window.navigateTo(urlParams, { replace: fromAutoFetch });
     if (summary.mode === 'night' && window.showNight) {
       window.showNight(summary);
     } else if (summary.mode === 'range' && window.showRange) {

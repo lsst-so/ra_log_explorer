@@ -84,6 +84,74 @@ def test_unknown_dataId_leaves_the_user_on_home(app: Any) -> None:
     expect(app.page.locator("#home-view")).to_be_visible()
 
 
+# ----- browser history ------------------------------------------------------
+#
+# Views are swapped inside one document, so the entries Back walks are
+# only the ones the app pushes. When it pushed none, Back from any view
+# left the application entirely and landed on whatever the tab happened
+# to hold before it — which deployed reads as the app throwing you at a
+# dead URL.
+
+
+def test_back_from_a_fetched_exposure_returns_to_home(app: Any) -> None:
+    """The reported bug: Back has to stay inside the app."""
+    app.goto("/")
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("shutter close (TAI)")
+    app.page.locator("#fetch-submit").click()
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
+    assert f"dataId={SHARED_ID}" in app.page.url
+
+    app.page.go_back()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    expect(app.page.locator("#explore-view")).to_be_hidden()
+    assert f"dataId={SHARED_ID}" not in app.page.url
+
+    # And forward again, because a Back you can't undo is its own bug.
+    app.page.go_forward()
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#expId-display")).to_contain_text(str(SHARED_ID))
+
+
+def test_back_undoes_the_explore_view_s_home_button(app: Any, corpus: StagedCorpus) -> None:
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    app.page.locator("#back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+
+    app.page.go_back()
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    expect(app.page.locator("#expId-display")).to_contain_text(str(SHARED_ID))
+
+
+def test_back_undoes_the_night_view_s_home_button(app: Any, corpus: StagedCorpus) -> None:
+    corpus.stageNight()
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-view")).to_be_visible()
+    app.page.locator("#night-back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+
+    app.page.go_back()
+    expect(app.page.locator("#night-view")).to_be_visible()
+    expect(app.page.locator("#night-dayobs-display")).to_contain_text(str(DAY_OBS))
+
+
+def test_a_drilldown_leaves_no_autoFetch_entry_behind(app: Any, corpus: StagedCorpus) -> None:
+    """``autoFetch=1`` means "fetch this for me", so the entry it lands on
+    must be rewritten rather than added to: Back onto it would fire the
+    fetch again instead of returning where the user came from."""
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app.goto("/")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam&autoFetch=1")
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
+    assert "autoFetch" not in app.page.url, "the loaded view must not keep asking to be re-fetched"
+
+    app.page.go_back()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    assert "dataId" not in app.page.url
+
+
 # ----- base path -----------------------------------------------------------
 
 
@@ -154,6 +222,26 @@ def test_a_whole_fetch_runs_under_a_base_path(
     assert "/log-explorer/?" in app.page.url or app.page.url.startswith(
         f"{app.origin}/log-explorer"
     ), app.page.url
+
+
+def test_history_entries_carry_the_base_path(appFactory: Any, corpus: StagedCorpus) -> None:
+    """A pushed entry that dropped the prefix would send Back to whatever
+    else shares the hostname — which is the shape of the bug this
+    replaced, in the one mode a laptop run never exercises."""
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app = appFactory(basePath="/log-explorer")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    app.page.locator("#back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    # Home re-stamps its instrument pin on arrival, so the query isn't
+    # empty; the prefix and the dropped exposure are the point.
+    assert app.page.url.startswith(f"{app.origin}/log-explorer/")
+    assert "dataId" not in app.page.url
+
+    app.page.go_back()
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    assert app.page.url.startswith(f"{app.origin}/log-explorer/?")
 
 
 # ----- the "what is this?" overlay ------------------------------------------

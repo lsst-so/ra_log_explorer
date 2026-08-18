@@ -4,11 +4,18 @@
  * /api/summary: when an exposure is loaded, switch to #explore-view and
  * hand control to explore.js; otherwise show #home-view and hand control
  * to home.js. Also wires the home↔explore transitions invoked by either
- * side via the `window.showHome` / `window.showExplore` hooks.
+ * side via the `window.showHome` / `window.showExplore` hooks, and owns
+ * the browser history those transitions write (see `navigateTo` below).
  */
 'use strict';
 
+// Which routing pass is the current one. Back and forward can arrive
+// faster than /api/summary answers, and the loser of that race would
+// otherwise render its view over the top of the winner's.
+let routeToken = 0;
+
 async function bootstrap() {
+  const token = ++routeToken;
   // URL is the source of truth for which view to render:
   //
   //   /                    -> home
@@ -45,6 +52,7 @@ async function bootstrap() {
       const r = await fetch(apiUrl(`/api/summary?${qs}${rangeInstQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;  // a later back/forward overtook us
     if (summary && summary.loaded) {
       window.showRange(summary);
     } else {
@@ -68,6 +76,7 @@ async function bootstrap() {
       const r = await fetch(apiUrl(`/api/summary?dataId=${encodeURIComponent(urlDataId)}${instQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;
     if (summary && summary.loaded) {
       window.showExplore(summary);
     } else {
@@ -85,6 +94,7 @@ async function bootstrap() {
       );
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;
     if (summary && summary.loaded) {
       window.showNight(summary);
     } else {
@@ -94,6 +104,41 @@ async function bootstrap() {
   }
   window.showHome();
 }
+
+// ----- history --------------------------------------------------------------
+//
+// Every view swap happens inside one document, so the entries the Back
+// button walks are ours to create — and until this existed the app
+// created none: `replaceState` everywhere meant one entry for the whole
+// session, and Back left the application altogether, landing on whatever
+// the tab held before it (a stale link, an old bookmark, a mistyped
+// URL). Deployed, that reads as the app sending you somewhere invalid.
+//
+// So: a transition the user asked for (home -> a view, a view -> home)
+// gets its own entry, and anything that merely refines the view already
+// on screen (the instrument pin, the range navigator's selected
+// exposure) rewrites the current one — otherwise stepping through
+// twenty exposures would cost twenty Back presses to undo.
+
+window.navigateTo = function navigateTo(query, opts) {
+  const url = query ? `${window.location.pathname}?${query}` : window.location.pathname;
+  // Pushing the URL we are already on buys the user a Back press that
+  // does nothing visible; rewrite in place instead.
+  const same = url === window.location.pathname + window.location.search;
+  if (same || (opts && opts.replace)) {
+    window.history.replaceState({}, '', url);
+  } else {
+    window.history.pushState({}, '', url);
+  }
+};
+
+window.addEventListener('popstate', () => {
+  // The URL is the router's only input, so re-running the router *is*
+  // the handling of back/forward. Everything we push is same-document,
+  // so nothing reloads and no fetch is repeated that the URL doesn't ask
+  // for.
+  bootstrap();
+});
 
 function hideAllViews() {
   document.getElementById('home-view').hidden = true;
