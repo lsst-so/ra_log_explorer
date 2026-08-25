@@ -126,8 +126,10 @@ Sibling docs:
        ├─ home.js
        ├─ explore.js  (per-exposure timeline + detail drawer)
        ├─ night.js    (dayObs-wide histograms + failure drilldown)
-       └─ range.js    (range navigator strip; drives the explore view
-                       for the selected dataId in the range)
+       ├─ range.js    (range navigator strip; drives the explore view
+       │               for the selected dataId in the range)
+       ├─ favicon.png (tab icon)
+       └─ logo.png    (the mark in every view's topbar)
 
        cli.py         optional "eager mode" — fetch + parse on the CLI before
                       the server starts; populates an exposure ServerState
@@ -171,7 +173,7 @@ Sibling docs:
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
 | `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
-| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId). One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId), plus the two images the page draws: `favicon.png` (the tab icon, declared in the template's `<link rel=icon>`) and `logo.png` (the observatory lockup, shown whole at the top-left of every view's topbar, which is what sets the bar's ~73 px height). Both are downscaled copies of the full-resolution art in `assets/`, because static files are sent with `Cache-Control: no-store` and are therefore re-fetched on every page load. One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
 
 ## Key Concepts
 

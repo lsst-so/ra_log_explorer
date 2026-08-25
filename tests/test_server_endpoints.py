@@ -86,6 +86,17 @@ def _get(host: str, port: int, path: str) -> tuple[int, dict]:
     return resp.status, parsed
 
 
+def _getBytes(host: str, port: int, path: str) -> tuple[int, str, bytes]:
+    """Status, Content-Type and raw body — for assets `_get` would choke on."""
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    contentType = resp.getheader("Content-Type") or ""
+    conn.close()
+    return resp.status, contentType, body
+
+
 def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("POST", path, body=json.dumps(body), headers={"Content-Type": "application/json"})
@@ -2545,6 +2556,18 @@ def test_static_assets_are_served_under_the_base_path(mountedServer: RunningServ
         assert body["_raw"].strip(), asset
     # And not outside the prefix.
     assert _get(host, port, "/static/app.js")[0] == 404
+
+
+def test_the_images_are_served_as_images(mountedServer: RunningServer) -> None:
+    """The tab icon and the topbar logo are the only binary assets here.
+    Served with the wrong Content-Type a browser refuses to draw them, and
+    the failure is a missing picture with nothing in the log to say why."""
+    host, port, _ctx = mountedServer
+    for asset in ("favicon.png", "logo.png"):
+        status, contentType, body = _getBytes(host, port, f"/log-explorer/static/{asset}")
+        assert status == 200, asset
+        assert contentType == "image/png", (asset, contentType)
+        assert body.startswith(b"\x89PNG\r\n\x1a\n"), asset
 
 
 def test_the_static_route_cannot_be_talked_into_serving_an_absolute_path(

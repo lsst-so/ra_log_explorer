@@ -244,6 +244,49 @@ def test_history_entries_carry_the_base_path(appFactory: Any, corpus: StagedCorp
     assert app.page.url.startswith(f"{app.origin}/log-explorer/?")
 
 
+# ----- the images -----------------------------------------------------------
+
+
+def test_the_logo_renders_in_every_view_s_topbar(app: Any, corpus: StagedCorpus) -> None:
+    """`naturalWidth` is zero for a broken image, and a broken image is
+    what a wrong path or a wrong Content-Type produces — the page looks
+    fine otherwise, with a gap where the mark should be. Checked per
+    view because the header is four separate blocks of markup rather
+    than one shared component, so three of them can be right."""
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    corpus.stageNight()
+    views = {
+        "/": "#home-view",
+        "/?admin=1": "#admin-view",
+        f"/?dataId={SHARED_ID}&instrument=lsstcam": "#explore-view",
+        f"/?dayObs={DAY_OBS}": "#night-view",
+    }
+    for path, view in views.items():
+        app.goto(path)
+        expect(app.page.locator(f"{view} .brand-mark")).to_be_visible()
+        width = app.page.evaluate(f"document.querySelector('{view} .brand-mark').naturalWidth")
+        assert width == 323, f"{view} drew a broken mark (naturalWidth={width})"
+
+
+def test_the_tab_icon_is_declared_and_loads(app: Any) -> None:
+    app.goto("/")
+    assert app.page.locator("link[rel=icon]").get_attribute("href") == "/static/favicon.png"
+    resp = app.page.request.get(app.url("/static/favicon.png"))
+    assert resp.status == 200
+    assert resp.headers["content-type"] == "image/png"
+
+
+def test_the_images_resolve_under_a_base_path(appFactory: Any) -> None:
+    """Both are named in the HTML with the prefix substituted in, which
+    is the one thing a laptop run can't tell you."""
+    app = appFactory(basePath="/log-explorer")
+    app.goto("/")
+    expect(app.page.locator("#home-view .brand-mark")).to_be_visible()
+    assert app.page.evaluate("document.querySelector('#home-view .brand-mark').naturalWidth") == 323
+    assert app.page.locator("link[rel=icon]").get_attribute("href") == "/log-explorer/static/favicon.png"
+    assert app.page.request.get(app.url("/static/logo.png")).status == 200
+
+
 # ----- the "what is this?" overlay ------------------------------------------
 
 

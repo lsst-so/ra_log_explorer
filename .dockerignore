@@ -6,6 +6,7 @@
 .venv
 .claude
 architecture
+assets
 tests
 tools
 *.egg-info

@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <title>Rapid Analysis Log Explorer</title>
+  <!-- Prefixed like every other asset: deployed, the tab icon lives at
+       /log-explorer/static/favicon.png, and a root-relative /favicon.ico
+       would belong to whatever else shares the hostname. -->
+  <link rel="icon" type="image/png" href="__BASE_PATH__/static/favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <!-- Loaded without blocking the first paint. A stylesheet link blocks
@@ -29,9 +33,12 @@
   <section id="home-view" hidden>
     <header id="topbar">
       <div class="title">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <strong>Rapid Analysis Log Explorer</strong>
-        <span class="muted">pick an exposure to explore</span>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
+        <span class="title-text">
+          <strong>Rapid Analysis Log Explorer</strong>
+          <span class="muted">pick an exposure to explore</span>
+        </span>
         <!-- The page-level instrument. Exposure ids restart at 1 per
              instrument each night, so everything below — the Tonight
              list, dataId lookups, fetches — is pinned to exactly one
@@ -207,7 +214,8 @@
     <header id="topbar">
       <div class="title">
         <a href="__BASE_PATH__/" class="ghost mini">&larr; home</a>
-        <span class="brand-mark" aria-hidden="true"></span>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
         <strong>Rapid Analysis Log Explorer</strong>
         <span class="muted">admin</span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
@@ -248,7 +256,8 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="back-home" class="ghost mini">&larr; home</button>
-        <span class="brand-mark" aria-hidden="true"></span>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
         <strong>Rapid Analysis Log Explorer</strong>
         <span id="expId-display"></span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
@@ -341,7 +350,8 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="night-back-home" class="ghost mini">&larr; home</button>
-        <span class="brand-mark" aria-hidden="true"></span>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
         <strong>Rapid Analysis Log Explorer</strong>
         <span id="night-dayobs-display"></span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>

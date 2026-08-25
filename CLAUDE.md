@@ -62,9 +62,11 @@ ra_log_explorer/
                                  the SSE event log, the shared stateLock
     server.py                    stdlib HTTP server + JSON API
     cli.py                       argument parsing + composition; cache subcmds
-    static/                      vanilla-JS UI, no build step: app.js
-                                 (bootstrap/routing), home.js, explore.js,
-                                 night.js, range.js, style.css
+    static/                      ← vanilla-JS UI, no build step: app.js
+                                 (bootstrap/routing + history), home.js,
+                                 explore.js, night.js, range.js, style.css,
+                                 favicon.png (tab icon), logo.png (the topbar
+                                 mark; both derived from assets/)
     templates/                   timeline.html (single-page app shell)
   architecture/                Design docs — keep these in sync with code
     architecture.md              component layout, data flow, JSON API
@@ -75,6 +77,8 @@ ra_log_explorer/
     data/                        sample Loki JSONL files
     data/ui/july11.tar.gz        a real cut-down night; the browser tests' corpus
     ui/                          Playwright browser tests (see testing.md)
+  assets/                      Full-resolution source art for the two images
+                               in static/; not packaged, not in the build context
   tools/                       Dev scripts that hit the real cluster (not shipped)
     captureNight.py              fetch whole nights into master corpora
     stageNight.py                clone masters into a cache root to serve
