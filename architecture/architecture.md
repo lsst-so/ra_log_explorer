@@ -189,8 +189,8 @@ Sibling docs:
   strips the prefix and 404s anything outside it (rather than serving
   the home page to a URL belonging to another app on the same host).
   Outbound, `templates/timeline.html` carries a literal `__BASE_PATH__`
-  at each URL back to us; `Handler._send_index` substitutes it at
-  request time, which is also what defines `window.BASE_PATH` and the
+  at each URL back to us (and `__APP_TITLE__` wherever the page names
+  itself); `Handler._send_index` substitutes them at request time, which is also what defines `window.BASE_PATH` and the
   `window.apiUrl()` helper that every `fetch` / `EventSource` / deep
   link in `static/*.js` goes through. Substituting per-request rather
   than at build time keeps the container image environment-agnostic
@@ -234,6 +234,19 @@ Sibling docs:
   `usdf-rsp.slac.stanford.edu`, token `~/.lsst/log-browser-token.txt`)
   and **bts** (cluster `manke`, ConsDB at `base-lsp.lsst.codes`, token
   `~/.lsst/manke-token.txt`).
+
+  A site also carries a **title** — what the page calls itself in the
+  browser tab and beside the logo in every topbar. `summit` is *Summit
+  Log Explorer* and `bts` is *Base Log Explorer*; neither names a
+  pipeline, because the tool is pointed at a namespace rather than
+  married to one. The mapping lives in `sites.SITE_TITLES`, keyed by
+  site name, rather than being required in the catalog: a deployment's
+  catalog is rendered by the Phalanx chart, which has no field for it,
+  so requiring one would leave both deployed instances calling
+  themselves something nobody calls them. A catalog entry can still set
+  `title` outright, which is where a site added later should say what it
+  wants to be called, and `sites.DEFAULT_TITLE` (a plain *Log Explorer*)
+  covers a site with neither.
 
   `consdbTokenFile` is optional. Omitting it (or leaving it blank)
   means the endpoint takes no bearer token — the case for a

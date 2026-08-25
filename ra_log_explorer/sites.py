@@ -24,6 +24,22 @@ from pathlib import Path
 SITES_FILE_ENV = "RA_LOG_EXPLORER_SITES_FILE"
 PACKAGED_SITES_FILE = Path(__file__).parent / "sites.toml"
 
+# What the page calls itself, per site — the browser tab, and the words
+# beside the logo in every view's topbar. Keyed by site name and held
+# here rather than required in the catalog because a deployment's catalog
+# is rendered by the Phalanx chart in another repository, which knows
+# nothing of titles: requiring the field would leave both deployed
+# instances showing a name nobody calls them. A catalog entry may still
+# set `title` outright, which is where a site added later should say what
+# it wants to be called.
+SITE_TITLES = {
+    "summit": "Summit Log Explorer",
+    "bts": "Base Log Explorer",
+}
+# For a site with neither an entry above nor a `title` in the catalog.
+# Deliberately plain: a wrong name is worse than no name.
+DEFAULT_TITLE = "Log Explorer"
+
 
 @dataclass(frozen=True)
 class Site:
@@ -43,6 +59,7 @@ class Site:
     lokiAddr: str  # Loki HTTP base URL
     consdbUrl: str  # ConsDB POST endpoint (full URL, includes /query)
     consdbTokenFile: Path | None  # absolute, ~ already expanded; None = no auth
+    title: str  # what the page calls itself; see SITE_TITLES
 
 
 class SitesConfigError(RuntimeError):
@@ -124,6 +141,11 @@ def _siteFromDict(entry: dict, path: Path, idx: int) -> Site:
     rawToken = entry.get("consdbTokenFile")
     if rawToken is not None and not isinstance(rawToken, str):
         raise SitesConfigError(f"Sites catalog entry #{idx} in {path} has a non-string consdbTokenFile.")
+    # Also optional, and for the same reason as consdbTokenFile: the
+    # chart-rendered catalog has no field for it.
+    rawTitle = entry.get("title")
+    if rawTitle is not None and not isinstance(rawTitle, str):
+        raise SitesConfigError(f"Sites catalog entry #{idx} in {path} has a non-string title.")
     return Site(
         name=entry["name"],
         cluster=entry["cluster"],
@@ -131,6 +153,7 @@ def _siteFromDict(entry: dict, path: Path, idx: int) -> Site:
         lokiAddr=entry["lokiAddr"],
         consdbUrl=entry["consdbUrl"],
         consdbTokenFile=Path(rawToken).expanduser() if rawToken else None,
+        title=rawTitle or SITE_TITLES.get(entry["name"], DEFAULT_TITLE),
     )
 
 

@@ -268,6 +268,20 @@ def test_the_logo_renders_in_every_view_s_topbar(app: Any, corpus: StagedCorpus)
         assert width == 323, f"{view} drew a broken mark (naturalWidth={width})"
 
 
+def test_the_page_calls_itself_by_its_site(app: Any, corpus: StagedCorpus) -> None:
+    """The harness serves the summit catalog, so every view — and the tab
+    itself, which is how you tell two of these apart — should say Summit
+    Log Explorer. Substituted server-side, so a stale placeholder would
+    show as the literal `__APP_TITLE__` on screen."""
+    corpus.stageNight()
+    app.goto("/")
+    expect(app.page).to_have_title("Summit Log Explorer")
+    expect(app.page.locator("#home-view #topbar strong")).to_have_text("Summit Log Explorer")
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-view #topbar strong")).to_have_text("Summit Log Explorer")
+    assert "Rapid Analysis" not in app.page.content()
+
+
 def test_the_tab_icon_is_declared_and_loads(app: Any) -> None:
     app.goto("/")
     assert app.page.locator("link[rel=icon]").get_attribute("href") == "/static/favicon.png"

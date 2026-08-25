@@ -2044,7 +2044,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
 
             ``timeline.html`` carries literal placeholders for the handful of
             values that differ between deployments: ``__BASE_PATH__``
-            everywhere a URL back to us appears, and the starting values of
+            everywhere a URL back to us appears, ``__APP_TITLE__`` wherever
+            the page names itself (this server serves one site, and each
+            site has its own name for the page), and the starting values of
             the fetch window fields. Substituting at request time (rather
             than baking it in at build time, as a bundler would) keeps the
             container image environment-agnostic and keeps the no-build-step
@@ -2057,6 +2059,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             text = path.read_text()
             for placeholder, value in (
                 ("__BASE_PATH__", ctx.basePath),
+                ("__APP_TITLE__", ctx.site().title),
                 # Only the *starting* values: the fields stay editable, so
                 # widening a window mid-investigation still works. The
                 # deployment just decides where they start.

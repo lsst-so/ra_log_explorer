@@ -684,6 +684,7 @@ def test_loadTokenForSite_returns_empty_for_a_token_less_site(tmp_path: Path) ->
         lokiAddr="https://l",
         consdbUrl="http://consdb-pq.consdb:8080/consdb/query",
         consdbTokenFile=None,
+        title="Log Explorer",
     )
     assert exposureTimes.loadTokenForSite(site) == ""
 

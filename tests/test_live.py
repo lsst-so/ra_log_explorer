@@ -676,6 +676,7 @@ def _site() -> sites.Site:
         lokiAddr="https://loki.example",
         consdbUrl="https://consdb.example/query",
         consdbTokenFile=None,
+        title="Summit Log Explorer",
     )
 
 

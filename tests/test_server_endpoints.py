@@ -2454,7 +2454,32 @@ def test_index_is_served_with_and_without_a_trailing_slash(mountedServer: Runnin
     for path in ("/log-explorer", "/log-explorer/"):
         status, body = _get(host, port, path)
         assert status == 200, path
-        assert "<title>Rapid Analysis Log Explorer</title>" in body["_raw"], path
+        assert "<title>Summit Log Explorer</title>" in body["_raw"], path
+
+
+def test_the_page_is_named_after_the_site_it_serves(siteCatalog: "FakeSiteCatalog") -> None:
+    """One process serves one cluster, so the name is the server's to
+    decide and not the visitor's. The BTS instance has to say Base and
+    the summit one Summit — in the tab, where somebody with both open
+    tells them apart, as much as on the page.
+    """
+    from http.server import ThreadingHTTPServer
+
+    for siteName, expected in (("summit", "Summit Log Explorer"), ("bts", "Base Log Explorer")):
+        ctx = ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteName)
+        httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            _status, body = _get("127.0.0.1", httpd.server_address[1], "/")
+            html = body["_raw"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=2.0)
+        assert f"<title>{expected}</title>" in html, siteName
+        assert html.count(f"<strong>{expected}</strong>") == 4, f"{siteName}: every view's topbar names it"
+        assert "Rapid Analysis" not in html, "the page no longer claims a pipeline"
 
 
 def test_index_substitutes_the_base_path_into_asset_urls(mountedServer: RunningServer) -> None:
@@ -2465,6 +2490,7 @@ def test_index_substitutes_the_base_path_into_asset_urls(mountedServer: RunningS
     _status, body = _get(host, port, "/log-explorer/")
     html = body["_raw"]
     assert "__BASE_PATH__" not in html
+    assert "__APP_TITLE__" not in html
     assert 'src="/log-explorer/static/app.js"' in html
     assert 'href="/log-explorer/static/style.css"' in html
     assert 'window.BASE_PATH = "/log-explorer";' in html

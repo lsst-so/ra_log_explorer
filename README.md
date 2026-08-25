@@ -1,10 +1,17 @@
-# Rapid Analysis Log Explorer
+# Log Explorer
 
-Interactive log exploration for the **rapid analysis** backend
-(Vera C. Rubin Observatory). Type a dataId; the tool resolves its
+Interactive log exploration for the Vera C. Rubin Observatory's
+real-time processing clusters — today the pods of the **rapid analysis**
+backend, which is the namespace each instance watches, though nothing in
+the tool is married to that. Type a dataId; it resolves the exposure's
 shutter close time, pulls every pod's logs from the cluster's Loki for a
 window around that moment, and serves a browser timeline showing what
 each pod did, when, and where the warnings / errors / tracebacks landed.
+
+Each instance names itself after the cluster it explains — **Summit Log
+Explorer** on the summit, **Base Log Explorer** on the Base Test Stand —
+which is how you tell two open tabs apart. (The repository and the
+Python package are still `ra_log_explorer`.)
 
 ![timeline placeholder]()
 
@@ -24,8 +31,8 @@ the usual RSP login:
 
 | Environment | URL |
 |-------------|-----|
-| Base Test Stand (`manke`) | `https://base-lsp.lsst.codes/log-explorer` |
-| Summit (`yagan`) | `https://summit-lsp.lsst.codes/log-explorer` |
+| Base Test Stand (`manke`) — *Base Log Explorer* | `https://base-lsp.lsst.codes/log-explorer` |
+| Summit (`yagan`) — *Summit Log Explorer* | `https://summit-lsp.lsst.codes/log-explorer` |
 
 Each instance queries its own cluster and its own ConsDB, so pick the one
 matching the data you care about — the same 13-digit dataId means

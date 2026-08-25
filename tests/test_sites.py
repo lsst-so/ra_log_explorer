@@ -35,6 +35,54 @@ def test_loadSites_reads_packaged_catalog() -> None:
     assert "base-lsp" in bts.consdbUrl
 
 
+def test_each_site_is_named_after_the_thing_it_explains() -> None:
+    """The page names itself after its site. One process serves one
+    cluster, so "which of these am I looking at" has to be answerable
+    from the tab strip, and neither deployment is called after the
+    pipeline it happens to read today."""
+    catalog, _ = sites.loadSites()
+    assert sites.siteByName(catalog, "summit").title == "Summit Log Explorer"
+    assert sites.siteByName(catalog, "bts").title == "Base Log Explorer"
+
+
+def test_a_catalog_entry_may_name_itself(tmp_path: Path) -> None:
+    """Which is how a site added later says what it wants to be called,
+    without a code change here."""
+    p = _writeCatalog(
+        tmp_path / "titled.toml",
+        'default_site = "summit"\n'
+        '[[site]]\nname = "summit"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\ntitle = "Cerro Pachon Explorer"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].title == "Cerro Pachon Explorer", "an explicit title must beat the built-in one"
+
+
+def test_an_unnamed_site_gets_a_plain_title(tmp_path: Path) -> None:
+    """A site the code has never heard of gets something bland rather
+    than something wrong — a page calling itself by another site's name
+    is worse than one calling itself nothing in particular."""
+    p = _writeCatalog(
+        tmp_path / "unknown.toml",
+        'default_site = "usdf"\n'
+        '[[site]]\nname = "usdf"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].title == sites.DEFAULT_TITLE
+
+
+def test_loadSites_raises_for_non_string_title(tmp_path: Path) -> None:
+    p = _writeCatalog(
+        tmp_path / "badtitle.toml",
+        'default_site = "s"\n'
+        '[[site]]\nname = "s"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\ntitle = 7\n',
+    )
+    with pytest.raises(sites.SitesConfigError):
+        sites.loadSites(p)
+
+
 def test_loadSites_uses_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``RA_LOG_EXPLORER_SITES_FILE`` redirects the loader; useful for
     ops who want to ship a different catalog without touching the
@@ -261,3 +309,8 @@ def test_the_catalog_the_helm_chart_renders_loads(tmp_path: Path) -> None:
     assert site.cluster == "manke"
     assert site.consdbTokenFile is None
     assert site.consdbUrl.startswith("http://consdb-pq.consdb")
+    # And the title, which the chart has no field for at all: the
+    # deployed instance has to call itself "Base Log Explorer" off the
+    # site name alone, or every BTS user reads a name that belongs to
+    # nobody until a change lands in the other repository.
+    assert site.title == "Base Log Explorer"

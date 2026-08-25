@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Rapid Analysis Log Explorer</title>
+  <title>__APP_TITLE__</title>
   <!-- Prefixed like every other asset: deployed, the tab icon lives at
        /log-explorer/static/favicon.png, and a root-relative /favicon.ico
        would belong to whatever else shares the hostname. -->
@@ -36,7 +36,7 @@
         <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
              alt="" />
         <span class="title-text">
-          <strong>Rapid Analysis Log Explorer</strong>
+          <strong>__APP_TITLE__</strong>
           <span class="muted">pick an exposure to explore</span>
         </span>
         <!-- The page-level instrument. Exposure ids restart at 1 per
@@ -60,7 +60,7 @@
       <main id="home-main">
         <div class="home-card-row">
         <section class="home-card">
-          <h2>All RA processing <span class="muted">explore one exposure</span></h2>
+          <h2>All processing <span class="muted">explore one exposure</span></h2>
           <form id="fetch-form">
             <div class="row">
               <label>
@@ -216,7 +216,7 @@
         <a href="__BASE_PATH__/" class="ghost mini">&larr; home</a>
         <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
              alt="" />
-        <strong>Rapid Analysis Log Explorer</strong>
+        <strong>__APP_TITLE__</strong>
         <span class="muted">admin</span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
@@ -258,7 +258,7 @@
         <button type="button" id="back-home" class="ghost mini">&larr; home</button>
         <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
              alt="" />
-        <strong>Rapid Analysis Log Explorer</strong>
+        <strong>__APP_TITLE__</strong>
         <span id="expId-display"></span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
@@ -352,7 +352,7 @@
         <button type="button" id="night-back-home" class="ghost mini">&larr; home</button>
         <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
              alt="" />
-        <strong>Rapid Analysis Log Explorer</strong>
+        <strong>__APP_TITLE__</strong>
         <span id="night-dayobs-display"></span>
         <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
@@ -487,8 +487,8 @@
     <div id="faq-panel" role="dialog" aria-label="What is this?">
       <button type="button" id="faq-close" class="ghost mini" aria-label="close">&times;</button>
       <h2>What am I looking at?</h2>
-      <p>What the <strong>rapid analysis</strong> pipeline did for each
-        image, reconstructed from its logs.</p>
+      <p>What the pipeline did for each image, reconstructed from the
+        logs its pods wrote.</p>
       <ul>
         <li><strong>Tonight</strong> — exposures as they are taken;
           <em>view</em> appears once an exposure's logs are ready

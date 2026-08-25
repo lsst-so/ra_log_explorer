@@ -248,4 +248,5 @@ def _site() -> Any:
         lokiAddr="https://loki.invalid",
         consdbUrl="https://consdb.invalid/query",
         consdbTokenFile=None,
+        title="Summit Log Explorer",
     )
