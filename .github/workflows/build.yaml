@@ -217,10 +217,28 @@ jobs:
           OVERRIDE: ${{ vars.PHALANX_REF }}
         run: |
           set -euo pipefail
+          repo="https://github.com/lsst-sqre/phalanx"
           ref="${OVERRIDE:-}"
+          # PHALANX_REF is set while an app change and its chart change are in
+          # flight together under names this job cannot match up by itself,
+          # and the branch it points at is usually deleted when that chart
+          # change merges. Left set, an unchecked override is not a degraded
+          # build but no build at all: the clone fails, this job fails with
+          # it, and `build` never runs — over a stale variable, reported as a
+          # git error that says nothing about which variable. So hold the
+          # override to the same existence check the branch match below
+          # already uses, and fall back instead of stopping. Tags as well as
+          # branches, since --branch takes either.
+          if [ -n "$ref" ] && ! git ls-remote --exit-code --heads --tags \
+               "$repo" "$ref" >/dev/null 2>&1; then
+            echo "::warning::PHALANX_REF is set to '$ref', which no longer" \
+                 "exists in Phalanx. Falling back. Unset it if the work it" \
+                 "was for has merged."
+            ref=""
+          fi
           if [ -z "$ref" ]; then
             if git ls-remote --exit-code --heads \
-                 https://github.com/lsst-sqre/phalanx "${{ github.ref_name }}" >/dev/null 2>&1; then
+                 "$repo" "${{ github.ref_name }}" >/dev/null 2>&1; then
               ref="${{ github.ref_name }}"
             else
               ref="main"
@@ -228,8 +246,7 @@ jobs:
           fi
           echo "Checking Phalanx out at $ref"
           echo "PHALANX_CHART_REF=$ref" >> "$GITHUB_ENV"
-          git clone --quiet --depth 1 --branch "$ref" \
-            https://github.com/lsst-sqre/phalanx phalanx
+          git clone --quiet --depth 1 --branch "$ref" "$repo" phalanx
 
       - uses: azure/setup-helm@v5
 
