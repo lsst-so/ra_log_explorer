@@ -24,6 +24,22 @@ from pathlib import Path
 SITES_FILE_ENV = "RA_LOG_EXPLORER_SITES_FILE"
 PACKAGED_SITES_FILE = Path(__file__).parent / "sites.toml"
 
+# What the page calls itself, per site — the browser tab, and the words
+# beside the logo in every view's topbar. Keyed by site name and held
+# here rather than required in the catalog because a deployment's catalog
+# is rendered by the Phalanx chart in another repository, which knows
+# nothing of titles: requiring the field would leave both deployed
+# instances showing a name nobody calls them. A catalog entry may still
+# set `title` outright, which is where a site added later should say what
+# it wants to be called.
+SITE_TITLES = {
+    "summit": "Summit Log Explorer",
+    "bts": "Base Log Explorer",
+}
+# For a site with neither an entry above nor a `title` in the catalog.
+# Deliberately plain: a wrong name is worse than no name.
+DEFAULT_TITLE = "Log Explorer"
+
 
 @dataclass(frozen=True)
 class Site:
@@ -31,7 +47,10 @@ class Site:
 
     ``consdbTokenFile`` is the on-disk path the server reads the bearer
     token from when calling ``consdbUrl``. It's resolved with ``~``
-    expansion against the *server's* HOME at load time.
+    expansion against the *server's* HOME at load time. ``None`` means
+    the endpoint takes no token at all — which is the case when
+    ``consdbUrl`` is a cluster-internal Service address, reached inside
+    the same cluster and so never passing through Gafaelfawr.
     """
 
     name: str  # short slug — "summit", "bts" — also used as the cache-key
@@ -39,7 +58,8 @@ class Site:
     namespace: str  # Loki `namespace` label
     lokiAddr: str  # Loki HTTP base URL
     consdbUrl: str  # ConsDB POST endpoint (full URL, includes /query)
-    consdbTokenFile: Path  # absolute, ~ already expanded
+    consdbTokenFile: Path | None  # absolute, ~ already expanded; None = no auth
+    title: str  # what the page calls itself; see SITE_TITLES
 
 
 class SitesConfigError(RuntimeError):
@@ -110,19 +130,30 @@ def loadSites(path: Path | None = None) -> tuple[list[Site], str]:
 
 def _siteFromDict(entry: dict, path: Path, idx: int) -> Site:
     """Validate one ``[[site]]`` table and construct a :class:`Site`."""
-    fields = ("name", "cluster", "namespace", "lokiAddr", "consdbUrl", "consdbTokenFile")
+    fields = ("name", "cluster", "namespace", "lokiAddr", "consdbUrl")
     missing = [f for f in fields if not isinstance(entry.get(f), str) or not entry[f]]
     if missing:
         raise SitesConfigError(
             f"Sites catalog entry #{idx} in {path} is missing required string field(s): {missing}."
         )
+    # Optional: omit it (or leave it blank) for a ConsDB that needs no
+    # bearer token, e.g. an in-cluster Service address.
+    rawToken = entry.get("consdbTokenFile")
+    if rawToken is not None and not isinstance(rawToken, str):
+        raise SitesConfigError(f"Sites catalog entry #{idx} in {path} has a non-string consdbTokenFile.")
+    # Also optional, and for the same reason as consdbTokenFile: the
+    # chart-rendered catalog has no field for it.
+    rawTitle = entry.get("title")
+    if rawTitle is not None and not isinstance(rawTitle, str):
+        raise SitesConfigError(f"Sites catalog entry #{idx} in {path} has a non-string title.")
     return Site(
         name=entry["name"],
         cluster=entry["cluster"],
         namespace=entry["namespace"],
         lokiAddr=entry["lokiAddr"],
         consdbUrl=entry["consdbUrl"],
-        consdbTokenFile=Path(entry["consdbTokenFile"]).expanduser(),
+        consdbTokenFile=Path(rawToken).expanduser() if rawToken else None,
+        title=rawTitle or SITE_TITLES.get(entry["name"], DEFAULT_TITLE),
     )
 
 

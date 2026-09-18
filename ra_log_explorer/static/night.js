@@ -15,8 +15,60 @@
 let nightSummary = null;
 let nightListenersWired = false;
 
+// Deep link from a night drilldown into one exposure's explore view.
+//
+// The instrument has to travel with the dataId. Both night views are
+// pinned to LSSTCam (the AOS half by construction; the SFM half because
+// its shutter closes are resolved under that pin) — but the link lands
+// on a *fresh* home page,
+// which otherwise picks up whatever instrument this browser last used.
+// On a browser that had been looking at LATISS, an un-pinned link would
+// resolve the LATISS exposure sharing this 13-digit id — a different
+// exposure, an hour away — and `autoFetch=1` would fetch it without
+// anyone touching a control.
+function nightExposureHref(dataId) {
+  const inst = (nightSummary && nightSummary.instrument) || 'lsstcam';
+  return apiUrl(
+    `/?dataId=${encodeURIComponent(dataId)}&autoFetch=1&instrument=${encodeURIComponent(inst)}`,
+  );
+}
+
+// The night is two views over the same dayObs — AOS pods, and everything
+// else. They are separate server-side states over separate fetches (the
+// AOS half pushes its pod filter down to Loki; the other half cannot, see
+// config.NIGHT_VIEWS), so switching tabs is a navigation, not a filter
+// applied to something already on the page.
+function renderNightTabs(summary) {
+  const strip = document.getElementById('night-tabs');
+  if (!strip) return;
+  const hint = document.getElementById('night-tab-hint');
+  for (const el of strip.querySelectorAll('.tab')) {
+    const isCurrent = el.dataset.view === summary.view;
+    el.classList.toggle('current', isCurrent);
+    if (isCurrent) {
+      el.setAttribute('aria-current', 'page');
+      el.removeAttribute('href');
+    } else {
+      el.removeAttribute('aria-current');
+      // A real href, so the other half is middle-clickable into its own
+      // browser tab and survives a reload. If it isn't loaded yet the
+      // landing page offers the fetch.
+      el.href = apiUrl(
+        `/?dayObs=${encodeURIComponent(summary.dayObs)}&nightView=${encodeURIComponent(el.dataset.view)}`,
+      );
+    }
+  }
+  if (hint) {
+    hint.textContent =
+      summary.view === 'sfm'
+        ? `${(summary.stats && summary.stats.nPods) || 0} pods — SFM workers, head node, plotters, one-offs`
+        : `${(summary.stats && summary.stats.nPods) || 0} AOS pods`;
+  }
+}
+
 function startNight(summary) {
   nightSummary = summary;
+  renderNightTabs(summary);
   if (window.renderFetchBanner) {
     window.renderFetchBanner(document.getElementById('night-fetch-banner'), summary);
   }
@@ -37,21 +89,31 @@ function startNight(summary) {
     'First task pickup',
     summary.histograms.firstTaskStart,
   );
-  renderHistogram(
-    'night-hist-cz',
-    'night-hist-cz-meta',
-    'night-hist-cz-title',
-    'night-hist-cz-bin',
-    'calcZernikes end',
-    summary.histograms.calcZernikesEnd,
-  );
-  renderFailures(summary.failures);
+  // calcZernikes is an AOS task. On the SFM half the server sends no
+  // histogram for it, and an empty chart there would read as "the task
+  // ran and produced nothing" rather than "this task isn't in this view".
+  const czCard = document.getElementById('night-hist-cz-card');
+  const cz = summary.histograms.calcZernikesEnd;
+  if (czCard) czCard.hidden = !cz;
+  if (cz) {
+    renderHistogram(
+      'night-hist-cz',
+      'night-hist-cz-meta',
+      'night-hist-cz-title',
+      'night-hist-cz-bin',
+      'calcZernikes end',
+      cz,
+    );
+  }
+  renderFailures(summary.failures, false);
   renderRestarts(summary.restarts);
   if (!nightListenersWired) {
     document.getElementById('night-back-home').addEventListener('click', () => {
-      // Drop the dayObs key out of the URL bar so a subsequent refresh
-      // lands on home — not back on whatever night we just left.
-      history.replaceState({}, '', window.location.pathname);
+      // Drop the dayObs key (and the half it named) out of the URL bar so
+      // a subsequent refresh lands on home — not back on whatever night we
+      // just left. Its own history entry, because going home is a
+      // navigation: Back from here returns to the night.
+      window.navigateTo('');
       if (window.showHome) window.showHome();
     });
     nightListenersWired = true;
@@ -71,7 +133,7 @@ function renderTopStats(stats) {
     { label: 'pods w/ traceback', value: stats.nPodsWithTraceback },
     { label: 'distinct exception classes', value: stats.nDistinctExceptionClasses },
     {
-      label: 'pod restarts',
+      label: 'in-place restarts',
       value: stats.nPodRestarts || 0,
       accent: (stats.nPodRestarts || 0) > 0 ? 'warn' : null,
     },
@@ -190,7 +252,7 @@ function renderGatherOnly(dataIds) {
   for (const id of shown) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.href = nightExposureHref(id);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -359,7 +421,7 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
   for (const id of dataIds) {
     const a = document.createElement('a');
     a.className = 'night-hist-bin-id mono';
-    a.href = `/?dataId=${encodeURIComponent(id)}&autoFetch=1`;
+    a.href = nightExposureHref(id);
     a.target = '_blank';
     a.rel = 'noopener';
     a.textContent = String(id);
@@ -372,16 +434,35 @@ function renderBinPanel(panel, svg, binIdx, binLo, binHi, dataIds) {
 
 // ----- failures table + drilldown -------------------------------------------
 
-function renderFailures(rows) {
+// How many failure rows to show before folding. A quiet night fits
+// entirely; a bad one runs to thousands, and every section below this
+// table used to be a very long scroll away.
+const FAILURES_FOLDED = 10;
+
+function renderFailures(rows, showAll) {
   const tbody = document.querySelector('#night-failures tbody');
   tbody.innerHTML = '';
   document.getElementById('night-failures-count').textContent =
     `(${rows.length} traceback${rows.length === 1 ? '' : 's'})`;
+  const expand = document.getElementById('night-failures-expand');
   if (rows.length === 0) {
     tbody.innerHTML = '<tr><td colspan="7" class="muted">No tracebacks 🎉</td></tr>';
+    if (expand) expand.hidden = true;
     return;
   }
-  for (const r of rows) {
+  const folded = !showAll && rows.length > FAILURES_FOLDED;
+  const shown = folded ? rows.slice(0, FAILURES_FOLDED) : rows;
+  if (expand) {
+    expand.hidden = rows.length <= FAILURES_FOLDED;
+    expand.textContent = folded
+      ? `show all ${rows.length} ▾`
+      : `show first ${FAILURES_FOLDED} only ▴`;
+    // Re-render rather than toggle row visibility: the drilldown inserts
+    // sibling rows, so "hidden rows" and "expanded rows" would have to
+    // agree about each other. Rebuilding has neither problem.
+    expand.onclick = () => renderFailures(rows, !showAll);
+  }
+  for (const r of shown) {
     const tr = document.createElement('tr');
     tr.className = 'night-failure-row';
     tr.appendChild(asTd(formatTimeHM(r.tIso), 'mono'));
@@ -430,8 +511,9 @@ async function toggleFailureExpansion(tr, row) {
   tr.parentNode.insertBefore(detail, tr.nextSibling);
   try {
     const r = await fetch(
-      `/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
-      + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`,
+      apiUrl(`/api/night/traceback/${encodeURIComponent(row.bodyKey)}`
+        + `?dayObs=${encodeURIComponent(nightSummary.dayObs)}`
+        + `&nightView=${encodeURIComponent(nightSummary.view || 'aos')}`),
     );
     if (!r.ok) {
       td.firstChild.textContent = `(failed to load: HTTP ${r.status})`;
@@ -529,6 +611,7 @@ const LIFECYCLE_LABELS = {
   POD_OOMKILLED: ['OOM-killed', 'oom'],
   POD_FAILED: ['failed', 'podfail'],
   POD_UNHEALTHY: ['unhealthy', 'podunhealthy'],
+  POD_MOUNT_FAILED: ['mount failed', 'mountfail'],
 };
 
 function renderRestarts(rows) {
@@ -555,7 +638,7 @@ function renderRestarts(rows) {
     } else {
       const a = document.createElement('a');
       a.className = 'mono';
-      a.href = `/?dataId=${encodeURIComponent(r.dataId)}&autoFetch=1`;
+      a.href = nightExposureHref(r.dataId);
       a.target = '_blank';
       a.rel = 'noopener';
       a.textContent = String(r.dataId);

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import json
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
@@ -10,8 +11,11 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import config, exposureTimes, parse, server, sites
+from ra_log_explorer import config, exposureTimes
+from ra_log_explorer import fetch as fetchModule
+from ra_log_explorer import parse, server, sites
 from ra_log_explorer.jobs import FetchJob, JobManager
+from ra_log_explorer.server import ServerContext, _loadExposureFromCache
 
 from .conftest import FakeSiteCatalog
 
@@ -24,7 +28,7 @@ def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> server.ServerContext:
     return server.ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
 
 
@@ -185,6 +189,31 @@ def test_summaryToDict_keeps_untagged_warn_only_in_work_window() -> None:
     kinds = [e["kind"] for e in out["events"]]
     # 2 targeted + 1 in-window untagged warn = 3
     assert kinds == ["WORKER_PICKUP", "WARN", "WORKER_BINNED_PRELIMINARY_VISIT_IMAGE"]
+
+
+def test_summaryToDict_keeps_a_pod_death_after_the_last_work_line() -> None:
+    """Lifecycle markers are windowed on the broad exposure window, not
+    the tight per-dataId one: a pod usually dies a few seconds AFTER its
+    last work line — which is precisely when 'the pod died here' needs
+    to stay visible. Narrowing them to the work window would silently
+    drop the one marker that explains a truncated lane."""
+    tZero = dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=dt.timezone.utc)
+    expId = 2026051900722
+    events = [
+        _ev(tZero + dt.timedelta(seconds=5), "WORKER_PICKUP", expId=expId),
+        _ev(tZero + dt.timedelta(seconds=10), "QUANTUM_DONE", expId=expId),
+        # The death lands two minutes after the last work line — far
+        # outside the [first-3s, last+3s] work window, well inside the
+        # broad exposure window.
+        _ev(tZero + dt.timedelta(seconds=120), "POD_RESTARTED", level="warn"),
+        # And one outside even the broad window (the next exposure's
+        # trouble) — that one stays off this lane.
+        _ev(tZero + dt.timedelta(seconds=400), "POD_KILLED", level="warn"),
+    ]
+    out = server._summaryToDict(_stubSummary(events), tZero, expId)
+    kinds = [e["kind"] for e in out["events"]]
+    assert "POD_RESTARTED" in kinds
+    assert "POD_KILLED" not in kinds
 
 
 def test_summaryToDict_anchors_untagged_window_on_tZero_when_no_targeted_events() -> None:
@@ -589,7 +618,7 @@ def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
     assert ctx.getNightState(20260521) is None  # matched, evicted
 
 
-# ----- _taiIsoToUtc --------------------------------------------------------
+# ----- taiIsoToUtc ---------------------------------------------------------
 
 
 def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
@@ -598,7 +627,7 @@ def test_taiIsoToUtc_applies_TAI_minus_UTC_offset() -> None:
     halves matter — getting either wrong silently shifts every
     histogram bar.
     """
-    out = server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    out = exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     expected = dt.datetime(2026, 5, 20, 8, 45, 39, 267000, tzinfo=dt.timezone.utc)
     assert out == expected
 
@@ -609,8 +638,8 @@ def test_utcToTaiIso_inverts_taiIsoToUtc() -> None:
     came from, so the manual value round-trips through the per-site cache.
     """
     taiIso = "2026-06-24T14:38:41.380663"
-    utc = server._taiIsoToUtc(taiIso)
-    assert server._utcToTaiIso(utc) == taiIso
+    utc = exposureTimes.taiIsoToUtc(taiIso)
+    assert exposureTimes.utcToTaiIso(utc) == taiIso
 
 
 # ----- _buildNightPayload --------------------------------------------------
@@ -886,24 +915,25 @@ def test_buildNightSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     """A minimal valid body produces a FetchSpec with the AOS pod-regex
     pinned and the window set to the dayObs's noon-UTC bounds."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, dayObs, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
+    spec, site, dayObs, view = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521})
     assert dayObs == 20260521
-    assert password is None
-    assert site.name == "summit"  # falls back to default
+    assert site.name == "summit"  # the site this server serves
+    assert view == server.DEFAULT_NIGHT_VIEW == "aos"
     assert spec.podRegex == server.NIGHT_AOS_POD_REGEX
     # Window: noon UTC dayObs → noon UTC dayObs+1.
     assert spec.fromIso.startswith("2026-05-21T12:00:00")
     assert spec.toIso.startswith("2026-05-22T12:00:00")
 
 
-def test_buildNightSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
-    """The night-fetch endpoint accepts the same ``site`` field as the
-    exposure-fetch endpoint — picking BTS swaps both the Loki target
-    and the ConsDB endpoint used for the prefetch pass."""
+def test_buildNightSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """Which cluster gets queried is the server's, decided by where it
+    runs. A body naming another site must not redirect the fetch — a
+    summit deployment answering with BTS logs would be worse than an
+    error, because it would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
     spec, site, _, _ = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "site": "bts"})
-    assert site.name == "bts"
-    assert spec.cluster == "manke"
+    assert site.name == "summit"
+    assert spec.cluster == "yagan"
 
 
 def test_buildNightSpecFromRequest_rejects_missing_dayObs(siteCatalog: FakeSiteCatalog) -> None:
@@ -927,10 +957,17 @@ def test_buildNightSpecFromRequest_rejects_out_of_range_dayObs(siteCatalog: Fake
         server._buildNightSpecFromRequest(ctx, {"dayObs": 12345})
 
 
-def test_buildNightSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildNightSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """Credentials are the service's, from its environment. A body that
+    supplies its own must be ignored rather than honoured: the process
+    env is shared, so one browser's wrong password would otherwise break
+    fetches for everyone using the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, password = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "password": "hunter2"})
-    assert password == "hunter2"
+    spec, _, _, _ = server._buildNightSpecFromRequest(
+        ctx, {"dayObs": 20260521, "password": "hunter2", "username": "someone-else", "workers": 999}
+    )
+    assert spec.username == server.DEFAULT_USERNAME
+    assert spec.workers == server.DEFAULT_WORKERS
 
 
 # ----- _buildRangeSpecFromRequest -----------------------------------------
@@ -952,12 +989,11 @@ def test_buildRangeSpecFromRequest_happy_path(siteCatalog: FakeSiteCatalog) -> N
     start anchor (minus the before-buffer) to the stop anchor (plus the
     after-buffer), with the TAI→UTC conversion applied to both anchors."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, startId, stopId, tZeroStart, tZeroStop, password = server._buildRangeSpecFromRequest(
+    spec, site, startId, stopId, tZeroStart, tZeroStop, _ = server._buildRangeSpecFromRequest(
         ctx, _rangeBody()
     )
     assert (startId, stopId) == (2026051900722, 2026051900750)
-    assert password is None
-    assert site.name == "summit"  # default
+    assert site.name == "summit"
     assert spec.podRegex is None  # range is an all-pods fetch
     # TAI inputs minus 37 s; default windowBefore=5, windowAfter=300.
     # start 08:46:16.267 TAI -> 08:45:39.267 UTC -> minus 5 s = 08:45:34.267.
@@ -975,10 +1011,10 @@ def test_buildRangeSpecFromRequest_tZeroUtc_skips_conversion(siteCatalog: FakeSi
     assert tZeroStart == dt.datetime(2026, 5, 20, 8, 46, 16, 267000, tzinfo=dt.timezone.utc)
 
 
-def test_buildRangeSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildRangeSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    _, site, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
-    assert site.name == "bts"
+    _, site, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(site="bts"))
+    assert site.name == "summit"
 
 
 def test_buildRangeSpecFromRequest_rejects_reversed_range(siteCatalog: FakeSiteCatalog) -> None:
@@ -1004,10 +1040,11 @@ def test_buildRangeSpecFromRequest_rejects_missing_anchor(siteCatalog: FakeSiteC
         server._buildRangeSpecFromRequest(ctx, body)
 
 
-def test_buildRangeSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildRangeSpecFromRequest_ignores_credentials_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    *_, password = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2"))
-    assert password == "hunter2"
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(password="hunter2", workers=999))
+    assert spec.username == server.DEFAULT_USERNAME
+    assert spec.workers == server.DEFAULT_WORKERS
 
 
 def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog: FakeSiteCatalog) -> None:
@@ -1016,7 +1053,7 @@ def test_buildRangeSpecFromRequest_null_window_falls_back_to_default(siteCatalog
     handler doesn't catch — it would drop the connection with no
     response)."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=None, windowAfter=None))
     # Defaults: start 08:45:39.267 − 5 s, stop 08:50:32.512 + 300 s.
     assert spec.fromIso.startswith("2026-05-20T08:45:34.267")
     assert spec.toIso.startswith("2026-05-20T08:55:32.512")
@@ -1026,7 +1063,7 @@ def test_buildRangeSpecFromRequest_zero_window_is_preserved(siteCatalog: FakeSit
     """``0`` is a legitimate window (start exactly at the shutter close)
     and must not be coerced to the default."""
     ctx = _ctxWithSites(siteCatalog)
-    spec, *_ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
+    spec, *_, _ = server._buildRangeSpecFromRequest(ctx, _rangeBody(windowBefore=0))
     assert spec.fromIso.startswith("2026-05-20T08:45:39.267")
 
 
@@ -1178,33 +1215,6 @@ def test_buildNightPayload_exposes_exposureInfo_map_keyed_by_string() -> None:
     assert payload["exposureInfo"] == {"2026052100051": rec}
 
 
-# ----- _maybeSetLokiPassword ----------------------------------------------
-
-
-def test_maybeSetLokiPassword_sets_env_when_given(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A non-empty password lands in ``LOKI_PASSWORD`` so the next
-    subprocess.run inherits it."""
-    monkeypatch.delenv("LOKI_PASSWORD", raising=False)
-    server._maybeSetLokiPassword("hunter2")
-    import os as _os
-
-    assert _os.environ["LOKI_PASSWORD"] == "hunter2"
-
-
-def test_maybeSetLokiPassword_noop_when_empty_or_None(monkeypatch: pytest.MonkeyPatch) -> None:
-    """An empty/None password must NOT clobber an existing ``LOKI_PASSWORD``
-    — otherwise the home page's optional credentials card would silently
-    blow away a working env var on every fetch.
-    """
-    import os as _os
-
-    monkeypatch.setenv("LOKI_PASSWORD", "preserve-me")
-    server._maybeSetLokiPassword(None)
-    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
-    server._maybeSetLokiPassword("")
-    assert _os.environ["LOKI_PASSWORD"] == "preserve-me"
-
-
 # ----- _parseClientIso ----------------------------------------------------
 
 
@@ -1281,7 +1291,12 @@ def test_resolveShutterCloses_requeries_manual_standins(
     queried: list[list[int]] = []
 
     def fakeBatch(
-        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
     ) -> dict[int, exposureTimes.ExposureRecord]:
         queried.append(sorted(dataIds))
         return {2026052000001: {"obs_end": "2026-05-20T08:46:16.267000", "physical_filter": "r"}}
@@ -1294,7 +1309,7 @@ def test_resolveShutterCloses_requeries_manual_standins(
 
     assert queried == [[2026052000001]]  # the stand-in was re-queried
     # ConsDB's value won, in memory and on disk.
-    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     assert info[2026052000001]["physical_filter"] == "r"
     stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
     assert exposureTimes.isManual(stored) is False
@@ -1315,7 +1330,12 @@ def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
     siteCatalog.writeSummitToken()
 
     def emptyBatch(
-        dataIds: Iterable[int], token: str, *, consdbUrl: str, chunkSize: int = 500
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
     ) -> dict[int, exposureTimes.ExposureRecord]:
         return {}
 
@@ -1325,7 +1345,7 @@ def test_resolveShutterCloses_keeps_manual_when_consdb_still_cannot_answer(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-06-24T14:38:41.380663")
     stored = exposureTimes.lookupCachedRecord(2026052000001, siteName="summit")
     assert exposureTimes.isManual(stored) is True
     assert _phase(job, "done")["stillMissing"] == 0
@@ -1345,7 +1365,7 @@ def test_resolveShutterCloses_manual_survives_a_missing_token(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-06-24T14:38:41.380663")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-06-24T14:38:41.380663")
     assert 2026052000002 not in target
     assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
 
@@ -1371,6 +1391,994 @@ def test_resolveShutterCloses_real_cache_hit_skips_consdb(
     info: dict[int, exposureTimes.ExposureRecord] = {}
     server._resolveShutterClosesInto({2026052000001}, target, info, job, site)
 
-    assert target[2026052000001] == server._taiIsoToUtc("2026-05-20T08:46:16.267000")
+    assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-05-20T08:46:16.267000")
     checked = _phase(job, "cache-checked")
     assert checked["cacheHits"] == 1 and checked["manualStandins"] == 0
+
+
+# ----- the served site -----------------------------------------------------
+
+
+def test_ctx_site_returns_the_configured_site(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    assert ctx.site().name == "summit"
+    # A process serves whichever entry it was started with, not the
+    # catalog's default: `--site bts` locally means BTS for the whole run.
+    ctx.siteName = "bts"
+    assert ctx.site().name == "bts"
+    assert ctx.site().cluster == "manke"
+
+
+def test_ctx_site_raises_for_a_name_not_in_the_catalog(siteCatalog: FakeSiteCatalog) -> None:
+    """Fail loudly rather than falling back to an arbitrary entry. Serving
+    the wrong observatory's logs is worse than serving none, because the
+    same dataId exists at both and the answer would look plausible."""
+    ctx = _ctxWithSites(siteCatalog)
+    ctx.siteName = "ghost"
+    with pytest.raises(sites.SitesConfigError):
+        ctx.site()
+
+
+def test_trimFloat_drops_a_pointless_decimal() -> None:
+    """These land in an HTML number field. "300" reads as the default it
+    is; "300.0" reads as a value somebody has already fiddled with."""
+    assert server._trimFloat(300.0) == "300"
+    assert server._trimFloat(5.0) == "5"
+    assert server._trimFloat(0.0) == "0"
+    assert server._trimFloat(12.5) == "12.5"
+    assert server._trimFloat(0.1) == "0.1"
+
+
+# ----- instrument threading -------------------------------------------------
+
+
+def test_instrumentFromBody_defaults_to_lsstcam() -> None:
+    """A body that doesn't say is an LSSTCam fetch — the default
+    instrument is always LSSTCam."""
+    assert server._instrumentFromBody({}) == "lsstcam"
+    assert server._instrumentFromBody({"instrument": ""}) == "lsstcam"
+    assert server._instrumentFromBody({"instrument": None}) == "lsstcam"
+
+
+def test_instrumentFromBody_normalises_and_validates() -> None:
+    assert server._instrumentFromBody({"instrument": "LATISS"}) == "latiss"
+    with pytest.raises(ValueError):
+        server._instrumentFromBody({"instrument": "hubble"})
+    with pytest.raises(ValueError):
+        server._instrumentFromBody({"instrument": 7})
+
+
+def test_podBelongsToInstrument_rules() -> None:
+    """Cross-instrument pods never belong; neutral pods always do; an
+    unknown side keeps the pod rather than hiding work."""
+    assert server._podBelongsToInstrument("LSSTCam", "lsstcam") is True
+    assert server._podBelongsToInstrument("LATISS", "lsstcam") is False
+    assert server._podBelongsToInstrument(None, "lsstcam") is True  # redis, squid, misc
+    assert server._podBelongsToInstrument("LSSTCam", None) is True
+    assert server._podBelongsToInstrument(None, None) is True
+
+
+def _instrumentSummary(pod: str, instrument: str | None, expId: int) -> parse.PodSummary:
+    return parse.PodSummary(
+        pod=pod,
+        group="sfm",
+        instrument=instrument,
+        ordinal=None,
+        nLines=1,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+        expIdsSeen={expId},
+        events=[],
+    )
+
+
+def test_buildSummaryPayload_filters_pods_by_instrument(tmp_path: Path) -> None:
+    """A LATISS view of id N must not attribute an LSSTCam pod's work —
+    the same bare id names a different exposure on each instrument."""
+    expId = 2026071100470
+    tZero = dt.datetime(2026, 7, 12, 5, 42, 20, tzinfo=dt.timezone.utc)
+    state = server.ServerState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+            _instrumentSummary("redis-0", None, expId),
+        ],
+        expId=expId,
+        tZero=tZero,
+        siteName="summit",
+        instrument="latiss",
+    )
+    payload = server._buildSummaryPayload(state)
+    assert payload["instrument"] == "latiss"
+    assert {p["pod"] for p in payload["pods"]} == {"s-latiss-run-sfm-runner-1", "redis-0"}
+    assert {p["pod"] for p in payload["podsAll"]} == {"s-latiss-run-sfm-runner-1", "redis-0"}
+
+
+def test_buildSummaryPayload_without_instrument_keeps_every_pod(tmp_path: Path) -> None:
+    """A state built before the instrument was known filters nothing —
+    hiding work on an unknown pin would be worse than showing extra."""
+    expId = 2026071100470
+    state = server.ServerState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+        ],
+        expId=expId,
+        tZero=dt.datetime(2026, 7, 12, 5, 42, 20, tzinfo=dt.timezone.utc),
+        siteName="summit",
+    )
+    payload = server._buildSummaryPayload(state)
+    assert len(payload["pods"]) == 2
+
+
+# ----- instrument pins through the resolution paths -------------------------
+
+
+def _captureResolvePin(monkeypatch: pytest.MonkeyPatch) -> dict:
+    """Replace _resolveShutterClosesInto with a capture of its pin."""
+    captured: dict = {}
+
+    def fakeResolve(
+        needIds: set[int],
+        target: dict,
+        infoTarget: dict,
+        job: FetchJob,
+        site: sites.Site,
+        instrument: str | None = None,
+    ) -> None:
+        captured["needIds"] = set(needIds)
+        captured["instrument"] = instrument
+
+    monkeypatch.setattr(server, "_resolveShutterClosesInto", fakeResolve)
+    return captured
+
+
+def _tracebackSummary(expId: int) -> parse.PodSummary:
+    s = _instrumentSummary("s-lsstcam-run-aos-worker-1", "LSSTCam", expId)
+    s.tracebacks = [
+        parse.TracebackRecord(
+            pod=s.pod,
+            t=dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc),
+            expId=expId,
+            excClass="RuntimeError",
+            excMessage="boom",
+            body="Traceback ...",
+            reachedTerminator=True,
+        )
+    ]
+    return s
+
+
+def test_prefetchNightShutterCloses_pins_lsstcam(
+    siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """AOS runs on LSSTCam only, so every dataId in a night's logs is an
+    LSSTCam id — the resolution must never wander to another table."""
+    captured = _captureResolvePin(monkeypatch)
+    state = server.NightState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260711,
+        startTime=dt.datetime(2026, 7, 11, 12, tzinfo=dt.timezone.utc),
+        endTime=dt.datetime(2026, 7, 12, 12, tzinfo=dt.timezone.utc),
+    )
+    job, site = _prefetchJob(siteCatalog)
+    server._prefetchNightShutterCloses(state, [_tracebackSummary(2026071100050)], job, site)
+    assert captured["needIds"] == {2026071100050}
+    assert captured["instrument"] == "lsstcam"
+
+
+def test_prefetchRangeShutterCloses_pins_the_jobs_instrument(
+    siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A range is a run of ONE instrument's exposures; its server-side
+    batch must resolve against that instrument's table only."""
+    captured = _captureResolvePin(monkeypatch)
+    t0 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc)
+    state = server.RangeState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026071100010,
+        stopId=2026071100012,
+        fromTime=t0,
+        toTime=t0,
+        instrument="latiss",
+    )
+    nightJob, site = _prefetchJob(siteCatalog)
+    job = JobManager().createRangeJob(
+        nightJob.spec, 2026071100010, 2026071100012, t0, t0, siteName="summit", instrument="latiss"
+    )
+    server._prefetchRangeShutterCloses(state, job, site)
+    assert captured["instrument"] == "latiss"
+    assert captured["needIds"] == {2026071100010, 2026071100011, 2026071100012}
+
+
+def test_resolveShutterCloses_pin_reaches_cache_and_batch(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pin governs BOTH halves of resolution: a colliding id already
+    cached for both instruments must anchor to the pinned instrument's
+    shutter close, and the ConsDB batch for misses must carry the pin."""
+    collidingId = 2026071100408
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName="summit",
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName="summit",
+    )
+    batchPins: list[str | None] = []
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        batchPins.append(instrument)
+        return {}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    job, site = _prefetchJob(siteCatalog)
+    missId = 2026071100999  # not cached -> goes to the batch
+    server._resolveShutterClosesInto({collidingId, missId}, target, info, job, site, instrument="latiss")
+
+    # The cached hit anchored to the LATISS shutter close (TAI -37 s).
+    assert target[collidingId] == dt.datetime(2026, 7, 12, 4, 57, 26, 354000, tzinfo=dt.timezone.utc)
+    assert info[collidingId]["instrument"] == "latiss"
+    assert batchPins == ["latiss"]
+
+
+def test_resolveShutterCloses_pinned_batch_never_claims_the_bare_key(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The bare cache key is defined as the probe-order winner, and only
+    writers that resolved the id that way may write it. A LATISS-pinned
+    range prefetch resolving a colliding id must therefore store only the
+    instrument key — clobbering the bare one would hand every later
+    unqualified lookup (the night view's rebuild path included) the wrong
+    exposure's shutter close."""
+    collidingId = 2026071100408
+    # The probe-order winner is already cached, as the poller would leave it.
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T03:58:52.091000",
+                "instrument": "lsstcam",
+            }
+        },
+        siteName="summit",
+    )
+    latissRec = {"exposure_id": collidingId, "obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {collidingId: latissRec}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    job, site = _prefetchJob(siteCatalog)
+    # Nothing cached under latiss:<id>, so the id goes to the batch.
+    server._resolveShutterClosesInto({collidingId}, target, info, job, site, instrument="latiss")
+
+    # The LATISS answer landed under its own key…
+    stored = exposureTimes.lookupCachedRecord(collidingId, siteName="summit", instrument="latiss")
+    assert stored is not None and stored["instrument"] == "latiss"
+    # …and the bare key still holds the probe-order winner.
+    bare = exposureTimes.lookupCachedRecord(collidingId, siteName="summit")
+    assert bare is not None and bare["instrument"] == "lsstcam"
+
+
+def test_resolveShutterCloses_lsstcam_pin_still_writes_the_bare_key(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The converse: an LSSTCam pin IS the probe-order answer, so the
+    night prefetch keeps seeding bare keys for the home form."""
+    missId = 2026071100999
+    camRec = {"exposure_id": missId, "obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}
+
+    def fakeBatch(
+        dataIds: Iterable[int],
+        token: str,
+        *,
+        consdbUrl: str,
+        chunkSize: int = 500,
+        instrument: str | None = None,
+    ) -> dict[int, exposureTimes.ExposureRecord]:
+        return {missId: camRec}
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", fakeBatch)
+    siteCatalog.writeSummitToken()
+
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    info: dict[int, exposureTimes.ExposureRecord] = {}
+    server._resolveShutterClosesInto({missId}, target, info, job, site, instrument="lsstcam")
+
+    bare = exposureTimes.lookupCachedRecord(missId, siteName="summit")
+    assert bare is not None and bare["instrument"] == "lsstcam"
+
+
+# ----- instrument on the cache-rebuild path ---------------------------------
+
+
+def _plantExposureCache(
+    root: Path,
+    expId: int,
+    fromIso: str,
+    toIso: str,
+    cluster: str = "yagan",
+    fetchedAt: str = "2026-07-12T06:00:00+00:00",
+    instruments: tuple[str, ...] = ("lsstcam",),
+) -> Path:
+    import json as _json
+
+    windowDir = root / cluster / "rapid-analysis" / "window-a"
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "_meta.json").write_text(
+        _json.dumps(
+            {
+                "spec": {"fromIso": fromIso, "toIso": toIso},
+                "fetched_at": fetchedAt,
+                "pod_count": 0,
+            }
+        )
+    )
+    (windowDir / "_exposure_ids.txt").write_text("".join(f"{inst}:{expId}\n" for inst in instruments))
+    return windowDir
+
+
+def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """Being recorded under an instrument is not enough on its own: the
+    pinned t0 must also fall inside the window, or the rebuild would dress
+    the wrong logs up as this exposure. One window can legitimately be
+    recorded for both instruments' exposures of an id (a wide enough
+    window gets reused by both), which is what leaves this check the only
+    thing standing between the two.
+    """
+    collidingId = 2026071100408
+    # An LSSTCam window around its shutter close in UTC (obs_end is
+    # TAI; -37 s puts t0 at 03:58:15.091 UTC).
+    _plantExposureCache(
+        tmpCacheRoot,
+        collidingId,
+        "2026-07-12T03:58:10.091000Z",
+        "2026-07-12T04:03:15.091000Z",
+        instruments=("lsstcam", "latiss"),
+    )
+    site = siteCatalog.catalog[0]
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName=site.name,
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName=site.name,
+    )
+    ctx = _ctxWithSites(siteCatalog)
+    # LATISS pin: its 04:58 t0 is outside the window on disk -> refuse.
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    # LSSTCam pin: t0 inside the window -> rebuilt, stamped with the pin.
+    state = server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam")
+    assert state is not None
+    assert state.instrument == "lsstcam"
+    assert state.tZero == dt.datetime(2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc)
+
+
+def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """The recorded pin rules a window out even when the t0 falls inside
+    it. The pads are the user's to widen, and an hour-wide LSSTCam window
+    swallows the LATISS twin's shutter close — at which point containment
+    alone would hand LSSTCam's logs back as the LATISS exposure. What the
+    fetch actually ran as is not a guess.
+    """
+    collidingId = 2026071100408
+    _plantExposureCache(
+        tmpCacheRoot,
+        collidingId,
+        "2026-07-12T03:58:10.091000Z",
+        "2026-07-12T05:03:15.091000Z",  # widened: spans both instruments' t0
+        instruments=("lsstcam",),
+    )
+    site = siteCatalog.catalog[0]
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T03:58:52.091000", "instrument": "lsstcam"}},
+        siteName=site.name,
+    )
+    exposureTimes.storeCachedRecords(
+        {collidingId: {"obs_end": "2026-07-12T04:58:03.354000", "instrument": "latiss"}},
+        siteName=site.name,
+    )
+    ctx = _ctxWithSites(siteCatalog)
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    assert server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam") is not None
+
+
+# ----- instrument through the range per-exposure view -----------------------
+
+
+def test_rangeExposurePayload_filters_pods_by_the_ranges_instrument(tmp_path: Path) -> None:
+    expId = 2026071100010
+    t0 = dt.datetime(2026, 7, 12, 3, 0, tzinfo=dt.timezone.utc)
+    state = server.RangeState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[
+            _instrumentSummary("s-latiss-run-sfm-runner-1", "LATISS", expId),
+            _instrumentSummary("s-lsstcam-run-sfm-runner-1", "LSSTCam", expId),
+        ],
+        startId=expId,
+        stopId=expId + 2,
+        fromTime=t0,
+        toTime=t0,
+        instrument="latiss",
+    )
+    state.shutterCloseByExpId[expId] = t0
+    payload = server._buildRangeExposurePayload(state, expId)
+    assert payload is not None
+    assert payload["instrument"] == "latiss"
+    assert {p["pod"] for p in payload["pods"]} == {"s-latiss-run-sfm-runner-1"}
+
+
+def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, siteCatalog: FakeSiteCatalog
+) -> None:
+    """A bare id is not unique: on a night both instruments observe, the
+    same id names an exposure on each and both windows can be cached at
+    once. Taking the newest and giving up if it doesn't fit made whichever
+    deep link was opened second break the first — and re-fetching to
+    repair it only swapped which one was broken."""
+    ctx = ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
+    expId = 2026071100445
+    windows = {
+        "lsstcam": (
+            "2026-07-12T04:21:17.502000Z",
+            "2026-07-12T04:26:22.502000Z",
+            "2026-07-12T04:21:59.502000",
+        ),
+        "latiss": (
+            "2026-07-12T05:24:48.895000Z",
+            "2026-07-12T05:29:53.895000Z",
+            "2026-07-12T05:25:30.895000",
+        ),
+    }
+    for i, (instrument, (fromIso, toIso, obsEnd)) in enumerate(windows.items()):
+        d = tmpCacheRoot / "yagan" / "rapid-analysis" / f"{fromIso}__{toIso}".replace(":", "")
+        (d / "pods").mkdir(parents=True)
+        (d / "_meta.json").write_text(
+            json.dumps(
+                {
+                    "spec": {"fromIso": fromIso, "toIso": toIso, "podRegex": None},
+                    "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+                    # The LATISS window is the more recently fetched one.
+                    "fetched_at": f"2026-07-12T0{i}:00:00+00:00",
+                }
+            )
+        )
+        (d / "_exposure_ids.txt").write_text(f"{instrument}:{expId}\n")
+        exposureTimes.storeCachedRecord(
+            expId,
+            {"exposure_id": expId, "obs_end": obsEnd, "instrument": instrument},
+            siteName="summit",
+            bareKey=(instrument == "lsstcam"),
+        )
+
+    for instrument, (fromIso, _toIso, _obsEnd) in windows.items():
+        state = _loadExposureFromCache(ctx, expId, instrument=instrument)
+        assert state is not None, f"{instrument} deep link fell back to a re-fetch"
+        assert state.cacheDir.name.startswith(fromIso.replace(":", "")[:17])
+        assert state.instrument == instrument
+
+
+def test_exposure_cache_lookup_tries_the_next_sites_window(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """A laptop's cache can hold windows from both clusters, and only one
+    site's exposure-time cache may know the id. The candidate with no
+    record must be skipped, not treated as proof that none will resolve —
+    giving up on the first miss broke the resolvable window behind it."""
+    ctx = _ctxWithSites(siteCatalog)
+    expId = 2026071100445
+    # The manke window is the more recently fetched, so it is probed
+    # first — and the bts exposure-time cache has no record at all.
+    _plantExposureCache(
+        tmpCacheRoot,
+        expId,
+        "2026-07-12T04:21:17.502000Z",
+        "2026-07-12T04:26:22.502000Z",
+        cluster="manke",
+        fetchedAt="2026-07-12T07:00:00+00:00",
+    )
+    _plantExposureCache(
+        tmpCacheRoot,
+        expId,
+        "2026-07-12T04:21:17.502000Z",
+        "2026-07-12T04:26:22.502000Z",
+        cluster="yagan",
+        fetchedAt="2026-07-12T06:00:00+00:00",
+    )
+    exposureTimes.storeCachedRecord(
+        expId,
+        {"exposure_id": expId, "obs_end": "2026-07-12T04:21:59.502000", "instrument": "lsstcam"},
+        siteName="summit",
+    )
+
+    state = _loadExposureFromCache(ctx, expId, instrument="lsstcam")
+    assert state is not None, "the resolvable yagan window was abandoned"
+    assert state.siteName == "summit"
+
+
+def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """The rebuild path resolves the same lookups _prefetchNightShutterCloses
+    does, and must pin them the same way: AOS is LSSTCam-only, and the bare
+    key can legitimately hold the other instrument's record for a colliding
+    id (probe order is evaluated at query time, and the LSSTCam row can
+    land later). An unpinned rebuild would anchor the histograms an hour
+    off."""
+    dayObs = 20260711
+    collidingId = 2026071100408
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "win" / "pods=__aos__"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "fromIso": "2026-07-11T12:00:00Z",
+                    "toIso": "2026-07-12T12:00:00Z",
+                    "podRegex": ".*aos.*",
+                },
+                "fetched_at": "2026-07-12T06:00:00+00:00",
+                "pod_count": 1,
+            }
+        )
+    )
+    # One AOS worker whose traceback puts the colliding id into the set
+    # of dataIds the night view needs a shutter close for.
+    lines = [
+        (
+            "2026-07-12T03:59:00.000+00:00",
+            "info",
+            f"2026-07-12 03:59:00,000 worker fn INFO   Running pipeline for {collidingId} detector 191",
+        ),
+        ("2026-07-12T03:59:10.000+00:00", "error", "Traceback (most recent call last):"),
+        ("2026-07-12T03:59:10.001+00:00", "error", "RuntimeError: bang"),
+    ]
+    with open(podsDir / "s-lsstcam-run-aos-worker-aosworkerset-2.jsonl", "w") as fh:
+        for ts, level, raw in lines:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": level}, "line": raw + "\n"}) + "\n"
+            )
+    # The bare key holds the LATISS record; the LSSTCam one is only under
+    # its instrument key.
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T04:58:03.354000",
+                "instrument": "latiss",
+            }
+        },
+        siteName="summit",
+    )
+    exposureTimes.storeCachedRecords(
+        {
+            collidingId: {
+                "exposure_id": collidingId,
+                "obs_end": "2026-07-12T03:58:52.091000",
+                "instrument": "lsstcam",
+            }
+        },
+        siteName="summit",
+        bareKey=False,
+    )
+
+    ctx = _ctxWithSites(siteCatalog)
+    state = server._loadNightFromCache(ctx, dayObs)
+    assert state is not None
+    # Anchored to the LSSTCam shutter close (TAI -37 s), not the bare key's.
+    assert state.shutterCloseByExpId[collidingId] == dt.datetime(
+        2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc
+    )
+
+
+# ----- LRU eviction vs loaded states ---------------------------------------
+
+
+def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window LRU eviction removes must take its loaded state with it.
+
+    Without this, a state held in memory over a deleted directory keeps
+    serving its summary while every pod drilldown quietly comes back
+    empty — iterPodLines treats the missing file as an empty one.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    oldDir = tmpCacheRoot / "summit-cluster" / "ra" / "old-window"
+    oldDir.mkdir(parents=True)
+    staleState = server.ServerState(
+        cacheDir=oldDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        expId=2026052000001,
+        tZero=dt.datetime(2026, 5, 20, 8, 46, tzinfo=dt.timezone.utc),
+    )
+    ctx.putExposureState(staleState)
+
+    newDir = tmpCacheRoot / "summit-cluster" / "ra" / "new-window"
+    (newDir / "pods").mkdir(parents=True)
+    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): [oldDir])
+    job = FetchJob(
+        jobId="j1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="summit-cluster",
+            namespace="ra",
+            fromIso="2026-05-20T08:45:00Z",
+            toIso="2026-05-20T08:50:00Z",
+        ),
+        siteName=siteCatalog.defaultName,
+        instrument="lsstcam",
+        expId=2026052000002,
+        tZero=dt.datetime(2026, 5, 20, 8, 47, tzinfo=dt.timezone.utc),
+    )
+    job.cacheDir = newDir
+    server._onFetchComplete(ctx)(job)
+    # The evicted window's state is gone; the fresh fetch's state is in.
+    assert ctx.getExposureState(2026052000001) is None
+    assert ctx.getExposureState(2026052000002) is not None
+
+
+# ----- superseded "night so far" windows ------------------------------------
+
+
+def _plantNightSlice(root: Path, fromIso: str, toIso: str, *, cluster: str = "yagan") -> Path:
+    """A night-mode cache dir at the window path a real one would use."""
+    windowDir = fetchModule.windowCachePath(
+        cluster, "rapid-analysis", fromIso, toIso, config.NIGHT_AOS_POD_REGEX
+    )
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "pods" / "s-lsstcam-run-aos-worker-1.jsonl").write_text("")
+    (windowDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "cluster": cluster,
+                    "namespace": "rapid-analysis",
+                    "fromIso": fromIso,
+                    "toIso": toIso,
+                    "podRegex": config.NIGHT_AOS_POD_REGEX,
+                },
+                "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+                "fetched_at": f"2026-07-12T{toIso[11:13]}:00:00+00:00",
+                "pod_count": 1,
+            }
+        )
+    )
+    fetchModule.markCacheViewed(windowDir)
+    return windowDir
+
+
+def _nightJob(cacheDir: Path, fromIso: str, toIso: str, siteName: str) -> FetchJob:
+    """A finished night job whose *written* window is [fromIso, toIso).
+
+    The requested window is always the whole night; the clamped one is
+    what landed on disk, and only ``meta`` knows it.
+    """
+    job = FetchJob(
+        jobId="n1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="2026-07-11T12:00:00.000000Z",
+            toIso="2026-07-12T12:00:00.000000Z",
+            podRegex=config.NIGHT_AOS_POD_REGEX,
+        ),
+        siteName=siteName,
+        kind="night",
+        dayObs=20260711,
+    )
+    job.cacheDir = cacheDir
+    job.meta = {
+        "spec": {
+            "cluster": "yagan",
+            "namespace": "rapid-analysis",
+            "fromIso": fromIso,
+            "toIso": toIso,
+            "podRegex": config.NIGHT_AOS_POD_REGEX,
+        }
+    }
+    return job
+
+
+NIGHT_START = "2026-07-11T12:00:00.000000Z"
+
+
+def test_night_fetch_drops_the_night_so_far_windows_it_supersedes(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """An in-progress night is served clamped to the watermark, so each
+    fetch mints a new `[nightStart, watermark]` window and the previous
+    one becomes a strict subset nothing will read again. Left alone they
+    accumulate a few hundred MiB a click — and LRU reaches them *last*,
+    because they are the freshest thing on disk, so the pass that
+    eventually runs prefers yesterday's 9 GiB finalised night dir.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    older = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    earlier = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # A tab is sitting on one of the doomed windows.
+    ctx.putNightState(
+        server.NightState(
+            cacheDir=older,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            dayObs=20260711,
+            startTime=config.dayObsStartUtc(20260711),
+            endTime=config.dayObsEndUtc(20260711),
+        )
+    )
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+
+    assert current.exists()
+    assert not older.exists() and not earlier.exists()
+    # The stale window's own parent went with it, not just its pods= subdir.
+    assert not older.parent.exists()
+    # The tab's state was replaced rather than left pointing at a deleted
+    # directory, which would serve a summary with empty pod drilldowns.
+    state = ctx.getNightState(20260711)
+    assert state is not None and state.cacheDir == current
+
+
+def test_the_superseded_window_is_reclaimed_before_eviction_looks(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Ordering, which is the whole point of doing this here rather than
+    leaving it to the LRU pass.
+
+    These are bytes already known to be dead, and freeing them first is
+    often the entire overage. A sweep that ran first would instead reach
+    for the least-recently-viewed window — typically yesterday's
+    finalised night dir, 9 GiB that cost minutes of Loki — and then this
+    would free the redundant copy anyway, having paid for it.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    stale = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    sawStale: list[bool] = []
+
+    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+        sawStale.append(stale.exists())
+        return []
+
+    monkeypatch.setattr(server, "evictToFit", recordingEvict)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert sawStale == [False], "eviction ran while the superseded window was still on disk"
+
+
+def test_supersededNightSlices_tolerates_a_meta_without_a_window(tmp_path: Path) -> None:
+    """A meta that can't say which window was written can't be reasoned
+    about — return nothing rather than raising on the job thread, where
+    the exception would surface as a failed fetch of a window that
+    actually succeeded."""
+    job = _nightJob(tmp_path, NIGHT_START, "2026-07-11T22:00:00.000000Z", "summit")
+    job.meta = {}
+    assert server._supersededNightSlices(job) == []
+    job.meta = {"spec": {"fromIso": NIGHT_START, "toIso": None}}
+    assert server._supersededNightSlices(job) == []
+
+
+def test_night_fetch_keeps_windows_it_does_not_contain(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """Only strict subsets go. A wider window still holds coverage this
+    one doesn't — reachable when the watermark regresses (a cache wipe
+    mid-night, or one tick of a newly-seen pod failing) — and another
+    night, another site, or a different pod filter is simply not this
+    night's business.
+    """
+    ctx = _ctxWithSites(siteCatalog)
+    wider = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-12T02:00:00.000000Z")
+    otherNight = _plantNightSlice(tmpCacheRoot, "2026-07-10T12:00:00.000000Z", "2026-07-11T12:00:00.000000Z")
+    otherSite = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z", cluster="manke")
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # An exposure-mode window inside the night: all pods, no filter, and
+    # nothing the AOS slice could stand in for.
+    exposureWindow = fetchModule.windowCachePath(
+        "yagan", "rapid-analysis", NIGHT_START, "2026-07-11T18:00:00.000000Z"
+    )
+    (exposureWindow / "pods").mkdir(parents=True)
+    (exposureWindow / "_meta.json").write_text(
+        json.dumps({"spec": {"fromIso": NIGHT_START, "toIso": "2026-07-11T18:00:00.000000Z"}})
+    )
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+
+    for survivor in (wider, otherNight, otherSite, current, exposureWindow):
+        assert survivor.exists(), survivor
+
+
+# ----- the night's two views -----------------------------------------------
+
+
+def test_nightViewFromBody_defaults_validates_and_normalises() -> None:
+    assert server._nightViewFromBody({}) == "aos"
+    assert server._nightViewFromBody({"view": None}) == "aos"
+    assert server._nightViewFromBody({"view": "  SFM "}) == "sfm"
+    with pytest.raises(ValueError, match="view must be one of"):
+        server._nightViewFromBody({"view": "everything"})
+
+
+def test_nightViewFromQuery_falls_back_rather_than_failing() -> None:
+    """This rides beside a dayObs on read paths, where a 400 helps nobody.
+
+    A body naming a bad view is a client bug worth reporting; a query
+    string is something a person can type, and showing them the night
+    they almost certainly meant beats an error page.
+    """
+    assert server._nightViewFromQuery({}) == "aos"
+    assert server._nightViewFromQuery({"nightView": ["sfm"]}) == "sfm"
+    assert server._nightViewFromQuery({"nightView": ["SFM"]}) == "sfm"
+    assert server._nightViewFromQuery({"nightView": ["nonsense"]}) == "aos"
+
+
+def test_nightPodFilter_is_None_for_aos_and_subtracts_for_sfm() -> None:
+    """The AOS half re-filters nothing: Loki already did it.
+
+    Testing every pod again would be a second implementation of the same
+    rule, and the failure mode of two implementations is that they
+    disagree without saying so.
+    """
+    assert server._nightPodFilter("aos") is None
+    keep = server._nightPodFilter("sfm")
+    assert keep is not None
+    assert keep("s-lsstcam-run-sfm-runner-workerset-1")
+    assert not keep("s-lsstcam-run-aos-worker-aosworkerset-1")
+
+
+def test_buildNightSpecFromRequest_sfm_view_pushes_no_filter_to_loki(
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """LogQL (RE2) has no negative lookahead, so "not aos" cannot be a
+    Loki filter at all — the SFM half fetches the night whole and
+    partitions afterwards."""
+    ctx = _ctxWithSites(siteCatalog)
+    spec, _, dayObs, view = server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "view": "sfm"})
+    assert (view, dayObs) == ("sfm", 20260521)
+    assert spec.podRegex is None
+    # Same window either way: a dayObs is a dayObs.
+    assert spec.fromIso.startswith("2026-05-21T12:00:00")
+    assert spec.toIso.startswith("2026-05-22T12:00:00")
+
+
+def test_buildNightSpecFromRequest_rejects_an_unknown_view(siteCatalog: FakeSiteCatalog) -> None:
+    ctx = _ctxWithSites(siteCatalog)
+    with pytest.raises(ValueError, match="view must be one of"):
+        server._buildNightSpecFromRequest(ctx, {"dayObs": 20260521, "view": "sfmm"})
+
+
+def test_both_night_views_of_one_dayObs_are_held_at_once(tmp_path: Path) -> None:
+    """The two halves are different pods parsed from different windows.
+
+    Keying the cache on dayObs alone — which is what it did before there
+    were two — would mean opening one tab silently replaced the other's
+    data with pods it never asked for.
+    """
+    ctx = server.ServerContext(jobs=JobManager())
+    for view in ("aos", "sfm"):
+        ctx.putNightState(
+            server.NightState(
+                cacheDir=tmp_path / view,
+                cacheBytes=0,
+                meta={},
+                summaries=[],
+                dayObs=20260813,
+                startTime=config.dayObsStartUtc(20260813),
+                endTime=config.dayObsEndUtc(20260813),
+                view=view,
+            )
+        )
+    assert len(ctx.nightStates) == 2
+    aos = ctx.getNightState(20260813, "aos")
+    sfm = ctx.getNightState(20260813, "sfm")
+    assert aos is not None and sfm is not None
+    assert aos.cacheDir != sfm.cacheDir
+    # The default is the AOS half, which is what a bare dayObs has always
+    # meant and what every existing deep link says.
+    assert ctx.getNightState(20260813) is aos
+    # Deleting one window drops only its own state.
+    ctx.evictByCacheDir(tmp_path / "aos")
+    assert ctx.getNightState(20260813, "aos") is None
+    assert ctx.getNightState(20260813, "sfm") is sfm
+
+
+def test_night_payload_carries_its_view(tmp_path: Path) -> None:
+    state = server.NightState(
+        cacheDir=tmp_path,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        dayObs=20260813,
+        startTime=config.dayObsStartUtc(20260813),
+        endTime=config.dayObsEndUtc(20260813),
+        view="sfm",
+    )
+    payload = server._buildNightPayload(state)
+    assert payload["view"] == "sfm"
+    assert payload["dayObs"] == 20260813
+
+
+def test_the_sfm_night_omits_the_calcZernikes_histogram(tmp_path: Path) -> None:
+    """calcZernikes is an AOS task. Drawing an empty chart for it on the
+    SFM half would read as "it ran and produced nothing" rather than "not
+    applicable here", so the payload leaves it out and the UI drops the
+    card."""
+
+    def state(view: str) -> server.NightState:
+        return server.NightState(
+            cacheDir=tmp_path,
+            cacheBytes=0,
+            meta={},
+            summaries=[],
+            dayObs=20260813,
+            startTime=config.dayObsStartUtc(20260813),
+            endTime=config.dayObsEndUtc(20260813),
+            view=view,
+        )
+
+    aos = server._buildNightPayload(state("aos"))
+    sfm = server._buildNightPayload(state("sfm"))
+    assert aos["histograms"]["calcZernikesEnd"] is not None
+    assert sfm["histograms"]["calcZernikesEnd"] is None
+    # The first-task histogram means the same thing in both halves and
+    # stays in both.
+    assert aos["histograms"]["firstTaskStart"] is not None
+    assert sfm["histograms"]["firstTaskStart"] is not None

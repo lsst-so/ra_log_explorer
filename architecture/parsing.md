@@ -118,12 +118,129 @@ pod) are dropped too.
 
 | Kind            | k8s `reason`                                            | level   | Notes |
 |-----------------|----------------------------------------------------------|---------|-------|
-| `POD_RESTARTED` | `Started` with `count ≥ 2`                               | warn    | The container has started before in this pod → it died and was restarted **in place**. The key "explains an abrupt mid-work gap" signal (e.g. an OOM the kernel didn't ship a message for). |
-| `POD_STARTED`   | `Started` with `count == 1`                              | info    | First start of the container; mostly relevant in night-wide windows. |
+| `POD_RESTARTED` | `Started` with `count ≥ 2`, **or** `count == 1` promoted by the log (below) | warn    | The container died and was restarted **in place**. The key "explains an abrupt mid-work gap" signal (e.g. an OOM the kernel didn't ship a message for). |
+| `POD_STARTED`   | `Started` with `count == 1`, not promoted                | info    | First start of the container; mostly relevant in night-wide windows. |
 | `POD_KILLED`    | `Killing`                                                | warn    | Container being stopped — graceful (rollout/scale-down) or pre-restart. |
 | `POD_OOMKILLED` | reason containing `OOM` (e.g. `OOMKilling`)             | error   | Node-pressure OOM. Note: a *container-limit* OOM emits no k8s event on this cluster (and the kernel line isn't shipped to Loki) — that case shows up only as `POD_RESTARTED`. |
 | `POD_FAILED`    | `Failed`/`BackOff`/`Evicted`/`Preempted`/`NodeNotReady`/`FailedKillPod` | error | Container failed / crash-looping / evicted. |
 | `POD_UNHEALTHY` | `Unhealthy`                                              | warn    | Liveness/readiness probe failed (often precedes a `Killing`). |
+| `POD_MOUNT_FAILED` | `FailedMount`                                         | warn    | The kubelet couldn't mount one of the pod's volumes — the pod is down (or wedged restarting) until it can, so this explains a gap the way a restart does. The kubelet retries on a backoff and emits one event per attempt, so a single incident shows as a small burst of markers. |
+
+### Promoting an isolated restart (`POD_STARTED` → `POD_RESTARTED`)
+
+Kubernetes' own restart signal is the event's `count`, and it is only
+half a signal. `count` is an aggregation counter on an Event object with
+a one-hour TTL, so it survives only while the *previous* start's event
+does. A crash loop keeps it alive — that is the `restart #6` in the
+capture above — but a single restart hours into a pod's life gets a
+fresh Event object with `count=1`, which by the events alone is
+indistinguishable from the pod's first start. That is precisely the
+shape an OOM kill takes here, and it is the case the whole lifecycle
+lane exists to explain: on dayObs 20260813 the `count` rule found 3 of
+the night's 7 restarts.
+
+So `summarizePod` settles the `count == 1` cases against something the
+events stream cannot see — the app log. A `Started` becomes a
+`POD_RESTARTED` when, and only when:
+
+1. the pod logged **after** it (something is running now), **and**
+2. the pod's *own* logging **before** it spans at least
+   `parse.RESTART_MIN_WORK_S` (60 s).
+
+"Own" is load-bearing: lines at or before the pod's most recent
+`Scheduled` / `AddedInterface` belong to a *predecessor*, because a
+StatefulSet pod keeps its name across a delete-and-recreate. Without
+that clause every rollout would read as a fleet-wide restart.
+
+Both clauses were chosen from measurement, not taste. Across four
+captured nights (20260711 summit, 20260811-13 BTS) there are 1672
+`Started` events, 846 of them with app logs on both sides:
+
+| | count | logging before the start |
+|---|---|---|
+| genuine in-place restarts | 13 | 4.8 min – 12.3 h (median 87 min) |
+| everything else | 833 | **0 s** — a single `secret-perm-fixer` init-container line, in the same second |
+
+The threshold therefore sits in an empty band two orders of magnitude
+wide. Applied to those nights the rule promotes 4 events, all on
+20260813, all corroborated by hand (log stops mid-quantum with no
+traceback; a fresh container's EUPS banner 4–7 s later), and promotes
+nothing on the other three nights.
+
+**What it still cannot do.** It cannot see a restart in the first 60 s
+of a window (there is no prior work to measure), and it would be fooled
+by a genuine long-lived *sidecar* — a second container logging
+continuously while the main one starts late. Neither exists in this
+deployment today; the only second container is `secret-perm-fixer`,
+which writes one line and exits. And none of this makes an OOM
+*confirmed* — a segfault looks identical from outside. `POD_RESTARTED`
+means "the container died and came back", which is as much as these
+logs can support.
+
+### Naming the exception (`_excClassFrom`)
+
+An exception line is recognised by *shape*, not by a list of known
+classes: an optional lowercase dotted module path, a Capital-led
+CamelCase name, then either `: message` or the end of the line. There is
+deliberately **no** `…Error` / `…Exception` suffix requirement. There
+used to be, and it was by far the biggest source of `<unclassified>`,
+because the pipeline names its exceptions for what went wrong rather
+than for the fact that something did:
+
+```
+lsst.meas.astrom.exceptions.BadAstrometryFit: Poor quality astrometric fit, 8.24" > 0.5"
+lsst.meas.astrom.exceptions.MatcherFailure: No matches found
+lsst.pipe.base...NoVisitWcs: No valid target WCSs were left after rejection.
+```
+
+A second rule was wrong in the same place and for a related reason: the
+module prefix had to be *all* lowercase, but LSST names a module after
+the camelCase task inside it. So
+`lsst.pipe.tasks.calibrateImage.NoPsfStarsToStarsMatchError` was
+declined too — despite carrying the `…Error` suffix the old rule
+demanded — purely because of the `I` in `calibrateImage`. Prefix
+components are now lowercase-*led* rather than all-lowercase.
+
+Between them the two fixes take `<unclassified>` to **zero** on every
+night we have captured: 20260711 (summit) from 5313 to 0 of 110003
+tracebacks, 20260813 from 1517 to 0 of 4768, 20260811 from 175 to 0 of
+648. The `<truncated>` count is untouched — those are genuinely
+cut-short bodies, and that label stays honest.
+
+What keeps that from being greedy is one extra rule: **the class token
+must contain a lowercase letter**. The shape alone would happily accept
+a bare `WARNING: …` or `ERROR: …` — column-0 words that do end a
+traceback but name nothing — and third-party output emits plenty of
+those. Every real class name has a lowercase letter; the log levels
+that would otherwise qualify do not.
+
+Lowercase-*named* classes exist too — `socket.gaierror`, `os.error` —
+and they get no free pass from shape, since a lowercase word is what
+most non-exception lines look like. They qualify only when they carry
+the canonical `…error` / `…Error` suffix, which is enough to separate
+`socket.gaierror` from a stray `custompkg.halt:` or `drp_pipe:`.
+
+**What real data exists behind these.** The nights we have captured are
+mostly healthy: their lifecycle streams hold `Started`, `Killing`,
+`Pulling`/`Pulled`/`Created`, `Scheduled` and little else. One reason
+shows up in the full captures that we deliberately drop (the cut-down
+corpus in this repo has no example) — `TaintManagerEviction`, whose
+message is *"Cancelling deletion of Pod …"* (the controller calling an
+eviction off, not a pod dying). `POD_MOUNT_FAILED` has a real capture
+behind it: a cluster-wide secret-sync hiccup on the summit (dayObs
+20260711) interrupted five running pods at one moment, ~1h40m into
+their app logs — pinned by a fixture line in `tests/test_parse.py`. One
+real crash is captured too: a step1b-AOS worker on BTS that restarted
+in place five times and then wedged in `ImagePullBackOff`, kept as
+`tests/data/pod_crash_events.jsonl` and used by both the parser tests
+and the browser tests.
+
+`POD_OOMKILLED` and `POD_UNHEALTHY` have **no** real capture behind them
+and are covered by hand-written event lines only. That is not an
+oversight: container-limit OOM emits no k8s event on these clusters at
+all (see the row above), so there is nothing to capture; `Unhealthy`
+simply hasn't occurred in a night we pulled. If one ever does, add it to
+the crash fixture rather than inventing a line.
 
 All lifecycle kinds share the `POD_` prefix (and are enumerated in
 `parse.LIFECYCLE_EVENT_KINDS`). They carry **no dataId** — `expId` is always
@@ -151,7 +268,7 @@ Each captured traceback becomes a `TracebackRecord`:
 | `pod`        | pod name                                                          |
 | `t`          | timestamp of the leader line                                       |
 | `expId`      | carryover-attributed dataId for worker pods; bare-id-on-the-line for control-plane pods; `None` if neither |
-| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. When no class is recognised, one of two sentinels is used, kept distinct: `<unclassified>` if the traceback reached its terminating exception line but the class wasn't in the classifier's suffix set (e.g. `StopIteration`, a custom `Halt: …`) — the record is complete, just unnamed; `<truncated>` if the body was cut short before any terminator (the log forwarder dropped the tail, or another logger interleaved a line mid-stack). |
+| `excClass`   | first exception class line seen inside the body, e.g. `RuntimeError`. Module-qualified shapes like `galsim.errors.GalSimRangeError` are stripped to the rightmost segment. When no class is recognised, one of two sentinels is used, kept distinct: `<unclassified>` if the traceback reached its terminating exception line but nothing on it could be read as a class name (an all-caps banner like `FAILURE: …`, or a lowercase `custompkg.halt: …`) — the record is complete, just unnamed; `<truncated>` if the body was cut short before any terminator (the log forwarder dropped the tail, or another logger interleaved a line mid-stack). |
 | `excMessage` | the rest of the exception line, capped at 200 chars                |
 | `body`       | the full traceback text, capped at `_TRACEBACK_MAX_LINES = 250` lines and `_TRACEBACK_MAX_CHARS = 32_000` chars |
 
@@ -232,9 +349,12 @@ names like `sfm-runner-workerset-094` or
 `aos-worker-aosworkerset-2`. Used to sort same-group rows
 numerically in the UI rather than lexicographically.
 
-`podInstrument(pod)` returns one of `"LSSTCam"`, `"LATISS"`,
-`"LSSTComCam"`, `"LSSTComCamSim"`, or `None`. The list is order-
-sensitive (`LSSTComCamSim` must be checked before `LSSTComCam`).
+`podInstrument(pod)` returns `"LSSTCam"`, `"LATISS"`, or `None`. Those
+two are the whole set this repo covers, so the needles no longer
+collide as substrings of one another and the match order carries no
+meaning. `None` means *instrument-neutral* (redis, cluster-manager, …)
+rather than unknown, and such pods are attributed to whichever exposure
+is being viewed.
 
 ## When to add a new event kind
 

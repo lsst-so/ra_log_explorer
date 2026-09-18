@@ -23,7 +23,7 @@ import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
 
 # ----- pod flavor classification -------------------------------------------
 
@@ -66,7 +66,7 @@ POD_GROUPS: dict[str, str] = {
 
 # Strip this stem off the front of a pod name before doing the prefix match.
 # The full set of instruments we expect in this repo's logs.
-_RUN_PREFIX_RE = re.compile(r"^s-(?:lsstcam|latiss|lsstcomcam|lsstcomcamsim|misc)-run-")
+_RUN_PREFIX_RE = re.compile(r"^s-(?:lsstcam|latiss|misc)-run-")
 
 
 def podGroup(pod: str) -> str:
@@ -90,6 +90,20 @@ def podGroup(pod: str) -> str:
     return bestLabel or "other"
 
 
+def isAosPod(pod: str) -> bool:
+    """Whether this pod belongs to the AOS half of the night view.
+
+    Deliberately a substring test on the pod *name* rather than anything
+    derived from :func:`podGroup`, because it has to be the exact
+    complement of :data:`config.NIGHT_AOS_POD_REGEX` — the LogQL filter
+    the AOS night fetch pushes down to Loki. If the two ever disagree, a
+    pod falls into both halves of the night view or into neither, and the
+    "neither" case is silent. ``tests/test_parse.py`` pins them together
+    against the real pod list.
+    """
+    return "aos" in pod
+
+
 def groupLabels() -> dict[str, str]:
     """Map each short ``podGroup`` label to its full on-disk role prefix.
 
@@ -103,15 +117,13 @@ def groupLabels() -> dict[str, str]:
 
 
 def podInstrument(pod: str) -> str | None:
-    """Return 'LSSTCam', 'LATISS', etc. from the pod name, or None.
+    """Return 'LSSTCam' or 'LATISS' from the pod name, or None.
 
-    Like ``POD_GROUPS``, order matters here because the match is "first
-    wins" — ``lsstcomcam`` is a substring of ``lsstcomcamsim``, so the
-    Sim variant must come first.
+    ``None`` means instrument-neutral (redis, cluster-manager, …) rather
+    than unknown, and such pods are attributed to whichever exposure is
+    being viewed.
     """
     for inst, needle in (
-        ("LSSTComCamSim", "lsstcomcamsim"),
-        ("LSSTComCam", "lsstcomcam"),
         ("LSSTCam", "lsstcam"),
         ("LATISS", "latiss"),
     ):
@@ -681,11 +693,50 @@ _POD_DOWN_REASONS: frozenset[str] = frozenset(
     {"Failed", "BackOff", "Evicted", "Preempted", "NodeNotReady", "FailedKillPod"}
 )
 
+# k8s reasons that mean "a *pod sandbox* was created here" — the pod
+# object itself is new, so any log lines before this point belong to its
+# predecessor (a StatefulSet pod keeps its name across a delete/recreate)
+# and any container start just after it is a first start, not a restart.
+_POD_SANDBOX_REASONS: frozenset[str] = frozenset({"Scheduled", "AddedInterface"})
+
+# How much of a pod instance's *own* logging must precede a "Container
+# started" event before we read that event as an in-place restart rather
+# than a first start. See :func:`_promoteInPlaceRestarts` for why the
+# rule is needed at all; this constant is the one judgement call in it,
+# and it was chosen from measurement rather than taste. Over four
+# captured nights (20260711 summit, 20260811-13 BTS) there were 1672
+# `Started` events; 19 survive the sandbox guard in
+# :class:`_RestartEvidence`, and they split cleanly:
+#
+#   * the 13 genuine restarts had 467-26175 lines of the same pod
+#     instance's logging before them, spanning 4.8 minutes to 12.3 hours;
+#   * the 6 others had a *single* line — the `secret-perm-fixer` init
+#     container's one-line complaint — i.e. a span of exactly zero.
+#
+# So any threshold above zero separates the two populations, and the
+# number's real job is deciding how short a *window* the rule still
+# works in. It runs over whatever window is loaded, not over the night:
+# in a 5-minute exposure window a pod that died 36 seconds in has only
+# 36 seconds of visible prior work, and at 60 s the same restart was
+# labelled `POD_RESTARTED` in the night view and `POD_STARTED` in the
+# explore view. Ten seconds keeps a wide margin over "an init container
+# that logged twice" while letting an exposure-width window agree with
+# the night about what happened.
+RESTART_MIN_WORK_S = 10.0
+
 # The lifecycle event kinds, for consumers that want to recognise the
 # family without string-prefix sniffing. Kept in sync with the kinds
 # emitted by :func:`classifyK8sEvent`.
 LIFECYCLE_EVENT_KINDS: frozenset[str] = frozenset(
-    {"POD_OOMKILLED", "POD_KILLED", "POD_FAILED", "POD_UNHEALTHY", "POD_RESTARTED", "POD_STARTED"}
+    {
+        "POD_OOMKILLED",
+        "POD_KILLED",
+        "POD_FAILED",
+        "POD_UNHEALTHY",
+        "POD_RESTARTED",
+        "POD_STARTED",
+        "POD_MOUNT_FAILED",
+    }
 )
 
 
@@ -747,6 +798,14 @@ def classifyK8sEvent(pod: str, jsonObj: dict) -> Event | None:
         kind, level = "POD_FAILED", "error"
     elif reason == "Unhealthy":  # liveness/readiness probe failed
         kind, level = "POD_UNHEALTHY", "warn"
+    elif reason == "FailedMount":
+        # The kubelet couldn't mount one of the pod's volumes — the pod is
+        # down (or being restarted) until it can, so this explains a gap
+        # the same way a restart does. Seen for real as a cluster-wide
+        # secret-sync hiccup hitting several running pods at one moment.
+        # The kubelet retries on a backoff and emits one event per attempt,
+        # so a single incident shows up as a small burst of these markers.
+        kind, level = "POD_MOUNT_FAILED", "warn"
     elif reason == "Killing":  # container stopping (graceful rollout, or pre-restart)
         kind, level = "POD_KILLED", "warn"
     elif reason == "Started":
@@ -766,17 +825,20 @@ def classifyK8sEvent(pod: str, jsonObj: dict) -> Event | None:
     return Event(pod, t, kind, level, flavor=reason, message=detail, raw=raw)
 
 
-def iterPodEvents(eventsLogPath: Path) -> Iterator[Event]:
-    """Yield classified lifecycle Events from a pod's ``pods_events`` file.
+def readPodLifecycle(eventsLogPath: Path) -> tuple[list[Event], list[dt.datetime]]:
+    """Read a pod's lifecycle file into (classified events, sandbox times).
 
-    Mirrors :func:`iterPodLines` but for the k8s/events stream: skips
-    unparseable lines and events that classify to nothing. Returns nothing
-    if the file is absent (the common case for a pod with no lifecycle
-    events in the window).
+    The sandbox times are the ``Scheduled`` / ``AddedInterface`` moments,
+    which :func:`classifyK8sEvent` deliberately drops — they say nothing
+    about a pod that is merely running. They matter only to
+    :func:`_promoteInPlaceRestarts`, which needs to know when *this* pod
+    instance began in order to judge what came before a container start.
     """
-    pod = eventsLogPath.stem
+    events: list[Event] = []
+    sandbox: list[dt.datetime] = []
     if not eventsLogPath.exists():
-        return
+        return events, sandbox
+    pod = eventsLogPath.stem
     with eventsLogPath.open("r", encoding="utf-8", errors="replace") as fh:
         for line in fh:
             line = line.strip()
@@ -788,7 +850,82 @@ def iterPodEvents(eventsLogPath: Path) -> Iterator[Event]:
                 continue
             ev = classifyK8sEvent(pod, obj)
             if ev is not None:
-                yield ev
+                events.append(ev)
+                continue
+            fields = _parseK8sEventFields(obj.get("line", ""))
+            if fields.get("reason") in _POD_SANDBOX_REASONS and fields.get("kind", "Pod") == "Pod":
+                try:
+                    sandbox.append(_parseTimestamp(obj.get("timestamp", "")))
+                except ValueError:
+                    continue
+    sandbox.sort()
+    return events, sandbox
+
+
+@dataclass
+class _RestartEvidence:
+    """Evidence gathered about one ``POD_STARTED``, to judge if it's a restart.
+
+    ``lower`` is the moment this pod instance came into being (its most
+    recent sandbox creation) or ``None`` when that happened before the
+    window. Lines at or before it belong to a previous pod of the same
+    name and are ignored — which is what stops a rescheduled StatefulSet
+    pod from looking like a restart.
+    """
+
+    event: Event
+    lower: dt.datetime | None
+    first: dt.datetime | None = None  # first line of this instance before the start
+    last: dt.datetime | None = None  # last such line
+    after: bool = False  # did this pod log anything after the start?
+
+    def workBeforeS(self) -> float:
+        """Seconds of this pod instance's logging that precede the start."""
+        if self.first is None or self.last is None:
+            return 0.0
+        return (self.last - self.first).total_seconds()
+
+    def isRestart(self) -> bool:
+        """Whether the evidence says the container restarted in place.
+
+        Both halves are needed. Without ``after`` a pod that started and
+        then went quiet reads as a restart; without the work threshold a
+        pod's *first* start reads as one, since an init container's
+        preamble lands before it.
+        """
+        return self.after and self.workBeforeS() >= RESTART_MIN_WORK_S
+
+
+def _promoteInPlaceRestarts(tracked: list[_RestartEvidence]) -> None:
+    """Re-label the ``POD_STARTED`` events that were really restarts.
+
+    Kubernetes' own restart signal is the event's ``count``, and
+    :func:`classifyK8sEvent` uses it: ``Started`` with ``count ≥ 2`` is a
+    restart. But ``count`` is an aggregation counter on an Event object
+    with a one-hour TTL, so it only survives while the *previous* start's
+    event does. A crash loop keeps it alive — hence the ``restart #6``
+    the fixtures capture — but an isolated restart hours into a pod's
+    life gets a fresh Event object with ``count=1``, indistinguishable by
+    that rule alone from the pod's first start. That is exactly the shape
+    an OOM takes, and it is the shape we most need to see: on 20260813
+    the ``count`` rule found 3 of the night's 7 restarts.
+
+    So we settle it with the app log instead, which the events stream
+    can't see: a container that was producing output for a sustained
+    period, and produces more afterwards, has restarted. The pod's *own*
+    logging is what counts — anything before its sandbox was created
+    belongs to a predecessor of the same name.
+    """
+    for tr in tracked:
+        if not tr.isRestart():
+            continue
+        tr.event.kind = "POD_RESTARTED"
+        tr.event.level = "warn"
+        mins = tr.workBeforeS() / 60.0
+        shown = f"{mins / 60:.1f} h" if mins >= 90 else f"{mins:.0f} min"
+        # Say what the label rests on: this one is inferred from the log,
+        # not read off the event, and a reader deserves to know which.
+        tr.event.message = f"{tr.event.message} (restart inferred: {shown} of work before it)"
 
 
 # ----- per-pod summary ------------------------------------------------------
@@ -882,16 +1019,64 @@ _TRACEBACK_MAX_CHARS = 32_000
 # exceptions whose module path is all lowercase. The earlier regex
 # required the entire line to start with a capital, which silently
 # missed those — every such traceback got tagged "<unknown>".
+#
+# There is deliberately **no** ``…Error|Exception|…`` suffix requirement.
+# There used to be, and it was the single biggest source of
+# ``<unclassified>``: the pipeline's own exceptions are named for what
+# went wrong rather than for the fact that something did —
+# ``lsst.meas.astrom.exceptions.BadAstrometryFit``, ``MatcherFailure``,
+# ``NoVisitWcs`` — and every traceback ending in one was binned as
+# unnameable. On 20260813 that was 1517 of the night's 4768 tracebacks,
+# and on 20260811 175 of 648: in both cases *every* unclassified
+# traceback, so the bucket empties. What keeps this honest instead of
+# greedy is the shape either side of the class token: a column-0
+# lowercase dotted module path, a Capital-led CamelCase name, and then
+# only ``: message`` or end of line — plus the lowercase-letter rule in
+# :func:`_excClassFrom`, which is what stops a bare ``WARNING: …`` from
+# being read as a class.
 _EXC_CLASS_RE = re.compile(
-    # Optional dotted lowercase module prefix, e.g. `galsim.errors.`.
-    r"^(?:[a-z_][a-z0-9_]*\.)*"
+    # Optional dotted module prefix, e.g. `galsim.errors.` or
+    # `lsst.pipe.tasks.calibrateImage.`. Each component is *lowercase-led*
+    # rather than all-lowercase: LSST names a module after the camelCase
+    # task it holds, so `calibrateImage`, `measureApCorr` and
+    # `psfexPsfDeterminer` are all module names. Requiring the whole
+    # component to be lowercase quietly rejected those — including
+    # exceptions that did carry an `…Error` suffix and should always have
+    # been named (`NoPsfStarsToStarsMatchError`, `MeasureApCorrError`).
+    r"^(?:[a-z_]\w*\.)*"
+    r"(?P<cls>"
     # Capital-led class name, allowing nested dotted suffixes
-    # (`Foo.SubError`), ending with one of the canonical class suffixes.
-    r"(?P<cls>[A-Z][A-Za-z0-9_]*"
-    r"(?:\.[A-Za-z][A-Za-z0-9_]*)*"
-    r"(?:Error|Exception|Exit|Warning|Interrupt|Cancelled))"
+    # (`Foo.SubError`). Recognised by shape alone.
+    r"[A-Z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)*"
+    # …or a lowercase-named one, which the standard library still has a
+    # few of (`socket.gaierror`, `os.error`). Those get no free pass from
+    # shape — a lowercase word is what most non-exception lines look
+    # like — so they must carry the canonical suffix to qualify.
+    r"|[a-z_]\w*(?:Error|Exception|error|exception)"
+    r")"
     r"(?:\s*:\s*(?P<msg>.*))?$"
 )
+
+
+def _excClassFrom(raw: str) -> tuple[str, str] | None:
+    """``(class, message)`` if ``raw`` is a traceback's exception line.
+
+    The all-caps rejection is the guard that lets the suffix requirement
+    go. Without it the shape alone would accept a bare ``WARNING: …`` or
+    ``ERROR: …`` — column-0 words that end a traceback but name nothing —
+    and those are common enough in third-party output to poison the
+    errors-by-type table. Every real exception class has a lowercase
+    letter in it; the log levels that would otherwise qualify do not.
+    """
+    m = _EXC_CLASS_RE.match(raw)
+    if m is None:
+        return None
+    cls = m.group("cls")
+    if not any(c.islower() for c in cls):
+        return None
+    return cls.rsplit(".", 1)[-1], (m.group("msg") or "").strip()[:200]
+
+
 # Broader "this is the terminating exception line of a traceback" shape:
 # a column-0 dotted identifier, optionally followed by ``: message``,
 # WITHOUT requiring the canonical class suffix. A superset of
@@ -914,7 +1099,7 @@ def _isTracebackBodyLine(raw: str) -> bool:
         return True
     if raw.startswith("During handling") or raw.startswith("The above exception"):
         return True
-    if _EXC_CLASS_RE.match(raw):
+    if _excClassFrom(raw) is not None:
         return True
     return False
 
@@ -944,8 +1129,32 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
     currentExpId: int | None = None
     activeTb: TracebackRecord | None = None
     tbLines: list[str] = []
+    # Read the lifecycle stream *before* the log, not after: judging
+    # whether a "Container started" is really a restart needs to know
+    # what the pod was doing either side of it, and the log is streamed
+    # once (a night's worth is far too big to hold).
+    lifecycle: list[Event] = []
+    sandboxTimes: list[dt.datetime] = []
+    if eventsLogPath is not None:
+        lifecycle, sandboxTimes = readPodLifecycle(eventsLogPath)
+    tracked = [
+        _RestartEvidence(event=ev, lower=_lastSandboxBefore(sandboxTimes, ev.t))
+        for ev in lifecycle
+        if ev.kind == "POD_STARTED"
+    ]
     for ln in iterPodLines(podLogPath):
         summary.nLines += 1
+        # Empty for all but a handful of pods in any window, so this
+        # costs one loop-setup per line and nothing else.
+        for tr in tracked:
+            if tr.lower is not None and ln.timestamp <= tr.lower:
+                continue
+            if ln.timestamp < tr.event.t:
+                if tr.first is None:
+                    tr.first = ln.timestamp
+                tr.last = ln.timestamp
+            else:
+                tr.after = True
         if summary.firstTs is None:
             summary.firstTs = ln.timestamp
         summary.lastTs = ln.timestamp
@@ -975,10 +1184,9 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
                 # otherwise overflow the body buffer.
                 if len(tbLines) < _TRACEBACK_MAX_LINES:
                     tbLines.append(ln.raw)
-                m = _EXC_CLASS_RE.match(ln.raw)
-                if m and activeTb.excClass == "<unknown>":
-                    activeTb.excClass = m.group("cls").rsplit(".", 1)[-1]
-                    activeTb.excMessage = (m.group("msg") or "").strip()[:200]
+                named = _excClassFrom(ln.raw)
+                if named is not None and activeTb.excClass == "<unknown>":
+                    activeTb.excClass, activeTb.excMessage = named
                     activeTb.reachedTerminator = True
             else:
                 # A non-body line ends the traceback. If it's itself a
@@ -1021,12 +1229,17 @@ def summarizePod(podLogPath: Path, eventsLogPath: Path | None = None) -> PodSumm
     # from the parallel events stream, if it was fetched. They carry their
     # own timestamps, so re-sort the combined list to keep the per-pod
     # event stream time-ascending for the timeline.
-    if eventsLogPath is not None:
-        lifecycle = list(iterPodEvents(eventsLogPath))
-        if lifecycle:
-            summary.events.extend(lifecycle)
-            summary.events.sort(key=lambda e: e.t)
+    if lifecycle:
+        _promoteInPlaceRestarts(tracked)
+        summary.events.extend(lifecycle)
+        summary.events.sort(key=lambda e: e.t)
     return summary
+
+
+def _lastSandboxBefore(sandboxTimes: list[dt.datetime], t: dt.datetime) -> dt.datetime | None:
+    """The most recent pod-sandbox creation before ``t``, if any."""
+    earlier = [s for s in sandboxTimes if s < t]
+    return earlier[-1] if earlier else None
 
 
 def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSummary) -> None:
@@ -1048,7 +1261,15 @@ def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSu
     summary.tracebacks.append(record)
 
 
-def summarizeAll(cacheDir: Path) -> list[PodSummary]:
+def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> list[PodSummary]:
+    """Summarize every pod in a window; ``keep`` filters by pod name.
+
+    The filter is applied before parsing, not after, because the caller
+    that uses it is the night view's SFM half: its window holds the whole
+    night unfiltered (see :data:`config.NIGHT_VIEWS`), and parsing the
+    AOS pods only to discard them would be most of a minute on a summit
+    night.
+    """
     podsDir = cacheDir / "pods"
     eventsDir = cacheDir / "pods_events"
     summaries: list[PodSummary] = []
@@ -1057,8 +1278,11 @@ def summarizeAll(cacheDir: Path) -> list[PodSummary]:
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
             continue
-        # The sibling pods_events/<pod>.jsonl is optional: absent for v3
-        # caches (pre-events) and for pods that had no lifecycle events.
+        if keep is not None and not keep(podFile.stem):
+            continue
+        # The sibling pods_events/<pod>.jsonl is optional: absent for a pod
+        # that had no lifecycle events in the window. (Not for an older
+        # cache: those don't survive the schema flush — see caching.md.)
         eventsFile = eventsDir / podFile.name
         summaries.append(summarizePod(podFile, eventsFile if eventsFile.exists() else None))
     return summaries

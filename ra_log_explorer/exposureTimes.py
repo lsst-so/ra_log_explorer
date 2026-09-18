@@ -26,11 +26,21 @@ the same dataId can refer to a real-camera exposure on the summit and a
 simulated exposure on BTS, with different records. Every helper here
 takes either a ``Site`` directly or its ``consdbUrl`` and the resolved
 bearer token explicitly, so callers can never accidentally mix sources.
+
+An exposure id is also **not unique within a site**: it is only unique
+within one instrument (see :data:`INSTRUMENT_RECORD_KEY`). Every record
+carries the instrument it came from, the on-disk cache keys records both
+ways, and :func:`queryExposureRecordsForDayObs` returns a list rather
+than an id-keyed map so a shared id can't silently drop an exposure.
 """
 
 from __future__ import annotations
 
+import datetime as dt
 import json
+import os
+import tempfile
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -41,6 +51,31 @@ from .config import cache_root
 from .sites import Site
 
 TAI_MINUS_UTC_S = 37.0
+
+
+def taiIsoToUtc(taiIso: str) -> dt.datetime:
+    """Parse a ConsDB ``obs_end`` (TAI ISO, no zone suffix) into aware UTC.
+
+    The one conversion every consumer of a record's t-zero needs, kept
+    beside :data:`TAI_MINUS_UTC_S` so the offset and its application
+    can't drift apart.
+    """
+    t = dt.datetime.fromisoformat(taiIso.replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=dt.timezone.utc)
+    return t.astimezone(dt.timezone.utc) - dt.timedelta(seconds=TAI_MINUS_UTC_S)
+
+
+def utcToTaiIso(t: dt.datetime) -> str:
+    """Inverse of :func:`taiIsoToUtc`: a UTC datetime → the ConsDB-style
+    TAI ``obs_end`` string (no timezone, microsecond precision).
+
+    Used to persist a hand-entered shutter close into the per-site
+    exposure-time cache in the same TAI form a real ConsDB row carries.
+    """
+    tai = t.astimezone(dt.timezone.utc) + dt.timedelta(seconds=TAI_MINUS_UTC_S)
+    return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
+
 
 # On-disk cache: per-site JSON file mapping ``dataId (as string) ->
 # exposure record (a JSON object of the columns below, including
@@ -79,17 +114,29 @@ EXPOSURE_RECORD_COLUMNS: tuple[str, ...] = (
 )
 
 # Instruments to probe in order — first match wins. LSSTCam first because
-# that's where ~all current rapid-analysis traffic comes from; the rest
-# are cheap to retry if the first table doesn't have the row.
+# that's where ~all current rapid-analysis traffic comes from; LATISS is
+# cheap to retry if that table doesn't have the row. These two are the
+# whole set the observatory runs today, and an instrument outside it is
+# rejected rather than probed.
 INSTRUMENTS_BY_PROBE_ORDER: tuple[str, ...] = (
     "lsstcam",
     "latiss",
-    "lsstcomcam",
-    "lsstcomcamsim",
 )
+
+# The instrument is part of an exposure's *identity*, not one of its
+# properties. `exposure_id` is only unique within one instrument's
+# `cdb_<instrument>.exposure` table: the id is `dayObs * 100000 + seqNum`
+# and every instrument counts its own seqNum from 1 each night, so on any
+# night where LSSTCam and LATISS both observe — which is most of them —
+# ids 1..N name a different exposure per instrument. Every record this
+# module hands out is therefore stamped with the table it came from,
+# authoritatively (we know which table we queried), and the on-disk cache
+# keys records by (instrument, id) as well as by the bare id.
+INSTRUMENT_RECORD_KEY = "instrument"
 
 # One exposure's curated ConsDB columns: ``{column -> value}``. ``obs_end``
 # is a TAI ISO string; numeric columns are int/float; others may be None.
+# ``instrument`` is stamped on by us rather than projected from the row.
 ExposureRecord = dict[str, Any]
 
 
@@ -119,6 +166,52 @@ def obsEnd(record: ExposureRecord | None) -> str | None:
     return v if isinstance(v, str) else None
 
 
+def recordInstrument(record: ExposureRecord | None) -> str | None:
+    """The ``cdb_<instrument>`` table a record came from, or ``None``.
+
+    ``None`` only when the record genuinely carries no instrument — a
+    manual stand-in typed without one.
+    """
+    if not record:
+        return None
+    v = record.get(INSTRUMENT_RECORD_KEY)
+    return v if isinstance(v, str) and v else None
+
+
+def recordExposureId(record: ExposureRecord | None) -> int | None:
+    """The record's ``exposure_id`` as an int, or ``None``."""
+    if not record:
+        return None
+    try:
+        return int(record["exposure_id"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def probeOrderWinners(records: Iterable[ExposureRecord]) -> dict[int, ExposureRecord]:
+    """Collapse records to one per *bare* exposure id, probe order deciding.
+
+    The bare-id views of the world — ``GET /api/exposure-time/<id>`` with
+    no ``instrument``, and the bare keys in the on-disk cache — answer
+    with whichever instrument :data:`INSTRUMENTS_BY_PROBE_ORDER` reaches
+    first. Anything that writes into those views has to agree with that
+    rule, or a night where two instruments share ids would answer
+    differently depending on who wrote last.
+    """
+    rank = {inst: i for i, inst in enumerate(INSTRUMENTS_BY_PROBE_ORDER)}
+    unranked = len(rank)
+    best: dict[int, tuple[int, ExposureRecord]] = {}
+    for rec in records:
+        eid = recordExposureId(rec)
+        if eid is None:
+            continue
+        r = rank.get(recordInstrument(rec) or "", unranked)
+        current = best.get(eid)
+        if current is None or r < current[0]:
+            best[eid] = (r, rec)
+    return {eid: rec for eid, (_, rec) in best.items()}
+
+
 # A hand-entered shutter close: the user typed a timestamp because ConsDB
 # was down/unreachable or had no row for the dataId. We persist it to the
 # same per-site cache as a real record (so the explore view can be
@@ -128,9 +221,17 @@ def obsEnd(record: ExposureRecord | None) -> str | None:
 MANUAL_RECORD_KEY = "_manual"
 
 
-def manualRecord(obsEndTai: str) -> ExposureRecord:
-    """Build a minimal manual exposure record carrying just ``obs_end``."""
-    return {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+def manualRecord(obsEndTai: str, instrument: str | None = None) -> ExposureRecord:
+    """Build a minimal manual exposure record carrying just ``obs_end``.
+
+    Stamped with ``instrument`` when the caller knows it, so the
+    instrument-pinned lookups used everywhere else can find the
+    stand-in — an unstamped manual record only answers bare lookups.
+    """
+    record: ExposureRecord = {"obs_end": obsEndTai, MANUAL_RECORD_KEY: True}
+    if instrument:
+        record[INSTRUMENT_RECORD_KEY] = instrument
+    return record
 
 
 def isManual(record: ExposureRecord | None) -> bool:
@@ -162,14 +263,20 @@ def queryExposureRecordBatch(
     *,
     consdbUrl: str,
     chunkSize: int = 500,
+    instrument: str | None = None,
 ) -> dict[int, ExposureRecord]:
     """Resolve many dataIds in one round trip per instrument.
 
-    For each instrument in :data:`INSTRUMENTS_BY_PROBE_ORDER` we send
-    a single ``SELECT * … WHERE exposure_id IN (…)`` covering whatever
-    dataIds are still unresolved. Returns ``{dataId: record}`` for the
-    matches found; dataIds with no row in any instrument's table
-    simply don't appear in the output.
+    With ``instrument`` pinned, only that instrument's table is asked —
+    the caller knows which instrument's exposures these ids name (a
+    range of one instrument's exposures, a night of AOS work), and a
+    probe-order answer could silently hand back the *other* instrument's
+    rows for colliding ids, anchoring every downstream Δshutter offset
+    to the wrong shutter. Unpinned, each instrument in
+    :data:`INSTRUMENTS_BY_PROBE_ORDER` is asked in turn with a single
+    ``SELECT * … WHERE exposure_id IN (…)`` covering whatever dataIds
+    are still unresolved. Returns ``{dataId: record}`` for the matches
+    found; dataIds with no row simply don't appear in the output.
 
     ``chunkSize`` caps the IN-list size per query so an enormous
     night doesn't trip ConsDB's SQL-length limits. With the default
@@ -179,21 +286,65 @@ def queryExposureRecordBatch(
     """
     out: dict[int, ExposureRecord] = {}
     remaining = [int(x) for x in dataIds]
-    for instrument in INSTRUMENTS_BY_PROBE_ORDER:
+    instruments = (instrument,) if instrument else INSTRUMENTS_BY_PROBE_ORDER
+    for inst in instruments:
         if not remaining:
             break
-        found = _queryBatch(remaining, token, instrument, chunkSize, consdbUrl=consdbUrl)
+        found = _queryBatch(remaining, token, inst, chunkSize, consdbUrl=consdbUrl)
         out.update(found)
         remaining = [d for d in remaining if d not in out]
     return out
 
 
-def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
+def queryExposureRecordsForDayObs(
+    dayObs: int,
+    token: str,
+    *,
+    consdbUrl: str,
+) -> list[ExposureRecord]:
+    """Return every instrument's exposure records for one dayObs.
+
+    The 13-digit dataId embeds its dayObs (``YYYYMMDDSSSSS``), so one
+    range predicate per instrument table covers the whole night without
+    needing a ``day_obs`` column in every schema. Unlike
+    :func:`queryExposureRecordBatch` this does **not** stop at the first
+    instrument with rows — LSSTCam and LATISS routinely observe on the
+    same night, and the caller wants both.
+
+    Returns a **list**, not a ``{id: record}`` map, precisely because the
+    two instruments' ids collide (see :data:`INSTRUMENT_RECORD_KEY`): a
+    map would silently drop one instrument's exposure for every shared
+    id. Callers that need a bare-id view collapse it themselves with
+    :func:`probeOrderWinners`. Ordered by (probe order, exposure id).
+    """
+    lo = dayObs * 100000
+    hi = lo + 99999
+    out: list[ExposureRecord] = []
+    for instrument in INSTRUMENTS_BY_PROBE_ORDER:
+        sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id BETWEEN {lo} AND {hi}"
+        try:
+            payload = _postQuery(sql, token, consdbUrl=consdbUrl)
+        except _UndefinedTableError:
+            continue
+        cols = payload.get("columns") or []
+        rows = payload.get("data") or []
+        if "exposure_id" not in cols:
+            continue
+        found = [_recordFromRow(cols, row, instrument) for row in rows]
+        keyed = [(eid, rec) for eid, rec in ((recordExposureId(r), r) for r in found) if eid is not None]
+        out.extend(rec for _, rec in sorted(keyed, key=lambda pair: pair[0]))
+    return out
+
+
+def _recordFromRow(cols: list[str], row: list, instrument: str) -> ExposureRecord:
     """Project one ConsDB result row to the curated record.
 
     Only columns in :data:`EXPOSURE_RECORD_COLUMNS` that the table
     actually returned are kept — so an instrument missing a column just
-    omits that key rather than failing.
+    omits that key rather than failing. ``instrument`` is stamped on
+    afterwards from the table we queried rather than read out of the row:
+    we know which table this came from, and not every schema carries the
+    column.
     """
     idx = {c: i for i, c in enumerate(cols)}
     out: ExposureRecord = {}
@@ -201,6 +352,7 @@ def _recordFromRow(cols: list[str], row: list) -> ExposureRecord:
         i = idx.get(c)
         if i is not None and i < len(row):
             out[c] = row[i]
+    out[INSTRUMENT_RECORD_KEY] = instrument
     return out
 
 
@@ -228,10 +380,9 @@ def _queryBatch(
         if "exposure_id" not in cols:
             continue
         for row in rows:
-            rec = _recordFromRow(cols, row)
-            try:
-                eid = int(rec.get("exposure_id"))  # type: ignore[arg-type]
-            except (TypeError, ValueError):
+            rec = _recordFromRow(cols, row, instrument)
+            eid = recordExposureId(rec)
+            if eid is None:
                 continue
             out[eid] = rec
     return out
@@ -245,16 +396,13 @@ class _UndefinedTableError(Exception):
 def _postQuery(sql: str, token: str, *, consdbUrl: str) -> dict:
     """POST one SQL query, return the parsed JSON payload."""
     body = json.dumps({"query": sql}).encode("utf-8")
-    req = Request(
-        consdbUrl,
-        data=body,
-        headers={
-            "accept": "application/json",
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {token}",
-        },
-        method="POST",
-    )
+    headers = {"accept": "application/json", "Content-Type": "application/json"}
+    # An empty token means the endpoint needs no auth (an in-cluster ConsDB
+    # Service, reached without going through Gafaelfawr). Sending
+    # ``Bearer`` with nothing after it would be rejected outright.
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    req = Request(consdbUrl, data=body, headers=headers, method="POST")
     try:
         with urlopen(req, timeout=30.0) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -290,7 +438,7 @@ def _queryOneRecord(dataId: int, token: str, instrument: str, *, consdbUrl: str)
     if not rows:
         return None
     cols = payload.get("columns") or []
-    return _recordFromRow(cols, rows[0])
+    return _recordFromRow(cols, rows[0], instrument)
 
 
 # ----- site-aware convenience wrappers -------------------------------------
@@ -299,11 +447,15 @@ def _queryOneRecord(dataId: int, token: str, instrument: str, *, consdbUrl: str)
 def loadTokenForSite(site: Site) -> str:
     """Read and return the bearer token for ``site.consdbTokenFile``.
 
-    Raises :exc:`OSError` if the file can't be read; returns the empty
-    string only if the file exists but is whitespace-only. Callers
-    check both conditions explicitly so they can report a clear UI
-    message ("token file missing" vs "token file empty") to the user.
+    Returns the empty string — meaning "send no Authorization header" —
+    for a site that declares no token file at all. Otherwise raises
+    :exc:`OSError` if the file can't be read, and returns the empty
+    string if the file exists but is whitespace-only. Callers check
+    both conditions explicitly so they can report a clear UI message
+    ("token file missing" vs "token file empty") to the user.
     """
+    if site.consdbTokenFile is None:
+        return ""
     return readToken(site.consdbTokenFile)
 
 
@@ -320,16 +472,34 @@ def cachedExposureTimesPath(siteName: str) -> Path:
     return cache_root() / EXPOSURE_TIME_CACHE_DIR / f"{siteName}.json"
 
 
-def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
+def cacheKey(dataId: int, instrument: str | None = None) -> str:
+    """The per-site cache key for a dataId, optionally scoped to an instrument.
+
+    Bare ``"<id>"`` is the probe-order view — what a lookup that doesn't
+    know (or care about) the instrument resolves to.
+    ``"<instrument>:<id>"`` is the unambiguous one, and is the only key
+    an instrument-scoped lookup will accept: falling back to the bare
+    key there could hand back a different instrument's exposure with the
+    same id.
+    """
+    return f"{instrument}:{dataId}" if instrument else str(dataId)
+
+
+def lookupCachedRecord(dataId: int, *, siteName: str, instrument: str | None = None) -> ExposureRecord | None:
     """Return a previously-cached exposure record for ``dataId`` under
     this site, or ``None``.
 
+    With ``instrument`` set, only that instrument's entry can match — a
+    bare-id fallback would defeat the point, since the bare key holds the
+    probe-order winner, which for a colliding id is a *different*
+    exposure. Without it, the bare (probe-order) entry is returned.
+
     The cache is best-effort: any read error (missing file, invalid
     JSON, unexpected schema) is swallowed and we return ``None`` so the
-    caller falls through to a fresh ConsDB query. A legacy entry stored
-    as a bare ``obs_end`` string (the pre-record cache format) is read
-    back as ``{"obs_end": <str>}`` so the t-zero still resolves; the
-    richer columns simply fill in on the next fetch.
+    caller falls through to a fresh ConsDB query. There is exactly one
+    on-disk shape — a record object; anything else (including entries an
+    older build wrote) is a miss, not something to interpret. Caches are
+    a convenience, and the schema flush is the upgrade path.
     """
     p = cachedExposureTimesPath(siteName)
     if not p.exists():
@@ -340,21 +510,85 @@ def lookupCachedRecord(dataId: int, *, siteName: str) -> ExposureRecord | None:
         return None
     if not isinstance(d, dict):
         return None
-    val = d.get(str(dataId))
-    if isinstance(val, dict):
-        return val
-    if isinstance(val, str):
-        return {"obs_end": val}
-    return None
+    val = d.get(cacheKey(dataId, instrument))
+    return val if isinstance(val, dict) else None
 
 
-def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str) -> None:
+def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str, bareKey: bool = True) -> None:
     """Persist one ``(dataId, record)`` in the on-disk cache for this site."""
-    storeCachedRecords({int(dataId): record}, siteName=siteName)
+    storeCachedRecords({int(dataId): record}, siteName=siteName, bareKey=bareKey)
 
 
-def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> None:
-    """Persist many ``(dataId, record)`` pairs in one read-modify-write.
+def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str, bareKey: bool = True) -> None:
+    """Persist ``{dataId: record}`` — resolved the bare-id way — in one write.
+
+    For callers that resolved their ids the way a bare-id lookup does
+    (``queryExposureRecord`` / ``queryExposureRecordBatch``, both of which
+    stop at the first instrument that has the row) plus manual
+    stand-ins. Each record lands under the bare key *and*, when it knows
+    its instrument, under the instrument-scoped one.
+
+    ``bareKey=False`` for a caller that pinned a non-first instrument:
+    its answer is right for that instrument but is *not* what a bare-id
+    lookup resolves to, and writing it there would make the same dataId
+    answer differently depending on who asked last.
+    """
+    entries: dict[str, ExposureRecord] = {}
+    for eid, rec in records.items():
+        instrument = recordInstrument(rec)
+        if instrument:
+            entries[cacheKey(int(eid), instrument)] = rec
+        if bareKey:
+            entries[cacheKey(int(eid))] = rec
+    _mergeIntoCache(entries, siteName=siteName)
+
+
+def isProbeOrderFirst(instrument: str | None) -> bool:
+    """True if resolving against ``instrument`` also answers the bare id.
+
+    A bare-id lookup probes :data:`INSTRUMENTS_BY_PROBE_ORDER` and stops
+    at the first table with the row — so a hit against the *first*
+    instrument is, by construction, also the bare-id answer, and may be
+    cached as one. ``None`` means the caller didn't pin an instrument at
+    all, which is the bare-id path itself.
+    """
+    return instrument is None or instrument == INSTRUMENTS_BY_PROBE_ORDER[0]
+
+
+def storeCachedRecordList(records: Iterable[ExposureRecord], *, siteName: str) -> None:
+    """Persist a batch of records whose exposure ids may collide.
+
+    Every record is stored under its own ``(instrument, id)`` key, so no
+    exposure is lost to a shared id; the *probe-order winner* for each id
+    is additionally stored under the bare key, so the bare-id view agrees
+    with what :func:`queryExposureRecord` would have answered. Used by
+    the live poller, which pulls a whole night from every instrument at
+    once (see :func:`queryExposureRecordsForDayObs`).
+    """
+    records = list(records)
+    entries: dict[str, ExposureRecord] = {}
+    for rec in records:
+        eid = recordExposureId(rec)
+        instrument = recordInstrument(rec)
+        if eid is None or not instrument:
+            continue
+        entries[cacheKey(eid, instrument)] = rec
+    for eid, rec in probeOrderWinners(records).items():
+        entries[cacheKey(eid)] = rec
+    _mergeIntoCache(entries, siteName=siteName)
+
+
+# Serialises the read-modify-write below. Several threads write this file
+# in one process: request threads resolving a dataId, a fetch job's
+# night/range prefetch, and — every tick — the live poller's exposure
+# list. Without the lock two of them interleave their writes into one
+# truncated file, and the loser's entries are lost along with anything
+# else the file held.
+_cacheWriteLock = threading.Lock()
+
+
+def _mergeIntoCache(entries: dict[str, ExposureRecord], *, siteName: str) -> None:
+    """Merge pre-keyed entries into the per-site cache file.
 
     Best-effort: any I/O error is swallowed (the cache is purely an
     optimisation). Records never need to be invalidated — once a
@@ -363,22 +597,35 @@ def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str) -> 
     ``_manual`` stand-in (see :func:`manualRecord`). Taking the whole
     batch in one rewrite keeps a night-prefetch of hundreds of dataIds
     from re-serialising the file once per id.
+
+    Written via a temp file and ``os.replace`` under a process-wide lock,
+    so a reader only ever sees a whole file and a crash or a concurrent
+    writer cannot leave a truncated one. Losing this file is not the
+    harmless cache miss it looks like: a ``_manual`` stand-in exists
+    nowhere else, so a hand-typed shutter close would be gone for good.
     """
-    if not records:
+    if not entries:
         return
     p = cachedExposureTimesPath(siteName)
-    try:
-        p.parent.mkdir(parents=True, exist_ok=True)
-        existing: dict = {}
-        if p.exists():
+    with _cacheWriteLock:
+        try:
+            p.parent.mkdir(parents=True, exist_ok=True)
+            existing: dict = {}
+            if p.exists():
+                try:
+                    raw = json.loads(p.read_text())
+                    if isinstance(raw, dict):
+                        existing = raw
+                except (OSError, json.JSONDecodeError):
+                    existing = {}
+            existing.update(entries)
+            fd, tmpName = tempfile.mkstemp(prefix=f"{p.stem}-", suffix=".json", dir=p.parent)
+            tmpPath = Path(tmpName)
             try:
-                raw = json.loads(p.read_text())
-                if isinstance(raw, dict):
-                    existing = raw
-            except (OSError, json.JSONDecodeError):
-                existing = {}
-        for eid, rec in records.items():
-            existing[str(eid)] = rec
-        p.write_text(json.dumps(existing, sort_keys=True, indent=2))
-    except OSError:
-        pass
+                with os.fdopen(fd, "w") as fh:
+                    json.dump(existing, fh, sort_keys=True, indent=2)
+                os.replace(tmpPath, p)
+            finally:
+                tmpPath.unlink(missing_ok=True)
+        except OSError:
+            pass

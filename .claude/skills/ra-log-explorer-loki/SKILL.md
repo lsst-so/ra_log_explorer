@@ -30,15 +30,24 @@ why `_run_logcli` doesn't already do what you need.
 
 ## Connection / auth
 
-- The cluster's Loki endpoint is `https://loki-query.ls.lsst.org`. There
-  is no other one in scope; don't parameterise away from this until there
-  is a real second target.
+- The Loki endpoint is `https://loki-query.ls.lsst.org` for both sites —
+  BTS and the summit share one Loki and are distinguished by the
+  `cluster` label (`manke` / `yagan`), not by the address. It comes from
+  the site catalog rather than being hard-coded, but there is no second
+  address in scope; don't parameterise further until there is.
 - HTTP basic auth: `--username=<user>` on the command line,
   `LOKI_PASSWORD` in the environment. `_run_logcli` refuses to spawn
   logcli if `LOKI_PASSWORD` is unset — surface that error to the user
-  rather than guessing.
-- The user is expected to have their password in their shell rc and to
-  have sourced it before running the CLI; we do **not** support keyring
+  rather than guessing. Deployed, both come from the environment: the
+  username from `$LOKI_USERNAME` (a service account, not a person) and
+  the password from the environment's Vault secret. On a laptop the
+  developer is expected to have the password in their shell rc.
+- **Credentials never come from a request.** There is no credentials
+  panel and the fetch endpoints ignore a `username` / `password` in the
+  body. `LOKI_PASSWORD` is process-global and one process serves every
+  user of a deployment, so honouring a browser-supplied password would
+  let one person's typo break fetching for everybody. Don't reintroduce
+  a path that sets it per request. We also do **not** support keyring
   prompts or other interactive paths.
 
 ## Query construction
@@ -94,6 +103,15 @@ back full and logcli asks for another. `_fetchOnePod` exploits that:
   exact oracle. It's a *server-side aggregation* (no entry pagination), so
   it's immune to the bug — `1717 == 1717` on a complete window. Use it to
   presize chunks (target `CHUNK_TARGET_LINES`, below the batch size).
+  One caveat when using it to *audit* a fetch: the metric path counts
+  duplicate entries sitting in overlapping storage chunks that the
+  log-query path deduplicates, so on real nights the oracle runs a
+  stable ~0.03% (tens of lines per pod) *high* against a byte-perfect
+  fetch — verified by refetching (identical bytes) and by fetching the
+  padded sliver (empty). Never treat a small `expected > got` as data
+  loss; `live.VERIFY_TOLERANCE_*` is the tolerance the finalisation
+  audit uses. (It can never run *low*, which is what chunk presizing
+  and the zero-count short-circuit rely on.)
   Mind the interval mismatch: a `[range]` selector at `--now=to` covers
   `(to - range, to]`, but the fetch covers `[from, to)`. Round the range
   **up** and pad it (we add 1 ms) so the count is a strict superset —
@@ -135,6 +153,23 @@ memory, then appended to the pod's `.jsonl` once trusted. The whole
 per-pod tree runs under `PER_POD_TIMEOUT_S` (1800 s); the oracle gets the
 shorter `COUNT_TIMEOUT_S`.
 
+### `-o jsonl` strips labels common to the response
+
+Each entry's `labels` object holds only the labels that **vary** within
+the response; logcli factors out the common ones (they are what
+`--quiet` suppresses from the preamble). So `container` appears on a
+pod's lines only when that response happened to span two containers, and
+its *absence* means "one container in this chunk", not "no container
+label". Presence is therefore an artefact of chunk boundaries.
+
+Consequence, learned the hard way: do not build logic on a label being
+there. A rule of the form "the lines before this event came from a
+different container" looked exact and was measured to work on four
+nights, but only because the init container's one line and the main
+container's lines happened to land in the same request every time. If
+you need per-container attribution, ask for it explicitly (a
+`{...} | container="x"` selector) rather than reading it off the entries.
+
 ### Timestamps
 
 - `--from` / `--to` / `--now` want RFC3339-ish strings; we format them as
@@ -151,10 +186,17 @@ shorter `COUNT_TIMEOUT_S`.
 
 ## Parallelism
 
-`FetchSpec.workers` (default 8) controls a `ThreadPoolExecutor`. 8–16 is
-the useful range; beyond that you start hitting Loki ingestion-side
-backpressure that manifests as occasional logcli timeouts (`_run_logcli`
-catches and reports those per-pod, so other pods keep going).
+`FetchSpec.workers` controls a `ThreadPoolExecutor`. It comes from
+`config.DEFAULT_WORKERS` (`$RA_LOG_EXPLORER_WORKERS`, default 8) and is
+*not* settable per request — it is deployment configuration, tuned per
+environment in the Helm chart. 8–16 is the useful range; beyond that you
+start hitting Loki ingestion-side backpressure that manifests as
+occasional logcli timeouts (`_run_logcli` catches and reports those
+per-pod, so other pods keep going).
+
+Remember that a deployment is shared: several people can trigger fetches
+at once, so the effective concurrency against Loki is workers × the
+number of in-flight jobs, not just `workers`.
 
 A chatty pod over a full night fans out into many count-presized chunks
 (plus the re-splits when a chunk overflows), each its own logcli process.
@@ -167,7 +209,11 @@ the cache makes the cost a one-time hit per window.
 ## Error modes you should expect
 
 - **`logcli binary not found on PATH`** — surfaced as `FetchError`.
-  Tell the user to `brew install grafana/grafana/logcli` or equivalent.
+  Locally, `brew install grafana/grafana/logcli` or equivalent. In the
+  deployed image logcli is baked in at a **pinned** version (see the
+  `Dockerfile`); the pin is deliberate, because the whole #17270
+  workaround below reasons about exactly when logcli paginates. Bumping
+  it needs the same end-to-end verification a fetch-path change does.
 - **`logcli failed (rc=N): ...`** — we keep the first 500 chars of
   stderr; the most common non-fatal reason is a transient 502/504
   through nginx, retryable by re-running.

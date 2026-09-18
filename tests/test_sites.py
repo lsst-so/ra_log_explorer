@@ -35,6 +35,54 @@ def test_loadSites_reads_packaged_catalog() -> None:
     assert "base-lsp" in bts.consdbUrl
 
 
+def test_each_site_is_named_after_the_thing_it_explains() -> None:
+    """The page names itself after its site. One process serves one
+    cluster, so "which of these am I looking at" has to be answerable
+    from the tab strip, and neither deployment is called after the
+    pipeline it happens to read today."""
+    catalog, _ = sites.loadSites()
+    assert sites.siteByName(catalog, "summit").title == "Summit Log Explorer"
+    assert sites.siteByName(catalog, "bts").title == "Base Log Explorer"
+
+
+def test_a_catalog_entry_may_name_itself(tmp_path: Path) -> None:
+    """Which is how a site added later says what it wants to be called,
+    without a code change here."""
+    p = _writeCatalog(
+        tmp_path / "titled.toml",
+        'default_site = "summit"\n'
+        '[[site]]\nname = "summit"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\ntitle = "Cerro Pachon Explorer"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].title == "Cerro Pachon Explorer", "an explicit title must beat the built-in one"
+
+
+def test_an_unnamed_site_gets_a_plain_title(tmp_path: Path) -> None:
+    """A site the code has never heard of gets something bland rather
+    than something wrong — a page calling itself by another site's name
+    is worse than one calling itself nothing in particular."""
+    p = _writeCatalog(
+        tmp_path / "unknown.toml",
+        'default_site = "usdf"\n'
+        '[[site]]\nname = "usdf"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].title == sites.DEFAULT_TITLE
+
+
+def test_loadSites_raises_for_non_string_title(tmp_path: Path) -> None:
+    p = _writeCatalog(
+        tmp_path / "badtitle.toml",
+        'default_site = "s"\n'
+        '[[site]]\nname = "s"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\ntitle = 7\n',
+    )
+    with pytest.raises(sites.SitesConfigError):
+        sites.loadSites(p)
+
+
 def test_loadSites_uses_env_override(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """``RA_LOG_EXPLORER_SITES_FILE`` redirects the loader; useful for
     ops who want to ship a different catalog without touching the
@@ -190,3 +238,79 @@ def test_siteByCluster_raises_for_unknown(tmp_path: Path) -> None:
     catalog, _ = sites.loadSites(p)
     with pytest.raises(sites.SitesConfigError):
         sites.siteByCluster(catalog, "ghost")
+
+
+def test_loadSites_allows_a_site_with_no_token_file(tmp_path: Path) -> None:
+    """A ConsDB reached in-cluster needs no bearer token, so the field is
+    optional and its absence must load as ``None`` rather than raising."""
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "incluster"\n'
+        '[[site]]\nname = "incluster"\ncluster = "manke"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "http://consdb-pq.consdb:8080/consdb/query"\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].consdbTokenFile is None
+
+
+def test_loadSites_treats_blank_token_file_as_absent(tmp_path: Path) -> None:
+    """An empty string is what a Helm template renders for "no token"; it
+    must mean the same thing as omitting the key, not a path of ``''``."""
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "a"\n'
+        '[[site]]\nname = "a"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\nconsdbTokenFile = ""\n',
+    )
+    catalog, _ = sites.loadSites(p)
+    assert catalog[0].consdbTokenFile is None
+
+
+def test_loadSites_rejects_non_string_token_file(tmp_path: Path) -> None:
+    p = _writeCatalog(
+        tmp_path / "x.toml",
+        'default_site = "a"\n'
+        '[[site]]\nname = "a"\ncluster = "c"\nnamespace = "ns"\n'
+        'lokiAddr = "https://l"\nconsdbUrl = "https://x"\nconsdbTokenFile = 7\n',
+    )
+    with pytest.raises(sites.SitesConfigError):
+        sites.loadSites(p)
+
+
+def test_the_catalog_the_helm_chart_renders_loads(tmp_path: Path) -> None:
+    """Contract with the Phalanx chart, which lives in another repo.
+
+    This is byte-for-byte what `applications/log-explorer/templates/
+    configmap.yaml` renders into the ConfigMap mounted at
+    /etc/ra-log-explorer/sites.toml. Nothing else checks it: the chart is
+    templated YAML producing TOML, and the first thing that would notice
+    a malformed result is the pod refusing to start. Pin the shape here
+    so a chart change that breaks it fails in this repo's test suite.
+
+    Note the deliberate absences — one `[[site]]` entry, and no
+    `consdbTokenFile`, because an in-cluster ConsDB Service address never
+    passes through Gafaelfawr and takes no bearer token.
+    """
+    rendered = (
+        'default_site = "bts"\n'
+        "\n"
+        "[[site]]\n"
+        'name = "bts"\n'
+        'cluster = "manke"\n'
+        'namespace = "rapid-analysis"\n'
+        'lokiAddr = "https://loki-query.ls.lsst.org"\n'
+        'consdbUrl = "http://consdb-pq.consdb.svc.cluster.local:8080/consdb/query"\n'
+    )
+    catalog, default = sites.loadSites(_writeCatalog(tmp_path / "chart.toml", rendered))
+    assert default == "bts"
+    assert len(catalog) == 1
+    site = catalog[0]
+    assert site.name == "bts"
+    assert site.cluster == "manke"
+    assert site.consdbTokenFile is None
+    assert site.consdbUrl.startswith("http://consdb-pq.consdb")
+    # And the title, which the chart has no field for at all: the
+    # deployed instance has to call itself "Base Log Explorer" off the
+    # site name alone, or every BTS user reads a name that belongs to
+    # nobody until a change lands in the other repository.
+    assert site.title == "Base Log Explorer"

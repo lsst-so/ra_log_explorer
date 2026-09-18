@@ -92,7 +92,7 @@ class LifecycleRow:
     interrupted. ``offsetS`` is the Δshutter of that dataId, when known.
     """
 
-    kind: str  # POD_RESTARTED / POD_KILLED / POD_OOMKILLED / POD_FAILED / POD_UNHEALTHY
+    kind: str  # POD_RESTARTED / POD_KILLED / POD_OOMKILLED / POD_FAILED / POD_UNHEALTHY / POD_MOUNT_FAILED
     reason: str  # the underlying k8s reason (Event.flavor)
     pod: str
     group: str

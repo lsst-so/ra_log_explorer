@@ -73,6 +73,7 @@ function kindClass(kind, level) {
   if (kind === 'POD_KILLED') return 'kind-killed';
   if (kind === 'POD_RESTARTED') return 'kind-restart';
   if (kind === 'POD_UNHEALTHY') return 'kind-podunhealthy';
+  if (kind === 'POD_MOUNT_FAILED') return 'kind-mountfail';
   if (kind === 'POD_STARTED') return 'kind-podstart';
   if (level === 'error') return 'kind-error';
   if (kind === 'WORKER_PICKUP') return 'kind-pickup';
@@ -123,6 +124,11 @@ function exposureInfoItems(rec, compact) {
     if (val !== null && val !== undefined && val !== '') items.push([label, String(val)]);
   };
   const num = (v, dp) => (v === null || v === undefined ? null : Number(v).toFixed(dp));
+  // First, and in the compact set, because it is part of the exposure's
+  // identity rather than one of its properties: a dataId's sequence
+  // number restarts at 1 per instrument each night, so the same id names
+  // a different image on LSSTCam and LATISS.
+  push('instrument', rec.instrument);
   push('image type', rec.img_type);
   push('reason', rec.observation_reason);
   push('program', rec.science_program);
@@ -471,9 +477,8 @@ function shortenPod(pod, group) {
   // The role prefix is what's already in the badge to the left.
   let stem = pod
     .replace(/^s-lsstcam-run-/, '')
-    .replace(/^s-latiss-run-/, '')
-    .replace(/^s-lsstcomcamsim-run-/, '')
-    .replace(/^s-lsstcomcam-run-/, '');
+    .replace(/^s-latiss-run-/, '');
+
   const prefix = (summary && summary.groupLabels && summary.groupLabels[group]);
   if (prefix && stem.startsWith(prefix + '-')) {
     stem = stem.slice(prefix.length + 1);
@@ -490,6 +495,14 @@ function groupDisplay(group) {
   return group;
 }
 
+// Lifecycle kinds worth shouting about, and the word to write on the
+// timeline next to each — so a death is legible without hovering.
+const ALARM_LIFECYCLE = {
+  POD_RESTARTED: 'restart',
+  POD_OOMKILLED: 'OOM kill',
+  POD_FAILED: 'pod failed',
+};
+
 function makeEventNode(e) {
   const n = document.createElement('div');
   n.className = 'tl-event ' + kindClass(e.kind, e.level);
@@ -497,6 +510,17 @@ function makeEventNode(e) {
   // ticks) so a restart/kill/OOM reads as "the whole pod" at that instant.
   if (e.kind && e.kind.startsWith('POD_')) {
     n.classList.add('lifecycle');
+    // The kinds that mean the pod *died*. A graceful `Killing` (rollout,
+    // scale-down) and a mount failure are ordinary enough that alarming
+    // on them would train people to ignore the alarm.
+    const label = ALARM_LIFECYCLE[e.kind];
+    if (label) {
+      n.classList.add('alarm');
+      const tag = document.createElement('span');
+      tag.className = 'tl-lifecycle-label';
+      tag.textContent = label;
+      n.appendChild(tag);
+    }
     n.style.left = xForOffset(e.offsetS) + 'px';
     n.addEventListener('mouseenter', (ev) => showTooltip(ev, e));
     n.addEventListener('mousemove', moveTooltip);
@@ -624,10 +648,15 @@ async function selectPod(pod) {
   if (!podDetailCache[pod]) {
     // In range mode the timeline payload carries a podDetailQuery that
     // routes the lookup back through the range state (so offsets anchor
-    // at this dataId's shutter close); single-exposure mode just keys
-    // off the loaded dataId.
-    const q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
-    const r = await fetch(`/api/pod/${pod}?${q}`);
+    // at this dataId's shutter close); single-exposure mode keys off the
+    // loaded dataId — plus the view's instrument, so a same-id state
+    // loaded by another tab under the other instrument 404s instead of
+    // answering with a different exposure's log lines.
+    let q = summary.podDetailQuery || `dataId=${encodeURIComponent(summary.expId)}`;
+    if (!summary.podDetailQuery && summary.instrument) {
+      q += `&instrument=${encodeURIComponent(summary.instrument)}`;
+    }
+    const r = await fetch(apiUrl(`/api/pod/${pod}?${q}`));
     podDetailCache[pod] = await r.json();
   }
   renderDetail();
@@ -699,8 +728,10 @@ function wireExploreListeners() {
   document.getElementById('groups-expand-all').addEventListener('click', expandAllGroups);
   document.getElementById('back-home').addEventListener('click', () => {
     // Drop the exposure key out of the URL bar so a subsequent refresh
-    // lands on home — not back on whatever exposure we just left.
-    history.replaceState({}, '', window.location.pathname);
+    // lands on home — not back on whatever exposure we just left. Its
+    // own history entry, because going home is a navigation: Back from
+    // here returns to the exposure.
+    window.navigateTo('');
     if (window.showHome) window.showHome();
   });
   window.addEventListener('keydown', (e) => {

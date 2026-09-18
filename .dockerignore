@@ -1,0 +1,20 @@
+# Keep the build context to what the image is actually built from. The
+# runtime is the package plus its static assets; everything else here is
+# development apparatus that would only invalidate layers.
+.git
+.github
+.venv
+.claude
+architecture
+assets
+tests
+tools
+*.egg-info
+__pycache__
+.mypy_cache
+.pytest_cache
+.ruff_cache
+.coverage
+.coverage.*
+.DS_Store
+*.log

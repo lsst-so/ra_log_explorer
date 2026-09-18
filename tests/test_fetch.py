@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -204,37 +205,55 @@ def test_getCacheExposureIds_returns_empty_when_no_sidecar(tmp_path: Path) -> No
 
 
 def test_addExposureToCache_then_get_roundtrips(tmp_path: Path) -> None:
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900722)]
 
 
 def test_addExposureToCache_accumulates_distinct_ids_sorted(tmp_path: Path) -> None:
     # Same cache, multiple triggering dataIds (the superset-reuse case).
-    fetch.addExposureToCache(tmp_path, 2026051900723)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900724)
+    fetch.addExposureToCache(tmp_path, 2026051900723, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900724, "lsstcam")
     assert fetch.getCacheExposureIds(tmp_path) == [
-        2026051900722,
-        2026051900723,
-        2026051900724,
+        ("lsstcam", 2026051900722),
+        ("lsstcam", 2026051900723),
+        ("lsstcam", 2026051900724),
     ]
 
 
 def test_addExposureToCache_dedupes_repeated_ids(tmp_path: Path) -> None:
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    fetch.addExposureToCache(tmp_path, 2026051900722)
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722]
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900722)]
+
+
+def test_addExposureToCache_keeps_both_instruments_of_a_shared_id(tmp_path: Path) -> None:
+    """A window wide enough to be reused by both instruments' exposures of
+    one id holds two *different* exposures. Collapsing them to the bare id
+    would drop one of them from the cache listing — and make the other's
+    link the only way back into a window that holds both."""
+    fetch.addExposureToCache(tmp_path, 2026051900722, "latiss")
+    fetch.addExposureToCache(tmp_path, 2026051900722, "lsstcam")
+    assert fetch.getCacheExposureIds(tmp_path) == [
+        ("latiss", 2026051900722),
+        ("lsstcam", 2026051900722),
+    ]
 
 
 def test_addExposureToCache_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
     # No raise.
-    fetch.addExposureToCache(tmp_path / "does-not-exist", 2026051900722)
+    fetch.addExposureToCache(tmp_path / "does-not-exist", 2026051900722, "lsstcam")
 
 
-def test_getCacheExposureIds_skips_unparseable_lines(tmp_path: Path) -> None:
-    (tmp_path / fetch.EXPOSURE_IDS_NAME).write_text("2026051900722\nnot-a-number\n2026051900723\n")
-    assert fetch.getCacheExposureIds(tmp_path) == [2026051900722, 2026051900723]
+def test_getCacheExposureIds_skips_unqualified_lines(tmp_path: Path) -> None:
+    """An entry that names no instrument names no exposure. Nothing
+    tolerates one — the deploy-time schema flush is how an older
+    sidecar's bare ids go away, not a reader that guesses at them."""
+    (tmp_path / fetch.EXPOSURE_IDS_NAME).write_text(
+        "2026051900722\nnot-a-number\nlatiss:nope\nlsstcam:2026051900723\n:2026051900724\n"
+    )
+    assert fetch.getCacheExposureIds(tmp_path) == [("lsstcam", 2026051900723)]
 
 
 # ----- markCacheRange / getCacheRange -------------------------------------
@@ -245,19 +264,32 @@ def test_getCacheRange_returns_None_when_no_sidecar(tmp_path: Path) -> None:
 
 
 def test_markCacheRange_then_get_roundtrips(tmp_path: Path) -> None:
-    fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750)
+    """The pin the range was fetched under rides in the sidecar, so the
+    rebuild path can resolve each in-range id against the right table."""
+    fetch.markCacheRange(tmp_path, 2026051900722, 2026051900750, instrument="latiss")
     assert fetch.getCacheRange(tmp_path) == (2026051900722, 2026051900750)
+    assert fetch.getCacheRangeInstrument(tmp_path) == "latiss"
+
+
+def test_a_two_line_range_sidecar_is_not_a_range_cache(tmp_path: Path) -> None:
+    """There is exactly one sidecar format — three lines. A two-line file
+    (what an older build wrote) is malformed, not a degraded-but-usable
+    range: this project keeps no backwards compatibility, and the
+    CACHE_SCHEMA_VERSION flush means such files never survive a deploy."""
+    (tmp_path / "_range.txt").write_text("2026051900722\n2026051900750\n")
+    assert fetch.getCacheRange(tmp_path) is None
+    assert fetch.getCacheRangeInstrument(tmp_path) is None
 
 
 def test_markCacheRange_on_missing_dir_is_a_noop(tmp_path: Path) -> None:
-    fetch.markCacheRange(tmp_path / "does-not-exist", 1, 2)  # no raise
+    fetch.markCacheRange(tmp_path / "does-not-exist", 1, 2, instrument="lsstcam")  # no raise
     assert fetch.getCacheRange(tmp_path / "does-not-exist") is None
 
 
 def test_getCacheRange_returns_None_on_malformed_sidecar(tmp_path: Path) -> None:
     (tmp_path / fetch.RANGE_NAME).write_text("only-one-line\n")
     assert fetch.getCacheRange(tmp_path) is None
-    (tmp_path / fetch.RANGE_NAME).write_text("not-a-number\nalso-bad\n")
+    (tmp_path / fetch.RANGE_NAME).write_text("not-a-number\nalso-bad\nlsstcam\n")
     assert fetch.getCacheRange(tmp_path) is None
 
 
@@ -469,6 +501,20 @@ def test_run_logcli_raises_when_LOKI_PASSWORD_missing(monkeypatch: pytest.Monkey
         fetch._run_logcli(_stubSpec(), ["series"])
 
 
+def test_run_logcli_treats_a_blank_LOKI_PASSWORD_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deployed, the password comes from a VaultSecret marked optional so
+    the pod starts before the secret exists — which means the variable
+    can be present and empty. That has to produce the same actionable
+    sentence as an absent one, not a bare logcli auth failure that reads
+    like a Loki outage."""
+    for blank in ("", "   "):
+        monkeypatch.setenv("LOKI_PASSWORD", blank)
+        with pytest.raises(fetch.FetchError, match="LOKI_PASSWORD"):
+            fetch._run_logcli(_stubSpec(), ["series"])
+
+
 def test_run_logcli_raises_FetchError_when_binary_missing(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -612,7 +658,8 @@ def test_countOverTime_builds_instant_query_and_parses(monkeypatch: pytest.Monke
     monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
     fromT = dt.datetime(2026, 5, 20, 8, 0, 0, tzinfo=dt.timezone.utc)
     toT = dt.datetime(2026, 5, 20, 8, 0, 5, tzinfo=dt.timezone.utc)
-    n = fetch._countOverTime(_stubSpec(), "pod-x", fromT, toT)
+    spec = _stubSpec()
+    n = fetch._countOverTime(spec, fetch._matcher(spec, pod="pod-x"), fromT, toT)
     assert n == 42
     args = captured["args"]
     assert args[0] == "instant-query"
@@ -1057,6 +1104,34 @@ def test_fetchAll_refetches_when_cache_schema_outdated(
     assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
 
 
+def test_fetchAll_refetches_when_the_cached_meta_is_corrupt(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """An unparseable ``_meta.json`` means "no usable cache", exactly as
+    a missing one does.
+
+    Every other reader already treats it that way. Letting the exact-hit
+    path raise instead would turn one truncated file — a full disk, a
+    killed writer — into a 500 on every future request for that window,
+    recoverable only by finding and deleting the directory by hand.
+    """
+    spec = _stubSpec()
+    cacheDir = fetch.ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (cacheDir / "_meta.json").write_text('{"spec": {"fromIso": "2026-')  # truncated mid-write
+
+    refetched: list[bool] = []
+
+    def fakeListPods(_spec: FetchSpec) -> list[str]:
+        refetched.append(True)
+        return []
+
+    monkeypatch.setattr(fetch, "listPods", fakeListPods)
+    _, meta = fetch.fetchAll(spec)
+    assert refetched == [True]
+    assert meta["cacheReuse"] == "none"
+    assert meta["fetchSchemaVersion"] == fetch.CACHE_SCHEMA_VERSION
+
+
 def test_fetchAll_marks_complete_when_all_pods_succeed(
     monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
 ) -> None:
@@ -1438,3 +1513,39 @@ def test_ensureCacheSchemaCurrent_noop_when_already_current(tmpCacheRoot: Path) 
     removed = fetch.ensureCacheSchemaCurrent()
     assert removed == 0
     assert d.exists()  # current-schema cache survives untouched
+
+
+def test_ensureCacheSchemaCurrent_drops_live_sidecars_before_removing(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The flush is best-effort per top-level entry, so its rmtree can fail
+    part-way — a concurrent `cache flush` from another process is enough.
+    A night that lost pod files while keeping its `_live.json` is worse
+    than either outcome: the poller would resume appending to files that
+    now start mid-night, and every slice cut from them would be short
+    while claiming to be complete."""
+    nightDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night"
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    fetch.writeLiveSidecar(
+        nightDir,
+        {
+            "version": fetch.LIVE_SIDECAR_VERSION,
+            "fromIso": "2026-07-11T12:00:00.000000Z",
+            "watermarkIso": "2026-07-11T13:00:00.000000Z",
+            "pods": {},
+        },
+    )
+    realRmtree = shutil.rmtree
+    doomed = nightDir.parent.parent  # the cluster tree the flush removes
+
+    def wedgedRmtree(path: Any, *a: Any, **k: Any) -> None:
+        if Path(path) == doomed:
+            # Fails having removed nothing, which is the case that leaves a
+            # sidecar behind to vouch for files that may already be gone.
+            raise OSError(39, "Directory not empty")
+        realRmtree(path, *a, **k)
+
+    monkeypatch.setattr(fetch.shutil, "rmtree", wedgedRmtree)
+    fetch.ensureCacheSchemaCurrent()
+    assert nightDir.exists(), "this test is about the delete failing, not succeeding"
+    assert fetch.readLiveSidecar(nightDir) is None

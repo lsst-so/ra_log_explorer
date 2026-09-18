@@ -8,10 +8,10 @@ repeat runs into instant loads.
 ## On-disk layout
 
 ```
-~/.cache/ra_log_explorer/                          ← override with $RA_LOG_EXPLORER_CACHE
+~/.cache/ra_log_explorer/                          ← $RA_LOG_EXPLORER_CACHE; deployed, this is
+│                                                    the mount point of the cache volume
 ├── _cache_schema_version.txt                      ← schema the cache was built with; a
 │                                                    mismatch flushes the whole tree at startup
-├── settings.json                                  ← server-side settings (maxCacheBytes)
 ├── exposure-times/                                ← persistent dataId → ConsDB exposure record
 │   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
 │   └── bts.json                                     per site so a colliding dataId between scopes
@@ -22,11 +22,18 @@ repeat runs into instant loads.
         │                                            byte/line counts + count_over_time oracle +
         │                                            fetchComplete + errors + incomplete_pods +
         │                                            pod_event_lines + event_errors
+        ├── _live.json                             ← (live night dirs only) watermark + per-pod
+        │                                            byte counts + event-only names + any
+        │                                            in-flight pod rewrite; marks the dir as
+        │                                            poller-built — sliced on demand, never
+        │                                            superset-parsed, never fetched into
         ├── pods.txt                               ← pods that emitted in the window
         ├── _last_viewed.txt                       ← ISO timestamp; sidecar for LRU eviction
-        ├── _exposure_ids.txt                      ← (exposure caches only) ascending dataIds
-        │                                            that triggered fetches landing here
-        ├── _range.txt                             ← (range caches only) two lines: startId, stopId
+        ├── _exposure_ids.txt                      ← (exposure caches only) the exposures that
+        │                                            triggered fetches landing here, one
+        │                                            <instrument>:<dataId> per line, ascending
+        ├── _range.txt                             ← (range caches only) startId, stopId,
+        │                                            instrument — one per line
         ├── pods/<pod>.jsonl                       ← raw Loki JSONL (app logs), --forward order
         ├── pods_events/<pod>.jsonl                ← raw Loki JSONL (k8s/events lifecycle
         │                                            stream); auxiliary, never gates
@@ -57,10 +64,16 @@ stopId]` bounds. Because they're plain all-pods windows, they also
 participate in superset reuse: a later single-exposure fetch whose
 window falls inside the range gets served from the range cache for free.
 
-`exposure-times/` and `settings.json` live at the root, not under
-the cluster/namespace tree, so they survive `rm -rf
-~/.cache/ra_log_explorer/<cluster>` but disappear with a full root
-wipe.
+`exposure-times/` lives at the root, not under the cluster/namespace
+tree, so it survives `rm -rf ~/.cache/ra_log_explorer/<cluster>` but
+disappears with a full root wipe.
+
+Deployed, the whole tree sits on a PersistentVolumeClaim. That is
+deliberate rather than incidental: fetching a night out of Loki takes
+minutes, so an emptyDir would throw the cache away on every pod restart —
+worst exactly when someone is restarting things in order to investigate
+something. It also means the cache is *shared*: a window one person
+fetched is instant for the next person to ask for it.
 
 ## Schema-version flush
 
@@ -88,21 +101,148 @@ history: v1 (implicit) capped each pod at 50 000 lines; v2 used
 (grafana/loki#17270); v3 fetches in count-presized single-batch chunks
 (see *Completeness* below); v4 additionally fetches each pod's
 `k8s/events` lifecycle stream into `pods_events/` — a v3 cache has no such
-tree, so the bump forces a re-fetch to pick up the new markers.
+tree, so the bump forces a re-fetch to pick up the new markers; v5
+dropped every compatibility reader (see *No backwards compatibility*
+below) — the flush is what makes that safe; v6 qualifies every
+`_exposure_ids.txt` entry with the instrument the fetch ran under, so
+the cache listing and the rebuild path can tell which of two
+same-numbered exposures a window holds.
+
+## No backwards compatibility
+
+**Nothing written by an older build is ever interpreted.** This is app
+code, not a library, and the cache is a temporary convenience, not a
+data store anyone supports: every on-disk shape here — `_meta.json`,
+`_live.json`, `_range.txt`, `_exposure_ids.txt`, the exposure-time
+records — has exactly one
+current format, readers treat anything else as absent or malformed, and
+a deploy invalidates everything on purpose (that is what the
+schema-version flush is *for*). When a format changes, bump
+`CACHE_SCHEMA_VERSION` in the same commit and delete the old reader —
+never write a tolerant one, never migrate in place. The cost is one
+re-fetch per window after a deploy; the alternative is a permanent tax
+of dual-format readers whose legacy halves are exercised by nothing and
+rot silently.
+
+## Live night dirs
+
+Live mode (see [architecture.md](architecture.md#live-mode)) maintains
+one additional kind of window dir: the **live night dir**, the ordinary
+all-pods window path for the current dayObs's noon→noon span, grown
+incrementally by the poller rather than written once by a fetch. It is
+marked by a `_live.json` sidecar (full schema in `fetch.py`) recording
+the *watermark* — the time up to which every pod's lines are durably on
+disk — per-pod byte/line counts, and the cumulative fall-short maps.
+The sidecar is the coordination point between the poller (single
+writer, atomic replace once per tick, only after the tick's bytes hit
+disk) and readers; bytes beyond the recorded counts are treated as not
+yet there. That contract holds because an append only ever *extends* a
+file, and because appends are all-or-nothing: a partial one — app log
+or events stream alike — is truncated back to the pre-append size, so
+the span the poller retries next tick lands after clean bytes rather
+than after a torn line the counts will later be extended over.
+
+One operation is not an append, and so has to announce itself:
+finalisation's whole-pod refetch swaps the file wholesale, and while it
+does the sidecar carries `rewritingPod: "<pod>"`. `_tryNightSlice`
+refuses to slice a night carrying it and falls back to a real fetch,
+and `materializeNightSlice` checks again against its own read of the
+sidecar — the gate and the copy are separated by acquiring the
+destination window's lock, which another thread's slice can hold for as
+long as its copy takes, and a refetch beginning in that gap would be
+invisible to the check that already ran. Zeroing the pod's counts is
+not enough on its own — a slicer reading a zeroed record doesn't wait,
+it omits the pod, and the resulting slice would be written
+`fetchComplete: true` with a pod missing and then exact-hit forever.
+The key is cleared on failure as well as success, so a failed refetch
+leaves a night that is visibly short rather than unsliceable.
+
+Three rules keep it coherent with everything else here:
+
+- While active it has **no `_meta.json`**, so nothing mistakes it for a
+  completed fetch and LRU eviction leaves it alone. Finalisation (at
+  noon-UTC rollover: final top-up, then a per-pod `count_over_time`
+  audit that refetches any pod falling short by more than the oracle's
+  dedup slack — `max(100, 0.2%)`, `live.VERIFY_TOLERANCE_*`; a pod
+  within tolerance is left alone) writes a normal `_meta.json`, after
+  which it is listed, evictable, and deletable like any window.
+- It is **excluded from superset reuse** forever (the sidecar stays
+  after finalisation as the marker): handing a whole night to the
+  parser to answer a five-minute window takes minutes.
+- Contained windows are instead served by **slicing**
+  (`materializeNightSlice`): each per-pod JSONL is time-ascending, so
+  the request's boundary offsets are found by binary-searching
+  timestamps and the byte range is copied into an ordinary exposure
+  cache dir at the requested window's own path, with a synthesized
+  `_meta.json` (`cacheReuse: "night-slice"`, `sliceSource` pointing
+  back at the night dir, the night's fall-short maps inherited
+  wholesale). The result is a first-class window: later identical
+  requests exact-hit it, nearby ones superset-reuse it, LRU eviction
+  reclaims it.
 
 ## Cache hit policy
 
-`fetchAll(spec, ...)` decides in order:
+`fetchAll(spec, ...)` runs the whole of the following under a
+**per-window write lock** (`windowWriteLock`, keyed on the requested
+window directory). The clamped night slice (step 2½) additionally
+locks the slice's *destination* — the clamped `[nightStart, watermark]`
+window is not the requested path, and a direct fetch of that same
+window locks it as its own; the locks are re-entrant so the common
+target-is-the-requested-dir case costs nothing. A cache window is a directory of files plus a
+`_meta.json` vouching for them; two threads asking for the same window
+would otherwise both find no cache and both write the same
+`pods/<pod>.jsonl`. The second caller waits and then takes the first's
+result as an ordinary hit — never longer than the fetch it would have
+duplicated. It then decides in order:
 
 1. **Skip the cache entirely** if either `forceRefresh=True` or the
    requested window's `to` is in the future. (The cluster might still
    produce new logs inside the window, so the cache would be stale.)
    This is the safety net for an in-progress dayObs in night mode.
 
-2. **Exact hit** if `<requestedDir>/_meta.json` exists, carries the
-   current `fetchSchemaVersion`, and there's no `.partial` flag.
+2. **Exact hit** if `<requestedDir>/_meta.json` exists, parses, carries
+   the current `fetchSchemaVersion`, and there's no `.partial` flag.
    Returns the requested directory and the saved meta with
-   `cacheReuse = "exact"`.
+   `cacheReuse = "exact"`. A meta that won't parse means exactly what a
+   missing one means — no usable cache, fall through — rather than an
+   exception: one truncated file (a full disk, a killed writer) would
+   otherwise 500 every future request for that window, with no way out
+   but finding and deleting the directory by hand. The superset step
+   below reads the same way, since the directory it picked can be
+   deleted or rewritten between the search and the read.
+
+2½. **Night slice** if the request falls inside a live/finalised night
+   dir. Two windows qualify: one the watermark fully covers (its `to`
+   at or before the watermark — all-pods *and* `podRegex` requests
+   alike; a filtered request slices only matching pods into the nested
+   `pods=` dir a real filtered fetch would use), and the night's *own*
+   window while the night is in progress (night mode on the current
+   dayObs), which is served clamped to the watermark — "the night so
+   far". This step deliberately sits **outside** the window-in-the-past
+   gate so the in-progress night qualifies; only `forceRefresh`
+   disables it. The window is materialized by slicing (see *Live night
+   dirs*) and returned with `cacheReuse = "night-slice"`; a repeat
+   against an unchanged watermark reuses the previous slice as an exact
+   hit. When the window to slice *is* the night's own — the watermark
+   has reached night end but finalisation hasn't run, which is where
+   `--live-day-obs` parks permanently — the night dir is returned
+   directly instead, since it already is that window.
+
+   The clamped window's *path* moves with the watermark, so each night
+   fetch while the night is in progress mints a new
+   `[nightStart, watermark]` directory and the previous one becomes a
+   strict subset of it — a few hundred MiB nothing will read again (a
+   reload picks the newest by `fetched_at`). `server`'s fetch-job
+   callback deletes them as each new one lands, rather than leaving them
+   to LRU: they are the *freshest* thing on disk, so a pass under
+   pressure would reclaim yesterday's finalised 9 GiB night dir first —
+   the same inversion `markCacheViewed` on the night dir guards against,
+   arriving from the other side. Only strict subsets go, so a watermark
+   that regressed (a cache wipe mid-night, one tick of a newly-seen pod
+   failing) leaves the wider directory alone. Any slice failure
+   falls through to the steps below (leaving `.partial` in place, so a
+   half-copied window can never pass for a hit) — worst case is the
+   fetch that would have happened anyway.
 
 3. **Superset hit** if any other completed cache directory under
    `<cluster>/<namespace>/` (or under `<cluster>/<namespace>/<window>/
@@ -120,10 +260,15 @@ tree, so the bump forces a re-fetch to pick up the new markers.
 
 4. Otherwise **fetch fresh**: create the requested directory, write
    `.partial`, list pods via `logcli series` (honouring `podRegex`
-   if set), fetch each pod in parallel in count-presized single-batch
-   chunks (every line, verified — see *Completeness* below), write
-   `_meta.json`, remove `.partial`. Returns the requested directory
-   with `cacheReuse = "none"`.
+   if set), drop any pod files a previous attempt on this window left
+   behind (`summarizeAll` reads the directory, not `pods.txt`, so a
+   stale file would be parsed as part of the window), fetch each pod in
+   parallel in count-presized single-batch chunks (every line, verified
+   — see *Completeness* below), write `_meta.json`, remove `.partial`.
+   Returns the requested directory with `cacheReuse = "none"`. A
+   requested directory carrying a `_live.json` is refused outright: it
+   belongs to the poller, and a fresh fetch would truncate files it is
+   appending to.
 
 Steps 2 and 3 ignore any cache whose `fetchSchemaVersion` doesn't match
 the current `CACHE_SCHEMA_VERSION`. That's what keeps a stale snapshot
@@ -183,10 +328,17 @@ of *single-batch* queries:
   the count being right (if the count is unavailable the chunker falls
   back to blind time-bisection and is still correct).
 - **Split and retry.** A chunk that comes back *full* (`got ≥` the cap)
-  is discarded untrusted and re-fetched as two half-open time halves
-  (`[a, mid) ∪ [mid, b)` tiles exactly — no gap, no dup). This recurses
-  until every piece fits one batch, keeping the output globally
-  time-ascending so the parser's ordering assumption holds.
+  is discarded untrusted and re-fetched as equal-time half-open
+  sub-windows, which tile it exactly — no gap, no dup. How many is
+  again the oracle's call: `min(MAX_SPLIT_PARTS, max(2,
+  ceil(expected / CHUNK_TARGET_LINES)))`, i.e. enough parts to aim at
+  `CHUNK_TARGET_LINES` each, capped at `MAX_SPLIT_PARTS` (60) so a
+  pathological count can't fan out into hundreds of children at once.
+  Two halves is the floor, and what a dark oracle always gives. This
+  recurses until every piece fits one batch, keeping the output
+  globally time-ascending so the parser's ordering assumption holds.
+  (A count that already predicts an overflow skips the doomed fetch and
+  splits up front.)
 - **Floor.** If a window is already `≤ MIN_SPLIT_S` wide and *still*
   overflows a batch (an implausible >5000-line burst in ≤1 s), it can't
   be fetched losslessly; we keep what we got and flag the pod rather than
@@ -231,8 +383,11 @@ the whole tree is flushed once at startup (see *Schema-version flush*).
 `.partial` is written before pods are enumerated and removed after
 the last pod file is on disk. A crashed/Ctrl-C'd fetch leaves the
 flag in place, and `fetchAll` then refuses to treat the directory as
-a cache hit even if `_meta.json` is somehow present. There's no
-automatic recovery — re-run with `--force-refresh` to overwrite.
+a cache hit even if `_meta.json` is somehow present. Nothing sweeps
+stale flags, but nothing needs to: the next request for that same
+window finds no usable cache and re-fetches over it, clearing the flag.
+`--force-refresh` is only needed when a *superset* window would be
+reused instead, so the flagged directory is never revisited.
 
 ## Per-cache sidecars
 
@@ -243,21 +398,42 @@ automatic recovery — re-run with `--force-refresh` to overwrite.
   best-effort by `markCacheViewed`; absent caches are treated as
   "never opened" (epoch zero) for LRU purposes.
 
-- **`_exposure_ids.txt`** — exposure caches only. Ascending list of
-  the dataIds that have ever triggered a fetch landing on this
-  cache. One window can serve many dataIds via superset reuse, and
-  the `/api/cache` listing surfaces all of them as clickable
-  shortcuts. Written by `addExposureToCache`; deduped and sorted on
-  every write. The on-demand cache rebuild path in `/api/summary`
-  uses this file to map a deep-linked dataId back to its cache
-  window without needing the in-memory state to already exist.
+- **`_exposure_ids.txt`** — exposure caches only. One
+  `<instrument>:<dataId>` per line, ascending by id: the exposures
+  that have ever triggered a fetch landing on this cache. One window
+  can serve many of them via superset reuse, and the `/api/cache`
+  listing surfaces all of them as clickable shortcuts. Written by
+  `addExposureToCache`; deduped and sorted on every write. The
+  on-demand cache rebuild path in `/api/summary` uses this file to map
+  a deep-linked exposure back to its cache window without needing the
+  in-memory state to already exist.
 
-- **`_range.txt`** — range caches only. Two lines, `startId` then
-  `stopId`. Written by `markCacheRange` when a range fetch completes.
-  This is the sole marker that tells the `/api/cache` listing to label
-  the window `kind: "range"` (rather than `"exposure"`) and deep-link
-  it back to `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it
-  to rehydrate a `RangeState` from disk on a reload / deep link.
+  The instrument is recorded because a bare id doesn't name an
+  exposure (see *dataId / expId* in
+  [architecture.md](architecture.md#key-concepts)), so without it
+  neither consumer can tell which run this window holds: the listing's
+  link would open the twin, and the rebuild path would have only the
+  t₀-containment check to go on — which a widened window that spans
+  *both* instruments' shutter closes doesn't settle. A window really
+  can hold both, so both entries are kept; the rebuild path takes the
+  pin as the first filter and still requires the pinned t₀ to fall
+  inside the window. A line without an instrument is skipped, not
+  guessed at: the flush is the upgrade path (see *No backwards
+  compatibility*).
+
+- **`_range.txt`** — range caches only. Three lines: `startId`,
+  `stopId`, then the `instrument` the range was fetched under. Written
+  by `markCacheRange` when a range fetch completes. This is the sole
+  marker that tells the `/api/cache` listing to label the window
+  `kind: "range"` (rather than `"exposure"`) and deep-link it back to
+  `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it to
+  rehydrate a `RangeState` from disk on a reload / deep link, and the
+  recorded instrument re-pins the rebuilt state's shutter-close
+  lookups — a range is a run of *one* instrument's exposures, and a
+  bare lookup on a colliding id would anchor that exposure to the
+  other instrument's t₀. Three lines is the *only* format: a shorter
+  file is malformed and the dir simply isn't a range cache (see *No
+  backwards compatibility* below).
 
 ## LRU eviction (size cap)
 
@@ -266,9 +442,13 @@ viewed caches until the on-disk total is at or below `maxBytes`,
 exempting whichever caches the caller passes in (the just-fetched
 one, typically).
 
-- The default `maxBytes` lives in `appSettings.json`'s
-  `maxCacheBytes` field (5 GiB by default). The user can change it
-  via `PUT /api/settings`.
+- `maxBytes` is `config.MAX_CACHE_BYTES`, from
+  `$RA_LOG_EXPLORER_MAX_CACHE_BYTES` (5 GiB if unset). Deployed, the
+  chart derives it from the size of the volume provisioned for the cache
+  rather than setting it separately, so the app cannot come to believe it
+  has more room than the PVC actually gives it. It is not settable at
+  runtime and there is no UI for it — see
+  [architecture.md](architecture.md#configuration).
 - Order: `(last-viewed ASC, dir name)`. Caches without a
   `_last_viewed.txt` sidecar are treated as oldest — they've never
   been opened, so they're the safest to drop.
@@ -277,6 +457,15 @@ one, typically).
   over-cap states during a fetch are acceptable.
 - Empty per-cluster, per-namespace, and (for night mode) per-window
   parent directories are pruned as their child windows go away.
+- **Not everything on the volume is evictable.** The total is measured
+  over the whole tree, but only directories carrying a `_meta.json` are
+  candidates — so the in-progress live night (which has none until
+  finalisation) and `exposure-times/` count against the cap without
+  ever being reclaimable. Eviction makes one pass and stops, so a cap
+  set below that floor doesn't spin; it just evicts every *other*
+  window and stays over. With live mode on, leave the cap comfortably
+  above one night's ~9 GiB, which is what deriving it from the volume
+  size already does.
 
 ## What's stable across reruns
 
@@ -307,12 +496,28 @@ one, typically).
 
 - When disk pressure matters above the configured cap. (Below the
   cap, LRU eviction handles it automatically.) Each exposure
-  window is roughly 40–50 MiB; a night cache is GiB-scale.
+  window is roughly 40–50 MiB; a live-built all-pods night is ~9 GiB
+  (measured: 35.7M lines / 576 pods for dayObs 20260711), of which
+  ~8.7 GiB is the 378 SFM workers — so an AOS night cache, which
+  excludes them, is a few hundred MiB rather than GiB-scale.
 
 Cache management lives in both the CLI (`python3 -m
-ra_log_explorer.cli cache info|flush`) and the home page in the
-browser (cache table with per-row ✕ delete, plus a "delete all"
-button).
+ra_log_explorer.cli cache info|flush`) and the browser's admin view at
+`/?admin=1` (the cached-windows table, with a per-row ✕ delete and a
+"flush entire cache" button).
+
+Every path that removes cache trees — the browser deletes, LRU
+eviction, `cache flush`, and the schema-version flush alike — unlinks
+every `_live.json` under the target *before* removing the tree. A
+partial delete is a real possibility — the poller may be creating files
+in there as `rmtree` walks it, and a request thread slicing out of it
+touches its `_last_viewed.txt` — and
+one that took the pod files but left the sidecar is worse than either
+clean outcome: the poller's intactness check would pass, it would
+resume appending to files that now begin mid-night, and every slice cut
+from them would be short while claiming to be whole. Without the
+sidecar a half-deleted night is simply not a live night dir, and the
+poller opens it again from scratch.
 
 ## The exposure-time cache
 
@@ -340,15 +545,38 @@ id that also exists on the summit, with a completely different record.
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
 
+Unlike the window caches this file is *not* disposable, so it is the one
+thing here written with care: every merge takes a process-wide lock and
+lands via a temp file and `os.replace`. Several threads write it in a
+deployed process — request threads resolving a dataId, a fetch job's
+night/range prefetch, the live poller's per-tick exposure list — and two
+of them interleaving a truncate and a write leave a file that parses as
+nothing at all. A re-queryable ConsDB row would survive that; a
+`_manual` stand-in exists nowhere else, so a hand-typed shutter close
+would be gone for good.
+
+Within a site it is keyed **twice**, because an id isn't unique there
+either — `SSSSS` is a per-instrument sequence number, so LSSTCam and
+LATISS share ids on any night both observe:
+
+- `"<instrument>:<id>"` — the unambiguous entry. An instrument-scoped
+  lookup accepts only this key; falling back to the bare one would
+  return a different exposure that happens to share the id.
+- `"<id>"` — the *probe-order* entry: what an unqualified lookup
+  resolves to, i.e. whichever of `INSTRUMENTS_BY_PROBE_ORDER` has the
+  row first. Only writers that resolved the id that way may write it
+  (`storeCachedRecord[s]`'s `bareKey`, `storeCachedRecordList`'s
+  `probeOrderWinners`), so the same dataId can't answer differently
+  depending on who wrote last.
+
 The lookup is best-effort: a corrupt JSON file, an unexpected schema,
 or an unusable value all return `None` from `lookupCachedRecord` and
 fall through to a fresh ConsDB query (which then overwrites the bad
-record). A legacy entry written by the pre-record format (a bare
-`obs_end` string per dataId) is read back as a 1-field record, so an
-existing cache keeps resolving t-zeros across the upgrade — the richer
-columns just backfill on the next fresh query. The store path is the
-same on every cache hit, miss, and batch-resolve, so `rm -r
-<cache_root>/exposure-times/` is the nuclear reset.
+record). There is exactly one entry shape — a record object; anything
+else is a miss, never interpreted (see *No backwards compatibility*
+below). The store path is the same on every cache hit, miss, and
+batch-resolve, so `rm -r <cache_root>/exposure-times/` is the nuclear
+reset.
 
 ## Future: cleaner subset semantics
 

@@ -10,9 +10,10 @@ These tests exist because the routing + body parsing + SSE handler in
 
 from __future__ import annotations
 
+import datetime as dt
 import http.client
 import json
-import os
+import shutil
 import socket
 import threading
 import time
@@ -22,8 +23,9 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import exposureTimes
+from ra_log_explorer import config, exposureTimes
 from ra_log_explorer import jobs as jobsModule
+from ra_log_explorer import parse
 from ra_log_explorer import server as serverModule
 from ra_log_explorer import sites as sitesModule
 from ra_log_explorer.config import FetchSpec
@@ -56,7 +58,7 @@ def runningServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterato
     ctx = ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
     handler = _makeHandler(ctx)
     port = _freePort()
@@ -82,6 +84,17 @@ def _get(host: str, port: int, path: str) -> tuple[int, dict]:
     except json.JSONDecodeError:
         parsed = {"_raw": body}
     return resp.status, parsed
+
+
+def _getBytes(host: str, port: int, path: str) -> tuple[int, str, bytes]:
+    """Status, Content-Type and raw body — for assets `_get` would choke on."""
+    conn = http.client.HTTPConnection(host, port, timeout=2.0)
+    conn.request("GET", path)
+    resp = conn.getresponse()
+    body = resp.read()
+    contentType = resp.getheader("Content-Type") or ""
+    conn.close()
+    return resp.status, contentType, body
 
 
 def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
@@ -478,6 +491,107 @@ def test_range_summary_index_and_per_dataId(runningServer: RunningServer, tmpCac
     assert status == 404
 
 
+def _seedRange(ctx: ServerContext, cacheDir: Path, instrument: str, base: dt.datetime) -> None:
+    """Put a two-exposure range state in the context under ``instrument``."""
+    import datetime as _dt
+
+    from ra_log_explorer.server import RangeState
+
+    (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+    state = RangeState(
+        cacheDir=cacheDir,
+        cacheBytes=0,
+        meta={},
+        summaries=[],
+        startId=2026051900010,
+        stopId=2026051900012,
+        fromTime=base,
+        toTime=base + _dt.timedelta(seconds=300),
+        instrument=instrument,
+    )
+    state.shutterCloseByExpId = {2026051900010: base, 2026051900012: base + _dt.timedelta(seconds=20)}
+    with ctx.jobs.stateLock:
+        ctx.putRangeState(state)
+
+
+def test_range_summary_refuses_a_span_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The range key is the bare [startId, stopId] span, which both
+    instruments share — comparing the same seq-number span across
+    instruments is a normal thing to do, and the second tab's fetch
+    overwrites the first's slot. Serving it would hand back a different
+    set of exposures anchored at shutter closes an hour away, with
+    nothing on the page to say so."""
+    import datetime as _dt
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    _seedRange(ctx, tmpCacheRoot / "range-lsstcam", "lsstcam", base)
+
+    qs = "rangeStart=2026051900010&rangeStop=2026051900012"
+    # Matching pin: served.
+    status, body = _get(host, port, f"/api/summary?{qs}&instrument=lsstcam")
+    assert status == 200 and body["loaded"] is True and body["instrument"] == "lsstcam"
+    # Other instrument's pin: not this range. Nothing on disk to rebuild
+    # from either, so the honest answer is "not loaded" — never the
+    # LSSTCam span dressed up as LATISS.
+    status, body = _get(host, port, f"/api/summary?{qs}&instrument=latiss")
+    assert status == 200 and body["loaded"] is False
+    # Unknown name is rejected outright rather than silently unpinned.
+    assert _get(host, port, f"/api/summary?{qs}&instrument=hubble")[0] == 400
+
+
+def test_range_pod_refuses_a_span_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Same guard on the pod-detail route: a mismatch 404s rather than
+    returning the twin span's log lines."""
+    import datetime as _dt
+    import json as _json
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    cacheDir = tmpCacheRoot / "range-lsstcam-pod"
+    (cacheDir / "pods").mkdir(parents=True)
+    podName = "s-lsstcam-run-sfm-runner-workerset-0"
+    (cacheDir / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-05-20T08:45:40.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "an lsstcam log line\n",
+            }
+        )
+        + "\n"
+    )
+    _seedRange(ctx, cacheDir, "lsstcam", base)
+    qs = "rangeStart=2026051900010&rangeStop=2026051900012&dataId=2026051900010"
+    assert _get(host, port, f"/api/pod/{podName}?{qs}&instrument=lsstcam")[0] == 200
+    assert _get(host, port, f"/api/pod/{podName}?{qs}&instrument=latiss")[0] == 404
+
+
+def test_range_exposure_payload_carries_its_instrument_into_podDetailQuery(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The client appends podDetailQuery verbatim to /api/pod/<pod>, so
+    the pin has to be in it — otherwise every pod-detail click in a range
+    view is an unpinned request against a shared key."""
+    import datetime as _dt
+
+    host, port, ctx = runningServer
+    base = _dt.datetime(2026, 5, 20, 8, 45, 39, tzinfo=_dt.timezone.utc)
+    _seedRange(ctx, tmpCacheRoot / "range-latiss", "latiss", base)
+    status, body = _get(
+        host,
+        port,
+        "/api/summary?rangeStart=2026051900010&rangeStop=2026051900012"
+        "&dataId=2026051900010&instrument=latiss",
+    )
+    assert status == 200, body
+    assert "instrument=latiss" in body["podDetailQuery"]
+
+
 def test_range_summary_unloaded_when_unknown(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/summary?rangeStart=1&rangeStop=2")
@@ -567,7 +681,7 @@ def test_cache_list_includes_range_kind(runningServer: RunningServer, tmpCacheRo
             }
         )
     )
-    markCacheRange(d, 2026051900722, 2026051900750)
+    markCacheRange(d, 2026051900722, 2026051900750, instrument="lsstcam")
     status, body = _get(host, port, "/api/cache")
     assert status == 200
     rows = [w for w in body["windows"] if w["kind"] == "range"]
@@ -628,14 +742,20 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
             }
         )
     )
-    markCacheRange(window, startId, stopId)
+    markCacheRange(window, startId, stopId, instrument="lsstcam")
     # Only start + stop were ever resolved into the per-site cache (the
-    # original fetch had no token for the middle id, say).
+    # original fetch had no token for the middle id, say). Stamped with
+    # their instrument, as the pinned prefetch stores them — the rebuild's
+    # pinned lookups accept only the instrument-scoped key.
     exposureTimes.storeCachedRecord(
-        startId, {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science"}, siteName="summit"
+        startId,
+        {"obs_end": "2026-05-20T08:46:16.267000", "img_type": "science", "instrument": "lsstcam"},
+        siteName="summit",
     )
     exposureTimes.storeCachedRecord(
-        stopId, {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science"}, siteName="summit"
+        stopId,
+        {"obs_end": "2026-05-20T08:46:36.267000", "img_type": "science", "instrument": "lsstcam"},
+        siteName="summit",
     )
 
     # Fresh server: nothing loaded in memory, so this must rebuild from disk.
@@ -645,6 +765,7 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     assert body["loaded"] is True
     assert body["mode"] == "range"
     assert body["site"] == "summit"  # derived from the yagan cluster path component
+    assert body["instrument"] == "lsstcam"  # read back from _range.txt
     assert body["nMissing"] == 1  # 723 had no cached shutter close
     assert [d["expId"] for d in body["dataIds"]] == [startId, stopId]
     # The curated record stored in the per-site cache rode through the
@@ -689,43 +810,34 @@ def _ctxWithSites(siteCatalog: FakeSiteCatalog) -> ServerContext:
     return ServerContext(
         jobs=JobManager(),
         sites=siteCatalog.catalog,
-        defaultSiteName=siteCatalog.defaultName,
+        siteName=siteCatalog.defaultName,
     )
 
 
 def test_buildSpecFromRequest_TAI_default(siteCatalog: FakeSiteCatalog) -> None:
     ctx = _ctxWithSites(siteCatalog)
-    spec, site, expId, tZero, password = serverModule._buildSpecFromRequest(
+    spec, site, expId, tZero, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267"}
     )
     assert expId == 1
     # 37s TAI->UTC adjustment applied by default
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
-    # `site` defaults to the catalog's default_site (summit).
     assert site.name == "summit"
     assert spec.cluster == "yagan"
     assert spec.namespace == "rapid-analysis"
-    assert password is None
 
 
-def test_buildSpecFromRequest_uses_named_site(siteCatalog: FakeSiteCatalog) -> None:
-    """An explicit ``site`` field overrides the catalog default. This is
-    the only knob clients have for picking the cluster now — we don't
-    accept cluster/namespace/lokiAddr in the body any more."""
+def test_buildSpecFromRequest_ignores_a_site_in_the_body(siteCatalog: FakeSiteCatalog) -> None:
+    """The cluster is decided by where this server runs, not by the
+    request. Honouring a body-supplied site would let a summit deployment
+    hand back BTS logs — worse than an error, because the same dataId
+    exists on both and the answer would look plausible."""
     ctx = _ctxWithSites(siteCatalog)
     spec, site, _, _, _ = serverModule._buildSpecFromRequest(
         ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "bts"}
     )
-    assert site.name == "bts"
-    assert spec.cluster == "manke"
-
-
-def test_buildSpecFromRequest_rejects_unknown_site(siteCatalog: FakeSiteCatalog) -> None:
-    ctx = _ctxWithSites(siteCatalog)
-    with pytest.raises(ValueError, match="No site"):
-        serverModule._buildSpecFromRequest(
-            ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "site": "ghost"}
-        )
+    assert site.name == "summit"
+    assert spec.cluster == "yagan"
 
 
 def test_buildSpecFromRequest_UTC_opt_out(siteCatalog: FakeSiteCatalog) -> None:
@@ -737,12 +849,24 @@ def test_buildSpecFromRequest_UTC_opt_out(siteCatalog: FakeSiteCatalog) -> None:
     assert tZero.hour == 8 and tZero.minute == 45 and tZero.second == 39
 
 
-def test_buildSpecFromRequest_password_passthrough(siteCatalog: FakeSiteCatalog) -> None:
+def test_buildSpecFromRequest_ignores_credentials_and_workers(siteCatalog: FakeSiteCatalog) -> None:
+    """Credentials and the worker count are the service's configuration.
+    A body supplying its own must be ignored: LOKI_PASSWORD is
+    process-global, so one browser's wrong password would otherwise break
+    fetches for every other user of the deployment."""
     ctx = _ctxWithSites(siteCatalog)
-    _, _, _, _, password = serverModule._buildSpecFromRequest(
-        ctx, {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "password": "hunter2"}
+    spec, _, _, _, _ = serverModule._buildSpecFromRequest(
+        ctx,
+        {
+            "exposureId": 1,
+            "tZero": "2026-05-20T08:46:16.267",
+            "password": "hunter2",
+            "username": "someone-else",
+            "workers": 999,
+        },
     )
-    assert password == "hunter2"
+    assert spec.username == serverModule.DEFAULT_USERNAME
+    assert spec.workers == serverModule.DEFAULT_WORKERS
 
 
 def test_buildSpecFromRequest_rejects_missing_expId(siteCatalog: FakeSiteCatalog) -> None:
@@ -901,38 +1025,29 @@ def test_exposure_time_writes_to_cache_on_consdb_hit(
     assert cached["img_type"] == "science"  # the richer columns landed too
 
 
-def test_exposure_time_picks_site_from_query_param(
+def test_exposure_time_ignores_a_site_query_param(
     runningServer: RunningServer,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     siteCatalog: FakeSiteCatalog,
 ) -> None:
-    """``?site=bts`` redirects the lookup at the BTS ConsDB + token file
-    AND writes the resolved value into the bts cache. Without the
-    explicit site, the server would fall back to ``default_site`` (summit)
-    and the BTS lookup would have no path to succeed."""
+    """The lookup goes to the server's own ConsDB whatever the query string
+    says, and the resolved value lands in that site's cache. The same
+    13-digit dataId exists on both BTS and the summit with different
+    obs_end values, so honouring a caller-supplied site would silently
+    cache one observatory's answer under the other's name."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    siteCatalog.writeBtsToken()
+    siteCatalog.writeSummitToken()
     _stubConsdb(monkeypatch, "2026-06-03T00:42:43.632000")
     host, port, _ = runningServer
     status, body = _get(host, port, "/api/exposure-time/2026060200001?site=bts")
     assert status == 200
-    assert body["site"] == "bts"
-    assert body["tZero"] == "2026-06-03T00:42:43.632000"
+    assert body["site"] == "summit"
     assert (
-        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="bts"))
+        exposureTimes.obsEnd(exposureTimes.lookupCachedRecord(2026060200001, siteName="summit"))
         == "2026-06-03T00:42:43.632000"
     )
-    # And NOT under the summit cache — the per-site isolation is the
-    # whole point of this scoping.
-    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="summit") is None
-
-
-def test_exposure_time_400_for_unknown_site(runningServer: RunningServer) -> None:
-    host, port, _ = runningServer
-    status, body = _get(host, port, "/api/exposure-time/2026051900722?site=ghost")
-    assert status == 400
-    assert "No site" in body["error"]
+    assert exposureTimes.lookupCachedRecord(2026060200001, siteName="bts") is None
 
 
 # ----- manual shutter-close stand-ins --------------------------------------
@@ -1065,24 +1180,26 @@ def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     assert loaded.referencePoints[0]["label"] == "shutter close (manual)"
 
 
-def test_sites_endpoint_returns_catalog(runningServer: RunningServer) -> None:
-    """``/api/sites`` exposes the catalog so the UI can render the
-    switcher; token-file paths are stripped because they're server-side
-    only."""
+def test_site_endpoint_returns_the_served_site(runningServer: RunningServer) -> None:
+    """``/api/site`` names the one site this server serves, so the UI can
+    label the page with it. The token-file path is server-side only and
+    must not appear in the payload."""
     host, port, _ = runningServer
-    status, body = _get(host, port, "/api/sites")
+    status, body = _get(host, port, "/api/site")
     assert status == 200
-    assert body["default_site"] == "summit"
-    names = sorted(s["name"] for s in body["sites"])
-    assert names == ["bts", "summit"]
-    for s in body["sites"]:
-        # No token file in the wire payload.
-        assert "consdbTokenFile" not in s
-        assert "tokenFile" not in s
-        assert s["consdbUrl"]
+    assert body["name"] == "summit"
+    assert body["cluster"] == "yagan"
+    assert body["consdbUrl"]
+    assert "consdbTokenFile" not in body
+    assert "tokenFile" not in body
 
 
-# ----- DELETE /api/cache (single + all) -----------------------------------
+def test_sites_endpoint_is_gone(runningServer: RunningServer) -> None:
+    """The plural catalog endpoint existed to populate a site switcher. The
+    switcher is gone — the deployment decides — so nothing should still be
+    serving a list of sites to choose from."""
+    host, port, _ = runningServer
+    assert _get(host, port, "/api/sites")[0] == 404
 
 
 def _plantCacheDir(root: Path, cluster: str, namespace: str, slug: str) -> Path:
@@ -1147,6 +1264,35 @@ def test_delete_night_cache_window_with_encoded_pods_segment(
     assert not nightDir.exists()
 
 
+def test_delete_answers_even_when_the_tree_regrows_mid_delete(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A window being deleted can be written into as it goes: another
+    request thread slicing out of it touches its `_last_viewed.txt`, and
+    `rmtree` then raises ENOTEMPTY. Letting that out of the handler drops
+    the connection with no response at all — the browser reports a network
+    error for a delete that mostly happened."""
+    host, port, _ = runningServer
+    slug = "2026-05-20T084500Z__2026-05-20T085000Z"
+    d = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", slug)
+    realRmtree = shutil.rmtree
+    calls: list[int] = []
+
+    def regrowingRmtree(path: Any, *a: Any, **k: Any) -> None:
+        calls.append(1)
+        realRmtree(path, *a, **k)
+        if len(calls) == 1:
+            Path(path).mkdir(parents=True, exist_ok=True)
+            (Path(path) / "_last_viewed.txt").write_text("2026-05-20T09:00:00+00:00")
+            raise OSError(39, "Directory not empty")
+
+    monkeypatch.setattr(serverModule.shutil, "rmtree", regrowingRmtree)
+    status, body = _delete(host, port, f"/api/cache/yagan/rapid-analysis/{slug}")
+    assert status == 200
+    assert body["windows"] == []
+    assert not d.exists()
+
+
 def test_delete_unknown_cache_window(runningServer: RunningServer) -> None:
     host, port, _ = runningServer
     status, body = _delete(host, port, "/api/cache/yagan/rapid-analysis/nope")
@@ -1175,6 +1321,50 @@ def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> N
     assert body["windows"] == []
     # The root itself should still exist (we recreate it).
     assert tmpCacheRoot.exists()
+
+
+def test_deleting_the_cache_drops_live_sidecars_first(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """A live night dir must never survive a delete with its sidecar but
+    without its pod files.
+
+    The sidecar is what vouches for each pod file's byte range, and the
+    poller's intactness check is "dir and sidecar exist". A tree that
+    lost pod files but kept the sidecar therefore passes that check: the
+    poller resumes appending to files that now start mid-night, the
+    recorded counts exceed the content, and every slice taken from them
+    is short while reporting itself complete. Removing sidecars first
+    makes a partial delete look like a full one, which the poller
+    already handles by re-opening the night.
+    """
+    from ra_log_explorer.fetch import LIVE_SIDECAR_NAME
+
+    host, port, _ctx = runningServer
+    nightDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night__win"
+    (nightDir / "pods").mkdir(parents=True)
+    (nightDir / "pods" / "pod-a.jsonl").write_text("{}\n")
+    (nightDir / LIVE_SIDECAR_NAME).write_text('{"version": 1}')
+
+    # Wedge the tree removal so it fails after _dropLiveSidecars has run
+    # — the partial-delete case this ordering exists for.
+    import shutil as _shutil
+
+    def boom(*_a: object, ignore_errors: bool = False, **_kw: object) -> None:
+        if ignore_errors:
+            return  # real rmtree swallows it; the retry does the same
+        raise OSError(39, "Directory not empty")
+
+    original = _shutil.rmtree
+    _shutil.rmtree = boom  # type: ignore[assignment]
+    try:
+        _delete(host, port, "/api/cache")
+    finally:
+        _shutil.rmtree = original  # type: ignore[assignment]
+
+    # Whatever else survived, the sidecar did not: no half-deleted night
+    # can be mistaken for a resumable one.
+    assert not (nightDir / LIVE_SIDECAR_NAME).exists()
 
 
 def test_night_traceback_endpoint_returns_dataId_block(
@@ -1272,6 +1462,77 @@ def test_night_traceback_endpoint_returns_dataId_block(
     assert not any("warming up" in r for r in rawTexts)
     assert not any("doing the next thing" in r for r in rawTexts)
     assert not any("2026052100013" in r for r in rawTexts)
+
+
+def test_night_traceback_rebuilds_the_night_from_disk(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The drilldown survives its night being evicted.
+
+    Failure rows are the whole point of the night view, and the state
+    behind them is an LRU slot capped at 8. Opening a ninth night — or
+    any window — evicted the first, and every row already on that page
+    then 404'd until the user happened to reload the summary, which is
+    not a connection anyone would make. Every other keyed route already
+    rebuilt from the cache; this one just never tried.
+    """
+    from ra_log_explorer import parse as _parse
+
+    host, port, ctx = runningServer
+    dayObs = 20260521
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night-win" / "pods=__aos__"
+    podsDir = cacheDir / "pods"
+    podsDir.mkdir(parents=True)
+    podName = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    with open(podsDir / f"{podName}.jsonl", "w") as fh:
+        for ts, level, raw in [
+            (
+                "2026-05-21T22:47:00.000+00:00",
+                "info",
+                "2026-05-21 22:47:00,000 worker fn INFO   Running pipeline for 2026052100012 detector 5",
+            ),
+            ("2026-05-21T22:47:10.000+00:00", "error", "Traceback (most recent call last):"),
+            ("2026-05-21T22:47:10.002+00:00", "error", "RuntimeError: bang"),
+        ]:
+            fh.write(
+                json.dumps({"timestamp": ts, "labels": {"detected_level": level}, "line": raw + "\n"}) + "\n"
+            )
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "lokiAddr": "x",
+                    "username": "u",
+                    "cluster": "yagan",
+                    "namespace": "rapid-analysis",
+                    "fromIso": "2026-05-21T12:00:00.000000Z",
+                    "toIso": "2026-05-22T12:00:00.000000Z",
+                    "podRegex": ".*aos.*",
+                    "workers": 8,
+                },
+                "fetched_at": "2026-05-22T15:00:00+00:00",
+                "pod_count": 1,
+                "total_bytes": 0,
+                "errors": {},
+                "fetchSchemaVersion": 5,
+            }
+        )
+    )
+    summary = _parse.summarizeAll(cacheDir)[0]
+    bodyKey = f"{summary.pod}@{summary.tracebacks[0].t.isoformat()}"
+
+    # Nothing loaded: exactly the post-eviction state.
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is None
+
+    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}")
+    assert status == 200, body
+    assert body["expId"] == 2026052100012
+    assert body["excClass"] == "RuntimeError"
+    # And the rebuilt night is resident, so the rest of the page's rows
+    # do not each pay for their own reparse.
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is not None
 
 
 def test_delete_cache_window_clears_loaded_state_if_match(
@@ -1417,128 +1678,6 @@ def test_two_nights_coexist_via_endpoint(runningServer: RunningServer, tmpCacheR
     assert bB["dayObs"] == 20260522
 
 
-def test_settings_get_returns_defaults_then_put_persists(
-    runningServer: RunningServer, tmpCacheRoot: Path
-) -> None:
-    """GET /api/settings returns the current settings; PUT persists changes.
-
-    The cache root is per-test (via tmpCacheRoot), so the first GET sees
-    the default value.
-    """
-    from ra_log_explorer.appSettings import DEFAULT_MAX_CACHE_BYTES
-
-    host, port, _ctx = runningServer
-    status, body = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body["maxCacheBytes"] == DEFAULT_MAX_CACHE_BYTES
-
-    # PUT a new value.
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": 2 * 1024 * 1024 * 1024}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    assert json.loads(text)["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
-
-    # GET reflects the persisted value.
-    status, body = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body["maxCacheBytes"] == 2 * 1024 * 1024 * 1024
-
-
-def test_settings_put_persists_cacheDir_and_resolves_effective_root(
-    runningServer: RunningServer, tmp_path: Path
-) -> None:
-    """``cacheDir`` round-trips through PUT/GET and the server reports
-    the *effective* cache root it'll actually use next — which honours
-    the env-var override over the persisted value.
-    """
-    host, port, _ctx = runningServer
-    target = tmp_path / "my-custom-cache"
-
-    # PUT a custom cacheDir.
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"cacheDir": str(target)}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    body = json.loads(text)
-    assert body["cacheDir"] == str(target)
-    # The env-var override (RA_LOG_EXPLORER_CACHE, set by the fixture)
-    # still wins over the persisted cacheDir, so effectiveCacheRoot
-    # reports the env-var value rather than `target`.
-    assert body["effectiveCacheRoot"] == os.environ["RA_LOG_EXPLORER_CACHE"]
-    # The directory was created on the server's side.
-    assert target.is_dir()
-
-    # GET still reports the persisted value.
-    status, body2 = _get(host, port, "/api/settings")
-    assert status == 200
-    assert body2["cacheDir"] == str(target)
-
-
-def test_settings_put_clears_cacheDir_when_set_to_empty(runningServer: RunningServer, tmp_path: Path) -> None:
-    """Setting ``cacheDir`` to an empty string or null reverts to the
-    default resolution chain — the user can undo a custom override
-    without hand-editing the settings JSON."""
-    host, port, _ctx = runningServer
-
-    # Plant a value, then clear it.
-    for clearer in ("", None):
-        conn = http.client.HTTPConnection(host, port, timeout=2.0)
-        conn.request(
-            "PUT",
-            "/api/settings",
-            body=json.dumps({"cacheDir": str(tmp_path / "first")}),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        resp.read()
-        conn.close()
-        assert resp.status == 200
-
-        conn = http.client.HTTPConnection(host, port, timeout=2.0)
-        conn.request(
-            "PUT",
-            "/api/settings",
-            body=json.dumps({"cacheDir": clearer}),
-            headers={"Content-Type": "application/json"},
-        )
-        resp = conn.getresponse()
-        text = resp.read().decode("utf-8")
-        conn.close()
-        assert resp.status == 200, text
-        assert json.loads(text)["cacheDir"] is None
-
-
-def test_settings_put_rejects_non_integer(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": "five gigs"}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "maxCacheBytes" in text
-
-
 def test_cache_list_includes_lastViewedAt_and_dayObs(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:
@@ -1589,12 +1728,14 @@ def test_cache_list_includes_lastViewedAt_and_dayObs(
     assert w["lastViewedAt"].startswith("2026-05-22T14:00")
 
 
-def test_cache_list_includes_exposureIds_for_exposure_caches(
+def test_cache_list_includes_exposures_for_exposure_caches(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:
-    """An exposure cache row carries the dataIds that triggered fetches
+    """An exposure cache row carries the exposures that triggered fetches
     landing on it, so the UI can render them as deep-links back to the
-    per-visit view."""
+    per-visit view. Each carries its instrument: without it the link is
+    a bare id, which on a colliding id opens the other instrument's
+    exposure — a different image, an hour away."""
     from ra_log_explorer.fetch import addExposureToCache
 
     host, port, _ctx = runningServer
@@ -1624,13 +1765,16 @@ def test_cache_list_includes_exposureIds_for_exposure_caches(
             }
         )
     )
-    addExposureToCache(d, 2026051900722)
-    addExposureToCache(d, 2026051900723)
+    addExposureToCache(d, 2026051900722, "lsstcam")
+    addExposureToCache(d, 2026051900723, "latiss")
     status, body = _get(host, port, "/api/cache")
     assert status == 200
     rows = [w for w in body["windows"] if w["kind"] == "exposure"]
     assert len(rows) == 1
-    assert rows[0]["exposureIds"] == [2026051900722, 2026051900723]
+    assert rows[0]["exposures"] == [
+        {"dataId": 2026051900722, "instrument": "lsstcam"},
+        {"dataId": 2026051900723, "instrument": "latiss"},
+    ]
 
 
 def test_summary_get_bumps_lastViewedAt(runningServer: RunningServer, tmpCacheRoot: Path) -> None:
@@ -1709,6 +1853,60 @@ def test_pod_endpoint_routes_by_dataId_query(runningServer: RunningServer, tmpCa
     assert status == 200, body
     # If the routing worked we got the loaded pod's events back.
     assert body["pod"] == podName
+
+
+def test_pod_endpoint_refuses_a_state_pinned_to_another_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """The same guard /api/summary applies. Two tabs can hold the same
+    bare id under different instruments; the id's in-memory slot then
+    belongs to whichever opened last, and its cache dir is a different
+    window — serving it would hand this tab another exposure's log
+    lines, offset against the wrong shutter close."""
+    import datetime as _dt
+    import json as _json
+
+    from ra_log_explorer import parse as _parse
+
+    host, port, ctx = runningServer
+    cd = tmpCacheRoot / "cache-latiss"
+    (cd / "pods").mkdir(parents=True)
+    podName = "s-latiss-run-sfm-runner-workerset-0"
+    (cd / "pods" / f"{podName}.jsonl").write_text(
+        _json.dumps(
+            {
+                "timestamp": "2026-07-12T05:25:00.000+00:00",
+                "labels": {"detected_level": "info"},
+                "line": "a latiss log line\n",
+            }
+        )
+        + "\n"
+    )
+    with ctx.jobs.stateLock:
+        ctx.putExposureState(
+            serverModule.ServerState(
+                cacheDir=cd,
+                cacheBytes=0,
+                meta={},
+                summaries=_parse.summarizeAll(cd),
+                expId=445,
+                tZero=_dt.datetime(2026, 7, 12, 5, 24, tzinfo=_dt.timezone.utc),
+                instrument="latiss",
+            )
+        )
+    # The matching pin — and the unpinned form, which stays a real
+    # feature (the bare-id view) — are both served.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=latiss")
+    assert status == 200 and body["pod"] == podName
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445")
+    assert status == 200 and body["pod"] == podName
+    # The other instrument's pin: same bare id, different exposure — 404,
+    # never the loaded state's lines.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=lsstcam")
+    assert status == 404
+    # An unknown name is a 400, not a silent bare-id answer.
+    status, body = _get(host, port, f"/api/pod/{podName}?dataId=445&instrument=hubble")
+    assert status == 400
 
 
 # ----- /api/summary error branches ---------------------------------------
@@ -1886,67 +2084,6 @@ def test_cache_delete_404_for_unknown_window(runningServer: RunningServer, tmpCa
     host, port, _ctx = runningServer
     status, _ = _delete(host, port, "/api/cache/yagan/rapid-analysis/2099-01-01T000000Z__2099-01-01T000100Z")
     assert status == 404
-
-
-# ----- /api/settings PUT validation ---------------------------------------
-
-
-def test_settings_put_with_empty_body_is_a_no_op(runningServer: RunningServer) -> None:
-    """PUT /api/settings now accepts partial updates — touching maxCacheBytes
-    alone must not clobber a previously-set cacheDir, and vice versa. The
-    degenerate case of an empty body is therefore a successful no-op that
-    returns whatever's currently persisted."""
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 200, text
-    body = json.loads(text)
-    assert "maxCacheBytes" in body
-    assert "cacheDir" in body
-    assert "effectiveCacheRoot" in body
-
-
-def test_settings_put_rejects_negative_value(runningServer: RunningServer) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=json.dumps({"maxCacheBytes": -1}),
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "non-negative" in text or "negative" in text
-
-
-def test_settings_put_rejects_bad_json_body(runningServer: RunningServer) -> None:
-    host, port, _ctx = runningServer
-    conn = http.client.HTTPConnection(host, port, timeout=2.0)
-    conn.request(
-        "PUT",
-        "/api/settings",
-        body=b"{this is not json",
-        headers={"Content-Type": "application/json"},
-    )
-    resp = conn.getresponse()
-    text = resp.read().decode("utf-8")
-    conn.close()
-    assert resp.status == 400
-    assert "JSON" in text or "json" in text
-
-
-# ----- _prefetchNightShutterCloses signalling ----------------------------
 
 
 def _aosPodSummary(expId: int) -> Any:
@@ -2249,3 +2386,677 @@ def test_prefetchNightShutterCloses_short_circuits_when_nothing_needs_lookup(
     _prefetchNightShutterCloses(state, [summary], job, summit)
     shutterEvents = [ev for ev in job.events if ev.get("type") == "shutter-close"]
     assert shutterEvents == []
+
+
+# ----- base path ----------------------------------------------------------
+
+
+@pytest.fixture
+def mountedServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterator[RunningServer]:
+    """Same server, mounted under ``/log-explorer`` — how it is deployed
+    behind a Gafaelfawr ingress that shares a hostname with the rest of
+    the RSP."""
+    from http.server import ThreadingHTTPServer
+
+    ctx = ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        siteName=siteCatalog.defaultName,
+        basePath="/log-explorer",
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield "127.0.0.1", httpd.server_address[1], ctx
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=2.0)
+
+
+def test_healthz_answers_at_the_root(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _get(host, port, "/healthz")
+    assert status == 200
+    assert body["status"] == "ok"
+
+
+def test_healthz_answers_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The readiness probe hits the prefixed path; if this 404s the pod
+    never becomes Ready and the deployment wedges."""
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/healthz")
+    assert status == 200
+    assert body["status"] == "ok"
+
+
+def test_api_routes_under_the_base_path(mountedServer: RunningServer) -> None:
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/api/summary")
+    assert status == 200
+    assert body["loaded"] is False
+
+
+def test_unprefixed_paths_404_when_mounted(mountedServer: RunningServer) -> None:
+    """Requests outside the base path belong to some other app on the same
+    hostname; answering them would be wrong even though we can."""
+    host, port, _ctx = mountedServer
+    assert _get(host, port, "/api/summary")[0] == 404
+    assert _get(host, port, "/healthz")[0] == 404
+    assert _get(host, port, "/log-explorer-other/api/summary")[0] == 404
+
+
+def test_index_is_served_with_and_without_a_trailing_slash(mountedServer: RunningServer) -> None:
+    """Ingress passes ``/log-explorer`` through verbatim, so the bare
+    prefix has to render the app rather than 404."""
+    host, port, _ctx = mountedServer
+    for path in ("/log-explorer", "/log-explorer/"):
+        status, body = _get(host, port, path)
+        assert status == 200, path
+        assert "<title>Summit Log Explorer</title>" in body["_raw"], path
+
+
+def test_the_page_is_named_after_the_site_it_serves(siteCatalog: "FakeSiteCatalog") -> None:
+    """One process serves one cluster, so the name is the server's to
+    decide and not the visitor's. The BTS instance has to say Base and
+    the summit one Summit — in the tab, where somebody with both open
+    tells them apart, as much as on the page.
+    """
+    from http.server import ThreadingHTTPServer
+
+    for siteName, expected in (("summit", "Summit Log Explorer"), ("bts", "Base Log Explorer")):
+        ctx = ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteName)
+        httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+        t = threading.Thread(target=httpd.serve_forever, daemon=True)
+        t.start()
+        try:
+            _status, body = _get("127.0.0.1", httpd.server_address[1], "/")
+            html = body["_raw"]
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+            t.join(timeout=2.0)
+        assert f"<title>{expected}</title>" in html, siteName
+        assert html.count(f"<strong>{expected}</strong>") == 4, f"{siteName}: every view's topbar names it"
+        assert "Rapid Analysis" not in html, "the page no longer claims a pipeline"
+
+
+def test_index_substitutes_the_base_path_into_asset_urls(mountedServer: RunningServer) -> None:
+    """Every URL the page asks for must carry the prefix; a leftover
+    ``__BASE_PATH__`` or a bare ``/static/`` means a blank page in the
+    browser."""
+    host, port, _ctx = mountedServer
+    _status, body = _get(host, port, "/log-explorer/")
+    html = body["_raw"]
+    assert "__BASE_PATH__" not in html
+    assert "__APP_TITLE__" not in html
+    assert 'src="/log-explorer/static/app.js"' in html
+    assert 'href="/log-explorer/static/style.css"' in html
+    assert 'window.BASE_PATH = "/log-explorer";' in html
+    assert 'src="/static/' not in html
+
+
+def test_index_at_the_root_has_no_prefix(runningServer: RunningServer) -> None:
+    """The local, unprefixed run is the common case; the substitution must
+    collapse to plain absolute paths rather than leaving a stray slash."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert "__BASE_PATH__" not in html
+    assert 'src="/static/app.js"' in html
+    assert 'window.BASE_PATH = "";' in html
+
+
+def test_post_and_delete_also_honour_the_base_path(mountedServer: RunningServer) -> None:
+    """Routing is per-method, so a prefix stripped in do_GET but not in
+    do_POST would leave the fetch button dead in the deployed app."""
+    host, port, _ctx = mountedServer
+    # A bad body proves the route was reached (400), not that it 404'd.
+    assert _post(host, port, "/log-explorer/api/fetch", {})[0] == 400
+    assert _post(host, port, "/api/fetch", {})[0] == 404
+    assert _delete(host, port, "/log-explorer/api/cache")[0] == 200
+    assert _delete(host, port, "/api/cache")[0] == 404
+
+
+def test_index_has_no_configuration_fields(runningServer: RunningServer) -> None:
+    """Credentials, worker count, cache size and cache location are all
+    deployment configuration read from the environment. A field for any of
+    them in a shared deployment would let one visitor change how the
+    service behaves for everyone else."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    for name in ('name="username"', 'name="password"', 'name="workers"', 'name="cacheDir"'):
+        assert name not in html, name
+    assert "creds-form" not in html
+    assert "settings-form" not in html
+
+
+def test_index_seeds_the_window_fields_from_the_server(runningServer: RunningServer) -> None:
+    """The window fields stay editable — widening a window mid-investigation
+    is a real workflow — but where they start is the deployment's call."""
+    host, port, _ctx = runningServer
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert "__WINDOW_BEFORE__" not in html
+    assert "__WINDOW_AFTER__" not in html
+    assert 'name="windowBefore" value="5"' in html
+    assert 'name="windowAfter" value="300"' in html
+
+
+@pytest.fixture
+def nestedServer(tmpCacheRoot: Path, siteCatalog: "FakeSiteCatalog") -> Iterator[RunningServer]:
+    """A server under a two-segment prefix.
+
+    `/log-explorer` is one path component, so a single-component prefix
+    would pass a router that only ever compared the first segment.
+    """
+    from http.server import ThreadingHTTPServer
+
+    ctx = ServerContext(
+        jobs=JobManager(),
+        sites=siteCatalog.catalog,
+        siteName=siteCatalog.defaultName,
+        basePath="/tools/log-explorer",
+    )
+    httpd = ThreadingHTTPServer(("127.0.0.1", _freePort()), _makeHandler(ctx))
+    t = threading.Thread(target=httpd.serve_forever, daemon=True)
+    t.start()
+    try:
+        yield "127.0.0.1", httpd.server_address[1], ctx
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+        t.join(timeout=2.0)
+
+
+def test_static_assets_are_served_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The HTML asks for prefixed asset URLs; the router has to answer
+    them. If it doesn't, the page loads and then renders nothing, which
+    looks like an application bug rather than a routing one."""
+    host, port, _ctx = mountedServer
+    for asset in ("app.js", "home.js", "explore.js", "night.js", "range.js", "style.css"):
+        status, body = _get(host, port, f"/log-explorer/static/{asset}")
+        assert status == 200, asset
+        assert body["_raw"].strip(), asset
+    # And not outside the prefix.
+    assert _get(host, port, "/static/app.js")[0] == 404
+
+
+def test_the_images_are_served_as_images(mountedServer: RunningServer) -> None:
+    """The tab icon and the topbar logo are the only binary assets here.
+    Served with the wrong Content-Type a browser refuses to draw them, and
+    the failure is a missing picture with nothing in the log to say why."""
+    host, port, _ctx = mountedServer
+    for asset in ("favicon.png", "logo.png"):
+        status, contentType, body = _getBytes(host, port, f"/log-explorer/static/{asset}")
+        assert status == 200, asset
+        assert contentType == "image/png", (asset, contentType)
+        assert body.startswith(b"\x89PNG\r\n\x1a\n"), asset
+
+
+def test_the_static_route_cannot_be_talked_into_serving_an_absolute_path(
+    mountedServer: RunningServer, tmp_path: Path
+) -> None:
+    """``/static//etc/passwd`` must 404, not read the filesystem.
+
+    ``Path("static") / "/etc/passwd"`` discards the left operand, so a
+    guard that only rejects ``..`` segments leaves every readable file
+    exposed. Deployed, the worst of them is ``/proc/self/environ``: the
+    process holds ``LOKI_PASSWORD``, so this would hand the Loki service
+    account's password to anyone who got through Gafaelfawr.
+    """
+    host, port, _ctx = mountedServer
+    secret = tmp_path / "token.txt"
+    secret.write_text("super-secret-loki-password")
+    for path in (
+        f"/log-explorer/static/{secret}",  # absolute -> "/static//tmp/..."
+        "/log-explorer/static//etc/hosts",
+        "/log-explorer/static/../ra_log_explorer/config.py",
+        "/log-explorer/static/%2e%2e/config.py",
+    ):
+        status, body = _get(host, port, path)
+        assert status == 404, path
+        assert "secret" not in body.get("_raw", ""), path
+    # The ordinary case still works.
+    assert _get(host, port, "/log-explorer/static/app.js")[0] == 200
+
+
+def test_base_path_survives_a_query_string(mountedServer: RunningServer) -> None:
+    """The prefix is stripped from the path only. Stripping it off the
+    whole request line would take the query with it and silently turn a
+    keyed lookup into a home-view response."""
+    host, port, _ctx = mountedServer
+    status, body = _get(host, port, "/log-explorer/api/summary?dataId=2026051900722")
+    assert status == 200
+    assert body["loaded"] is False  # answered the keyed form, not an error
+
+
+def test_multi_segment_base_path(nestedServer: RunningServer) -> None:
+    """A prefix can be more than one path component."""
+    host, port, _ctx = nestedServer
+    assert _get(host, port, "/tools/log-explorer/healthz")[0] == 200
+    assert _get(host, port, "/tools/log-explorer/api/summary")[0] == 200
+    _s, body = _get(host, port, "/tools/log-explorer/")
+    assert 'src="/tools/log-explorer/static/app.js"' in body["_raw"]
+    # Partial prefixes belong to somebody else.
+    assert _get(host, port, "/tools/healthz")[0] == 404
+    assert _get(host, port, "/log-explorer/healthz")[0] == 404
+
+
+def test_healthz_is_unaffected_by_a_running_fetch(
+    mountedServer: RunningServer, monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path
+) -> None:
+    """The probe must keep answering while a fetch is in flight. If a
+    long fetch could make it fail, Kubernetes would pull the only pod out
+    of the Service mid-investigation — the one moment it must not."""
+    host, port, _ctx = mountedServer
+    started = threading.Event()
+    release = threading.Event()
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Any = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        started.set()
+        release.wait(timeout=10.0)
+        cacheDir = tmpCacheRoot / "slow"
+        (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, _ = _post(
+        host,
+        port,
+        "/log-explorer/api/fetch",
+        {"exposureId": 2026051900722, "tZero": "2026-05-20T08:46:16.267"},
+    )
+    assert status == 202
+    assert started.wait(timeout=5.0), "fetch worker never started"
+    try:
+        # Mid-fetch, with the worker thread parked inside fetchAll.
+        probeStatus, probeBody = _get(host, port, "/log-explorer/healthz")
+        assert probeStatus == 200
+        assert probeBody["status"] == "ok"
+    finally:
+        release.set()
+
+
+def test_sse_progress_is_reachable_under_the_base_path(mountedServer: RunningServer) -> None:
+    """The progress stream is the one endpoint the browser holds open for
+    minutes; a prefix bug here shows up as a fetch that appears to hang."""
+    host, port, _ctx = mountedServer
+    assert _get(host, port, "/log-explorer/api/fetch/deadbeef/progress")[0] == 404
+    assert _get(host, port, "/api/fetch/deadbeef/progress")[0] == 404
+    assert _get(host, port, "/log-explorer/api/fetch/deadbeef/status")[0] == 404
+
+
+def test_index_window_fields_track_the_configured_defaults(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deployment sets the starting window through the environment;
+    what the form offers has to follow it, or the value in the chart is
+    decorative."""
+    host, port, _ctx = runningServer
+    monkeypatch.setattr(serverModule, "DEFAULT_WINDOW_BEFORE_S", 12.5)
+    monkeypatch.setattr(serverModule, "DEFAULT_WINDOW_AFTER_S", 900.0)
+    _status, body = _get(host, port, "/")
+    html = body["_raw"]
+    assert 'name="windowBefore" value="12.5"' in html
+    # A whole number renders without a trailing ".0" — a spinner showing
+    # "900" reads as the default it is, "900.0" reads as fiddled-with.
+    assert 'name="windowAfter" value="900"' in html
+
+
+def test_exposure_time_honours_an_instrument_query_param(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    siteCatalog: FakeSiteCatalog,
+) -> None:
+    """A dataId names an exposure only together with its instrument —
+    LSSTCam and LATISS number from 1 each night, so the same id exists on
+    both with different shutter closes. Unlike `site` (server
+    configuration, ignored if a caller sends it), the instrument is part
+    of what is being asked for, so the caller does get to name it."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    siteCatalog.writeSummitToken()
+    import io as _io
+
+    cols = ["exposure_id", "obs_end"]
+    seen: list[str] = []
+
+    def fakeUrlopen(req: object, **_kw: Any) -> object:
+        sql = json.loads(req.data.decode("utf-8"))["query"]  # type: ignore[attr-defined]
+        seen.append(sql)
+        iso = "2026-07-11T12:06:37" if "cdb_latiss" in sql else "2026-07-11T12:00:37"
+        return _io.BytesIO(json.dumps({"columns": cols, "data": [[2026071100001, iso]]}).encode("utf-8"))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026071100001?instrument=latiss")
+    assert status == 200
+    assert body["tZero"] == "2026-07-11T12:06:37"
+    assert body["instrument"] == "latiss"
+    assert all("cdb_latiss" in sql for sql in seen)  # lsstcam never probed
+
+    # The LATISS answer is cached under its own key and must not shadow a
+    # bare-id lookup, which stays the probe-order (LSSTCam) one.
+    seen.clear()
+    status, body = _get(host, port, "/api/exposure-time/2026071100001")
+    assert status == 200
+    assert body["tZero"] == "2026-07-11T12:00:37"
+    assert body["instrument"] == "lsstcam"
+
+
+def test_exposure_time_rejects_an_unknown_instrument(
+    runningServer: RunningServer, siteCatalog: FakeSiteCatalog
+) -> None:
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/exposure-time/2026071100001?instrument=hubble")
+    assert status == 400
+    assert "hubble" in body["error"]
+
+
+# ----- instrument threading through the HTTP surface ------------------------
+
+
+def _completeFetch(
+    host: str, port: int, body: dict, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, slug: str
+) -> None:
+    """POST /api/fetch with ``body`` (fetchAll stubbed) and wait for done."""
+    from collections.abc import Callable
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        cacheDir = tmpCacheRoot / slug
+        (cacheDir / "pods").mkdir(parents=True)
+        return cacheDir, {
+            "spec": {},
+            "cacheReuse": "none",
+            "pod_count": 0,
+            "total_bytes": 0,
+            "elapsed_s": 0.0,
+            "fromCache": False,
+        }
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, posted = _post(host, port, "/api/fetch", body)
+    assert status == 202, posted
+    st: dict = {}
+    for _ in range(100):
+        _s, st = _get(host, port, f"/api/fetch/{posted['jobId']}/status")
+        if st["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert st.get("status") == "done", st
+
+
+def test_fetch_rejects_an_unknown_instrument(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch",
+        {"exposureId": 1, "tZero": "2026-05-20T08:46:16.267", "instrument": "hubble"},
+    )
+    assert status == 400
+    assert "instrument" in body["error"]
+
+
+def test_fetch_instrument_lands_on_the_state_and_summary_guard_enforces_it(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The body's instrument is the state's instrument, the payload says
+    so, and a same-id request pinned to the OTHER instrument is treated
+    as not loaded rather than answered with the wrong exposure."""
+    host, port, ctx = runningServer
+    expId = 2026071100408
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-07-12T04:58:03.354", "instrument": "latiss"},
+        tmpCacheRoot,
+        monkeypatch,
+        "latiss-408",
+    )
+    with ctx.jobs.stateLock:
+        state = ctx.getExposureState(expId)
+        assert state is not None and state.instrument == "latiss"
+
+    # Pinned to the matching instrument: served, and labelled.
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=latiss")
+    assert status == 200 and body["loaded"] is True
+    assert body["instrument"] == "latiss"
+    # Unpinned: the loaded state is served (bare ids stay meaningful).
+    status, body = _get(host, port, f"/api/summary?dataId={expId}")
+    assert status == 200 and body["loaded"] is True
+    # Pinned to the other instrument: same bare id, different exposure —
+    # never served; falls through to not-loaded (no cache to rebuild).
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=lsstcam")
+    assert status == 200 and body["loaded"] is False
+    # Unknown instrument name: a 400, not a silent probe-order answer.
+    status, body = _get(host, port, f"/api/summary?dataId={expId}&instrument=hubble")
+    assert status == 400
+
+
+def test_the_job_status_and_done_event_carry_the_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The client's post-fetch summary request has to be pinned, and the
+    only place it can learn the pin is the job it just watched.
+
+    Between the fetch finishing and that request arriving, the bare
+    expId's slot can be taken over by the twin — another tab's fetch, or
+    a rebuild — and an unpinned request would then render the other
+    exposure and stamp *its* instrument into the URL, making the wrong
+    exposure stick across a refresh.
+    """
+    host, port, _ctx = runningServer
+    expId = 2026071100408
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-07-12T04:58:03.354", "instrument": "latiss"},
+        tmpCacheRoot,
+        monkeypatch,
+        "latiss-instrument-echo",
+    )
+    job = next(j for j in _ctx.jobs._jobs.values() if j.expId == expId)
+    _s, status = _get(host, port, f"/api/fetch/{job.jobId}/status")
+    assert status["instrument"] == "latiss"
+    done = [e for e in job.events if e.get("type") == "done"]
+    assert done and done[0]["instrument"] == "latiss"
+
+
+def test_fetch_defaults_the_instrument_to_lsstcam(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    host, port, ctx = runningServer
+    expId = 2026051900722
+    _completeFetch(
+        host,
+        port,
+        {"exposureId": expId, "tZero": "2026-05-20T08:46:16.267"},
+        tmpCacheRoot,
+        monkeypatch,
+        "default-inst",
+    )
+    with ctx.jobs.stateLock:
+        state = ctx.getExposureState(expId)
+        assert state is not None and state.instrument == "lsstcam"
+
+
+def test_fetch_range_rejects_an_unknown_instrument(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(
+        host,
+        port,
+        "/api/fetch-range",
+        {
+            "rangeStart": 2026051900722,
+            "rangeStop": 2026051900724,
+            "tZeroStart": "2026-05-20T08:46:16.267",
+            "tZeroStop": "2026-05-20T08:47:16.267",
+            "instrument": "hubble",
+        },
+    )
+    assert status == 400
+    assert "instrument" in body["error"]
+
+
+def test_manual_tZero_is_stamped_with_the_fetches_instrument(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A hand-entered shutter close for a LATISS exposure must be found
+    by LATISS-pinned lookups later — an unstamped stand-in only answers
+    bare lookups."""
+    host, port, _ctx = runningServer
+    expId = 2026071100777
+    _completeFetch(
+        host,
+        port,
+        {
+            "exposureId": expId,
+            "tZero": "2026-07-12T05:00:00.000",
+            "instrument": "latiss",
+            "tZeroManual": True,
+        },
+        tmpCacheRoot,
+        monkeypatch,
+        "manual-latiss",
+    )
+    rec = exposureTimes.lookupCachedRecord(expId, siteName="summit", instrument="latiss")
+    assert rec is not None and exposureTimes.isManual(rec)
+    assert exposureTimes.recordInstrument(rec) == "latiss"
+    # A LATISS stand-in is not the probe-order answer, so the bare key is
+    # left alone — otherwise one hand-typed t₀ would redefine what the
+    # shared id means for every unqualified lookup on this site.
+    assert exposureTimes.lookupCachedRecord(expId, siteName="summit") is None
+
+
+def test_manual_tZero_for_lsstcam_still_claims_the_bare_key(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """LSSTCam is what a bare probe reaches first, so its stand-in is
+    also the bare-id answer and may claim the bare key."""
+    host, port, _ctx = runningServer
+    expId = 2026071100778
+    _completeFetch(
+        host,
+        port,
+        {
+            "exposureId": expId,
+            "tZero": "2026-07-12T05:00:00.000",
+            "instrument": "lsstcam",
+            "tZeroManual": True,
+        },
+        tmpCacheRoot,
+        monkeypatch,
+        "manual-lsstcam",
+    )
+    bare = exposureTimes.lookupCachedRecord(expId, siteName="summit")
+    assert bare is not None and exposureTimes.isManual(bare)
+    assert exposureTimes.recordInstrument(bare) == "lsstcam"
+
+
+# ----- the night's two views, over the wire --------------------------------
+
+
+def test_night_fetch_rejects_an_unknown_view(runningServer: RunningServer) -> None:
+    host, port, _ctx = runningServer
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 20260813, "view": "everything"})
+    assert status == 400
+    assert "view must be one of" in body["error"]
+
+
+def test_the_sfm_night_fetch_asks_loki_for_every_pod(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """And the finished job says which half it was, so the client can ask
+    for the right state — a dayObs alone no longer names one."""
+    from collections.abc import Callable
+
+    host, port, ctx = runningServer
+    seen: list[str | None] = []
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict]:
+        seen.append(spec.podRegex)
+        cacheDir = tmpCacheRoot / "fake-night-sfm"
+        (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
+    status, body = _post(host, port, "/api/fetch-night", {"dayObs": 20260813, "view": "sfm"})
+    assert status == 202, body
+    jobId = body["jobId"]
+    for _ in range(100):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        if body["status"] in ("done", "error"):
+            break
+        time.sleep(0.02)
+    assert body["status"] == "done", body
+    assert body["nightView"] == "sfm"
+    assert seen == [None]  # no pod filter pushed down — see config.NIGHT_VIEWS
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(20260813, "sfm") is not None
+        # And the AOS half of the same night is untouched by it.
+        assert ctx.getNightState(20260813, "aos") is None
+
+
+def test_summary_serves_the_night_view_it_is_asked_for(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Two states, one dayObs. Asking for one must never serve the other:
+    they are different pods, and the difference is silent on screen."""
+    from ra_log_explorer.server import NightState
+
+    host, port, ctx = runningServer
+    for view, pod in (("aos", "s-lsstcam-run-aos-worker-aosworkerset-1"), ("sfm", "s-x-run-sfm-1")):
+        podDir = tmpCacheRoot / f"night-{view}" / "pods"
+        podDir.mkdir(parents=True, exist_ok=True)
+        summary = parse.PodSummary(
+            pod=pod,
+            group=parse.podGroup(pod),
+            instrument=parse.podInstrument(pod),
+            ordinal=None,
+            nLines=1,
+            nWarn=0,
+            nError=0,
+            nTraceback=0,
+            firstTs=None,
+            lastTs=None,
+        )
+        with ctx.jobs.stateLock:
+            ctx.putNightState(
+                NightState(
+                    cacheDir=tmpCacheRoot / f"night-{view}",
+                    cacheBytes=0,
+                    meta={},
+                    summaries=[summary],
+                    dayObs=20260813,
+                    startTime=config.dayObsStartUtc(20260813),
+                    endTime=config.dayObsEndUtc(20260813),
+                    view=view,
+                )
+            )
+    status, body = _get(host, port, "/api/summary?dayObs=20260813&nightView=sfm")
+    assert status == 200
+    assert body["view"] == "sfm"
+    assert body["stats"]["nPods"] == 1
+    # A bare dayObs still means the AOS half, which is what every link
+    # written before there were two of them says.
+    status, body = _get(host, port, "/api/summary?dayObs=20260813")
+    assert body["view"] == "aos"
+    # And a nonsense view falls back to it rather than erroring.
+    status, body = _get(host, port, "/api/summary?dayObs=20260813&nightView=wat")
+    assert body["view"] == "aos"

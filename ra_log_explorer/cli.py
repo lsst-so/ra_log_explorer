@@ -38,13 +38,18 @@ import webbrowser
 
 from . import parse as parser
 from .config import (
+    BASE_PATH_ENV,
     DEFAULT_HTTP_PORT,
     DEFAULT_USERNAME,
     DEFAULT_WINDOW_AFTER_S,
     DEFAULT_WINDOW_BEFORE_S,
     DEFAULT_WORKERS,
+    LIVE_LAG_S,
+    LIVE_POLL_S,
     FetchSpec,
     cache_root,
+    defaultBasePath,
+    normalizeBasePath,
 )
 
 # Imported here so `cli.TAI_MINUS_UTC_S` keeps resolving and so that the
@@ -53,15 +58,17 @@ from .config import (
 # seconds have been added). Butler `DimensionRecord` timestamps are TAI,
 # so by default we subtract this when converting the user's t-zero into
 # UTC. Override with --t-zero-utc.
-from .exposureTimes import TAI_MINUS_UTC_S
+from .exposureTimes import INSTRUMENTS_BY_PROBE_ORDER, TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    dropLiveSidecarsUnder,
     ensureCacheSchemaCurrent,
     fetchAll,
     humanBytes,
     stderrProgress,
 )
 from .jobs import JobManager
+from .live import LiveNightManager
 from .server import ServerContext, ServerState, serve
 from .sites import Site, loadSites, siteByName
 
@@ -116,13 +123,29 @@ def _addCommonArgs(p: argparse.ArgumentParser) -> None:
         help="Seconds after t-zero to end the fetch window",
     )
     p.add_argument("--force-refresh", action="store_true", help="Re-fetch even if cached results exist")
+    p.add_argument(
+        "--live-poll-s",
+        type=float,
+        default=LIVE_POLL_S,
+        help="Poll interval (seconds) for live mode, which keeps the current "
+        "night's logs continuously fetched so exposure views load instantly. "
+        "0 disables it. Defaults to $RA_LOG_EXPLORER_LIVE_POLL_S, or 0.",
+    )
+    p.add_argument(
+        "--live-day-obs",
+        type=int,
+        default=None,
+        help="Testing: pin live mode to this dayObs instead of tracking the "
+        "clock, so a staged historical night plays the role of 'tonight'. "
+        "Only meaningful with --live-poll-s > 0.",
+    )
 
 
-def _resolveSite(args: argparse.Namespace) -> Site:
-    """Look up the site named by --site (or the catalog default)."""
+def _resolveSite(args: argparse.Namespace) -> tuple[Site, list[Site]]:
+    """The site named by --site (or the catalog default), plus the catalog."""
     sites, defaultName = loadSites()
     name = args.site or defaultName
-    return siteByName(sites, name)
+    return siteByName(sites, name), sites
 
 
 def _warnIfIncompleteFetch(meta: dict, cacheDir: object) -> None:
@@ -223,6 +246,10 @@ def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerStat
         summaries=summaries,
         expId=args.exposure_id,
         tZero=tZero,
+        # The pin scopes which pods the timeline attributes work to —
+        # the window is fetched namespace-wide, so it genuinely holds
+        # the other instrument's pods too.
+        instrument=args.instrument,
         referencePoints=[
             {
                 "label": f"shutter close (caller-supplied, {tZeroScale} input)",
@@ -245,8 +272,7 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
         return 2
 
-    site = _resolveSite(args)
-    sites, defaultName = loadSites()
+    site, sites = _resolveSite(args)
     state: ServerState | None = None
     if eager:
         state = _eagerFetchAndBuildState(args, site)
@@ -261,10 +287,40 @@ def cmdRun(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
-    ctx = ServerContext(jobs=JobManager(), sites=sites, defaultSiteName=defaultName)
+    basePath = normalizeBasePath(args.base_path)
+    ctx = ServerContext(jobs=JobManager(), sites=sites, siteName=site.name, basePath=basePath)
+    if args.live_poll_s > 0:
+        # Live mode: keep the current night hot on disk so exposure
+        # views are served by slicing. Deployment-only in practice (the
+        # chart sets RA_LOG_EXPLORER_LIVE_POLL_S); the flag exists so a
+        # laptop can exercise the same path against a real cluster.
+        ctx.live = LiveNightManager(
+            site=site,
+            username=args.username,
+            workers=args.workers,
+            pollS=args.live_poll_s,
+            lagS=LIVE_LAG_S,
+            fixedDayObs=args.live_day_obs,
+        )
+        ctx.live.start()
+        pinned = f" (pinned to dayObs {args.live_day_obs})" if args.live_day_obs else ""
+        print(
+            f"Live mode: polling {site.name} every {args.live_poll_s:.0f}s "
+            f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot{pinned}.",
+            file=sys.stderr,
+        )
+    elif args.live_day_obs is not None:
+        # The flag only means anything to the poller, and without live mode
+        # there is no poller — say so rather than starting a server that
+        # silently ignores it and shows no Tonight panel.
+        print(
+            f"Warning: --live-day-obs {args.live_day_obs} has no effect without "
+            "--live-poll-s > 0 (or $RA_LOG_EXPLORER_LIVE_POLL_S); live mode is off.",
+            file=sys.stderr,
+        )
     if state is not None:
         ctx.putExposureState(state)
-    url = f"http://{args.host}:{args.port}/"
+    url = f"http://{args.host}:{args.port}{basePath}/"
     if not args.no_browser:
         try:
             webbrowser.open(url)
@@ -323,7 +379,17 @@ def cmdCacheFlush(args: argparse.Namespace) -> int:
         print("Nothing to flush.")
         return 0
     if args.yes or input(f"Delete entire cache at {root}? [y/N] ").lower() == "y":
-        shutil.rmtree(root)
+        # Sidecars first, then the tree (see fetch.dropLiveSidecarsUnder).
+        # A server may be running against this same cache with its live
+        # poller writing into tonight's night dir, which can make the
+        # rmtree fail part-way — and a night that lost pod files while
+        # keeping its `_live.json` would be resumed and sliced from as
+        # though it were whole.
+        dropLiveSidecarsUnder(root)
+        try:
+            shutil.rmtree(root)
+        except OSError:
+            shutil.rmtree(root, ignore_errors=True)
         print("Cache flushed.")
     return 0
 
@@ -353,8 +419,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Treat --t-zero as already-UTC instead of TAI (default off; "
         f"the default subtracts {int(TAI_MINUS_UTC_S)} s from the input).",
     )
+    runP.add_argument(
+        "--instrument",
+        choices=INSTRUMENTS_BY_PROBE_ORDER,
+        default="lsstcam",
+        help="The instrument --exposure-id belongs to (default lsstcam). "
+        "A dataId is only unique within one instrument, so this scopes "
+        "which pods the eager-fetched timeline attributes work to.",
+    )
     runP.add_argument("--host", default="127.0.0.1")
     runP.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    runP.add_argument(
+        "--base-path",
+        default=defaultBasePath(),
+        help="URL prefix to serve under, e.g. /log-explorer, for deployments sharing a "
+        f"hostname with other apps. Defaults to ${BASE_PATH_ENV}, or the root.",
+    )
     runP.add_argument(
         "--no-serve",
         action="store_true",
@@ -377,8 +457,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--exposure-id", type=int)
     p.add_argument("--t-zero")
     p.add_argument("--t-zero-utc", action="store_true")
+    p.add_argument("--instrument", choices=INSTRUMENTS_BY_PROBE_ORDER, default="lsstcam")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=DEFAULT_HTTP_PORT)
+    p.add_argument("--base-path", default=defaultBasePath())
     p.add_argument("--no-serve", action="store_true")
     p.add_argument("--no-browser", action="store_true")
     _addCommonArgs(p)

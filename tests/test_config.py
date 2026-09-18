@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -163,3 +164,194 @@ def test_dayObsStartUtc_alignment_at_year_boundary() -> None:
     # The end therefore lands on Jan 1.
     end = config.dayObsEndUtc(20251231)
     assert end == _dt.datetime(2026, 1, 1, 12, 0, 0, tzinfo=_dt.timezone.utc)
+
+
+# ----- base path -----------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        (None, ""),
+        ("", ""),
+        ("   ", ""),
+        ("/", ""),
+        ("///", ""),
+        ("/log-explorer", "/log-explorer"),
+        ("log-explorer", "/log-explorer"),
+        ("/log-explorer/", "/log-explorer"),
+        ("  /log-explorer/  ", "/log-explorer"),
+        ("/a/b", "/a/b"),
+    ],
+)
+def test_normalizeBasePath(raw: str | None, expected: str) -> None:
+    """Anything a human or a Helm value might supply collapses to the one
+    canonical form the router and the HTML template both assume."""
+    assert config.normalizeBasePath(raw) == expected
+
+
+def test_defaultBasePath_reads_and_normalizes_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(config.BASE_PATH_ENV, "log-explorer/")
+    assert config.defaultBasePath() == "/log-explorer"
+    monkeypatch.delenv(config.BASE_PATH_ENV)
+    assert config.defaultBasePath() == ""
+
+
+# ----- environment-driven configuration ------------------------------------
+
+
+def test_envInt_and_envFloat_return_the_default_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("RA_LOG_EXPLORER_TEST_KNOB", raising=False)
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 7
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 1.5
+    # Surrounding whitespace on a real value is tolerated — YAML block
+    # scalars pick it up and it means nothing.
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", " 9 ")
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 9
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 9.0
+
+
+def test_envInt_and_envFloat_reject_a_blank_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A present-but-blank variable is malformed, not a request for the
+    default.
+
+    It is exactly what a mistyped Helm reference renders to
+    (``value: {{ .Values.typo }}``), which is the silent
+    never-took-effect failure the ConfigError design exists to prevent.
+    Only an *absent* variable means "use the default".
+    """
+    for blank in ("", "   "):
+        monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", blank)
+        with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+            config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+        with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+            config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5)
+
+
+def test_envInt_and_envFloat_read_the_value(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "16")
+    assert config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7) == 16
+    assert config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5) == 16.0
+
+
+def test_envInt_and_envFloat_raise_on_garbage(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A typo'd deployment value must stop the container, not silently
+    revert to the built-in default — a setting that quietly never took
+    effect is far harder to notice than one that refuses to start."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "eight")
+    with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+        config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+    with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+        config._envFloat("RA_LOG_EXPLORER_TEST_KNOB", 1.5)
+    # A float is not an int; the worker count must not silently truncate.
+    monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", "8.5")
+    with pytest.raises(config.ConfigError):
+        config._envInt("RA_LOG_EXPLORER_TEST_KNOB", 7)
+
+
+def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The knobs the UI used to expose are now read once, at import, from
+    the environment. Reload the module under a patched environment to pin
+    that each name is actually wired to its variable."""
+    import importlib
+
+    monkeypatch.setenv("RA_LOG_EXPLORER_WORKERS", "3")
+    monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_BEFORE_S", "12.5")
+    monkeypatch.setenv("RA_LOG_EXPLORER_WINDOW_AFTER_S", "600")
+    monkeypatch.setenv("RA_LOG_EXPLORER_MAX_CACHE_BYTES", "1234567")
+    monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_POLL_S", "123")
+    monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_LAG_S", "45")
+    monkeypatch.setenv("LOKI_USERNAME", "omega")
+    try:
+        reloaded = importlib.reload(config)
+        assert reloaded.DEFAULT_WORKERS == 3
+        assert reloaded.DEFAULT_WINDOW_BEFORE_S == 12.5
+        assert reloaded.DEFAULT_WINDOW_AFTER_S == 600.0
+        assert reloaded.MAX_CACHE_BYTES == 1234567
+        # Distinct values so swapping the two live names would be caught.
+        assert reloaded.LIVE_POLL_S == 123.0
+        assert reloaded.LIVE_LAG_S == 45.0
+        assert reloaded.DEFAULT_USERNAME == "omega"
+    finally:
+        # Other modules hold references to this module object; leaving it
+        # reloaded under a patched environment would leak into them.
+        monkeypatch.undo()
+        importlib.reload(config)
+
+
+def test_cacheRoot_ignores_a_stale_settings_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`cache_root` used to consult a persisted settings JSON that the UI
+    wrote. That file is gone; one left over from an older version must not
+    still be able to redirect where a deployment writes its cache."""
+    monkeypatch.delenv("RA_LOG_EXPLORER_CACHE", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    stale = tmp_path / ".config" / "ra_log_explorer"
+    stale.mkdir(parents=True)
+    (stale / "settings.json").write_text('{"cacheDir": "/somewhere/else"}')
+    assert config.cache_root() == tmp_path / ".cache" / "ra_log_explorer"
+
+
+def test_the_set_of_environment_variables_is_pinned() -> None:
+    """Tripwire for the cross-repo contract.
+
+    Every one of these is set by the Phalanx chart in a *different*
+    repository (`applications/log-explorer/`). Adding one here without
+    adding it there gives a production deployment that silently runs on
+    the built-in default — a setting that appears to do nothing, which is
+    the sort of thing nobody notices for months. Renaming one without
+    renaming it there is the same failure with an extra step.
+
+    So: if this test fails, the change is fine, but it is not finished
+    until the chart matches. Update the list, then update
+    `values.yaml`, `templates/deployment.yaml`, and the Configuration
+    tables in `README.md` and `architecture/architecture.md`.
+    """
+    package = Path(config.__file__).parent
+    found: set[str] = set()
+    for module in sorted(package.glob("*.py")):
+        found |= set(re.findall(r'"(RA_LOG_EXPLORER_[A-Z_]+|LOKI_[A-Z_]+)"', module.read_text()))
+    assert found == {
+        "RA_LOG_EXPLORER_BASE_PATH",
+        "RA_LOG_EXPLORER_CACHE",
+        "RA_LOG_EXPLORER_LIVE_LAG_S",
+        "RA_LOG_EXPLORER_LIVE_POLL_S",
+        "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
+        "RA_LOG_EXPLORER_SITES_FILE",
+        "RA_LOG_EXPLORER_WINDOW_AFTER_S",
+        "RA_LOG_EXPLORER_WINDOW_BEFORE_S",
+        "RA_LOG_EXPLORER_WORKERS",
+        "LOKI_PASSWORD",
+        "LOKI_USERNAME",
+    }
+
+
+def test_defaults_are_usable_with_no_environment_at_all(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A laptop run needs no configuration. Every variable is optional
+    and the built-in defaults have to add up to a working local server,
+    or the development mode stops being a development convenience."""
+    import importlib
+
+    for name in (
+        "RA_LOG_EXPLORER_BASE_PATH",
+        "RA_LOG_EXPLORER_CACHE",
+        "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
+        "RA_LOG_EXPLORER_WINDOW_AFTER_S",
+        "RA_LOG_EXPLORER_WINDOW_BEFORE_S",
+        "RA_LOG_EXPLORER_WORKERS",
+        "LOKI_USERNAME",
+    ):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    try:
+        c = importlib.reload(config)
+        assert c.defaultBasePath() == ""
+        assert c.DEFAULT_WORKERS > 0
+        assert c.DEFAULT_WINDOW_AFTER_S > c.DEFAULT_WINDOW_BEFORE_S >= 0
+        assert c.MAX_CACHE_BYTES > 0
+        assert c.DEFAULT_USERNAME
+        assert c.cache_root() == tmp_path / ".cache" / "ra_log_explorer"
+    finally:
+        monkeypatch.undo()
+        importlib.reload(config)

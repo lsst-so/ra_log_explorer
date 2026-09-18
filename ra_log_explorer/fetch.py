@@ -76,18 +76,25 @@ import datetime as dt
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import BinaryIO, Callable
 
 from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
+
+# The canonical Loki-timestamp parser (nanosecond precision, local-cluster
+# offset) lives in parse.py; the slice path bisects raw JSONL by timestamp
+# and must agree with the parser about what those timestamps mean.
+from .parse import _parseTimestamp as _parseLokiTimestamp
 
 # Bumped whenever a change to how we fetch makes older caches untrustworthy.
 # v1 (implicit, no field) capped each pod at 50_000 lines and so silently
@@ -97,10 +104,17 @@ from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
 # verifies completeness structurally; v4 additionally fetches each pod's
 # k8s/events stream into a parallel pods_events/ tree (restart/kill/OOM
 # lifecycle markers) — a v3 cache has no such tree, so it must re-fetch to
-# pick those up. Bumping this value flushes the whole cache (see
+# pick those up; v5 dropped every compatibility reader (bare-string
+# exposure-time entries, two-line _range.txt sidecars, pre-eventPods live
+# sidecars) — nothing written by an older build is interpreted, per the
+# no-backwards-compatibility rule in caching.md, and this flush is what
+# makes that safe; v6 qualifies every _exposure_ids.txt entry with the
+# instrument it was fetched under, since a bare id names a different
+# exposure on each and the cache listing links back to one of them.
+# Bumping this value flushes the whole cache (see
 # ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
 # individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 4
+CACHE_SCHEMA_VERSION = 6
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so
@@ -161,14 +175,18 @@ PODS_EVENTS_DIR_NAME = "pods_events"
 # the cache (rather than in a central index) means deleting the
 # directory takes the bookkeeping with it.
 LAST_VIEWED_NAME = "_last_viewed.txt"
-# Per-cache sidecar holding the dataIds (one per line, ascending) that
-# have been the *trigger* for a fetch landing on this cache. One cache
-# can serve multiple dataIds via superset reuse — the user-facing cache
-# table surfaces all of them as clickable shortcuts back to each
-# exposure's per-visit view. See ``addExposureToCache`` for the writer.
+# Per-cache sidecar holding the exposures that have been the *trigger*
+# for a fetch landing on this cache: one ``<instrument>:<dataId>`` per
+# line, ascending by id. One cache can serve multiple dataIds via
+# superset reuse — the user-facing cache table surfaces all of them as
+# clickable shortcuts back to each exposure's per-visit view, and each
+# needs its instrument to link anywhere useful (a bare id names a
+# different exposure on each). See ``addExposureToCache`` for the writer.
 EXPOSURE_IDS_NAME = "_exposure_ids.txt"
-# Per-cache sidecar marking a range-mode fetch: two lines, ``startId``
-# then ``stopId``. A range cache is structurally an ordinary exposure
+# Per-cache sidecar marking a range-mode fetch: three lines, ``startId``,
+# ``stopId``, then the instrument the run was fetched under — the bounds
+# alone don't identify a range, since every instrument that observed that
+# many exposures has a span with them. A range cache is structurally an ordinary exposure
 # cache (all pods, one wide window) — this sidecar is what lets the
 # cache listing label it "range" and deep-link back to /?rangeStart=…&
 # rangeStop=… instead of the single-exposure view. See ``markCacheRange``.
@@ -212,6 +230,13 @@ def ensureCacheSchemaCurrent() -> int:
             continue
         try:
             if child.is_dir():
+                # Sidecars first, for the reason spelled out in
+                # ``dropLiveSidecarsUnder``: this rmtree is best-effort, and
+                # a night dir that lost pod files but kept its ``_live.json``
+                # would be adopted by the poller and sliced from as though it
+                # were whole. A concurrent ``cache flush`` from another
+                # process is enough to make that partial delete happen.
+                dropLiveSidecarsUnder(child)
                 shutil.rmtree(child)
             else:
                 child.unlink()
@@ -256,7 +281,11 @@ def _run_logcli(
         *extraArgs,
     ]
     env = os.environ.copy()
-    if "LOKI_PASSWORD" not in env:
+    # Blank counts as unset. Deployed, LOKI_PASSWORD comes from a
+    # VaultSecret marked optional, so the variable can exist and be empty
+    # while the secret is still missing — and an empty password reaches
+    # logcli as a bare auth failure rather than as the sentence below.
+    if not (env.get("LOKI_PASSWORD") or "").strip():
         raise FetchError(
             "LOKI_PASSWORD is not set in the environment. "
             "Export it (or source the shell rc that does) before running."
@@ -337,8 +366,8 @@ def _fmtLogcliTime(t: dt.datetime) -> str:
     return t.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f") + "Z"
 
 
-def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime) -> int | None:
-    """Return how many lines this pod emitted in ``[fromT, toT)``, or None.
+def _countOverTime(spec: FetchSpec, matcher: str, fromT: dt.datetime, toT: dt.datetime) -> int | None:
+    """Return how many lines ``matcher`` emitted in ``[fromT, toT)``, or None.
 
     Uses ``sum(count_over_time(...))`` evaluated at ``--now=toT`` over a
     range selector spanning the window. count_over_time is a *server-side*
@@ -374,7 +403,6 @@ def _countOverTime(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.dateti
     if spanMs <= 0:
         return 0
     rangeMs = math.ceil(spanMs) + 1
-    matcher = _matcher(spec, pod=pod)
     query = f"sum(count_over_time({matcher}[{rangeMs}ms]))"
     try:
         out = _run_logcli(
@@ -428,15 +456,16 @@ def _parseCountOutput(out: bytes) -> int | None:
     return total if found else None
 
 
-def _queryWindowToFile(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, outPath: Path) -> int:
-    """Fetch ``[fromT, toT)`` for one pod into ``outPath``; return line count.
+def _queryWindowToFile(
+    spec: FetchSpec, matcher: str, fromT: dt.datetime, toT: dt.datetime, outPath: Path
+) -> int:
+    """Fetch ``[fromT, toT)`` for one matcher into ``outPath``; return line count.
 
     A single ``query`` with ``--batch=SERVER_QUERY_CAP``. ``--forward`` =>
     ascending output; ``-o jsonl`` => one Loki API JSON object per line
     (keeps labels, esp. detected_level, intact). The caller decides whether
     to trust the result based on the returned count vs the batch size.
     """
-    matcher = _matcher(spec, pod=pod)
     _run_logcli(
         spec,
         [
@@ -502,9 +531,10 @@ def _fetchOnePod(spec: FetchSpec, pod: str, outPath: Path) -> _PodFetch:
     """
     fromT = _parseIso(spec.fromIso)
     toT = _parseIso(spec.toIso)
-    expected = _countOverTime(spec, pod, fromT, toT)
+    matcher = _matcher(spec, pod=pod)
+    expected = _countOverTime(spec, matcher, fromT, toT)
     with open(outPath, "wb") as fh:
-        lines, complete, reason = _fetchWindowInto(spec, pod, fromT, toT, fh, expected)
+        lines, complete, reason = _fetchWindowInto(spec, matcher, fromT, toT, fh, expected)
     return _PodFetch(
         pod=pod,
         nbytes=outPath.stat().st_size,
@@ -517,13 +547,13 @@ def _fetchOnePod(spec: FetchSpec, pod: str, outPath: Path) -> _PodFetch:
 
 def _fetchWindowInto(
     spec: FetchSpec,
-    pod: str,
+    matcher: str,
     fromT: dt.datetime,
     toT: dt.datetime,
     fh: BinaryIO,
     expected: int | None,
 ) -> tuple[int, bool, str]:
-    """Fetch ``[fromT, toT)`` for one pod, appending to open file ``fh``.
+    """Fetch ``[fromT, toT)`` for one matcher, appending to open file ``fh``.
 
     Returns ``(linesWritten, complete, reason)``. ``expected`` is the
     count_over_time oracle for *this* window (``None`` => look it up). The
@@ -532,7 +562,7 @@ def _fetchWindowInto(
     logcli never advanced a batch cursor and so #17270 never fired.
     """
     if expected is None:
-        expected = _countOverTime(spec, pod, fromT, toT)
+        expected = _countOverTime(spec, matcher, fromT, toT)
     if expected == 0:
         # Safe to skip the query outright: the oracle's range is padded to be
         # a strict superset of this window (see :func:`_countOverTime`), so a
@@ -542,7 +572,7 @@ def _fetchWindowInto(
     # Oracle already proves this won't fit one batch: split up front rather
     # than waste a fetch we know will paginate (and be discarded).
     if expected is not None and expected >= SERVER_QUERY_CAP and span > MIN_SPLIT_S:
-        return _splitWindowInto(spec, pod, fromT, toT, fh, expected)
+        return _splitWindowInto(spec, matcher, fromT, toT, fh, expected)
 
     # Chunk temps go in the system temp dir, NOT the pods dir: a crash mid-
     # fetch must never strand a ".chunk-*.jsonl" beside the real pod files,
@@ -552,7 +582,7 @@ def _fetchWindowInto(
     os.close(fd)  # mkstemp opens it; _queryWindowToFile reopens to write
     tmpPath = Path(tmpName)
     try:
-        got = _queryWindowToFile(spec, pod, fromT, toT, tmpPath)
+        got = _queryWindowToFile(spec, matcher, fromT, toT, tmpPath)
         if got < SERVER_QUERY_CAP:
             _appendFileInto(tmpPath, fh)  # one un-paginated batch — trusted
             return got, True, ""
@@ -566,12 +596,12 @@ def _fetchWindowInto(
         tmpPath.unlink(missing_ok=True)
     # got >= cap and we have room to split: the count under-counted (or was
     # unavailable). Discard the untrusted fetch and recurse on halves.
-    return _splitWindowInto(spec, pod, fromT, toT, fh, max(expected or 0, got))
+    return _splitWindowInto(spec, matcher, fromT, toT, fh, max(expected or 0, got))
 
 
 def _splitWindowInto(
     spec: FetchSpec,
-    pod: str,
+    matcher: str,
     fromT: dt.datetime,
     toT: dt.datetime,
     fh: BinaryIO,
@@ -593,12 +623,60 @@ def _splitWindowInto(
     complete = True
     reason = ""
     for a, b in zip(edges[:-1], edges[1:]):
-        ln, ok, why = _fetchWindowInto(spec, pod, a, b, fh, expected=None)
+        ln, ok, why = _fetchWindowInto(spec, matcher, a, b, fh, expected=None)
         total += ln
         if not ok:
             complete = False
             reason = reason or why
     return total, complete, reason
+
+
+def fetchPodWindowInto(
+    spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+) -> tuple[int, bool, str]:
+    """Append every app-log line of one pod's ``[fromT, toT)`` to open ``fh``.
+
+    The live poller's building block: same lossless count-presized
+    single-batch chunking as a full fetch (see :func:`_fetchWindowInto`),
+    but appending an arbitrary window to an already-open file instead of
+    owning a whole cache directory. Returns ``(lines, complete, reason)``.
+    """
+    return _fetchWindowInto(spec, _matcher(spec, pod=pod), fromT, toT, fh, expected=None)
+
+
+def countPodWindow(spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime) -> int | None:
+    """Exact server-side line count for one pod's ``[fromT, toT)``, or None.
+
+    The count_over_time oracle (immune to #17270 — see
+    :func:`_countOverTime`), exposed for the live poller's end-of-night
+    verification pass: lines-appended-over-the-night is checked against
+    this before a night dir is finalised as trustworthy.
+    """
+    return _countOverTime(spec, _matcher(spec, pod=pod), fromT, toT)
+
+
+def _namespaceEventsMatcher(spec: FetchSpec) -> str:
+    """LogQL matcher for the whole namespace's k8s/events stream.
+
+    Unlike :func:`_eventsMatcher` this doesn't pin ``name=`` to one pod:
+    the live poller fetches every pod's lifecycle events in one chunked
+    query per tick (rather than one query per pod per tick) and splits
+    the result by the ``name`` label afterwards.
+    """
+    return f'{{cluster="{spec.cluster}",namespace="{spec.namespace}",job="k8s/events"}}'
+
+
+def fetchEventsWindowInto(
+    spec: FetchSpec, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+) -> tuple[int, bool, str]:
+    """Append the namespace's k8s/events lines for ``[fromT, toT)`` to ``fh``.
+
+    Chunked with the same lossless machinery as the app-log fetch: a
+    per-exposure events window is a handful of lines, but the live
+    poller's first catch-up tick can span most of a night, where a naive
+    single query would paginate (and #17270 could bite).
+    """
+    return _fetchWindowInto(spec, _namespaceEventsMatcher(spec), fromT, toT, fh, expected=None)
 
 
 def _fetchOnePodEvents(spec: FetchSpec, pod: str, outPath: Path) -> int:
@@ -644,6 +722,562 @@ def _parseIso(s: str) -> dt.datetime:
     return t.astimezone(dt.timezone.utc)
 
 
+# ----- live night cache -----------------------------------------------------
+#
+# The live poller (see ``live.py``) maintains one all-pods window dir per
+# night, at the ordinary window path for [noon UTC, noon UTC + 24h), and
+# appends to its per-pod JSONL files every tick. While it does, a
+# ``_live.json`` sidecar records how far the night has been fetched:
+#
+#   {
+#     "version": 1,
+#     "dayObs": 20260711,
+#     "fromIso": "...", "toIso": "...",       # the nominal night window
+#     "watermarkIso": "...",                  # all app logs <= this are on disk
+#     "eventsWatermarkIso": "...",            # ditto for the k8s/events stream
+#     "finalised": false,                     # true once the night is complete
+#     "updatedAt": "...",
+#     "pods": {"<pod>": {"watermarkIso": "...", "bytes": N, "lines": N,
+#                         "eventBytes": N, "eventLines": N}},
+#     "eventPods": {"<name>": {"eventBytes": N, "eventLines": N}},
+#     "errors": {"<pod>": "..."},             # cumulative hard fetch failures
+#     "incomplete_pods": {"<pod>": "..."}     # cumulative unreconcilable chunks
+#   }
+#
+# ``pods`` holds pods that emitted *app logs*, and only those records
+# carry a ``watermarkIso`` — the global watermark is the minimum over
+# them. ``eventPods`` holds names seen only in the namespace's k8s/events
+# stream: rescheduled pods, and non-Pod objects (ReplicaSets, Jobs) whose
+# events that stream also carries. They are kept — breadth costs nothing
+# and the parser ignores what it can't use — but they make no claim about
+# app-log coverage, so they must not be able to hold the watermark back.
+# A name promotes from ``eventPods`` into ``pods``, carrying its counters,
+# the first time it appears in an app-log listing.
+#
+# The sidecar is the coordination point between the poller (single
+# writer; atomic replace once per tick, only after the tick's bytes are
+# on disk) and everyone else (readers): a byte recorded in ``pods`` is
+# durably on disk, and a request window ending at or before
+# ``watermarkIso`` can be served entirely from the night dir. Because
+# the per-pod files are time-ascending JSONL, an arbitrary sub-window is
+# extracted by binary-searching each file for the boundary offsets and
+# copying the byte range — no index to maintain, no parsing.
+#
+# "Durably" here means the poller wrote and closed those bytes before it
+# published the count — enough that a process restart (the case that
+# happens) recovers exactly, via truncation back to the recorded counts.
+# Neither the appends nor the sidecar replace are fsync'd, so a machine
+# losing power could in principle land the sidecar without the bytes;
+# recovery would then leave a short file the finalisation audit catches.
+#
+# A dir carrying this sidecar (live *or* finalised) is deliberately
+# excluded from superset reuse: handing a whole night to the parser to
+# answer a five-minute question would take minutes, while slicing is
+# near-instant. ``fetchAll`` consults the slice path before the superset
+# path, so every contained request is still served without touching Loki.
+
+LIVE_SIDECAR_NAME = "_live.json"
+LIVE_SIDECAR_VERSION = 1
+
+# One lock per window directory, guarding everything that writes into it.
+# Two request threads asking for the same window used to race: both would
+# find no cache, and both would then write the same pods/<pod>.jsonl
+# files — a fresh fetch against a slice, or two slices against each
+# other, interleaving bytes and clearing each other's .partial flag. The
+# window is the unit because the window is what a directory holds; the
+# loser simply waits and then takes the winner's result as an exact hit,
+# which is also what makes a duplicate fetch cost nothing.
+_windowLocks: dict[Path, threading.RLock] = {}
+_windowLocksGuard = threading.Lock()
+
+
+def windowWriteLock(windowDir: Path) -> threading.RLock:
+    """The process-wide write lock for one cache window directory.
+
+    Re-entrant so that nested acquisition — ``fetchAll`` holds the
+    requested window's lock across a slice that can target that same
+    window — is safe by construction rather than by everyone remembering
+    the ordering. The registry only ever grows: one small entry per
+    distinct window this process has written, which is cheap enough not
+    to be worth reclaiming.
+    """
+    with _windowLocksGuard:
+        lock = _windowLocks.get(windowDir)
+        if lock is None:
+            lock = threading.RLock()
+            _windowLocks[windowDir] = lock
+        return lock
+
+
+def readLiveSidecar(nightDir: Path) -> dict | None:
+    """Return the parsed ``_live.json`` for a night dir, or ``None``.
+
+    Best-effort by design: a missing, unparseable, or wrong-version
+    sidecar means "not a usable live night dir" — callers fall back to
+    the ordinary fetch paths rather than failing the request.
+    """
+    p = nightDir / LIVE_SIDECAR_NAME
+    try:
+        sidecar = json.loads(p.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(sidecar, dict) or sidecar.get("version") != LIVE_SIDECAR_VERSION:
+        return None
+    if not sidecar.get("fromIso") or not sidecar.get("watermarkIso"):
+        return None
+    return sidecar
+
+
+def writeLiveSidecar(nightDir: Path, sidecar: dict) -> None:
+    """Atomically replace a night dir's ``_live.json``.
+
+    Written via a temp file + ``os.replace`` so a reader can never see a
+    half-written sidecar — it observes either the previous tick's state
+    or this one's, both of which under-promise relative to the bytes
+    actually on disk.
+    """
+    target = nightDir / LIVE_SIDECAR_NAME
+    fd, tmpName = tempfile.mkstemp(prefix="_live-", suffix=".json", dir=nightDir)
+    tmpPath = Path(tmpName)
+    try:
+        with os.fdopen(fd, "w") as fh:
+            json.dump(sidecar, fh, indent=2)
+        os.replace(tmpPath, target)
+    finally:
+        tmpPath.unlink(missing_ok=True)
+
+
+def firstOffsetAtOrAfter(fh: BinaryIO, target: dt.datetime, limit: int) -> int:
+    """Byte offset of the first line in ``fh`` with timestamp >= ``target``.
+
+    ``fh`` is an open Loki JSONL file in ``--forward`` (time-ascending)
+    order; ``limit`` bounds the search to the first ``limit`` bytes — the
+    poller may be appending beyond that (including a partial line), so
+    everything past the recorded byte count is treated as not there.
+    Returns ``limit`` when every line in range is earlier than ``target``.
+
+    Binary search over byte positions, resolving each probe to the next
+    line boundary. The probe seeks to ``pos - 1`` so a probe landing
+    exactly on a line start doesn't skip that line.
+    """
+
+    def lineStartAtOrAfter(pos: int) -> int:
+        if pos <= 0:
+            return 0
+        fh.seek(pos - 1)
+        fh.readline()
+        return fh.tell()
+
+    def timestampAt(start: int) -> dt.datetime:
+        fh.seek(start)
+        raw = fh.readline()
+        obj = json.loads(raw)
+        return _parseLokiTimestamp(obj["timestamp"])
+
+    lo, hi = 0, limit
+    # Invariants: every line starting before ``lo`` has ts < target, and
+    # the answer is the first line boundary at or after ``hi``'s final
+    # value — see the return below.
+    while lo < hi:
+        mid = (lo + hi) // 2
+        start = lineStartAtOrAfter(mid)
+        if start >= limit:
+            hi = mid
+            continue
+        fh.seek(start)
+        line = fh.readline()
+        if start + len(line) > limit:
+            # The line straddles the recorded byte count — a concurrent
+            # append in progress. Beyond the durable range; not there.
+            hi = mid
+            continue
+        if timestampAt(start) < target:
+            lo = start + len(line)
+        else:
+            hi = mid
+    return min(lineStartAtOrAfter(lo), limit)
+
+
+def findNightDirCovering(cluster: str, namespace: str, fromT: dt.datetime, toT: dt.datetime) -> Path | None:
+    """Return the live/finalised night dir fully covering ``[fromT, toT)``.
+
+    Coverage means the night's window start is at or before ``fromT``
+    *and* the recorded watermark is at or past ``toT`` — i.e. every line
+    the request could want is already durably on disk. Nights don't
+    overlap, so the first match is the only one.
+    """
+    base = cache_root() / cluster / namespace
+    if not base.exists():
+        return None
+    for window in base.iterdir():
+        if not window.is_dir():
+            continue
+        sidecar = readLiveSidecar(window)
+        if sidecar is None:
+            continue
+        try:
+            nightFrom = _parseIso(sidecar["fromIso"])
+            watermark = _parseIso(sidecar["watermarkIso"])
+        except (KeyError, ValueError):
+            continue
+        if nightFrom <= fromT and toT <= watermark:
+            return window
+    return None
+
+
+def _sliceFileByTime(
+    src: Path, dst: Path, fromT: dt.datetime, toT: dt.datetime, limit: int
+) -> tuple[int, int]:
+    """Copy ``src``'s lines with ``fromT <= ts < toT`` to ``dst``.
+
+    ``limit`` is the durable byte count from the sidecar — bytes past it
+    (a concurrent append) are ignored. Returns ``(bytes, lines)`` copied;
+    ``(0, 0)`` means ``dst`` was not created.
+    """
+    if src.resolve() == dst.resolve():
+        # Opening dst "wb" would truncate src before a single byte was
+        # read, silently emptying the file we were asked to copy. Callers
+        # are supposed to prevent this (see materializeNightSlice); this
+        # is the backstop that keeps a bug there from destroying data.
+        raise FetchError(f"refusing to slice {src} into itself")
+    limit = min(limit, src.stat().st_size)
+    if limit <= 0:
+        return 0, 0
+    with open(src, "rb") as fh:
+        a = firstOffsetAtOrAfter(fh, fromT, limit)
+        b = firstOffsetAtOrAfter(fh, toT, limit)
+        if b <= a:
+            return 0, 0
+        fh.seek(a)
+        remaining = b - a
+        lines = 0
+        with open(dst, "wb") as out:
+            while remaining > 0:
+                chunk = fh.read(min(1 << 20, remaining))
+                if not chunk:
+                    break
+                out.write(chunk)
+                lines += chunk.count(b"\n")
+                remaining -= len(chunk)
+    return b - a, lines
+
+
+def materializeNightSlice(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
+    """Extract ``spec``'s window from a live night dir into a normal cache.
+
+    The result is byte-identical to what a fresh Loki fetch of the same
+    window would have produced (the night dir holds every line, in the
+    same ``--forward`` JSONL shape), laid out as an ordinary exposure
+    cache at the requested window's own path — so everything downstream
+    (parsing, superset reuse, the cache listing, deletion) treats it as
+    a first-class window and later identical requests exact-hit it.
+
+    Call under :func:`windowWriteLock` for the destination window (which
+    is what :func:`fetchAll` does): two threads materializing the same
+    slice would otherwise interleave bytes in the same pod files.
+    """
+    t0 = time.time()
+    sidecar = readLiveSidecar(nightDir)
+    if sidecar is None:
+        raise FetchError(f"{nightDir} has no usable {LIVE_SIDECAR_NAME}")
+    if sidecar.get("rewritingPod"):
+        # Re-checked against *this* read of the sidecar, not only the one
+        # ``_tryNightSlice`` gated on: acquiring the destination window's
+        # lock can block for as long as another thread's slice takes, and
+        # end-of-night verification can start swapping a pod's file in
+        # that gap. The slice would then honour that pod's zeroed byte
+        # count by omitting it — and be written as complete, because
+        # finalisation clears the pod's error flags before refetching.
+        raise FetchError(f"{nightDir} is rewriting {sidecar['rewritingPod']}; refusing to slice it")
+    fromT = _parseIso(spec.fromIso)
+    toT = _parseIso(spec.toIso)
+    requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    if requestedDir.resolve() == nightDir.resolve():
+        # The destination *is* the source: every pod file would be opened
+        # for writing while being read, emptying the night. Reachable when
+        # the night's watermark has reached its end but it hasn't been
+        # finalised yet (so the exact-hit check upstream found no
+        # _meta.json) and the request is the night's own all-pods window.
+        # Nothing to extract anyway — the night dir already is that window.
+        raise FetchError(f"night slice for {spec.fromIso}..{spec.toIso} would overwrite {nightDir}")
+    ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    partialPath = requestedDir / PARTIAL_FLAG
+    partialPath.write_text("")
+    # Deliberately no try/finally around the flag: if the copy raises,
+    # the flag must *stay*, so a half-copied window can never be mistaken
+    # for a cache hit. The fallback fetch — or the next slice attempt —
+    # rewrites the directory and clears it then.
+    meta = _sliceNightInto(nightDir, sidecar, spec, requestedDir, fromT, toT, t0)
+    partialPath.unlink(missing_ok=True)
+    return requestedDir, meta
+
+
+def _sliceNightInto(
+    nightDir: Path,
+    sidecar: dict,
+    spec: FetchSpec,
+    requestedDir: Path,
+    fromT: dt.datetime,
+    toT: dt.datetime,
+    t0: float,
+) -> dict:
+    """Copy the byte ranges and write the slice's ``_meta.json``."""
+    podsDir = requestedDir / PODS_DIR_NAME
+    podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
+    podsDir.mkdir(parents=True, exist_ok=True)
+    podsEventsDir.mkdir(parents=True, exist_ok=True)
+
+    # Loki pod-regex matchers are RE2 and fully anchored; fullmatch is
+    # the Python equivalent, so a filtered (night-mode) slice keeps
+    # exactly the pods a real filtered fetch would have listed.
+    podFilter = re.compile(spec.podRegex) if spec.podRegex else None
+
+    podRecords = sidecar.get("pods") or {}
+    perPodBytes: dict[str, int] = {}
+    perPodLines: dict[str, int] = {}
+    perPodEventLines: dict[str, int] = {}
+    totalBytes = 0
+    for pod, record in sorted(podRecords.items()):
+        if podFilter is not None and podFilter.fullmatch(pod) is None:
+            continue
+        src = nightDir / PODS_DIR_NAME / f"{pod}.jsonl"
+        if not src.exists():
+            continue
+        nbytes, lines = _sliceFileByTime(
+            src, podsDir / f"{pod}.jsonl", fromT, toT, int(record.get("bytes") or 0)
+        )
+        if lines == 0:
+            (podsDir / f"{pod}.jsonl").unlink(missing_ok=True)
+            continue
+        perPodBytes[pod] = nbytes
+        perPodLines[pod] = lines
+        totalBytes += nbytes
+        # Events only for pods that emitted app logs in the window —
+        # mirroring a real fetch, which enumerates pods via the app-log
+        # series listing before fetching either stream. (The night dir
+        # also holds lifecycle events for non-pod objects; those have no
+        # app-log file, so they never reach a slice.)
+        evSrc = nightDir / PODS_EVENTS_DIR_NAME / f"{pod}.jsonl"
+        if evSrc.exists():
+            _, evLines = _sliceFileByTime(
+                evSrc, podsEventsDir / f"{pod}.jsonl", fromT, toT, int(record.get("eventBytes") or 0)
+            )
+            if evLines:
+                perPodEventLines[pod] = evLines
+            else:
+                (podsEventsDir / f"{pod}.jsonl").unlink(missing_ok=True)
+
+    pods = sorted(perPodBytes)
+    # A previous attempt on this window (a slice that failed part-way, or
+    # a fetch against an older schema) may have left pod files the night
+    # dir has nothing to say about. summarizeAll reads the directory, not
+    # pods.txt, so anything stale left here would be parsed as part of
+    # this window.
+    _pruneStalePodFiles(podsDir, set(pods))
+    _pruneStalePodFiles(podsEventsDir, set(perPodEventLines))
+    (requestedDir / PODS_LIST_NAME).write_text("\n".join(pods) + "\n")
+
+    # The night's cumulative fall-short maps are inherited for every pod
+    # the slice's filter admits — not narrowed to the window: a pod whose
+    # fetch failed at *some* point in the night may be missing lines
+    # anywhere, including here, and a short slice must not pass for
+    # complete. Pods outside the filter can't affect this slice's data,
+    # so a filtered (night-mode) slice drops their entries rather than
+    # inheriting alarms about pods it doesn't contain.
+    def _inherited(m: dict | None) -> dict[str, str]:
+        return {
+            p: why for p, why in (m or {}).items() if podFilter is None or podFilter.fullmatch(p) is not None
+        }
+
+    errors = _inherited(sidecar.get("errors"))
+    incompletePods = _inherited(sidecar.get("incomplete_pods"))
+    meta = {
+        "spec": asdict(spec),
+        "fetchSchemaVersion": CACHE_SCHEMA_VERSION,
+        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "elapsed_s": time.time() - t0,
+        "pod_count": len(pods),
+        "total_bytes": totalBytes,
+        "pod_bytes": perPodBytes,
+        "pod_lines": perPodLines,
+        "pod_expected": {},
+        "errors": errors,
+        "incomplete_pods": incompletePods,
+        "fetchComplete": not errors and not incompletePods,
+        "pod_event_lines": perPodEventLines,
+        "event_errors": {},
+        "window_in_past": True,
+        "fromCache": False,
+        "cacheReuse": "night-slice",
+        "sliceSource": str(nightDir),
+    }
+    (requestedDir / META_NAME).write_text(json.dumps(meta, indent=2))
+    return meta
+
+
+def _pruneStalePodFiles(podsDir: Path, keep: set[str]) -> None:
+    """Remove ``<podsDir>/*.jsonl`` for pods not in ``keep``."""
+    for f in podsDir.glob("*.jsonl"):
+        if f.stem not in keep:
+            f.unlink(missing_ok=True)
+
+
+def liveNightMeta(
+    sidecar: dict,
+    spec: FetchSpec,
+    *,
+    podExpected: dict[str, int] | None = None,
+    elapsedS: float = 0.0,
+) -> dict:
+    """Build a normal ``_meta.json`` body from a live night's sidecar.
+
+    One builder for both users so a night dir is described the same way
+    whether it is being finalised (the poller writes this to disk, adding
+    the ``count_over_time`` audit in ``podExpected``) or handed straight
+    to a caller asking for the night's own window before finalisation.
+    The result is deliberately indistinguishable from a batch fetch's
+    meta apart from ``liveBuilt``, so every downstream consumer — the
+    cache listing, LRU eviction, deletion, the rebuild paths — treats it
+    as an ordinary window.
+    """
+    pods: dict[str, dict] = sidecar.get("pods") or {}
+    errors = dict(sidecar.get("errors") or {})
+    incomplete = dict(sidecar.get("incomplete_pods") or {})
+    return {
+        "spec": asdict(spec),
+        "fetchSchemaVersion": CACHE_SCHEMA_VERSION,
+        "fetched_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "elapsed_s": elapsedS,
+        "pod_count": len(pods),
+        "total_bytes": sum(int(r.get("bytes") or 0) for r in pods.values()),
+        "pod_bytes": {p: int(r.get("bytes") or 0) for p, r in pods.items()},
+        "pod_lines": {p: int(r.get("lines") or 0) for p, r in pods.items()},
+        "pod_expected": dict(podExpected or {}),
+        "errors": errors,
+        "incomplete_pods": incomplete,
+        "fetchComplete": not errors and not incomplete,
+        "pod_event_lines": {p: int(r.get("eventLines") or 0) for p, r in pods.items()},
+        "event_errors": {},
+        "window_in_past": True,
+        "fromCache": False,
+        "cacheReuse": "none",
+        "liveBuilt": True,
+    }
+
+
+def _findNightDirTouching(cluster: str, namespace: str, fromT: dt.datetime) -> tuple[Path, dict] | None:
+    """Return the ``(dir, sidecar)`` of the night dir whose span holds ``fromT``.
+
+    Weaker than :func:`findNightDirCovering`: the caller decides what to
+    do about the request's *end* (full coverage, or clamping the night's
+    own window to the watermark). Nights don't overlap, so the first
+    match is the only one.
+    """
+    base = cache_root() / cluster / namespace
+    if not base.exists():
+        return None
+    for window in base.iterdir():
+        if not window.is_dir():
+            continue
+        sidecar = readLiveSidecar(window)
+        if sidecar is None:
+            continue
+        try:
+            nightFrom = _parseIso(sidecar["fromIso"])
+            nightTo = _parseIso(sidecar["toIso"])
+        except (KeyError, ValueError):
+            continue
+        if nightFrom <= fromT < nightTo:
+            return window, sidecar
+    return None
+
+
+def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
+    """Serve ``spec`` from a live/finalised night dir, or return ``None``.
+
+    Two windows qualify:
+
+    * one the watermark fully covers — sliced as asked (works for both
+      all-pods and ``podRegex`` requests; the night dir's pod set is a
+      superset of any filter, and the slice applies the filter);
+    * the night's *own* window while the night is still in progress
+      (night mode on the current dayObs) — sliced clamped to the
+      watermark, i.e. "the night so far". Only the full night window
+      gets this treatment: silently clamping an arbitrary user window
+      would hand back less than was asked for with nothing to say so.
+
+    Any slice failure returns ``None`` — the ordinary fetch paths are
+    the fallback, and the worst case is the fetch that would have
+    happened anyway.
+    """
+    found = _findNightDirTouching(spec.cluster, spec.namespace, _parseIso(spec.fromIso))
+    if found is None:
+        return None
+    nightDir, sidecar = found
+    if sidecar.get("rewritingPod"):
+        # End-of-night verification is replacing a pod's file wholesale
+        # (see live._refetchWholePod). Its record currently claims zero
+        # bytes, which a slice would honour by omitting the pod — and
+        # that slice would be written as complete and reused forever.
+        # Fall back to an ordinary fetch for the minutes this takes.
+        return None
+    try:
+        watermark = _parseIso(sidecar["watermarkIso"])
+    except (KeyError, ValueError):
+        return None
+    if _parseIso(spec.toIso) <= watermark:
+        sliceSpec = spec
+    elif spec.fromIso == sidecar["fromIso"] and spec.toIso == sidecar["toIso"]:
+        if watermark <= _parseIso(spec.fromIso):
+            return None  # nothing fetched yet
+        sliceSpec = replace(spec, toIso=sidecar["watermarkIso"])
+    else:
+        return None
+    # A repeat of the same request against an unchanged watermark lands
+    # on a slice that already exists — reuse it rather than re-copying.
+    target = windowCachePath(
+        sliceSpec.cluster, sliceSpec.namespace, sliceSpec.fromIso, sliceSpec.toIso, sliceSpec.podRegex
+    )
+    # fetchAll's lock is on the *requested* window path. In the clamped
+    # branch the slice lands somewhere else — [nightStart, watermark] —
+    # which a direct request for that same window locks as its own
+    # requested path, so without this a clamped night-mode open and a
+    # direct fetch of "the night so far" could interleave bytes in the
+    # same pod files. Re-entrant, so the common (unclamped) case, where
+    # target IS the already-locked requested dir, costs nothing.
+    with windowWriteLock(target):
+        # Serving anything out of this night counts as using the night
+        # itself. Without this only the slice's own sidecar is touched,
+        # so a finalised night whose slices are in daily use looks
+        # untouched to LRU eviction and is reclaimed before them — the
+        # expensive thing evicted to keep the cheap derivatives that
+        # cannot be rebuilt without it.
+        markCacheViewed(nightDir)
+        if (target / META_NAME).exists() and not (target / PARTIAL_FLAG).exists():
+            try:
+                meta = json.loads((target / META_NAME).read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = None
+            if meta and meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "exact"
+                return target, meta
+        if target.resolve() == nightDir.resolve():
+            # The request *is* the night's own window, and the night dir
+            # already holds exactly that — hand it over rather than copying
+            # it onto itself (which would truncate every pod file as it read
+            # it). A finalised night takes the exact-hit branch above; this
+            # covers the gap between the watermark reaching night end and
+            # finalisation writing _meta.json, which is where the
+            # --live-day-obs staging mode parks permanently.
+            return nightDir, liveNightMeta(sidecar, sliceSpec)
+        try:
+            return materializeNightSlice(nightDir, sliceSpec)
+        except Exception as e:  # noqa: BLE001 — slice is an optimisation
+            print(f"night-slice from {nightDir} failed ({e}); falling back", file=sys.stderr)
+            return None
+
+
 def findSupersetCache(
     cluster: str,
     namespace: str,
@@ -672,7 +1306,12 @@ def findSupersetCache(
     # Walk both depths so each mode finds its own kind.
     windowDirs: list[Path] = []
     if podRegex is None:
-        windowDirs = [d for d in base.iterdir() if d.is_dir()]
+        # Live-built night dirs (active or finalised, marked by their
+        # _live.json sidecar) are excluded: parsing a whole night to
+        # answer a contained window takes minutes, and fetchAll's slice
+        # path — consulted before this one — already serves those
+        # requests near-instantly.
+        windowDirs = [d for d in base.iterdir() if d.is_dir() and not (d / LIVE_SIDECAR_NAME).exists()]
     else:
         for d in base.iterdir():
             if not d.is_dir():
@@ -720,8 +1359,25 @@ def fetchAll(
     Returns a ``(cacheDir, meta)`` tuple. ``cacheDir`` is the directory the
     caller should read pod files from — typically the exact-spec dir, but on
     a superset cache hit it points to whichever wider window we found.
+
+    Serialised per requested window (see :func:`windowWriteLock`): a
+    second caller asking for a window someone else is already fetching or
+    slicing blocks until they're done, and then takes their result as an
+    ordinary cache hit rather than writing the same files underneath
+    them. The wait is the price of the fetch it would have duplicated.
     """
     requestedDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
+    with windowWriteLock(requestedDir):
+        return _fetchAllLocked(spec, requestedDir, progress, forceRefresh)
+
+
+def _fetchAllLocked(
+    spec: FetchSpec,
+    requestedDir: Path,
+    progress: Callable[[str, int, int], None] | None,
+    forceRefresh: bool,
+) -> tuple[Path, dict]:
+    """:func:`fetchAll`'s body, under the requested window's write lock."""
     metaPath = requestedDir / META_NAME
     partialPath = requestedDir / PARTIAL_FLAG
 
@@ -742,11 +1398,30 @@ def fetchAll(
         # the current fetch schema — an older (v1) cache may be truncated,
         # so we fall through and re-fetch rather than re-serve it.
         if requestedDir.exists() and metaPath.exists() and not partialPath.exists():
-            meta = json.loads(metaPath.read_text())
-            if meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
+            # A meta we can't parse means the same thing as one that
+            # isn't there: no usable cache. Every other reader treats it
+            # that way; raising out of here instead would turn a
+            # truncated file (a full disk, a killed writer) into a 500 on
+            # every future request for that window, with no way back
+            # except finding and deleting the directory by hand.
+            try:
+                meta = json.loads(metaPath.read_text())
+            except (OSError, json.JSONDecodeError):
+                meta = None
+            if meta is not None and meta.get("fetchSchemaVersion") == CACHE_SCHEMA_VERSION:
                 meta["fromCache"] = True
                 meta["cacheReuse"] = "exact"
                 return requestedDir, meta
+    # A live-built night dir serves contained windows by slicing —
+    # near-instant, no Loki round trip. Deliberately *outside* the
+    # cacheEligible gate: an in-progress night's own window (night mode
+    # on the current dayObs) ends in the future, but is legitimately
+    # served clamped to the watermark — "the night so far".
+    if not forceRefresh:
+        sliced = _tryNightSlice(spec)
+        if sliced is not None:
+            return sliced
+    if cacheEligible:
         # Otherwise, look for a wider cached window that contains us.
         # Superset reuse is only honoured when the pod-filter matches;
         # otherwise an exposure-mode (all-pods) window could pretend to
@@ -754,13 +1429,30 @@ def fetchAll(
         # though their on-disk contents differ.
         superset = findSupersetCache(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
         if superset is not None:
-            meta = loadCacheMeta(superset)
-            meta["fromCache"] = True
-            meta["cacheReuse"] = "superset"
-            meta["cacheReusePath"] = str(superset)
-            return superset, meta
+            # findSupersetCache already parsed this meta, but it can be
+            # deleted or rewritten between then and here; an unreadable
+            # one just means "no superset after all", not a 500.
+            try:
+                meta = loadCacheMeta(superset)
+            except (OSError, json.JSONDecodeError, FileNotFoundError):
+                meta = None
+            if meta is not None:
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "superset"
+                meta["cacheReusePath"] = str(superset)
+                return superset, meta
 
-    # No usable cache — fetch fresh into the requested dir.
+    # No usable cache — fetch fresh into the requested dir. Unless the
+    # poller owns it: a fresh fetch opens every pods/<pod>.jsonl "wb",
+    # which against a live night dir means truncating files the poller is
+    # concurrently appending to. Refusing loudly beats corrupting the
+    # night. (Normally unreachable — the slice path above serves these —
+    # but forceRefresh skips it, and so does an unparseable sidecar.)
+    if (requestedDir / LIVE_SIDECAR_NAME).exists():
+        raise FetchError(
+            f"{requestedDir} is a live night directory maintained by the poller; "
+            "refusing to overwrite it with a fresh fetch"
+        )
     ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
     podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
@@ -772,6 +1464,12 @@ def fetchAll(
     t0 = time.time()
     pods = listPods(spec)
     podsListPath.write_text("\n".join(pods) + "\n")
+    # A previous attempt on this window (a fetch that died, or a night
+    # slice that failed part-way) may have left pod files behind.
+    # summarizeAll reads the directory rather than pods.txt, so anything
+    # stale here would be parsed as part of this window.
+    _pruneStalePodFiles(podsDir, set(pods))
+    _pruneStalePodFiles(podsEventsDir, set(pods))
 
     perPodBytes: dict[str, int] = {}
     perPodLines: dict[str, int] = {}
@@ -922,9 +1620,8 @@ def markCacheViewed(cacheDir: Path, when: dt.datetime | None = None) -> None:
         pass
 
 
-def addExposureToCache(cacheDir: Path, expId: int) -> None:
-    """Record that ``expId`` was a trigger for the contents of this
-    cache window.
+def addExposureToCache(cacheDir: Path, expId: int, instrument: str) -> None:
+    """Record that ``(instrument, expId)`` was a trigger for this cache window.
 
     A given window can be reused by multiple dataIds (the default
     fetch window is ~5 minutes wide, so consecutive exposures often
@@ -932,42 +1629,61 @@ def addExposureToCache(cacheDir: Path, expId: int) -> None:
     de-duplicate, and keep the file sorted so the UI can render a
     stable list. Best-effort: a write failure does not interrupt the
     request — the sidecar just won't carry that id.
+
+    ``instrument`` is required, for the same reason ``markCacheRange``
+    requires one: a bare id names a different exposure on each
+    instrument, so an unqualified entry can't tell the cache listing
+    which run this window holds — and the link it renders would open the
+    twin. There is one sidecar format and no reader tolerates a bare id.
     """
     if not cacheDir.exists():
         return
     existing = set(getCacheExposureIds(cacheDir))
-    existing.add(int(expId))
-    body = "\n".join(str(i) for i in sorted(existing)) + "\n"
+    existing.add((instrument, int(expId)))
+    body = "\n".join(f"{inst}:{eid}" for eid, inst in sorted((e, i) for i, e in existing)) + "\n"
     try:
         (cacheDir / EXPOSURE_IDS_NAME).write_text(body)
     except OSError:
         pass
 
 
-def getCacheExposureIds(cacheDir: Path) -> list[int]:
-    """Return the dataIds previously recorded as triggers for this
-    cache, sorted ascending. ``[]`` if the sidecar is missing or
-    unparseable — same best-effort contract as the writer."""
+def getCacheExposureIds(cacheDir: Path) -> list[tuple[str, int]]:
+    """The ``(instrument, dataId)`` pairs recorded as triggers for this cache.
+
+    Sorted by ascending dataId, then instrument. ``[]`` if the sidecar is
+    missing or unparseable — same best-effort contract as the writer. A
+    line that isn't ``<instrument>:<dataId>`` is skipped rather than
+    interpreted: the deploy-time schema flush is the upgrade path from an
+    older format, not a tolerant reader (see caching.md).
+    """
     p = cacheDir / EXPOSURE_IDS_NAME
     if not p.exists():
         return []
-    out: list[int] = []
+    out: set[tuple[str, int]] = set()
     try:
         for line in p.read_text().splitlines():
-            s = line.strip()
-            if not s:
+            instrument, sep, rawId = line.strip().partition(":")
+            if not sep or not instrument:
                 continue
             try:
-                out.append(int(s))
+                out.add((instrument, int(rawId)))
             except ValueError:
                 continue
     except OSError:
         return []
-    return sorted(set(out))
+    return [(inst, eid) for eid, inst in sorted((e, i) for i, e in out)]
 
 
-def markCacheRange(cacheDir: Path, startId: int, stopId: int) -> None:
+def markCacheRange(cacheDir: Path, startId: int, stopId: int, instrument: str) -> None:
     """Record that this cache is a range-mode fetch over ``[startId, stopId]``.
+
+    ``instrument`` is the pin the range was fetched under — a range is a
+    run of *one* instrument's exposures, and the rebuild path needs the
+    pin back to resolve each in-range id against the right table (a bare
+    lookup on a colliding id would anchor to the other instrument's
+    shutter close). It is required: there is exactly one sidecar format,
+    three lines, and no reader tolerates fewer (see caching.md's
+    no-backwards-compatibility rule).
 
     Best-effort, same contract as :func:`addExposureToCache`: a write
     failure does not interrupt the request — the cache just won't be
@@ -976,7 +1692,7 @@ def markCacheRange(cacheDir: Path, startId: int, stopId: int) -> None:
     if not cacheDir.exists():
         return
     try:
-        (cacheDir / RANGE_NAME).write_text(f"{int(startId)}\n{int(stopId)}\n")
+        (cacheDir / RANGE_NAME).write_text(f"{int(startId)}\n{int(stopId)}\n{instrument}\n")
     except OSError:
         pass
 
@@ -985,6 +1701,31 @@ def getCacheRange(cacheDir: Path) -> tuple[int, int] | None:
     """Return the ``(startId, stopId)`` recorded for a range cache, or
     ``None`` if the sidecar is missing or unparseable — same best-effort
     contract as the writer."""
+    lines = _readRangeSidecar(cacheDir)
+    if lines is None:
+        return None
+    try:
+        return int(lines[0]), int(lines[1])
+    except ValueError:
+        return None
+
+
+def getCacheRangeInstrument(cacheDir: Path) -> str | None:
+    """The instrument recorded in a range cache's sidecar, or ``None``
+    when the sidecar is missing or malformed (in which case
+    :func:`getCacheRange` won't recognise the dir as a range either)."""
+    lines = _readRangeSidecar(cacheDir)
+    return lines[2] if lines is not None else None
+
+
+def _readRangeSidecar(cacheDir: Path) -> list[str] | None:
+    """The non-blank lines of ``_range.txt``, or ``None`` if unusable.
+
+    Exactly one format exists: startId, stopId, instrument — one per
+    line. Anything shorter (including what an older build wrote) is
+    malformed, so the dir simply isn't a range cache; the deploy-time
+    schema flush is the upgrade path, not a tolerant reader.
+    """
     p = cacheDir / RANGE_NAME
     if not p.exists():
         return None
@@ -992,12 +1733,7 @@ def getCacheRange(cacheDir: Path) -> tuple[int, int] | None:
         lines = [s.strip() for s in p.read_text().splitlines() if s.strip()]
     except OSError:
         return None
-    if len(lines) < 2:
-        return None
-    try:
-        return int(lines[0]), int(lines[1])
-    except ValueError:
-        return None
+    return lines if len(lines) >= 3 else None
 
 
 def getCacheLastViewed(cacheDir: Path) -> dt.datetime | None:
@@ -1038,6 +1774,30 @@ def _iterCacheDirs(root: Path) -> list[Path]:
     return out
 
 
+def dropLiveSidecarsUnder(target: Path) -> None:
+    """Unlink every ``_live.json`` under ``target`` before it is removed.
+
+    A live night dir is only trustworthy because its sidecar vouches for
+    the byte ranges of the files beside it. Deleting the tree can fail
+    part-way — the poller or a request thread can be concurrently
+    creating files in it, so ``rmtree`` can hit ``ENOTEMPTY`` — and a
+    tree that lost pod files but kept its sidecar is worse than either
+    outcome: the poller's intactness check passes, it resumes appending
+    to files that now start mid-night, and every slice taken from them
+    is short while claiming to be complete.
+
+    Removing the sidecar first makes a partial delete indistinguishable
+    from a full one: no sidecar, so the poller opens the night afresh.
+    Every path that removes cache trees — the DELETE endpoints and LRU
+    eviction alike — goes through this first.
+    """
+    for sidecar in [target / LIVE_SIDECAR_NAME, *target.rglob(LIVE_SIDECAR_NAME)]:
+        try:
+            sidecar.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
     """Evict the least-recently-viewed cache windows until the on-disk
     total is at or below ``maxBytes``.
@@ -1073,6 +1833,11 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
         if total <= maxBytes:
             break
         sz = cacheDuSizeBytes(d)
+        # Sidecar first: a finalised live night is an ordinary evictable
+        # window, but if its rmtree fails part-way the surviving sidecar
+        # would vouch for files that are gone — and every slice taken
+        # from it would be short while claiming to be complete.
+        dropLiveSidecarsUnder(d)
         try:
             shutil.rmtree(d)
         except OSError:

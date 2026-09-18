@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 from collections import Counter
 from pathlib import Path
 
 import pytest
 
 from ra_log_explorer import parse
+from ra_log_explorer.config import NIGHT_AOS_POD_REGEX
 
 # ----- LogLine ------------------------------------------------------------
 
@@ -333,8 +335,6 @@ def test_podOrdinal(pod: str, expected: int | None) -> None:
     [
         ("s-lsstcam-run-head-node-x", "LSSTCam"),
         ("s-latiss-run-head-node-x", "LATISS"),
-        ("s-lsstcomcam-run-x-y", "LSSTComCam"),
-        ("s-lsstcomcamsim-run-x-y", "LSSTComCamSim"),
         ("unrelated-pod", None),
     ],
 )
@@ -741,9 +741,11 @@ def test_podInstrument_recognises_inst_prefixes() -> None:
     # Butler `instrument` field that the rest of the codebase compares
     # against).
     assert parse.podInstrument("s-lsstcam-run-aos-worker-0") == "LSSTCam"
-    # Longest-match wins over shorter substring: lsstcomcamsim must NOT
-    # be misclassified as lsstcomcam.
-    assert parse.podInstrument("s-lsstcomcamsim-run-sfm-runner-0") == "LSSTComCamSim"
+    assert parse.podInstrument("s-latiss-run-sfm-runner-0") == "LATISS"
+    # Instrument-neutral pods (redis, cluster-manager) return None, which
+    # attribution treats as "belongs to whichever exposure is in view"
+    # rather than as an unknown instrument.
+    assert parse.podInstrument("s-misc-run-redis-0") is None
 
 
 # ----- edge cases: traceback capture --------------------------------------
@@ -932,11 +934,11 @@ def test_summarizePod_traceback_interleaved_log_line_marks_truncated(tmp_path: P
 
 def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_path: Path) -> None:
     """A traceback that reaches its terminating exception line but whose
-    class our classifier doesn't recognise (here ``StopIteration`` — no
-    canonical Error/Exception/… suffix) is *complete*, so it must label
-    ``"<unclassified>"`` — never ``"<truncated>"``, which is reserved for
-    genuinely cut-short bodies. The terminating line is still captured in
-    the body so the user can read the type by eye."""
+    class we decline to name (here a bare all-caps ``FAILURE:`` — the
+    shape of a third-party banner, not of a class) is *complete*, so it
+    must label ``"<unclassified>"`` — never ``"<truncated>"``, which is
+    reserved for genuinely cut-short bodies. The terminating line is
+    still captured in the body so the user can read the type by eye."""
     p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
     _writePodLog(
         p,
@@ -945,9 +947,9 @@ def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_pa
             ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
             ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
             ("2026-05-21T13:00:01.002+00:00", "error", "    next(it)"),
-            # Terminating exception line, but StopIteration isn't in the
-            # classifier's suffix set — complete, just unclassifiable.
-            ("2026-05-21T13:00:01.003+00:00", "error", "StopIteration: queue drained"),
+            # Terminating line: the right shape, but all-caps, so it is
+            # a banner rather than a class name. Complete, unnameable.
+            ("2026-05-21T13:00:01.003+00:00", "error", "FAILURE: queue drained"),
             # A following line so the traceback finalises via the normal
             # (non-EOF) terminator path.
             ("2026-05-21T13:00:02.000+00:00", "info", "moving on"),
@@ -957,20 +959,24 @@ def test_summarizePod_complete_traceback_unknown_class_marks_unclassified(tmp_pa
     assert len(s.tracebacks) == 1
     tb = s.tracebacks[0]
     assert tb.excClass == "<unclassified>"
-    assert "StopIteration: queue drained" in tb.body
+    assert "FAILURE: queue drained" in tb.body
 
 
 def test_summarizePod_complete_traceback_unknown_class_at_eof_marks_unclassified(tmp_path: Path) -> None:
     """Same as above but the unclassified terminator line is the last
     line in the pod log: it still finalises as ``"<unclassified>"`` (the
-    terminator was seen before EOF), not ``"<truncated>"``."""
+    terminator was seen before EOF), not ``"<truncated>"``.
+
+    Here the final component is lowercase, so there is no class name to
+    read off it — the shape says "a traceback ended here" and nothing
+    more."""
     p = tmp_path / "s-lsstcam-run-aos-worker-0.jsonl"
     _writePodLog(
         p,
         [
             ("2026-05-21T13:00:01.000+00:00", "error", "Traceback (most recent call last):"),
             ("2026-05-21T13:00:01.001+00:00", "error", '  File "/x.py", line 1, in foo'),
-            ("2026-05-21T13:00:01.003+00:00", "error", "custompkg.Halt: shutting down"),
+            ("2026-05-21T13:00:01.003+00:00", "error", "custompkg.halt: shutting down"),
         ],
     )
     s = parse.summarizePod(p)
@@ -1145,6 +1151,16 @@ _EV_UNHEALTHY = (
     f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
     'reason=Unhealthy type=Warning count=1 msg="Liveness probe failed"'
 )
+# A real FailedMount from the summit (dayObs 20260711): a cluster-wide
+# secret-sync hiccup hit five running pods at one moment. Only the pod
+# name is edited (onto this file's fixture pod).
+_EV_FAILEDMOUNT = (
+    f"name={_POD} kind=Pod objectAPIversion=v1 objectRV=827044507 eventRV=828082659 "
+    "reportinginstance=yagan02 reportingcontroller=kubelet sourcecomponent=kubelet "
+    "sourcehost=yagan02 reason=FailedMount type=Warning count=1 "
+    'msg="MountVolume.SetUp failed for volume \\"rapid-analysis-secrets\\" : '
+    'failed to sync secret cache: timed out waiting for the condition"'
+)
 # Noise we drop: an image-pull event, and a StatefulSet (non-Pod) event.
 _EV_PULLED = (
     f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
@@ -1203,11 +1219,47 @@ def test_classifyK8sEvent_killing_oom_backoff_unhealthy() -> None:
         assert ev.flavor == reason
 
 
+def test_classifyK8sEvent_failedmount_is_a_pod_down_marker() -> None:
+    """A pod that can't mount a volume is down (or wedged restarting)
+    until it can — it explains a mid-work gap the same way a restart
+    does, and it happened for real: a cluster-wide secret-sync hiccup
+    interrupted five running pods at one moment on the summit."""
+    ev = parse.classifyK8sEvent(_POD, _evObj(_EV_FAILEDMOUNT))
+    assert ev is not None
+    assert ev.kind == "POD_MOUNT_FAILED"
+    assert ev.kind in parse.LIFECYCLE_EVENT_KINDS
+    assert ev.level == "warn"
+    assert ev.flavor == "FailedMount"
+    assert ev.expId is None
+    # The volume name is the whole diagnosis; it must survive into the
+    # tooltip text.
+    assert "rapid-analysis-secrets" in ev.message
+    assert "yagan02" in ev.message
+
+
 def test_classifyK8sEvent_drops_noise_and_non_pod() -> None:
     # Image pull is lifecycle chatter; a StatefulSet event names the set,
     # not the pod. Both must classify to nothing.
     assert parse.classifyK8sEvent(_POD, _evObj(_EV_PULLED)) is None
     assert parse.classifyK8sEvent(_POD, _evObj(_EV_STATEFULSET)) is None
+
+
+def test_classifyK8sEvent_drops_taint_manager_eviction() -> None:
+    """``TaintManagerEviction`` reads like a pod death and is not one.
+
+    Its message is the taint manager *cancelling* a deletion, so
+    surfacing it would put a "pod died here" marker on a timeline where
+    nothing died — and it is common (143 occurrences across our
+    captures), so the timeline would be noisy as well as wrong. Pinned
+    because the obvious reading of the name invites exactly the broad
+    ``"Eviction" in reason`` branch that would resurrect it.
+    """
+    line = (
+        f"name={_POD} kind=Pod objectAPIversion=v1 sourcehost=yagan01 "
+        "reason=TaintManagerEviction type=Normal count=1 "
+        'msg="Cancelling deletion of Pod rapid-analysis/s-lsstcam-run-aos-worker-0"'
+    )
+    assert parse.classifyK8sEvent(_POD, _evObj(line)) is None
 
 
 def test_classifyK8sEvent_returns_None_without_timestamp() -> None:
@@ -1417,3 +1469,375 @@ def _countLines(path: Path) -> int:
         if line.strip():
             n += 1
     return n
+
+
+# ----- a real crash loop, end to end ----------------------------------------
+
+
+def test_classifyK8sEvent_reads_a_whole_real_crash_loop(podCrashEventsJsonl: Path) -> None:
+    """The captured stream of a pod that flapped and then wedged.
+
+    Hand-written event lines prove each branch in isolation; this proves
+    the sequence a human actually has to read. The pod restarts in place
+    five times (`Started` with a rising `count`), gets rescheduled, and
+    then fails to pull its image — which is the shape of "why did this
+    pod stop doing work" in practice.
+    """
+    kinds: list[str] = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("s-lsstcam-run-step-1b-aos-worker-gather1baosset-0", json.loads(line))
+        if ev is not None:
+            kinds.append(ev.kind)
+    # Image pulls, scheduling and interface attachment are chatter; only
+    # the lifecycle facts survive.
+    assert kinds == [
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_STARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_RESTARTED",
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_FAILED",
+        "POD_STARTED",
+    ]
+
+
+def test_a_restart_marker_says_which_restart_it_was(podCrashEventsJsonl: Path) -> None:
+    """The count is the whole signal: a container on its sixth start has
+    died five times, and that number is what tells a reader whether they
+    are looking at a blip or a crash loop."""
+    restarts = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("pod", json.loads(line))
+        if ev is not None and ev.kind == "POD_RESTARTED":
+            restarts.append(ev.message)
+    assert len(restarts) == 5
+    assert "restart #2" in restarts[0]
+    assert "restart #6" in restarts[-1]
+    # And the node, so a pod that keeps dying on one machine is visible.
+    assert "manke" in restarts[0]
+
+
+def test_the_crash_reason_survives_into_the_event(podCrashEventsJsonl: Path) -> None:
+    """`flavor` carries the k8s reason and the message carries the text,
+    because "it failed" is not actionable and "ImagePullBackOff" is."""
+    failures = []
+    for line in podCrashEventsJsonl.read_text().splitlines():
+        ev = parse.classifyK8sEvent("pod", json.loads(line))
+        if ev is not None and ev.kind == "POD_FAILED":
+            failures.append(ev)
+    assert [e.flavor for e in failures] == ["Failed", "Failed", "BackOff", "Failed"]
+    assert all(e.level == "error" for e in failures)
+    joined = " ".join(e.message or "" for e in failures)
+    assert "ErrImagePull" in joined
+    assert "ImagePullBackOff" in joined
+    assert "pull QPS exceeded" in joined
+
+
+def test_summarizePod_carries_crash_markers_onto_the_timeline(
+    aosWorkerJsonl: Path, podCrashEventsJsonl: Path
+) -> None:
+    """The markers have to reach the pod summary, which is what both the
+    exposure timeline and the night rollups read."""
+    summary = parse.summarizePod(aosWorkerJsonl, podCrashEventsJsonl)
+    lifecycle = [e for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS]
+    assert len(lifecycle) == 15
+    assert {e.kind for e in lifecycle} == {
+        "POD_KILLED",
+        "POD_STARTED",
+        "POD_RESTARTED",
+        "POD_FAILED",
+    }
+    # Lifecycle events carry no dataId: a pod dies, not an exposure.
+    assert all(e.expId is None for e in lifecycle)
+    # And they stay in time order alongside the app-log events.
+    stamps = [e.t for e in summary.events]
+    assert stamps == sorted(stamps)
+
+
+# ----- an isolated in-place restart, inferred from the log ------------------
+#
+# k8s's own restart signal is the event `count`, and it only survives while
+# the previous start's Event object does (a one-hour TTL). A crash loop keeps
+# it alive; a single restart hours into a pod's life does not, and arrives
+# as `count=1` — indistinguishable from a first start by the event alone.
+# `summarizePod` settles those against the app log. The threshold that
+# separates the two populations is `parse.RESTART_MIN_WORK_S`, whose
+# docstring records the measurement it came from.
+
+
+def _writePod(tmp_path: Path, name: str, logLines: list[str], eventLines: list[str]) -> tuple[Path, Path]:
+    """Write a pod's app-log and lifecycle files; return both paths."""
+    logPath = tmp_path / f"{name}.jsonl"
+    evPath = tmp_path / f"{name}.events.jsonl"
+    logPath.write_text("".join(f"{ln}\n" for ln in logLines))
+    evPath.write_text("".join(f"{ln}\n" for ln in eventLines))
+    return logPath, evPath
+
+
+def _logLine(ts: str, text: str = "lsst.isr run  INFO   working") -> str:
+    return json.dumps({"timestamp": ts, "labels": {"detected_level": "info"}, "line": text})
+
+
+def _evLine(ts: str, reason: str, count: int = 1) -> str:
+    return json.dumps(
+        {
+            "timestamp": ts,
+            "labels": {},
+            "line": (
+                f"name=p kind=Pod objectAPIversion=v1 sourcehost=manke01 "
+                f'reason={reason} type=Normal count={count} msg="Container started"'
+            ),
+        }
+    )
+
+
+def test_summarizePod_infers_an_isolated_restart_from_the_log(
+    inplaceRestartLogJsonl: Path, inplaceRestartEventsJsonl: Path
+) -> None:
+    """The real 20260813 SFM-worker restart, which `count` alone misses.
+
+    The pod worked for 47 minutes, stopped mid-`isr` with no traceback,
+    and a `Started` (`count=1`) landed 3 s later followed by a fresh
+    container's EUPS banner. That is a restart, and before this rule it
+    was reported as a first start — invisible in the night view, which
+    excludes those.
+    """
+    summary = parse.summarizePod(inplaceRestartLogJsonl, inplaceRestartEventsJsonl)
+    restarts = [e for e in summary.events if e.kind == "POD_RESTARTED"]
+    assert len(restarts) == 1
+    ev = restarts[0]
+    assert ev.level == "warn"
+    assert ev.flavor == "Started"  # the k8s reason still rides along
+    assert ev.t == dt.datetime(2026, 8, 13, 16, 47, 15, tzinfo=dt.timezone.utc)
+    # The message says the label was inferred, and from what — the same
+    # event read off `count` says "restart #N" instead.
+    assert "restart inferred" in ev.message
+    assert "46 min of work" in ev.message
+    assert "manke01" in ev.message
+    # No POD_STARTED survives for it: promotion re-labels, never duplicates.
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_RESTARTED"]
+
+
+def test_summarizePod_leaves_a_first_start_alone_after_an_init_container(tmp_path: Path) -> None:
+    """A pod's own first start is preceded by its init container's preamble.
+
+    This is the shape that would flood the night view if "any log line
+    before the start" were the rule: 833 of the 846 candidate starts
+    across four captured nights look exactly like this — a single
+    `secret-perm-fixer` line complaining about a missing secret, emitted
+    in the same second the sandbox was created.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "s-lsstcam-run-plotter-7f8bcbcd8c-4t4th",
+        [_logLine("2026-08-11T23:38:16.889+01:00", "cat: can't open '/secrets/gcs.json'")]
+        + [_logLine(f"2026-08-11T23:44:{s:02d}.000+01:00") for s in (10, 20, 30)],
+        [
+            _evLine("2026-08-11T23:38:16+01:00", "Scheduled"),
+            _evLine("2026-08-11T23:44:06+01:00", "Started"),
+        ],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    kinds = [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS]
+    assert kinds == ["POD_STARTED"]
+
+
+def test_summarizePod_leaves_a_rescheduled_pod_alone(tmp_path: Path) -> None:
+    """A StatefulSet pod keeps its name across a delete/recreate.
+
+    So its log file holds the *previous* pod's lines too, and those must
+    not count as work this instance was doing — otherwise every rollout
+    reads as a fleet-wide restart. `redis-0` on 20260811 is the real
+    case: 3.9 h of a predecessor's logging before a `Started` whose
+    sandbox was created 8 s earlier.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "redis-0",
+        [_logLine(f"2026-08-11T{h:02d}:00:00.000+01:00") for h in (18, 19, 20, 21, 22)]
+        + [_logLine("2026-08-11T22:38:50.000+01:00")],
+        [
+            _evLine("2026-08-11T22:38:34+01:00", "Scheduled"),
+            _evLine("2026-08-11T22:38:42+01:00", "Started"),
+        ],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_STARTED"]
+
+
+def test_summarizePod_needs_activity_on_both_sides_of_the_start(tmp_path: Path) -> None:
+    """A pod that logged and then went silent has not demonstrably restarted.
+
+    Without the after-side requirement, a window that happens to end at
+    a container start would relabel it on the strength of what came
+    before — the one thing that cannot distinguish a restart from a
+    pod being shut down for good.
+    """
+    logPath, evPath = _writePod(
+        tmp_path,
+        "s-lsstcam-run-sfm-runner-workerset-1",
+        [_logLine(f"2026-08-13T17:{m:02d}:00.000+01:00") for m in (0, 20, 40)],
+        [_evLine("2026-08-13T17:47:15+01:00", "Started")],
+    )
+    summary = parse.summarizePod(logPath, evPath)
+    assert [e.kind for e in summary.events if e.kind in parse.LIFECYCLE_EVENT_KINDS] == ["POD_STARTED"]
+
+
+def test_readPodLifecycle_returns_sandbox_times_classify_drops(
+    inplaceRestartEventsJsonl: Path, podCrashEventsJsonl: Path
+) -> None:
+    """Sandbox events are chatter to the timeline but load-bearing here."""
+    events, sandbox = parse.readPodLifecycle(inplaceRestartEventsJsonl)
+    assert [e.kind for e in events] == ["POD_STARTED"]
+    assert sandbox == []  # the restart's whole point: no new pod sandbox
+    _, crashSandbox = parse.readPodLifecycle(podCrashEventsJsonl)
+    # The crash-loop capture *does* contain a reschedule, so it has one.
+    assert len(crashSandbox) >= 1
+    assert crashSandbox == sorted(crashSandbox)
+
+
+def test_readPodLifecycle_on_a_missing_file_is_empty(tmp_path: Path) -> None:
+    events, sandbox = parse.readPodLifecycle(tmp_path / "nope.jsonl")
+    assert events == []
+    assert sandbox == []
+
+
+# ----- the two night halves partition the pods ------------------------------
+
+
+def test_isAosPod_is_the_exact_complement_of_the_loki_filter() -> None:
+    """The night's two views must divide the pods, not overlap or leak.
+
+    The AOS half pushes `NIGHT_AOS_POD_REGEX` down to Loki, so its window
+    holds exactly the pods that regex matched. The SFM half fetches
+    everything and subtracts `isAosPod` in Python. If the two rules ever
+    part company a pod appears twice or — worse, because it is silent —
+    in neither view. So they are pinned against each other here, over the
+    real pod names the group fixture already carries.
+    """
+    pattern = re.compile(NIGHT_AOS_POD_REGEX)
+    pods = [
+        "s-lsstcam-run-head-node-684d89d6bb-44ctd",
+        "s-lsstcam-run-sfm-runner-workerset-0",
+        "s-lsstcam-run-aos-worker-aosworkerset-3",
+        "s-lsstcam-run-step-1b-aos-worker-gather1baosset-0",
+        "s-lsstcam-run-metadata-server-aos-6f778fc678-lqsd9",
+        "s-lsstcam-run-zernike-prediction-plotting-x",
+        "s-lsstcam-run-backlog-worker-backlogset-18",
+        "s-latiss-run-butler-watcher-9855795b8-g42sd",
+        "redis-0",
+        "rapid-analysis-squid-55c7c86f5-hp9d8",
+    ]
+    for pod in pods:
+        # fullmatch: LogQL anchors a label regex, so ".*aos.*" is a
+        # whole-value match — which for this pattern is the same as a
+        # substring test, and that equivalence is the thing being pinned.
+        assert parse.isAosPod(pod) == bool(pattern.fullmatch(pod)), pod
+    # And the split is non-trivial in both directions, so a rule that
+    # said "everything" or "nothing" could not pass this test.
+    assert any(parse.isAosPod(p) for p in pods)
+    assert any(not parse.isAosPod(p) for p in pods)
+
+
+def test_summarizeAll_keep_filters_before_parsing(tmp_path: Path) -> None:
+    """`keep` selects pods by name; without it every pod is summarized."""
+    podsDir = tmp_path / "pods"
+    podsDir.mkdir()
+    for pod in ("s-lsstcam-run-aos-worker-aosworkerset-1", "s-lsstcam-run-sfm-runner-workerset-1"):
+        (podsDir / f"{pod}.jsonl").write_text(
+            json.dumps({"timestamp": "2026-08-13T13:00:00+01:00", "labels": {}, "line": "hello"}) + "\n"
+        )
+    assert len(parse.summarizeAll(tmp_path)) == 2
+    aos = parse.summarizeAll(tmp_path, keep=parse.isAosPod)
+    assert [s.pod for s in aos] == ["s-lsstcam-run-aos-worker-aosworkerset-1"]
+    rest = parse.summarizeAll(tmp_path, keep=lambda p: not parse.isAosPod(p))
+    assert [s.pod for s in rest] == ["s-lsstcam-run-sfm-runner-workerset-1"]
+
+
+def test_summarizePod_names_a_pipeline_exception_with_no_Error_suffix(tmp_path: Path) -> None:
+    """The pipeline names its exceptions for what went wrong, not for the
+    fact that something did — `BadAstrometryFit`, `MatcherFailure`,
+    `NoVisitWcs`. Requiring an `…Error`/`…Exception` suffix binned every
+    one of them as `<unclassified>`: 1517 of 20260813's 4768 tracebacks,
+    which was *all* of that night's unclassified ones.
+
+    The lines here are verbatim from that night's `calibrateImage`
+    failures.
+    """
+    p = tmp_path / "s-lsstcam-run-sfm-runner-workerset-134.jsonl"
+    _writePodLog(
+        p,
+        [
+            ("2026-08-13T16:02:46.893+00:00", "error", "Running pipeline for 2026081300001 detector 144"),
+            ("2026-08-13T16:02:46.910+00:00", "error", "Traceback (most recent call last):"),
+            (
+                "2026-08-13T16:02:46.911+00:00",
+                "error",
+                '  File "/opt/lsst/.../pipe_tasks/calibrateImage.py", line 890, in runQuantum',
+            ),
+            ("2026-08-13T16:02:46.912+00:00", "error", "    raise exception"),
+            (
+                "2026-08-13T16:02:46.913+00:00",
+                "error",
+                "lsst.meas.astrom.exceptions.BadAstrometryFit: Poor quality astrometric fit, "
+                "8.245119905190442\" > 0.5\": {'nMatches': 383}",
+            ),
+            ("2026-08-13T16:02:47.000+00:00", "info", "moving on"),
+        ],
+    )
+    s = parse.summarizePod(p)
+    assert len(s.tracebacks) == 1
+    tb = s.tracebacks[0]
+    # The dotted module path is dropped; the class alone is the label the
+    # errors-by-type table groups on.
+    assert tb.excClass == "BadAstrometryFit"
+    assert tb.excMessage.startswith("Poor quality astrometric fit")
+    assert tb.expId == 2026081300001
+
+
+@pytest.mark.parametrize(
+    "line,expected",
+    [
+        # Named: the module path is stripped, the class kept.
+        ("lsst.meas.astrom.exceptions.BadAstrometryFit: nope", "BadAstrometryFit"),
+        ("lsst.meas.astrom.exceptions.MatcherFailure", "MatcherFailure"),
+        ("NoVisitWcs: no wcs for visit 1", "NoVisitWcs"),
+        ("RuntimeError: still works", "RuntimeError"),
+        ("galsim.errors.GalSimRangeError: x", "GalSimRangeError"),
+        # camelCase module names: LSST names a module after the task it
+        # holds, and requiring an all-lowercase module path rejected
+        # these — even the ones already carrying an `…Error` suffix.
+        ("lsst.pipe.tasks.calibrateImage.NoPsfStarsToStarsMatchError: x", "NoPsfStarsToStarsMatchError"),
+        ("lsst.meas.algorithms.measureApCorr.MeasureApCorrError: x", "MeasureApCorrError"),
+        # Lowercase class names exist in the standard library, but only
+        # qualify when they carry the canonical suffix — a lowercase word
+        # is what most non-exception lines look like.
+        ("socket.gaierror: [Errno -2] Name or service not known", "gaierror"),
+        ("error: a bare word is not a class", None),
+        ("StopIteration", "StopIteration"),
+        ("Foo.SubError: nested", "SubError"),
+        # Declined: all-caps banners are the shape but not a class. These
+        # are why the suffix requirement could be dropped safely.
+        ("WARNING: AstropyDeprecationWarning is deprecated", None),
+        ("ERROR: something went wrong", None),
+        ("FAILURE", None),
+        # Declined: no Capital-led component at all.
+        ("drp_pipe:", None),
+        ("custompkg.halt: shutting down", None),
+        # Declined: prose, not an exception line — the class token has to
+        # be followed by `:` or the end of the line, nothing else.
+        ("Poor quality astrometric fit, 8.2 > 0.5", None),
+        ("Traceback (most recent call last):", None),
+    ],
+)
+def test_excClassFrom_names_classes_and_declines_banners(line: str, expected: str | None) -> None:
+    got = parse._excClassFrom(line)
+    assert (got[0] if got else None) == expected

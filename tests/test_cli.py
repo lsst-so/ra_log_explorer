@@ -373,13 +373,56 @@ def test_eagerFetch_builds_state_with_tai_to_utc_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     # 08:46:16.267 TAI - 37s = 08:45:39.267 UTC.
     assert state.tZero.hour == 8 and state.tZero.minute == 45 and state.tZero.second == 39
     assert state.expId == 2026051900722
     # Reference points carry a "TAI input" label so the UI can show
     # which scale the user typed in.
     assert state.referencePoints[0]["source"] == "shutter close"
+    # An unpinned state would attribute the other instrument's pods to
+    # this exposure, so the default pin (LSSTCam, matching the server's)
+    # must land on the state.
+    assert state.instrument == "lsstcam"
+
+
+def test_eagerFetch_honours_the_instrument_flag(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """--instrument pins the eager state, exactly as the POST body's
+    field pins a browser-driven fetch; an unknown name is an argparse
+    error rather than a silently wrong table."""
+    from ra_log_explorer import cli
+    from ra_log_explorer import parse as _parse
+
+    def fakeFetchAll(
+        spec: FetchSpec,
+        progress: Callable[[str, int, int], None] | None = None,
+        forceRefresh: bool = False,
+    ) -> tuple[Path, dict[str, Any]]:
+        d = tmpCacheRoot / "fake"
+        (d / "pods").mkdir(parents=True, exist_ok=True)
+        return d, {"pod_count": 0, "total_bytes": 0, "elapsed_s": 0.0, "cacheReuse": "none"}
+
+    monkeypatch.setattr(cli, "fetchAll", fakeFetchAll)
+    monkeypatch.setattr(_parse, "summarizeAll", lambda _d: [])
+
+    args = cli.build_parser().parse_args(
+        [
+            "run",
+            "--exposure-id",
+            "2026071100445",
+            "--t-zero",
+            "2026-07-12T05:25:30.895",
+            "--instrument",
+            "latiss",
+            "--no-serve",
+            "--no-browser",
+        ]
+    )
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
+    assert state.instrument == "latiss"
+
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(["run", "--instrument", "hubble"])
 
 
 def test_eagerFetch_utc_flag_skips_tai_conversion(
@@ -414,7 +457,7 @@ def test_eagerFetch_utc_flag_skips_tai_conversion(
             "--no-browser",
         ]
     )
-    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    state = cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     # Same numeric value: no conversion applied.
     assert state.tZero.second == 39
 
@@ -436,6 +479,35 @@ def test_cmdRun_home_mode_starts_server(monkeypatch: pytest.MonkeyPatch) -> None
     ctx = captured["ctx"]
     assert len(ctx.exposureStates) == 0
     assert len(ctx.nightStates) == 0
+
+
+def test_cmdRun_live_mode_starts_the_poller_pinned_to_a_day(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--live-poll-s`` + ``--live-day-obs`` is how a staged historical
+    night plays the role of tonight, so the flags have to reach the
+    manager rather than only the help text."""
+    captured: dict[str, Any] = {}
+    monkeypatch.setattr(cli, "serve", lambda host, port, ctx: captured.setdefault("ctx", ctx))
+    monkeypatch.setattr(cli.LiveNightManager, "start", lambda self: captured.setdefault("started", True))
+    args = cli.build_parser().parse_args(
+        ["run", "--no-browser", "--live-poll-s", "60", "--live-day-obs", "20260711"]
+    )
+    assert cli.cmdRun(args) == 0
+    live = captured["ctx"].live
+    assert live is not None and captured["started"] is True
+    assert live._fixedDayObs == 20260711
+    assert live._pollS == 60.0
+
+
+def test_cmdRun_warns_that_live_day_obs_alone_does_nothing(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Without live mode there is no poller to pin, so the flag is a
+    silent no-op — and a staged test night that never appears looks like
+    the staging failed rather than like a missing flag."""
+    monkeypatch.setattr(cli, "serve", lambda host, port, ctx: None)
+    args = cli.build_parser().parse_args(["run", "--no-browser", "--live-day-obs", "20260711"])
+    assert cli.cmdRun(args) == 0
+    assert "--live-day-obs 20260711 has no effect" in capsys.readouterr().err
 
 
 def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -471,7 +543,7 @@ def test_eagerFetch_force_refresh_propagates(tmpCacheRoot: Path, monkeypatch: py
             "--no-browser",
         ]
     )
-    cli._eagerFetchAndBuildState(args, cli._resolveSite(args))
+    cli._eagerFetchAndBuildState(args, cli._resolveSite(args)[0])
     assert captured["forceRefresh"] is True
 
 

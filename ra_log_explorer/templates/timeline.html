@@ -2,32 +2,65 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <title>Rapid Analysis Log Explorer</title>
+  <title>__APP_TITLE__</title>
+  <!-- Prefixed like every other asset: deployed, the tab icon lives at
+       /log-explorer/static/favicon.png, and a root-relative /favicon.ico
+       would belong to whatever else shares the hostname. -->
+  <link rel="icon" type="image/png" href="__BASE_PATH__/static/favicon.png" />
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="/static/style.css" />
+  <!-- Loaded without blocking the first paint. A stylesheet link blocks
+       rendering until it resolves, and this one points off-site: on an
+       observatory network that cannot reach Google the page would sit
+       blank until the request timed out. `media="print"` makes it
+       non-blocking; the onload swap applies it once it arrives. The
+       webfonts are a nicety — style.css names full system fallback
+       stacks, so never getting them costs only the typeface. -->
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap"
+        rel="stylesheet" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="__BASE_PATH__/static/style.css" />
+  <script>
+    /* The server substitutes __BASE_PATH__ for the URL prefix it is served
+     * under ("" locally, e.g. "/log-explorer" on the RSP). Every request the
+     * app makes back to itself goes through apiUrl() so one deployment-time
+     * value moves them all. */
+    window.BASE_PATH = "__BASE_PATH__";
+    window.apiUrl = (p) => window.BASE_PATH + p;
+  </script>
 </head>
 <body>
   <!-- ===================== HOME VIEW ===================== -->
   <section id="home-view" hidden>
     <header id="topbar">
       <div class="title">
-        <span class="brand-mark" aria-hidden="true"></span>
-        <strong>Rapid Analysis Log Explorer</strong>
-        <span class="muted">pick an exposure to explore</span>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
+        <span class="title-text">
+          <strong>__APP_TITLE__</strong>
+          <span class="muted">Pick an exposure or night to explore</span>
+        </span>
+        <!-- The page-level instrument. Exposure ids restart at 1 per
+             instrument each night, so everything below — the Tonight
+             list, dataId lookups, fetches — is pinned to exactly one
+             instrument at a time. LSSTCam is the default. -->
+        <div id="instrument-switch" role="group" aria-label="instrument">
+          <button type="button" data-instrument="lsstcam" class="active">LSSTCam</button>
+          <button type="button" data-instrument="latiss">LATISS</button>
+        </div>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
+        <a href="__BASE_PATH__/?admin=1" class="ghost mini" id="admin-link">admin</a>
       </div>
-      <div class="site-switcher" id="site-switcher" hidden>
-        <label for="site-select">site</label>
-        <select id="site-select"></select>
+      <div class="site-badge" id="site-badge" hidden>
+        <span class="site-name" id="site-name"></span>
         <span class="muted" id="site-info"></span>
       </div>
     </header>
 
     <div id="home-layout">
       <main id="home-main">
+        <div class="home-card-row">
         <section class="home-card">
-          <h2>Explore exposure processing</h2>
+          <h2>All processing <span class="muted">explore one exposure</span></h2>
           <form id="fetch-form">
             <div class="row">
               <label>
@@ -44,19 +77,6 @@
                 <span id="manual-tzero-status" class="hint">enter the shutter close as TAI ISO-8601, e.g. 2026-06-24T14:38:41.380663</span>
               </label>
             </div>
-            <details>
-              <summary>per-exposure tuning</summary>
-              <div class="row">
-                <label>
-                  <span class="lbl">window before t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="5" step="0.1" />
-                </label>
-                <label>
-                  <span class="lbl">window after t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="300" step="1" />
-                </label>
-              </div>
-            </details>
             <div class="row submit-row">
               <button type="submit" id="fetch-submit" class="primary">Fetch &amp; explore</button>
               <span id="fetch-message" class="hint"></span>
@@ -66,64 +86,72 @@
               <div class="progress-text hint"></div>
             </div>
           </form>
-        </section>
-
-        <section class="home-card">
-          <h2>Explore a range of exposures</h2>
-          <p class="hint">
-            Give a start and stop dataId. One Loki fetch covers the whole
-            span (shutter close of the start, through shutter close of the
-            stop plus the after-buffer) as a single cache block — far
-            cheaper than fetching each exposure's overlapping window
-            separately. Step through each exposure's timeline in the
-            explore view, anchored at its own shutter close. Skipped
-            integers in the range are expected and simply omitted.
-          </p>
-          <form id="range-form">
+          <details id="advanced-options">
+            <summary>advanced options</summary>
+            <!-- One shared pair of window fields. They belong to the
+                 single-exposure form (form="fetch-form") but apply to
+                 both flows: a range is fetched from the *start*
+                 exposure's t0 minus the before-pad through the *stop*
+                 exposure's t0 plus the after-pad, so a single exposure
+                 is just the start==stop case. -->
             <div class="row">
               <label>
-                <span class="lbl">start dataId</span>
-                <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
-                <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
+                <span class="lbl">window before t<sub>0</sub> (s)</span>
+                <input type="number" name="windowBefore" value="__WINDOW_BEFORE__"
+                       form="fetch-form" step="0.1" />
               </label>
               <label>
-                <span class="lbl">stop dataId</span>
-                <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
-                <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
+                <span class="lbl">window after t<sub>0</sub> (s)</span>
+                <input type="number" name="windowAfter" value="__WINDOW_AFTER__"
+                       form="fetch-form" step="1" />
               </label>
             </div>
-            <details>
-              <summary>per-exposure tuning</summary>
+            <p class="hint">
+              For a range, the window runs from the start exposure's
+              t<sub>0</sub> (minus the before-pad) through the stop
+              exposure's t<sub>0</sub> (plus the after-pad).
+            </p>
+            <p class="hint">
+              <strong>Explore a range of exposures:</strong> give a start
+              and stop dataId to load a run of consecutive exposures in
+              one go, then step through each exposure's timeline in the
+              explore view, anchored at its own shutter close. Skipped
+              integers in the range are expected and simply omitted.
+            </p>
+            <form id="range-form">
               <div class="row">
                 <label>
-                  <span class="lbl">window before start t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowBefore" value="5" step="0.1" />
+                  <span class="lbl">start dataId</span>
+                  <input type="number" name="rangeStart" placeholder="e.g. 2026051900722" />
+                  <span id="range-start-status" class="hint">13-digit dataId of the first exposure</span>
                 </label>
                 <label>
-                  <span class="lbl">window after stop t<sub>0</sub> (s)</span>
-                  <input type="number" name="windowAfter" value="300" step="1" />
+                  <span class="lbl">stop dataId</span>
+                  <input type="number" name="rangeStop" placeholder="e.g. 2026051900750" />
+                  <span id="range-stop-status" class="hint">13-digit dataId of the last exposure</span>
                 </label>
               </div>
-            </details>
-            <div class="row submit-row">
-              <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
-              <span id="range-message" class="hint"></span>
-            </div>
-            <div id="range-progress" class="inline-progress" hidden>
-              <div class="progress-bar"><div class="progress-fill"></div></div>
-              <div class="progress-text hint"></div>
-            </div>
-          </form>
+              <div class="row submit-row">
+                <button type="submit" id="range-submit" class="primary">Fetch &amp; explore range</button>
+                <span id="range-message" class="hint"></span>
+              </div>
+              <div id="range-progress" class="inline-progress" hidden>
+                <div class="progress-bar"><div class="progress-fill"></div></div>
+                <div class="progress-text hint"></div>
+              </div>
+            </form>
+          </details>
         </section>
 
-        <section class="home-card">
-          <h2>Investigate night</h2>
+        <section class="home-card" id="night-card">
+          <h2>Night processing <span class="muted">investigate a whole night · LSSTCam only</span></h2>
           <p class="hint">
-            Pulls the full 24-hour log window for the AOS-flavoured pods
-            (<code>*aos*</code>) for the given <code>dayObs</code> and
-            serves a failure breakdown — error counts by type and pod,
-            per-dataId tracebacks, and Δshutter histograms for the first
-            task pickup and the calcZernikes finish.
+            Covers the full 24-hour night for the given <code>dayObs</code>
+            and serves a failure breakdown — error counts by type and pod,
+            per-dataId tracebacks, pod restarts and deaths, and Δshutter
+            histograms for the first task pickup and the calcZernikes
+            finish. The AOS pods (<code>*aos*</code>) and everything else
+            are separate views; you can open both and switch with the tabs.
           </p>
           <form id="night-form">
             <div class="row">
@@ -131,6 +159,17 @@
                 <span class="lbl">dayObs (YYYYMMDD)</span>
                 <input type="number" name="dayObs" required placeholder="e.g. 20260521" />
                 <span id="night-status" class="hint">a dayObs covers UTC noon to UTC noon the next day</span>
+              </label>
+              <label>
+                <span class="lbl">pods</span>
+                <select name="view" id="night-view-select">
+                  <option value="aos">AOS</option>
+                  <option value="sfm">SFM + misc</option>
+                </select>
+                <span class="hint">
+                  AOS filters at the Loki end and is quick; SFM + misc fetches
+                  the whole night, so it is much bigger and slower
+                </span>
               </label>
             </div>
             <div class="row submit-row">
@@ -143,94 +182,72 @@
             </div>
           </form>
         </section>
+        </div>
 
-        <section class="home-card">
-          <h2>Recent runs <span class="muted" id="cache-summary"></span></h2>
-          <p class="hint">
-            Click a row to open that run in a new tab. The ✕ button removes a
-            window from disk.
-            <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
-            <button type="button" id="cache-delete-all" class="ghost mini delete">delete all</button>
-          </p>
-          <table id="cache-table">
+        <section class="home-card" id="tonight-card" hidden>
+          <h2>Tonight <span class="muted" id="tonight-summary"></span></h2>
+          <div id="tonight-status" class="hint"></div>
+          <div id="tonight-banner" class="fetch-banner" hidden></div>
+          <table id="tonight-table">
             <thead>
               <tr>
-                <th>cluster / ns</th>
-                <th>key</th>
-                <th>window</th>
-                <th>fetched</th>
-                <th>last viewed</th>
-                <th>pods</th>
-                <th>size</th>
-                <th></th>
+                <th>dataId</th>
+                <th>shutter close</th>
+                <th>type</th>
+                <th>filter</th>
+                <th>reason</th>
+                <th>status</th>
               </tr>
             </thead>
-            <tbody id="cache-tbody"></tbody>
-            <tfoot id="cache-tfoot"></tfoot>
+            <tbody id="tonight-tbody"></tbody>
           </table>
+          <div id="tonight-more" class="hint" hidden></div>
         </section>
 
       </main>
 
-      <aside id="home-sidebar">
-        <section class="home-card sidebar-card">
-          <h2>App settings</h2>
-          <form id="settings-form">
-            <div class="row">
-              <label>
-                <span class="lbl">parallel fetch workers</span>
-                <input type="number" name="workers" value="8" min="1" max="64" />
-                <span class="hint">used by both exposure &amp; night fetches</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">max cache space (GiB)</span>
-                <input type="number" name="maxCacheGiB" value="5" min="0" step="0.5" />
-                <span class="hint">server LRU-evicts oldest caches above this; updates live</span>
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">cache directory</span>
-                <input type="text" name="cacheDir" placeholder="~/.cache/ra_log_explorer" autocomplete="off" />
-                <span class="hint">blank = default; <code>RA_LOG_EXPLORER_CACHE</code> env var overrides this</span>
-                <span id="cache-dir-effective" class="hint"></span>
-              </label>
-            </div>
-            <div class="row submit-row">
-              <span id="settings-state" class="hint"></span>
-            </div>
-          </form>
-        </section>
+    </div>
+  </section>
 
-        <section class="home-card sidebar-card">
-          <h2>Credentials <span class="muted" id="creds-state"></span></h2>
-          <form id="creds-form">
-            <div class="row">
-              <label>
-                <span class="lbl">Loki username</span>
-                <input type="text" name="username" value="merlin" />
-              </label>
-            </div>
-            <div class="row">
-              <label>
-                <span class="lbl">Loki password</span>
-                <input type="password" name="password" placeholder="(falls back to LOKI_PASSWORD env)" autocomplete="off" />
-              </label>
-            </div>
-            <div class="row">
-              <label class="cb">
-                <input type="checkbox" name="remember" /> remember in this browser
-              </label>
-              <span class="hint">localStorage only; never sent anywhere but this server</span>
-            </div>
-            <div class="row submit-row">
-              <button type="button" id="creds-forget" class="ghost mini">forget stored credentials</button>
-            </div>
-          </form>
-        </section>
-      </aside>
+  <!-- ===================== ADMIN VIEW ===================== -->
+  <section id="admin-view" hidden>
+    <header id="topbar">
+      <div class="title">
+        <a href="__BASE_PATH__/" class="ghost mini">&larr; home</a>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
+        <strong>__APP_TITLE__</strong>
+        <span class="muted">admin</span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
+      </div>
+    </header>
+
+    <div id="admin-layout">
+      <section class="home-card">
+        <h2>Cached windows <span class="muted" id="cache-summary"></span></h2>
+        <p class="hint">
+          Every log window currently held on disk. Click a row to open
+          that run in a new tab; the ✕ button removes one window.
+          <button type="button" id="cache-refresh" class="ghost mini">refresh</button>
+          <button type="button" id="cache-delete-all" class="ghost mini delete">flush entire cache</button>
+        </p>
+        <table id="cache-table">
+          <thead>
+            <tr>
+              <th>cluster / ns</th>
+              <th>key</th>
+              <th>window</th>
+              <th>fetched</th>
+              <th>last viewed</th>
+              <th>pods</th>
+              <th>size</th>
+              <th></th>
+            </tr>
+          </thead>
+          <tbody id="cache-tbody"></tbody>
+          <tfoot id="cache-tfoot"></tfoot>
+        </table>
+      </section>
     </div>
   </section>
 
@@ -239,9 +256,11 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="back-home" class="ghost mini">&larr; home</button>
-        <span class="brand-mark" aria-hidden="true"></span>
-        <strong>Rapid Analysis Log Explorer</strong>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
+        <strong>__APP_TITLE__</strong>
         <span id="expId-display"></span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
     </header>
 
@@ -300,6 +319,7 @@
         <span class="lg lg-lifecycle lg-killed">killed</span>
         <span class="lg lg-lifecycle lg-oom">OOM-killed</span>
         <span class="lg lg-lifecycle lg-podunhealthy">unhealthy</span>
+        <span class="lg lg-lifecycle lg-mountfail">mount failed</span>
       </div>
       <div class="lg-block">
         <strong>tasks:</strong>
@@ -330,14 +350,26 @@
     <header id="topbar">
       <div class="title">
         <button type="button" id="night-back-home" class="ghost mini">&larr; home</button>
-        <span class="brand-mark" aria-hidden="true"></span>
-        <strong>Rapid Analysis Log Explorer</strong>
+        <img class="brand-mark" src="__BASE_PATH__/static/logo.png" width="323" height="160"
+             alt="" />
+        <strong>__APP_TITLE__</strong>
         <span id="night-dayobs-display"></span>
+        <button type="button" class="ghost mini faq-toggle">what is this?</button>
       </div>
       <div class="cache">
         <span id="night-cache-info"></span>
       </div>
     </header>
+
+    <!-- The night is served in two halves, which are separate fetches over
+         different pod sets (see config.NIGHT_VIEWS). Each tab is a link, so
+         a half can be deep-linked, opened in its own browser tab, and
+         reloaded — the URL carries `nightView`. -->
+    <nav id="night-tabs" class="tabstrip" aria-label="night view">
+      <a class="tab" id="night-tab-aos" href="#" data-view="aos">AOS view</a>
+      <a class="tab" id="night-tab-sfm" href="#" data-view="sfm">SFM + misc view</a>
+      <span class="muted" id="night-tab-hint"></span>
+    </nav>
 
     <!-- Loud warning when the night fetch did not get every pod's logs in
          full. Critical here: a truncated/incomplete night silently biases
@@ -384,7 +416,7 @@
             <div id="night-hist-first-meta" class="hint"></div>
             <div id="night-hist-first-bin" class="night-hist-bin"></div>
           </div>
-          <div class="night-hist">
+          <div class="night-hist" id="night-hist-cz-card">
             <h3 id="night-hist-cz-title">calcZernikes end</h3>
             <svg id="night-hist-cz" class="night-hist-svg"></svg>
             <div id="night-hist-cz-meta" class="hint"></div>
@@ -396,9 +428,10 @@
       <section class="home-card">
         <h2>Failed dataIds <span class="muted" id="night-failures-count"></span></h2>
         <p class="hint">
-          One row per traceback. Click a row to expand the captured
-          traceback body inline. The arrow on the right opens the
-          full per-pod log in the explore view.
+          One row per traceback, newest first. Click a row to expand the
+          captured traceback body inline. The arrow on the right opens the
+          full per-pod log in the explore view. Long lists are folded to
+          the first ten — the count in the heading is always the total.
         </p>
         <table id="night-failures">
           <thead>
@@ -414,13 +447,17 @@
           </thead>
           <tbody></tbody>
         </table>
+        <button type="button" id="night-failures-expand" class="ghost mini" hidden></button>
       </section>
 
       <section class="home-card">
         <h2>Pod restarts &amp; deaths <span class="muted" id="night-restarts-count"></span></h2>
         <p class="hint">
           Pod lifecycle events from Kubernetes (the <code>k8s/events</code>
-          stream). A <strong>restart</strong> is an in-place container
+          stream) — restarts, kills, evictions and mount failures alike,
+          so this count is normally larger than the <em>in-place
+          restarts</em> stat above, which counts only the restarts. A
+          <strong>restart</strong> is an in-place container
           restart — most often an out-of-memory kill the kernel didn't log
           to us — so a pod whose work stops mid-visit with no traceback
           usually has a restart here. Each row is attributed to the dataId
@@ -444,10 +481,36 @@
     </main>
   </section>
 
-  <script src="/static/explore.js"></script>
-  <script src="/static/home.js"></script>
-  <script src="/static/night.js"></script>
-  <script src="/static/range.js"></script>
-  <script src="/static/app.js"></script>
+  <!-- Shared "what is this?" panel, toggled from every view's topbar.
+       Deliberately terse: it says what is being shown, not how. -->
+  <div id="faq-overlay" hidden>
+    <div id="faq-panel" role="dialog" aria-label="What is this?">
+      <button type="button" id="faq-close" class="ghost mini" aria-label="close">&times;</button>
+      <h2>What am I looking at?</h2>
+      <p>What the pipeline did for each image, reconstructed from the
+        logs its pods wrote.</p>
+      <ul>
+        <li><strong>Tonight</strong> — exposures as they are taken;
+          <em>view</em> appears once an exposure's logs are ready
+          (~5&nbsp;min after shutter close).</li>
+        <li><strong>Exposure view</strong> — one exposure's processing.
+          Each row is a pipeline worker, coloured bars are its tasks,
+          and time runs from that exposure's shutter close
+          (t<sub>0</sub>&nbsp;=&nbsp;0). Click a row for its full
+          log.</li>
+        <li><strong>Night view</strong> — a whole night at a glance:
+          how long processing took per image, and every failure with a
+          click-through to its traceback.</li>
+      </ul>
+      <p class="muted">Times are UTC. A red banner means some logs
+        could not be retrieved, so that view may be incomplete.</p>
+    </div>
+  </div>
+
+  <script src="__BASE_PATH__/static/explore.js"></script>
+  <script src="__BASE_PATH__/static/home.js"></script>
+  <script src="__BASE_PATH__/static/night.js"></script>
+  <script src="__BASE_PATH__/static/range.js"></script>
+  <script src="__BASE_PATH__/static/app.js"></script>
 </body>
 </html>

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import threading
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -11,6 +12,7 @@ from urllib.error import HTTPError
 import pytest
 
 from ra_log_explorer import exposureTimes
+from ra_log_explorer import sites as sitesModule
 
 # A throwaway URL used for every call below. The point of these tests is the
 # helper's behaviour around the response shape, not its URL routing — the URL
@@ -287,7 +289,7 @@ def test_queryExposureRecord_returns_record_even_without_obs_end(monkeypatch: py
 
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     rec = exposureTimes.queryExposureRecord(2026051900722, "TOKEN", consdbUrl=URL, instrument="lsstcam")
-    assert rec == {"exposure_id": 2026051900722, "img_type": "science"}
+    assert rec == {"exposure_id": 2026051900722, "img_type": "science", "instrument": "lsstcam"}
     assert exposureTimes.obsEnd(rec) is None
 
 
@@ -322,6 +324,34 @@ def test_queryExposureRecordBatch_returns_resolved_in_one_call(monkeypatch: pyte
     # One call: lsstcam matched everything, so we don't even try the
     # other instruments.
     assert callCount == 1
+
+
+def test_queryExposureRecordBatch_pinned_instrument_never_falls_through(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With ``instrument`` pinned, only that instrument's table is asked —
+    even for ids it has no row for. A probe-order fallthrough would hand
+    back the *other* instrument's exposure for a colliding id, anchoring
+    every downstream Δshutter offset to the wrong shutter."""
+    tablesQueried: list[str] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        sentSql = json.loads(req.data.decode("utf-8"))["query"]
+        tablesQueried.append(sentSql.split("FROM ")[1].split(".")[0])
+        # latiss knows one of the two ids; the other resolves nowhere.
+        return _stubResponse(
+            {
+                "columns": _FULL_COLS,
+                "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")],
+            }
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    out = exposureTimes.queryExposureRecordBatch(
+        [2026051900722, 2026051900999], "TOKEN", consdbUrl=URL, instrument="latiss"
+    )
+    assert set(out) == {2026051900722}
+    assert tablesQueried == ["cdb_latiss"]  # nothing else was ever asked
 
 
 def test_queryExposureRecordBatch_falls_through_to_other_instruments(
@@ -361,9 +391,9 @@ def test_queryExposureRecordBatch_chunks_oversized_in_lists(monkeypatch: pytest.
     monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
     ids = list(range(2026051900000, 2026051901500))  # 1500 dataIds
     exposureTimes.queryExposureRecordBatch(ids, "TOKEN", consdbUrl=URL, chunkSize=500)
-    # 1500 / 500 = 3 chunks per instrument; loop short-circuits since
-    # we never resolve anything, so all 4 instruments are tried.
-    assert len(seenQueries) == 3 * 4
+    # 1500 / 500 = 3 chunks per instrument, and nothing resolves, so
+    # every instrument is tried rather than the loop short-circuiting.
+    assert len(seenQueries) == 3 * len(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)
 
 
 def test_queryExposureRecordBatch_falls_through_on_UndefinedTable(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -491,19 +521,20 @@ def test_storeCachedRecord_then_lookup_round_trip(monkeypatch: pytest.MonkeyPatc
     assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
 
 
-def test_lookupCachedRecord_reads_legacy_obs_end_string(
+def test_lookupCachedRecord_ignores_a_non_record_entry(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A cache written by the pre-record format stored a bare obs_end
-    string per dataId. It must still resolve (wrapped as a 1-field
-    record) so an existing cache keeps working across the upgrade."""
+    """There is exactly one on-disk shape: a record object. A bare string
+    (what a pre-record build wrote) is a miss, not something to
+    interpret — this project keeps no backwards compatibility, and the
+    CACHE_SCHEMA_VERSION flush guarantees such entries never survive a
+    deploy anyway. A miss falls through to a fresh ConsDB query, which
+    overwrites the entry with the real shape."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
     p = exposureTimes.cachedExposureTimesPath("summit")
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"2026051900722": "2026-05-20T08:46:16.267000"}))
-    got = exposureTimes.lookupCachedRecord(2026051900722, siteName="summit")
-    assert got == {"obs_end": "2026-05-20T08:46:16.267000"}
-    assert exposureTimes.obsEnd(got) == "2026-05-20T08:46:16.267000"
+    assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
 
 
 def test_storeCachedRecords_batches_one_write(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -593,3 +624,190 @@ def test_storeCachedRecords_recovers_from_corrupt_existing_file(
     )
     data = json.loads(cachePath.read_text())
     assert data == {"2026051900722": {"obs_end": "2026-05-20T08:46:16.267000"}}
+
+
+def test_concurrent_stores_all_survive(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Several threads write this one file in a deployed process: request
+    threads resolving a dataId, a fetch job's night prefetch, and the live
+    poller's per-tick exposure list. Two of them interleaving a truncate
+    and a write leaves a file that parses as nothing at all — and a
+    ``_manual`` stand-in exists nowhere else, so a hand-typed shutter
+    close would be gone for good.
+    """
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    # Big enough records that a rewrite is not a single small write.
+    padding = {f"col{i}": "x" * 200 for i in range(20)}
+    ids = list(range(2026051900001, 2026051900081))
+
+    def store(expId: int) -> None:
+        exposureTimes.storeCachedRecord(
+            expId, {"obs_end": "2026-05-20T08:46:16.267000", **padding}, siteName="summit"
+        )
+
+    threads = [threading.Thread(target=store, args=(i,)) for i in ids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(30)
+    data = json.loads(exposureTimes.cachedExposureTimesPath("summit").read_text())
+    assert sorted(data) == sorted(str(i) for i in ids)
+    # Nothing but the finished file is left behind.
+    assert [p.name for p in exposureTimes.cachedExposureTimesPath("summit").parent.iterdir()] == [
+        "summit.json"
+    ]
+
+
+def test_postQuery_omits_auth_header_without_a_token(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An in-cluster ConsDB takes no token. Sending a bare ``Bearer`` with
+    nothing after it would be rejected, so the header must be absent
+    entirely rather than empty."""
+    seen: list[dict[str, str]] = []
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        seen.append(dict(req.header_items()))
+        return _stubResponse(
+            {"columns": _FULL_COLS, "data": [_fullRow(2026051900722, "2026-05-20T08:46:16.267000")]}
+        )
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    rec = exposureTimes.queryExposureRecord(2026051900722, "", consdbUrl=URL)
+    assert rec is not None
+    # urllib title-cases header names, so check case-insensitively.
+    assert not [k for k in seen[0] if k.lower() == "authorization"]
+
+
+def test_loadTokenForSite_returns_empty_for_a_token_less_site(tmp_path: Path) -> None:
+    site = sitesModule.Site(
+        name="incluster",
+        cluster="manke",
+        namespace="ns",
+        lokiAddr="https://l",
+        consdbUrl="http://consdb-pq.consdb:8080/consdb/query",
+        consdbTokenFile=None,
+        title="Log Explorer",
+    )
+    assert exposureTimes.loadTokenForSite(site) == ""
+
+
+# ----- instrument identity --------------------------------------------------
+
+
+def _payload(rows: list[list[Any]]) -> dict:
+    return {"columns": ["exposure_id", "obs_end"], "data": rows}
+
+
+def test_records_are_stamped_with_the_table_they_came_from(monkeypatch: pytest.MonkeyPatch) -> None:
+    """We know which cdb_<instrument> table we queried, so the record says
+    so — rather than depending on every schema carrying the column."""
+
+    def fakeUrlopen(req: Any, **_kw: Any) -> Any:
+        return _stubResponse(_payload([[2026071100001, "2026-07-11T12:00:37"]]))
+
+    monkeypatch.setattr(exposureTimes, "urlopen", fakeUrlopen)
+    rec = exposureTimes.queryExposureRecord(2026071100001, "T", consdbUrl=URL, instrument="latiss")
+    assert exposureTimes.recordInstrument(rec) == "latiss"
+
+
+def test_queryExposureRecordsForDayObs_keeps_both_instruments(monkeypatch: pytest.MonkeyPatch) -> None:
+    """LSSTCam and LATISS number from 1 each night, so on any night both
+    observe the same id names a different exposure on each. Returning a
+    {id: record} map would silently drop one of every colliding pair."""
+
+    seen: list[str] = []
+
+    def fakePost(sql: str, token: str, *, consdbUrl: str) -> dict:
+        seen.append(sql)
+        if "cdb_lsstcam" in sql:
+            return _payload([[2026071100002, "cam-2"], [2026071100001, "cam-1"]])
+        if "cdb_latiss" in sql:
+            return _payload([[2026071100001, "latiss-1"]])
+        raise exposureTimes._UndefinedTableError()
+
+    monkeypatch.setattr(exposureTimes, "_postQuery", fakePost)
+    recs = exposureTimes.queryExposureRecordsForDayObs(20260711, "T", consdbUrl=URL)
+    assert [(r["exposure_id"], r["instrument"], r["obs_end"]) for r in recs] == [
+        (2026071100001, "lsstcam", "cam-1"),
+        (2026071100002, "lsstcam", "cam-2"),
+        (2026071100001, "latiss", "latiss-1"),
+    ]
+    # Every instrument is asked, not just the first with rows, and the id
+    # range is that dayObs's own 5-digit sequence space.
+    assert len(seen) == len(exposureTimes.INSTRUMENTS_BY_PROBE_ORDER)
+    assert "BETWEEN 2026071100000 AND 2026071199999" in seen[0]
+
+
+def test_probeOrderWinners_resolves_a_shared_id_the_bare_lookup_way() -> None:
+    """The bare-id view has to agree with queryExposureRecord, which stops
+    at the first instrument with the row — otherwise the same dataId
+    resolves differently depending on which code path answered."""
+    cam = {"exposure_id": 1, "instrument": "lsstcam"}
+    latiss = {"exposure_id": 1, "instrument": "latiss"}
+    assert exposureTimes.probeOrderWinners([latiss, cam]) == {1: cam}
+    assert exposureTimes.probeOrderWinners([cam, latiss]) == {1: cam}
+    # A record with no instrument (an unstamped manual stand-in) never
+    # beats a real one.
+    assert exposureTimes.probeOrderWinners([{"exposure_id": 1}, latiss]) == {1: latiss}
+
+
+def test_storeCachedRecordList_keys_by_instrument_and_bare_id(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    cam = {"exposure_id": 2026071100001, "obs_end": "cam", "instrument": "lsstcam"}
+    latiss = {"exposure_id": 2026071100001, "obs_end": "latiss", "instrument": "latiss"}
+    exposureTimes.storeCachedRecordList([latiss, cam], siteName="summit")
+
+    byInstrument = exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="latiss")
+    assert byInstrument is not None and byInstrument["obs_end"] == "latiss"
+    bare = exposureTimes.lookupCachedRecord(2026071100001, siteName="summit")
+    assert bare is not None and bare["obs_end"] == "cam"  # probe order wins
+
+
+def test_instrument_lookup_never_falls_back_to_the_bare_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Falling back would hand out a *different exposure* with the same id."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecord(
+        2026071100001,
+        {"exposure_id": 2026071100001, "obs_end": "cam", "instrument": "lsstcam"},
+        siteName="summit",
+    )
+    assert exposureTimes.lookupCachedRecord(2026071100001, siteName="summit") is not None
+    assert exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="latiss") is None
+    # The instrument-scoped key for the record we *did* store is there.
+    assert (
+        exposureTimes.lookupCachedRecord(2026071100001, siteName="summit", instrument="lsstcam") is not None
+    )
+
+
+def test_pinning_the_first_probe_instrument_still_answers_the_bare_id() -> None:
+    """A hit against the instrument a bare lookup probes first *is* the
+    bare-id answer, so pinning it may still warm the bare cache key."""
+    assert exposureTimes.isProbeOrderFirst(None) is True
+    assert exposureTimes.isProbeOrderFirst("lsstcam") is True
+    assert exposureTimes.isProbeOrderFirst("latiss") is False
+
+
+def test_storeCachedRecord_can_skip_the_bare_key(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    latiss = {"exposure_id": 7, "obs_end": "latiss", "instrument": "latiss"}
+    exposureTimes.storeCachedRecord(7, latiss, siteName="summit", bareKey=False)
+    assert exposureTimes.lookupCachedRecord(7, siteName="summit") is None
+    assert exposureTimes.lookupCachedRecord(7, siteName="summit", instrument="latiss") == latiss
+
+
+def test_manualRecord_instrument_stamp_round_trips(tmpCacheRoot: Path) -> None:
+    """A stamped manual record answers instrument-pinned lookups; an
+    unstamped one only answers bare lookups."""
+    stamped = exposureTimes.manualRecord("2026-07-12T05:00:37.000", instrument="latiss")
+    assert exposureTimes.recordInstrument(stamped) == "latiss"
+    exposureTimes.storeCachedRecord(101, stamped, siteName="summit")
+    assert exposureTimes.lookupCachedRecord(101, siteName="summit", instrument="latiss") is not None
+    assert exposureTimes.lookupCachedRecord(101, siteName="summit", instrument="lsstcam") is None
+
+    bare = exposureTimes.manualRecord("2026-07-12T05:00:37.000")
+    assert exposureTimes.recordInstrument(bare) is None
+    exposureTimes.storeCachedRecord(102, bare, siteName="summit")
+    assert exposureTimes.lookupCachedRecord(102, siteName="summit") is not None
+    assert exposureTimes.lookupCachedRecord(102, siteName="summit", instrument="latiss") is None

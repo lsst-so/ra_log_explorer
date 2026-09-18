@@ -83,13 +83,19 @@ async function loadRangeExposure(expId) {
   rangeSelectedExpId = expId;
   markSelectedChip();
   const idx = rangeIndex;
+  // The run's instrument travels with every request and stays in the
+  // URL: the [startId, stopId] key is shared with the other
+  // instrument's span, so dropping it here would let a refresh — or the
+  // server's loaded slot — answer with the twin's exposures.
+  const instQ = idx.instrument ? `&instrument=${encodeURIComponent(idx.instrument)}` : '';
   const qs =
     `rangeStart=${encodeURIComponent(idx.startId)}`
     + `&rangeStop=${encodeURIComponent(idx.stopId)}`
-    + `&dataId=${encodeURIComponent(expId)}`;
+    + `&dataId=${encodeURIComponent(expId)}`
+    + instQ;
   let payload;
   try {
-    const r = await fetch(`/api/summary?${qs}`);
+    const r = await fetch(apiUrl(`/api/summary?${qs}`));
     payload = await r.json();
   } catch (e) {
     return;
@@ -97,8 +103,10 @@ async function loadRangeExposure(expId) {
   if (!payload || !payload.loaded) return;
   // Keep the URL pointed at the selected exposure so a refresh returns
   // here (bootstrap still routes ?rangeStart&rangeStop to the range view
-  // and startRange reads back the dataId).
-  window.history.replaceState({}, '', `${window.location.pathname}?${qs}`);
+  // and startRange reads back the dataId). A rewrite, not an entry:
+  // stepping the navigator is moving within one view, and a run of forty
+  // exposures would otherwise take forty Back presses to escape.
+  window.navigateTo(qs, { replace: true });
   window.startExplore(payload);
 }
 

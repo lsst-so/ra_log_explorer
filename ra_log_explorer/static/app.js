@@ -4,11 +4,18 @@
  * /api/summary: when an exposure is loaded, switch to #explore-view and
  * hand control to explore.js; otherwise show #home-view and hand control
  * to home.js. Also wires the home↔explore transitions invoked by either
- * side via the `window.showHome` / `window.showExplore` hooks.
+ * side via the `window.showHome` / `window.showExplore` hooks, and owns
+ * the browser history those transitions write (see `navigateTo` below).
  */
 'use strict';
 
+// Which routing pass is the current one. Back and forward can arrive
+// faster than /api/summary answers, and the loser of that race would
+// otherwise render its view over the top of the winner's.
+let routeToken = 0;
+
 async function bootstrap() {
+  const token = ++routeToken;
   // URL is the source of truth for which view to render:
   //
   //   /                    -> home
@@ -16,11 +23,17 @@ async function bootstrap() {
   //   /?dataId=X&autoFetch=1 -> home with the form pre-submitted (deep-link
   //                            from a night-view bar drilldown)
   //   /?dayObs=Y           -> night view for night Y (or home if not loaded)
+  //   /?dayObs=Y&nightView=sfm -> the SFM+misc half of that night, which is
+  //                            a separate fetch and a separate server state
   //
   // Each tab carries its own URL, so opening / refreshing different
   // tabs hits the server state for *that tab's* key without disturbing
   // the others.
   const urlParams = new URLSearchParams(window.location.search);
+  if (urlParams.get('admin') === '1') {
+    window.showAdmin();
+    return;
+  }
   const urlDataId = urlParams.get('dataId');
   const urlDayObs = urlParams.get('dayObs');
   const urlRangeStart = urlParams.get('rangeStart');
@@ -30,10 +43,16 @@ async function bootstrap() {
   if (urlRangeStart && urlRangeStop) {
     let summary;
     try {
+      // Same pin the dataId form carries: [startId, stopId] names a
+      // different run of exposures on each instrument, so a bare span
+      // would resolve to whichever twin was fetched last.
+      const rangeInstrument = urlParams.get('instrument');
+      const rangeInstQ = rangeInstrument ? `&instrument=${encodeURIComponent(rangeInstrument)}` : '';
       const qs = `rangeStart=${encodeURIComponent(urlRangeStart)}&rangeStop=${encodeURIComponent(urlRangeStop)}`;
-      const r = await fetch(`/api/summary?${qs}`);
+      const r = await fetch(apiUrl(`/api/summary?${qs}${rangeInstQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;  // a later back/forward overtook us
     if (summary && summary.loaded) {
       window.showRange(summary);
     } else {
@@ -50,9 +69,14 @@ async function bootstrap() {
   if (urlDataId) {
     let summary;
     try {
-      const r = await fetch(`/api/summary?dataId=${encodeURIComponent(urlDataId)}`);
+      // Carry the URL's instrument so the server can refuse to serve a
+      // same-id state that belongs to the *other* instrument.
+      const urlInstrument = urlParams.get('instrument');
+      const instQ = urlInstrument ? `&instrument=${encodeURIComponent(urlInstrument)}` : '';
+      const r = await fetch(apiUrl(`/api/summary?dataId=${encodeURIComponent(urlDataId)}${instQ}`));
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;
     if (summary && summary.loaded) {
       window.showExplore(summary);
     } else {
@@ -62,10 +86,15 @@ async function bootstrap() {
   }
   if (urlDayObs) {
     let summary;
+    const urlNightView = urlParams.get('nightView') || 'aos';
     try {
-      const r = await fetch(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`);
+      const r = await fetch(
+        apiUrl(`/api/summary?dayObs=${encodeURIComponent(urlDayObs)}`
+          + `&nightView=${encodeURIComponent(urlNightView)}`),
+      );
       summary = await r.json();
     } catch (e) { /* fall through to home */ }
+    if (token !== routeToken) return;
     if (summary && summary.loaded) {
       window.showNight(summary);
     } else {
@@ -76,16 +105,58 @@ async function bootstrap() {
   window.showHome();
 }
 
+// ----- history --------------------------------------------------------------
+//
+// Every view swap happens inside one document, so the entries the Back
+// button walks are ours to create — and until this existed the app
+// created none: `replaceState` everywhere meant one entry for the whole
+// session, and Back left the application altogether, landing on whatever
+// the tab held before it (a stale link, an old bookmark, a mistyped
+// URL). Deployed, that reads as the app sending you somewhere invalid.
+//
+// So: a transition the user asked for (home -> a view, a view -> home)
+// gets its own entry, and anything that merely refines the view already
+// on screen (the instrument pin, the range navigator's selected
+// exposure) rewrites the current one — otherwise stepping through
+// twenty exposures would cost twenty Back presses to undo.
+
+window.navigateTo = function navigateTo(query, opts) {
+  const url = query ? `${window.location.pathname}?${query}` : window.location.pathname;
+  // Pushing the URL we are already on buys the user a Back press that
+  // does nothing visible; rewrite in place instead.
+  const same = url === window.location.pathname + window.location.search;
+  if (same || (opts && opts.replace)) {
+    window.history.replaceState({}, '', url);
+  } else {
+    window.history.pushState({}, '', url);
+  }
+};
+
+window.addEventListener('popstate', () => {
+  // The URL is the router's only input, so re-running the router *is*
+  // the handling of back/forward. Everything we push is same-document,
+  // so nothing reloads and no fetch is repeated that the URL doesn't ask
+  // for.
+  bootstrap();
+});
+
 function hideAllViews() {
   document.getElementById('home-view').hidden = true;
   document.getElementById('explore-view').hidden = true;
   document.getElementById('night-view').hidden = true;
+  document.getElementById('admin-view').hidden = true;
 }
 
 window.showHome = function showHome() {
   hideAllViews();
   document.getElementById('home-view').hidden = false;
   window.startHome();
+};
+
+window.showAdmin = function showAdmin() {
+  hideAllViews();
+  document.getElementById('admin-view').hidden = false;
+  window.startAdmin();
 };
 
 function _applyActiveSite(summary) {
@@ -147,6 +218,27 @@ function renderFetchBanner(bannerEl, summary) {
   const problems = Object.assign({}, incomplete, errors);
   const pods = Object.keys(problems);
   const complete = meta ? (meta.fetchComplete !== false && pods.length === 0) : true;
+  // A fetch that found *no pods at all* reports itself perfectly
+  // complete, because it completed — it just completed over nothing.
+  // On screen that is indistinguishable from a quiet night, and the
+  // usual cause is asking the wrong cluster: this server serves one
+  // site, so a BTS dayObs opened on a summit instance renders an empty
+  // night with no error anywhere. Say so.
+  if (meta && meta.pod_count === 0) {
+    bannerEl.hidden = false;
+    const t = document.createElement('div');
+    t.className = 'fetch-banner-title';
+    t.textContent = '⚠ No pods found in this window';
+    bannerEl.appendChild(t);
+    const s2 = document.createElement('div');
+    s2.className = 'fetch-banner-sub';
+    s2.textContent =
+      `Nothing logged to ${(summary && summary.site) || 'this site'} in the requested window. `
+      + 'Most often that means the dataId or dayObs belongs to the other site — '
+      + 'this server serves one cluster and cannot see the other.';
+    bannerEl.appendChild(s2);
+    return;
+  }
   if (complete) {
     bannerEl.hidden = true;
     return;
@@ -188,5 +280,26 @@ function renderFetchBanner(bannerEl, summary) {
   bannerEl.appendChild(list);
 }
 window.renderFetchBanner = renderFetchBanner;
+
+// ----- "what is this?" overlay ---------------------------------------------
+// One shared panel, toggled from every view's topbar. Wired here (the
+// bootstrap script) because the buttons exist in all three views.
+
+function wireFaq() {
+  const overlay = document.getElementById('faq-overlay');
+  if (!overlay) return;
+  const setOpen = (open) => { overlay.hidden = !open; };
+  for (const btn of document.querySelectorAll('.faq-toggle')) {
+    btn.addEventListener('click', () => setOpen(overlay.hidden));
+  }
+  document.getElementById('faq-close').addEventListener('click', () => setOpen(false));
+  overlay.addEventListener('click', (ev) => {
+    if (ev.target === overlay) setOpen(false);  // click outside the panel
+  });
+  document.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Escape' && !overlay.hidden) setOpen(false);
+  });
+}
+wireFaq();
 
 bootstrap();

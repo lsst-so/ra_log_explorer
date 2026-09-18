@@ -57,10 +57,23 @@ class FetchJob:
     # resulting ServerState / NightState and which per-site exposure-
     # time cache file the resolved values land in.
     siteName: str = ""
+    # The instrument this fetch is *for* (lowercase table name, e.g.
+    # "lsstcam"). Part of the exposure's identity — the same dataId
+    # names a different exposure per instrument — so it pins every
+    # ConsDB resolution downstream of this job and scopes which pods
+    # the resulting view attributes work to. None only for night jobs,
+    # which are AOS and therefore LSSTCam by construction.
+    instrument: str | None = None
     kind: JobKind = "exposure"
     expId: int | None = None
     tZero: dt.datetime | None = None
     dayObs: int | None = None
+    # Night mode: which half of the night this fetch covers (see
+    # `config.NIGHT_VIEWS`). It has to ride on the job rather than be
+    # re-derived from the spec, because the client asks `/api/summary`
+    # for the finished night by name the moment the `done` event lands
+    # and would otherwise open the wrong tab's data.
+    nightView: str = "aos"
     # Range mode: the [startId, stopId] dataId span plus the two UTC
     # shutter-close anchors that define the fetch window.
     startId: int | None = None
@@ -105,19 +118,41 @@ class JobManager:
         self._lock = threading.Lock()
         self.stateLock = threading.Lock()
 
-    def createJob(self, spec: FetchSpec, expId: int, tZero: dt.datetime, siteName: str = "") -> FetchJob:
+    def createJob(
+        self,
+        spec: FetchSpec,
+        expId: int,
+        tZero: dt.datetime,
+        siteName: str = "",
+        instrument: str | None = None,
+    ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
             job = FetchJob(
-                jobId=jobId, spec=spec, siteName=siteName, kind="exposure", expId=expId, tZero=tZero
+                jobId=jobId,
+                spec=spec,
+                siteName=siteName,
+                instrument=instrument,
+                kind="exposure",
+                expId=expId,
+                tZero=tZero,
             )
             self._jobs[jobId] = job
             return job
 
-    def createNightJob(self, spec: FetchSpec, dayObs: int, siteName: str = "") -> FetchJob:
+    def createNightJob(
+        self, spec: FetchSpec, dayObs: int, siteName: str = "", nightView: str = "aos"
+    ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
-            job = FetchJob(jobId=jobId, spec=spec, siteName=siteName, kind="night", dayObs=dayObs)
+            job = FetchJob(
+                jobId=jobId,
+                spec=spec,
+                siteName=siteName,
+                kind="night",
+                dayObs=dayObs,
+                nightView=nightView,
+            )
             self._jobs[jobId] = job
             return job
 
@@ -129,6 +164,7 @@ class JobManager:
         tZeroStart: dt.datetime,
         tZeroStop: dt.datetime,
         siteName: str = "",
+        instrument: str | None = None,
     ) -> FetchJob:
         with self._lock:
             jobId = uuid.uuid4().hex[:12]
@@ -136,6 +172,7 @@ class JobManager:
                 jobId=jobId,
                 spec=spec,
                 siteName=siteName,
+                instrument=instrument,
                 kind="range",
                 startId=startId,
                 stopId=stopId,
@@ -191,8 +228,16 @@ class JobManager:
                     "type": "done",
                     "kind": job.kind,
                     "expId": job.expId,
+                    # The pin this fetch ran under. The client needs it
+                    # to ask for the right state afterwards: the bare
+                    # expId's slot may by then hold the other
+                    # instrument's exposure of the same id.
+                    "instrument": job.instrument,
                     "tZero": job.tZero.isoformat() if job.tZero else None,
                     "dayObs": job.dayObs,
+                    # Same reasoning as ``instrument`` above, for nights:
+                    # a dayObs alone no longer names one loaded state.
+                    "nightView": job.nightView if job.kind == "night" else None,
                     "startId": job.startId,
                     "stopId": job.stopId,
                     "cacheDir": str(cacheDir),

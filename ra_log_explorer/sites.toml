@@ -10,6 +10,12 @@
 # running the server. Get tokens from the relevant RSP token page
 # (USDF / summit RSP for summit, base-lsp.lsst.codes for BTS).
 #
+# `title` is optional and is what the page calls itself — the browser
+# tab, and the words beside the logo. Omitted here because `summit` and
+# `bts` have defaults in sites.py (a deployment's catalog is rendered by
+# the Helm chart, which has no field for it); set it outright on a site
+# added later.
+#
 # Override the path to this file at runtime with the
 # `RA_LOG_EXPLORER_SITES_FILE` env var.
 default_site = "summit"
