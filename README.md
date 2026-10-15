@@ -825,6 +825,11 @@ The contributor guide and coding conventions live in
 mypy-coverage, pytest) is summarised in the
 [validation skill](.claude/skills/ra-log-explorer-validation/SKILL.md).
 
+Develop in the repo's own `.venv`, not a conda or Rubin stack
+environment: `source ./activate.sh` from any bash or zsh shell activates
+it, clears the stack's `PYTHONPATH` (which would otherwise shadow the
+venv's packages), and prints how to create the venv if it is missing.
+
 The test suite includes **browser tests** that drive Chromium against
 the real app over a real (cut-down) night of logs, so they need one
 extra setup step. They fail rather than skip if it is missing, on
