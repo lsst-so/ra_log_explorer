@@ -261,6 +261,7 @@ def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("RA_LOG_EXPLORER_MAX_CACHE_BYTES", "1234567")
     monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_POLL_S", "123")
     monkeypatch.setenv("RA_LOG_EXPLORER_LIVE_LAG_S", "45")
+    monkeypatch.setenv("RA_LOG_EXPLORER_LOG_LEVEL", " debug ")
     monkeypatch.setenv("LOKI_USERNAME", "omega")
     try:
         reloaded = importlib.reload(config)
@@ -272,6 +273,7 @@ def test_module_constants_come_from_the_environment(monkeypatch: pytest.MonkeyPa
         assert reloaded.LIVE_POLL_S == 123.0
         assert reloaded.LIVE_LAG_S == 45.0
         assert reloaded.DEFAULT_USERNAME == "omega"
+        assert reloaded.LOG_LEVEL == "DEBUG"
     finally:
         # Other modules hold references to this module object; leaving it
         # reloaded under a patched environment would leak into them.
@@ -315,6 +317,7 @@ def test_the_set_of_environment_variables_is_pinned() -> None:
         "RA_LOG_EXPLORER_CACHE",
         "RA_LOG_EXPLORER_LIVE_LAG_S",
         "RA_LOG_EXPLORER_LIVE_POLL_S",
+        "RA_LOG_EXPLORER_LOG_LEVEL",
         "RA_LOG_EXPLORER_MAX_CACHE_BYTES",
         "RA_LOG_EXPLORER_SITES_FILE",
         "RA_LOG_EXPLORER_WINDOW_AFTER_S",
@@ -355,3 +358,14 @@ def test_defaults_are_usable_with_no_environment_at_all(
     finally:
         monkeypatch.undo()
         importlib.reload(config)
+
+
+def test_envLogLevel_rejects_what_logging_would_not_understand(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Same loud-failure rule as the numeric knobs: a typo, or a blank
+    from a mistyped Helm reference, must not quietly mean INFO."""
+    monkeypatch.delenv("RA_LOG_EXPLORER_TEST_KNOB", raising=False)
+    assert config._envLogLevel("RA_LOG_EXPLORER_TEST_KNOB", "INFO") == "INFO"
+    for bad in ("verbose", "", "  "):
+        monkeypatch.setenv("RA_LOG_EXPLORER_TEST_KNOB", bad)
+        with pytest.raises(config.ConfigError, match="RA_LOG_EXPLORER_TEST_KNOB"):
+            config._envLogLevel("RA_LOG_EXPLORER_TEST_KNOB", "INFO")

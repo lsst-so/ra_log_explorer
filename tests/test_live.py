@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import shutil
 import time
 from dataclasses import replace
@@ -1931,3 +1932,54 @@ def test_consdb_failure_is_surfaced_without_stopping_the_night(
     assert snap["exposures"] == []
     assert fetch._parseIso(snap["watermark"]) == _t(10)
     assert snap["totalLines"] == 1
+
+
+# ----- diagnostics logging -------------------------------------------------
+
+
+def test_a_failing_tick_is_logged_with_its_traceback(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The loop survives anything, so a failure it doesn't log here reaches
+    only /api/live, and the pod log says nothing."""
+
+    def boom(now: dt.datetime | None = None) -> None:
+        manager.stop()
+        raise fetch.FetchError("logcli failed (rc=1): 401 Unauthorized")
+
+    monkeypatch.setattr(manager, "tick", boom)
+    with caplog.at_level(logging.ERROR, logger="ra_log_explorer.live"):
+        manager._runLoop()
+    assert "Live tick failed" in caplog.text
+    assert "401 Unauthorized" in caplog.text
+    assert "Traceback" in caplog.text
+    assert "401 Unauthorized" in (manager.snapshot()["lastError"] or "")
+
+
+def test_each_tick_logs_a_summary(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(live, "fetchPodWindowInto", _podFetchStub([_t(3), _t(7)]))
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.live"):
+        manager.tick(now=_t(10))
+    assert "Live: opened dayObs 20260711" in caplog.text
+    assert "Live tick dayObs 20260711: +2 lines from 1 active pods (1 pods tonight)" in caplog.text
+
+
+def test_a_consdb_outage_is_logged_once_and_its_end_noted(
+    manager: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(*a: Any, **k: Any) -> Any:
+        raise exposureTimes.ConsDbError("ConsDB HTTP 503: Service Unavailable")
+
+    monkeypatch.setattr(live.exposureTimes, "queryExposureRecordsForDayObs", boom)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.live"):
+        manager.tick(now=_t(10))
+        manager.tick(now=_t(20))
+        monkeypatch.setattr(
+            live.exposureTimes, "queryExposureRecordsForDayObs", lambda dayObs, token, *, consdbUrl: []
+        )
+        manager.tick(now=_t(30))
+    assert caplog.text.count("ConsDB query for dayObs 20260711 failed") == 1
+    assert "ConsDB reachable again" in caplog.text

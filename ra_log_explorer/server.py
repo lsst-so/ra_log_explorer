@@ -36,9 +36,11 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import mimetypes
 import re
 import shutil
+import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Iterator
 from dataclasses import asdict, dataclass, field, is_dataclass
@@ -70,6 +72,7 @@ from .fetch import (
     PARTIAL_FLAG,
     addExposureToCache,
     cacheDuSizeBytes,
+    checkLokiAccess,
     dropLiveSidecarsUnder,
     evictToFit,
     getCacheExposureIds,
@@ -84,6 +87,8 @@ from .fetch import (
 from .jobs import FetchJob, JobManager
 from .live import LiveNightManager
 from .sites import Site, SitesConfigError, siteByCluster, siteByName
+
+log = logging.getLogger(__name__)
 
 STATIC_DIR = Path(__file__).parent / "static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
@@ -2024,6 +2029,8 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             self.wfile.write(body)
 
         def _send_error_json(self, status: int, message: str) -> None:
+            if status >= 500:
+                log.warning("%s %s -> %d: %s", self.command, self.path, status, message)
             self._send_json({"error": message}, status=status)
 
         def _send_file(self, path: Path) -> None:
@@ -2093,7 +2100,12 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             return None
 
         def log_message(self, format: str, *args: Any) -> None:  # noqa: A003
-            return  # silence default access logs
+            # No ``path`` when the stdlib rejects a malformed request line
+            # and logs the 400 it is about to send; raising here would drop
+            # the response. The readiness probe hits /healthz every few
+            # seconds, which would drown everything else even at DEBUG.
+            if not getattr(self, "path", "").endswith("/healthz"):
+                log.debug("%s " + format, self.address_string(), *args)
 
         def _instrumentParam(self, qs: dict[str, list[str]]) -> tuple[str | None, bool]:
             """Read and validate the optional ``instrument`` query param.
@@ -2934,10 +2946,17 @@ def _isoForLogcli(t: dt.datetime) -> str:
 def serve(host: str, port: int, ctx: ServerContext) -> None:
     handler = _makeHandler(ctx)
     httpd = ThreadingHTTPServer((host, port), handler)
-    print(f"Serving on http://{host}:{port}{ctx.basePath}/ (Ctrl-C to stop)")
+    log.info("Serving on http://%s:%d%s/ (Ctrl-C to stop)", host, port, ctx.basePath)
+    site = ctx.site()
+    threading.Thread(
+        target=checkLokiAccess,
+        args=(site.lokiAddr, DEFAULT_USERNAME, site.cluster, site.namespace),
+        name="loki-self-check",
+        daemon=True,
+    ).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down.")
+        log.info("Shutting down.")
     finally:
         httpd.server_close()

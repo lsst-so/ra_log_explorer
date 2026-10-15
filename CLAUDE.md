@@ -126,7 +126,8 @@ between the two projects doesn't have to context-switch.
 
 - **Python version**: 3.13. A `.venv` at the repo root (created from
   pyenv 3.13.x) holds the dev toolchain; the runtime itself is
-  stdlib-only.
+  stdlib-only. `source ./activate.sh` puts it on a shell, clearing any
+  stack `PYTHONPATH` that would shadow it.
 - **Line length**: 110 (black + flake8 + isort all set to this).
 - **Identifier style**: camelCase for functions, methods, variables;
   PascalCase for classes; UPPER_CASE for module-level constants.

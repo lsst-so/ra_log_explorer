@@ -593,6 +593,7 @@ everyone else's fetches behave.
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
 | `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables live mode | `0` (off) |
 | `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* each live increment stops (Loki ingestion lag) | `60` |
+| `RA_LOG_EXPLORER_LOG_LEVEL` | stdlib `logging` level for the server's stderr log (`DEBUG` adds every `logcli` call and HTTP request) | `INFO` |
 | `LOKI_USERNAME` | `DEFAULT_USERNAME`, the Loki basic-auth user | `merlin` |
 | `LOKI_PASSWORD` | the Loki basic-auth password, read by `logcli` | *(required)* |
 

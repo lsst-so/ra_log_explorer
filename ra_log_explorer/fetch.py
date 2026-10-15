@@ -74,6 +74,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import math
 import os
 import re
@@ -95,6 +96,8 @@ from .config import FetchSpec, cache_root, ensureWindowCacheDir, windowCachePath
 # offset) lives in parse.py; the slice path bisects raw JSONL by timestamp
 # and must agree with the parser about what those timestamps mean.
 from .parse import _parseTimestamp as _parseLokiTimestamp
+
+log = logging.getLogger(__name__)
 
 # Bumped whenever a change to how we fetch makes older caches untrustworthy.
 # v1 (implicit, no field) capped each pod at 50_000 lines and so silently
@@ -248,10 +251,12 @@ def ensureCacheSchemaCurrent() -> int:
     except OSError:
         pass
     if removed:
-        print(
-            f"Cache schema changed (was {recorded or 'unversioned'}, now {current}); "
-            f"flushed {removed} cached window(s). They will re-fetch on demand.",
-            file=sys.stderr,
+        log.info(
+            "Cache schema changed (was %s, now %s); flushed %d cached window(s). "
+            "They will re-fetch on demand.",
+            recorded or "unversioned",
+            current,
+            removed,
         )
     return removed
 
@@ -290,20 +295,28 @@ def _run_logcli(
             "LOKI_PASSWORD is not set in the environment. "
             "Export it (or source the shell rc that does) before running."
         )
+    # The password travels in the environment, never in argv, so the
+    # arguments are safe to log.
+    t0 = time.monotonic()
     try:
         if stdoutPath is not None:
             with open(stdoutPath, "wb") as fh:
                 subprocess.run(cmd, check=True, stdout=fh, stderr=subprocess.PIPE, env=env, timeout=timeout)
+            log.debug("logcli %s -> %s (%.2fs)", extraArgs, stdoutPath.name, time.monotonic() - t0)
             return b""
         result = subprocess.run(cmd, check=True, capture_output=True, env=env, timeout=timeout)
+        log.debug("logcli %s -> %d bytes (%.2fs)", extraArgs, len(result.stdout), time.monotonic() - t0)
         return result.stdout
     except FileNotFoundError as e:
         raise FetchError("logcli binary not found on PATH") from e
     except subprocess.CalledProcessError as e:
-        raise FetchError(
+        err = FetchError(
             f"logcli failed (rc={e.returncode}): {e.stderr.decode('utf-8', 'replace').strip()[:500]}"
-        ) from e
+        )
+        log.debug("logcli %s failed after %.2fs: %s", extraArgs, time.monotonic() - t0, err)
+        raise err from e
     except subprocess.TimeoutExpired as e:
+        log.debug("logcli %s timed out after %.0fs", extraArgs, timeout)
         raise FetchError(f"logcli timed out after {timeout}s") from e
 
 
@@ -353,6 +366,85 @@ def listPods(spec: FetchSpec) -> list[str]:
             continue
         pods.add(line[idx + 5 : end])
     return sorted(pods)
+
+
+def _warnNoPods(spec: FetchSpec) -> None:
+    """Log that a listing Loki answered successfully came back empty.
+
+    On screen this is just "No pods found", with nothing raised anywhere.
+    The usual causes are a window Loki no longer holds (retention, or a
+    gap in the cluster's log shipping), credentials that can't see the
+    cluster, or a window on the wrong side of a timezone mistake. Not
+    called from the live poller, whose short increments are legitimately
+    empty whenever the namespace is quiet.
+    """
+    log.warning(
+        "Loki has no streams for %s from %s to %s (user %r at %s)",
+        _matcher(spec),
+        spec.fromIso,
+        spec.toIso,
+        spec.username,
+        spec.lokiAddr,
+    )
+
+
+# How far back the startup self-check looks. Long enough that a namespace
+# whose pods are all alive is certain to have logged something, short
+# enough to be one cheap query.
+SELF_CHECK_WINDOW = dt.timedelta(hours=1)
+
+
+def checkLokiAccess(lokiAddr: str, username: str, cluster: str, namespace: str) -> None:
+    """Log what Loki shows these credentials over the last hour.
+
+    Run once at startup, off the request path, and never raises. A fetch
+    that finds no pods is otherwise silent (every query succeeds and comes
+    back empty), so this says up front whether the configured cluster is
+    visible at all, and if not, which clusters are.
+    """
+    toT = dt.datetime.now(dt.timezone.utc)
+    spec = FetchSpec(
+        lokiAddr=lokiAddr,
+        username=username,
+        cluster=cluster,
+        namespace=namespace,
+        fromIso=_fmtLogcliTime(toT - SELF_CHECK_WINDOW),
+        toIso=_fmtLogcliTime(toT),
+    )
+    who = f"user {username!r} at {lokiAddr}"
+    try:
+        out = _run_logcli(
+            spec,
+            ["labels", "cluster", f"--from={spec.fromIso}", f"--to={spec.toIso}"],
+            timeout=COUNT_TIMEOUT_S,
+        )
+        clusters = sorted({ln.strip() for ln in out.decode("utf-8", "replace").splitlines() if ln.strip()})
+        if cluster not in clusters:
+            log.warning(
+                "Loki self-check: %s sees no cluster %r in the last hour, so fetches of recent "
+                "windows will find no pods. Clusters it can see: %s",
+                who,
+                cluster,
+                ", ".join(clusters) or "(none)",
+            )
+            return
+        pods = listPods(spec)
+    except FetchError as e:
+        log.error("Loki self-check failed for %s: %s", who, e)
+        return
+    except Exception:  # noqa: BLE001 (diagnostics only; never take the server down)
+        log.exception("Loki self-check failed for %s", who)
+        return
+    if not pods:
+        _warnNoPods(spec)
+        return
+    log.info(
+        "Loki self-check OK: %s sees %d pod(s) logging to %s/%s in the last hour",
+        who,
+        len(pods),
+        cluster,
+        namespace,
+    )
 
 
 def _fmtLogcliTime(t: dt.datetime) -> str:
@@ -1274,7 +1366,7 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
         try:
             return materializeNightSlice(nightDir, sliceSpec)
         except Exception as e:  # noqa: BLE001 — slice is an optimisation
-            print(f"night-slice from {nightDir} failed ({e}); falling back", file=sys.stderr)
+            log.warning("night-slice from %s failed (%s); falling back to a fetch", nightDir, e)
             return None
 
 
@@ -1463,6 +1555,8 @@ def _fetchAllLocked(
 
     t0 = time.time()
     pods = listPods(spec)
+    if not pods:
+        _warnNoPods(spec)
     podsListPath.write_text("\n".join(pods) + "\n")
     # A previous attempt on this window (a fetch that died, or a night
     # slice that failed part-way) may have left pod files behind.
@@ -1524,6 +1618,26 @@ def _fetchAllLocked(
                 eventErrors[pod] = str(e)
 
     elapsed = time.time() - t0
+    log.info(
+        "Fetched %s/%s %s to %s: %d pods, %d lines, %s in %.1fs",
+        spec.cluster,
+        spec.namespace,
+        spec.fromIso,
+        spec.toIso,
+        len(pods),
+        sum(perPodLines.values()),
+        humanBytes(totalBytes).strip(),
+        elapsed,
+    )
+    for label, failures in (("failed", errors), ("could not be fetched losslessly", incompletePods)):
+        if failures:
+            first = next(iter(sorted(failures)))
+            log.warning("%d pod(s) %s; e.g. %s: %s", len(failures), label, first, failures[first])
+    if eventErrors:
+        first = next(iter(sorted(eventErrors)))
+        log.warning(
+            "k8s/events fetch failed for %d pod(s); e.g. %s: %s", len(eventErrors), first, eventErrors[first]
+        )
     meta = {
         "spec": asdict(spec),
         "fetchSchemaVersion": CACHE_SCHEMA_VERSION,

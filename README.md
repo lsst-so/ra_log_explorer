@@ -610,6 +610,7 @@ last change how everyone else's fetches behave.
 | `RA_LOG_EXPLORER_BASE_PATH` | URL prefix to serve under | `""` (the root) |
 | `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables | `0` (off) |
 | `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* live fetches stop | `60` |
+| `RA_LOG_EXPLORER_LOG_LEVEL` | server log verbosity: `DEBUG`, `INFO`, `WARNING`, `ERROR` | `INFO` |
 
 Most have a matching CLI flag (`--workers`, `--window-after`, `--site`,
 `--base-path`, …) that wins over the environment for a one-off run.
@@ -695,6 +696,19 @@ still resolve without a token. (For a one-off where you
 can't fix the token but know the shutter close, use the **manual
 shutter close** field that appears under the dataId input — see step 2
 of *Getting started*.)
+
+**"No pods found in this window"**: Loki answered, with nothing. Either
+the dataId belongs to the other site, or this server's Loki credentials
+can't see its cluster. The server's log says which: at startup it runs
+a self-check of the last hour: `Loki self-check OK: ...` with a pod
+count, or `... sees no cluster 'yagan' ...` followed by the clusters the
+credentials can see. Every fetch whose pod listing comes back empty
+logs a `Loki has no streams for ...` warning with the matcher, window
+and user. Check also that the window is inside Loki's retention (about
+90 days) and not in a gap in the cluster's log shipping. On a deployment, read those
+lines from the pod's log in Grafana/Loki or Argo CD. Set
+`RA_LOG_EXPLORER_LOG_LEVEL=DEBUG` to also log every `logcli` call and
+HTTP request.
 
 **"No exposure-time record for dataId=N" / ConsDB unreachable** — ConsDB
 either has no row for that id yet or is down. The **manual shutter close**
@@ -810,6 +824,11 @@ The contributor guide and coding conventions live in
 [architecture/](architecture/). The validation loop (pre-commit, mypy,
 mypy-coverage, pytest) is summarised in the
 [validation skill](.claude/skills/ra-log-explorer-validation/SKILL.md).
+
+Develop in the repo's own `.venv`, not a conda or Rubin stack
+environment: `source ./activate.sh` from any bash or zsh shell activates
+it, clears the stack's `PYTHONPATH` (which would otherwise shadow the
+venv's packages), and prints how to create the venv if it is missing.
 
 The test suite includes **browser tests** that drive Chromium against
 the real app over a real (cut-down) night of logs, so they need one

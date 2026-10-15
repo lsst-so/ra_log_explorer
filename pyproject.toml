@@ -35,6 +35,8 @@ ra_log_explorer = ["static/*", "templates/*"]
 ui-test = ["pytest-playwright", "pytest-xdist"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
 markers = [
     "ui: browser tests (tests/ui/); need `pip install -e '.[ui-test]'` + `playwright install chromium`",
 ]

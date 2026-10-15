@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import os
 import shutil
 import tempfile
@@ -87,6 +88,8 @@ from .fetch import (
     writeLiveSidecar,
 )
 from .sites import Site
+
+log = logging.getLogger(__name__)
 
 # The end-of-night verification refetches a pod only when its appended
 # line count falls short of the count_over_time oracle by more than
@@ -246,6 +249,7 @@ class LiveNightManager:
                 self.tick()
             except Exception:  # noqa: BLE001 — the loop must survive anything
                 self._lastError = traceback.format_exc(limit=6)
+                log.exception("Live tick failed; retrying in %.0fs", self._pollS)
                 self._publishSnapshot()
             elapsed = time.time() - started
             self._stopEvent.wait(max(1.0, self._pollS - elapsed))
@@ -269,6 +273,7 @@ class LiveNightManager:
                 # fail it. Opening the new night is the urgent half; the
                 # orphan sweep below rediscovers this one and retries.
                 self._orphanError = f"could not finalise {night.dir.name}: {e}"
+                log.warning("Live: %s", self._orphanError)
             night = self._night = None
         if night is None:
             night = self._night = self._openNight(dayObs, now)
@@ -290,6 +295,7 @@ class LiveNightManager:
         self._lastTick = tickStats
         self._lastError = None
         self._publishSnapshot()
+        _logTick(night, tickStats)
 
     # ----- night lifecycle --------------------------------------------------
 
@@ -336,8 +342,16 @@ class LiveNightManager:
                 "incomplete_pods": {},
             }
             writeLiveSidecar(nightDir, sidecar)
+            log.info("Live: opened dayObs %d at %s, fetching from %s", dayObs, nightDir, spec.fromIso)
         else:
             _recoverNight(nightDir, sidecar)
+            log.info(
+                "Live: resumed dayObs %d at %s, %d pods so far, watermark %s",
+                dayObs,
+                nightDir,
+                len(sidecar.get("pods") or {}),
+                sidecar.get("watermarkIso"),
+            )
         night = _Night(dayObs=dayObs, dir=nightDir, sidecar=sidecar)
         self._orphanDirs = self._findOrphanNights(nightDir, now)
         self._exposures = []
@@ -397,6 +411,7 @@ class LiveNightManager:
                 self._orphanError = None
             except Exception as e:  # noqa: BLE001 — never break the tick over an old night
                 self._orphanError = f"could not finalise {window.name}: {e}"
+                log.warning("Live: %s", self._orphanError)
                 self._orphanDirs.append(window)
             return
 
@@ -411,6 +426,7 @@ class LiveNightManager:
         sidecar = night.sidecar
         if sidecar.get("finalised"):
             return
+        log.info("Live: finalising dayObs %d", night.dayObs)
         spec = self._nightSpec(night.dayObs)
         nightStart = dayObsStartUtc(night.dayObs)
         nightEnd = dayObsEndUtc(night.dayObs)
@@ -471,6 +487,13 @@ class LiveNightManager:
         sidecar["updatedAt"] = dt.datetime.now(dt.timezone.utc).isoformat()
         writeLiveSidecar(night.dir, sidecar)
         markCacheViewed(night.dir)
+        log.info(
+            "Live: finalised dayObs %d: %d pods, %d error(s), %d incomplete",
+            night.dayObs,
+            len(pods),
+            len(errors),
+            len(incomplete),
+        )
 
     def _refetchWholePod(
         self, night: _Night, spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime
@@ -751,18 +774,17 @@ class LiveNightManager:
         try:
             token = exposureTimes.loadTokenForSite(self._site)
         except OSError as e:
-            self._consdbError = f"token unreadable: {e}"
+            self._setConsdbError(dayObs, f"token unreadable: {e}")
             return
         try:
             records = exposureTimes.queryExposureRecordsForDayObs(
                 dayObs, token, consdbUrl=self._site.consdbUrl
             )
-        except exposureTimes.ConsDbError as e:
-            self._consdbError = str(e)
+        except (exposureTimes.ConsDbError, OSError) as e:  # OSError: DNS failure, connection refused, ...
+            self._setConsdbError(dayObs, str(e))
             return
-        except OSError as e:  # DNS failure, connection refused, ...
-            self._consdbError = str(e)
-            return
+        if self._consdbError is not None:
+            log.info("Live: ConsDB reachable again")
         self._consdbError = None
         self._exposures = records
         # Persist only when something new turned up — records are
@@ -775,6 +797,13 @@ class LiveNightManager:
         if keys - self._storedExposureKeys:
             exposureTimes.storeCachedRecordList(records, siteName=self._site.name)
             self._storedExposureKeys = keys
+
+    def _setConsdbError(self, dayObs: int, error: str) -> None:
+        # Logged on change only: an outage would otherwise repeat the
+        # same line every poll for as long as it lasts.
+        if error != self._consdbError:
+            log.warning("Live: ConsDB query for dayObs %d failed: %s", dayObs, error)
+        self._consdbError = error
 
     def _exposureRows(self, watermark: dt.datetime | None) -> list[dict[str, Any]]:
         """Tonight's exposures, newest first, with readiness computed.
@@ -862,6 +891,26 @@ class LiveNightManager:
         }
         with self._lock:
             self._snapshot = snapshot
+
+
+def _logTick(night: _Night, tickStats: dict[str, Any]) -> None:
+    """One line per tick, plus a warning while any pod or the events stream is failing."""
+    sidecar = night.sidecar
+    errors: dict[str, str] = sidecar.get("errors") or {}
+    log.info(
+        "Live tick dayObs %d: +%d lines from %d active pods (%d pods tonight), watermark %s, %.1fs",
+        night.dayObs,
+        tickStats.get("newLines", 0),
+        tickStats.get("activePods", 0),
+        len(sidecar.get("pods") or {}),
+        sidecar.get("watermarkIso"),
+        tickStats["elapsedS"],
+    )
+    if errors:
+        first = min(errors)
+        log.warning("Live: %d pod(s) failing to fetch; e.g. %s: %s", len(errors), first, errors[first])
+    if sidecar.get("eventsError"):
+        log.warning("Live: k8s/events fetch failing: %s", sidecar["eventsError"])
 
 
 def _nightDirIntact(night: _Night) -> bool:
