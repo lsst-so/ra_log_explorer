@@ -32,6 +32,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import logging
+import os
 import shutil
 import sys
 import webbrowser
@@ -46,6 +48,8 @@ from .config import (
     DEFAULT_WORKERS,
     LIVE_LAG_S,
     LIVE_POLL_S,
+    LOG_LEVEL,
+    MAX_CACHE_BYTES,
     FetchSpec,
     cache_root,
     defaultBasePath,
@@ -71,6 +75,8 @@ from .jobs import JobManager
 from .live import LiveNightManager
 from .server import ServerContext, ServerState, serve
 from .sites import Site, loadSites, siteByName
+
+log = logging.getLogger("ra_log_explorer.cli")  # not __name__: run as -m, that is __main__
 
 
 def _parseIsoUtc(s: str) -> dt.datetime:
@@ -261,6 +267,35 @@ def _eagerFetchAndBuildState(args: argparse.Namespace, site: Site) -> ServerStat
     )
 
 
+def _logConfiguration(args: argparse.Namespace, site: Site) -> None:
+    """Log what this process will talk to, once, at startup.
+
+    Deployed, every one of these comes from the Helm chart, and a wrong
+    one shows up only as fetches that quietly return nothing; having them
+    at the top of the pod's log is what makes that checkable without
+    access to the pod.
+    """
+    password = "set" if (os.environ.get("LOKI_PASSWORD") or "").strip() else "NOT SET"
+    log.info(
+        "Loki %s as user %r (password %s), cluster=%s namespace=%s; ConsDB %s",
+        site.lokiAddr,
+        args.username,
+        password,
+        site.cluster,
+        site.namespace,
+        site.consdbUrl,
+    )
+    log.info(
+        "Cache %s (cap %s); %d fetch workers; window -%gs/+%gs; log level %s",
+        cache_root(),
+        humanBytes(MAX_CACHE_BYTES).strip(),
+        args.workers,
+        args.window_before,
+        args.window_after,
+        LOG_LEVEL,
+    )
+
+
 def cmdRun(args: argparse.Namespace) -> int:
     eager = args.exposure_id is not None and args.t_zero is not None
     if (args.exposure_id is None) != (args.t_zero is None):
@@ -281,11 +316,8 @@ def cmdRun(args: argparse.Namespace) -> int:
         if args.no_serve:
             return 0
     else:
-        print(
-            f"Starting in home mode (site={site.name}, cluster={site.cluster}) — "
-            "pick an exposure in the browser.",
-            file=sys.stderr,
-        )
+        log.info("Starting in home mode (site=%s, cluster=%s).", site.name, site.cluster)
+    _logConfiguration(args, site)
 
     basePath = normalizeBasePath(args.base_path)
     ctx = ServerContext(jobs=JobManager(), sites=sites, siteName=site.name, basePath=basePath)
@@ -304,10 +336,12 @@ def cmdRun(args: argparse.Namespace) -> int:
         )
         ctx.live.start()
         pinned = f" (pinned to dayObs {args.live_day_obs})" if args.live_day_obs else ""
-        print(
-            f"Live mode: polling {site.name} every {args.live_poll_s:.0f}s "
-            f"(lag {LIVE_LAG_S:.0f}s) to keep tonight's logs hot{pinned}.",
-            file=sys.stderr,
+        log.info(
+            "Live mode: polling %s every %.0fs (lag %.0fs) to keep tonight's logs hot%s.",
+            site.name,
+            args.live_poll_s,
+            LIVE_LAG_S,
+            pinned,
         )
     elif args.live_day_obs is not None:
         # The flag only means anything to the poller, and without live mode
@@ -470,6 +504,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     p = build_parser()
     args = p.parse_args(argv)
+    logging.basicConfig(
+        level=LOG_LEVEL,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        stream=sys.stderr,
+    )
     # Reconcile the on-disk cache to the current schema before doing anything.
     # If CACHE_SCHEMA_VERSION was bumped, this flushes the whole tree once, up
     # front, so no stale (possibly line-dropping) data is read and the user

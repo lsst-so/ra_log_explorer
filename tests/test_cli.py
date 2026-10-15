@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import logging
 from pathlib import Path
 from typing import Any, Callable
 
@@ -560,3 +561,15 @@ def test_cmdCacheFlush_on_empty_cache_root_is_noop(
     assert rc == 0
     out = capsys.readouterr().out
     assert "Nothing to flush" in out
+
+
+def test_the_startup_configuration_never_logs_the_password(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    monkeypatch.setenv("LOKI_PASSWORD", "hunter2-secret")
+    args = cli.build_parser().parse_args(["run", "--no-browser"])
+    site, _ = cli._resolveSite(args)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.cli"):
+        cli._logConfiguration(args, site)
+    assert "password set" in caplog.text
+    assert "hunter2-secret" not in caplog.text

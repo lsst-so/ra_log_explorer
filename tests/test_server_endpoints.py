@@ -13,6 +13,7 @@ from __future__ import annotations
 import datetime as dt
 import http.client
 import json
+import logging
 import shutil
 import socket
 import threading
@@ -3060,3 +3061,32 @@ def test_summary_serves_the_night_view_it_is_asked_for(
     # And a nonsense view falls back to it rather than erroring.
     status, body = _get(host, port, "/api/summary?dayObs=20260813&nightView=wat")
     assert body["view"] == "aos"
+
+
+def test_a_malformed_request_line_still_gets_its_error_response(
+    runningServer: RunningServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The stdlib logs the 400 for an unparseable request line before
+    ``path`` exists; the access log must not raise there and drop it."""
+    host, port, _ = runningServer
+    with caplog.at_level(logging.DEBUG, logger="ra_log_explorer.server"):
+        with socket.create_connection((host, port), timeout=2.0) as sock:
+            sock.sendall(b"GET / HTTP/9\r\n\r\n")
+            reply = b""
+            while chunk := sock.recv(4096):
+                reply += chunk
+    # Which form the 400 takes depends on the Python patch release: some
+    # answer as HTTP/0.9 (no status line, only the error page), later ones
+    # with a status line. Either way, it has to arrive.
+    assert reply.startswith(b"HTTP/1.0 400 ") or b"Error code: 400" in reply
+
+
+def test_the_access_log_skips_the_readiness_probe(
+    runningServer: RunningServer, caplog: pytest.LogCaptureFixture
+) -> None:
+    host, port, _ = runningServer
+    with caplog.at_level(logging.DEBUG, logger="ra_log_explorer.server"):
+        assert _get(host, port, "/healthz")[0] == 200
+        assert _get(host, port, "/api/site")[0] == 200
+    assert "/api/site" in caplog.text
+    assert "/healthz" not in caplog.text

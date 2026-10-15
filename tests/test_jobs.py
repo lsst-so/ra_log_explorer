@@ -9,9 +9,11 @@ event.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import time
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -274,3 +276,41 @@ def test_jobManager_stateLock_is_a_real_lock() -> None:
         finally:
             if acquired:
                 mgr.stateLock.release()
+
+
+# ----- diagnostics logging -------------------------------------------------
+
+
+def test_a_job_that_finds_no_pods_says_so(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Zero pods is a successful fetch, so nothing else logs it, and it is
+    what the UI shows as "No pods found in this window"."""
+
+    def fakeFetchAll(spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False) -> Any:
+        return tmp_path, {"cacheReuse": "exact", "pod_count": 0}
+
+    monkeypatch.setattr(jobs, "fetchAll", fakeFetchAll)
+    mgr = jobs.JobManager()
+    job = mgr.createJob(_spec(), 2026101400123, _tZero(), instrument="lsstcam")
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.jobs"):
+        mgr.runJob(job, lambda j: None)
+    assert f"Job {job.jobId}: exposure lsstcam:2026101400123" in caplog.text
+    assert "0 pods, cache exact" in caplog.text
+    assert "found no pods" in caplog.text
+
+
+def test_a_failed_job_is_logged_with_its_traceback(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fakeFetchAll(spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False) -> Any:
+        raise RuntimeError("Loki went away")
+
+    monkeypatch.setattr(jobs, "fetchAll", fakeFetchAll)
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20261014, siteName="summit")
+    with caplog.at_level(logging.ERROR, logger="ra_log_explorer.jobs"):
+        mgr.runJob(job, lambda j: None)
+    assert job.status == "error"
+    assert "(night 20261014 (aos)) failed" in caplog.text
+    assert "Loki went away" in caplog.text

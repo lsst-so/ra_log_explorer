@@ -102,6 +102,29 @@ LIVE_POLL_S = _envFloat("RA_LOG_EXPLORER_LIVE_POLL_S", 0.0)
 # ingestion frontier.
 LIVE_LAG_S = _envFloat("RA_LOG_EXPLORER_LIVE_LAG_S", 60.0)
 
+_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+
+
+def _envLogLevel(name: str, default: str) -> str:
+    """Read a logging level name from the environment, or return ``default``.
+
+    Fails loudly on anything else, for the reasons in :func:`_envInt`.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    level = raw.strip().upper()
+    if level not in _LOG_LEVELS:
+        raise ConfigError(f"{name} must be one of {', '.join(_LOG_LEVELS)}; got {raw!r}")
+    return level
+
+
+# Verbosity of the service's own log on stderr. INFO is a few lines per
+# fetch plus one per live tick; DEBUG adds every logcli invocation and
+# every HTTP request, which is what to turn on when a fetch comes back
+# wrong and the reason isn't in the INFO lines.
+LOG_LEVEL = _envLogLevel("RA_LOG_EXPLORER_LOG_LEVEL", "INFO")
+
 
 def normalizeBasePath(raw: str | None) -> str:
     """Normalize a URL prefix to the one form the router and template agree on.

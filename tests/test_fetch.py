@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import logging
 import shutil
 from pathlib import Path
 from typing import Any
@@ -1549,3 +1550,119 @@ def test_ensureCacheSchemaCurrent_drops_live_sidecars_before_removing(
     fetch.ensureCacheSchemaCurrent()
     assert nightDir.exists(), "this test is about the delete failing, not succeeding"
     assert fetch.readLiveSidecar(nightDir) is None
+
+
+# ----- diagnostics logging -------------------------------------------------
+
+
+def _summitSpec() -> FetchSpec:
+    return FetchSpec(
+        lokiAddr="https://loki.example",
+        username="omega",
+        cluster="yagan",
+        namespace="rapid-analysis",
+        fromIso="2026-10-15T00:00:00.000000Z",
+        toIso="2026-10-15T00:05:00.000000Z",
+    )
+
+
+def test_listPods_is_quiet_even_when_empty(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The live poller lists every few minutes, and a quiet namespace makes
+    an empty listing normal there; only callers that expect pods warn."""
+    monkeypatch.setattr(fetch, "_run_logcli", lambda spec, args, **k: b"")
+    with caplog.at_level(logging.WARNING, logger="ra_log_explorer.fetch"):
+        assert fetch.listPods(_summitSpec()) == []
+    assert caplog.text == ""
+
+
+def test_fetchAll_warns_when_the_listing_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmpCacheRoot: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An empty listing is the one failure that raises nothing, so a fetch
+    that gets one leaves a line naming what was asked and as whom."""
+    monkeypatch.setattr(fetch, "listPods", lambda spec: [])
+    with caplog.at_level(logging.WARNING, logger="ra_log_explorer.fetch"):
+        _, meta = fetch.fetchAll(_summitSpec())
+    assert meta["pod_count"] == 0
+    assert "Loki has no streams" in caplog.text
+    assert 'cluster="yagan"' in caplog.text
+    assert "user 'omega' at https://loki.example" in caplog.text
+
+
+def test_checkLokiAccess_warns_when_the_cluster_has_no_pods(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fake(spec: FetchSpec, args: list[str], **k: Any) -> bytes:
+        return b"yagan\n" if args[0] == "labels" else b""
+
+    monkeypatch.setattr(fetch, "_run_logcli", fake)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.fetch"):
+        fetch.checkLokiAccess("https://loki.example", "omega", "yagan", "rapid-analysis")
+    assert "Loki has no streams" in caplog.text
+    assert "self-check OK" not in caplog.text
+
+
+def test_checkLokiAccess_keeps_the_traceback_of_an_unexpected_error(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A FetchError is an answer from Loki; anything else is a bug here."""
+
+    def fake(spec: FetchSpec, args: list[str], **k: Any) -> bytes:
+        raise KeyError("boom")
+
+    monkeypatch.setattr(fetch, "_run_logcli", fake)
+    with caplog.at_level(logging.ERROR, logger="ra_log_explorer.fetch"):
+        fetch.checkLokiAccess("https://loki.example", "omega", "yagan", "rapid-analysis")
+    assert "Loki self-check failed" in caplog.text
+    assert "Traceback" in caplog.text
+
+
+def test_checkLokiAccess_names_the_clusters_it_can_see(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Pointed at a Loki (or tenant) without the configured cluster, every
+    fetch succeeds empty; the self-check is what says so."""
+    calls: list[list[str]] = []
+
+    def fake(spec: FetchSpec, args: list[str], **k: Any) -> bytes:
+        calls.append(args)
+        return b"antu\nmanke\n"
+
+    monkeypatch.setattr(fetch, "_run_logcli", fake)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.fetch"):
+        fetch.checkLokiAccess("https://loki.example", "omega", "yagan", "rapid-analysis")
+    assert [a[:2] for a in calls] == [["labels", "cluster"]], "no series query once the cluster is missing"
+    assert "sees no cluster 'yagan'" in caplog.text
+    assert "antu, manke" in caplog.text
+
+
+def test_checkLokiAccess_reports_ok(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def fake(spec: FetchSpec, args: list[str], **k: Any) -> bytes:
+        if args[0] == "labels":
+            return b"manke\nyagan\n"
+        return b'{cluster="yagan", namespace="rapid-analysis", pod="head-node-0"}\n'
+
+    monkeypatch.setattr(fetch, "_run_logcli", fake)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.fetch"):
+        fetch.checkLokiAccess("https://loki.example", "omega", "yagan", "rapid-analysis")
+    assert "Loki self-check OK" in caplog.text
+    assert "1 pod(s) logging to yagan/rapid-analysis" in caplog.text
+
+
+def test_checkLokiAccess_logs_failures_without_raising(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """It runs on a bare thread at startup; an exception there would vanish."""
+
+    def fake(spec: FetchSpec, args: list[str], **k: Any) -> bytes:
+        raise fetch.FetchError("logcli timed out after 180.0s")
+
+    monkeypatch.setattr(fetch, "_run_logcli", fake)
+    with caplog.at_level(logging.ERROR, logger="ra_log_explorer.fetch"):
+        fetch.checkLokiAccess("https://loki.example", "omega", "yagan", "rapid-analysis")
+    assert "Loki self-check failed" in caplog.text
+    assert "timed out" in caplog.text

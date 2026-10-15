@@ -19,6 +19,7 @@ ever consume.
 from __future__ import annotations
 
 import datetime as dt
+import logging
 import threading
 import traceback
 import uuid
@@ -33,6 +34,8 @@ from .fetch import fetchAll
 JobStatus = Literal["pending", "running", "parsing", "done", "error"]
 JobKind = Literal["exposure", "night", "range"]
 ProgressEvent = dict[str, Any]
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -98,6 +101,14 @@ class FetchJob:
 
     def isTerminal(self) -> bool:
         return self.status in ("done", "error")
+
+    def describe(self) -> str:
+        """Short human label for log lines, e.g. ``exposure lsstcam:2026051900722``."""
+        if self.kind == "night":
+            return f"night {self.dayObs} ({self.nightView})"
+        if self.kind == "range":
+            return f"range {self.instrument}:{self.startId}-{self.stopId}"
+        return f"exposure {self.instrument}:{self.expId}"
 
 
 # Callback signature for whatever wants to react to a finished fetch
@@ -199,8 +210,9 @@ class JobManager:
         after the server state has been updated.
         """
         job.status = "running"
-        job.startedAt = dt.datetime.now(dt.timezone.utc)
+        startedAt = job.startedAt = dt.datetime.now(dt.timezone.utc)
         job.push({"type": "start", "fromIso": job.spec.fromIso, "toIso": job.spec.toIso})
+        log.info("Job %s: %s, window %s to %s", job.jobId, job.describe(), job.spec.fromIso, job.spec.toIso)
 
         def cb(pod: str, i: int, total: int) -> None:
             # fetchAll loops over completed futures sequentially, so this
@@ -222,7 +234,18 @@ class JobManager:
             )
             onComplete(job)
             job.status = "done"
-            job.finishedAt = dt.datetime.now(dt.timezone.utc)
+            finishedAt = job.finishedAt = dt.datetime.now(dt.timezone.utc)
+            podCount = meta.get("pod_count", 0)
+            log.info(
+                "Job %s done in %.1fs: %d pods, cache %s, %s",
+                job.jobId,
+                (finishedAt - startedAt).total_seconds(),
+                podCount,
+                meta.get("cacheReuse", "none"),
+                cacheDir,
+            )
+            if not podCount:
+                log.warning("Job %s (%s) found no pods in its window", job.jobId, job.describe())
             job.push(
                 {
                     "type": "done",
@@ -251,6 +274,7 @@ class JobManager:
             job.status = "error"
             job.finishedAt = dt.datetime.now(dt.timezone.utc)
             job.error = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=4)}"
+            log.exception("Job %s (%s) failed", job.jobId, job.describe())
             job.push({"type": "error", "error": job.error})
 
     def startJob(self, job: FetchJob, onComplete: OnComplete) -> None:
