@@ -567,10 +567,12 @@ that just ended.
 From then on the dir is a
 complete, trustworthy all-pods night window (still sliced, never
 superset-parsed), subject to ordinary LRU eviction; the poller moves on
-to the new night. On the deployments, one busy night is ~9 GiB of JSONL
-on the cache volume (measured: 35.7M lines / 576 pods for 20260711), so
-the chart's 50 GiB volume holds four-or-so finalised nights plus slices
-before LRU eviction reclaims the oldest. Night mode's own "night so
+to the new night. On the summit, one busy night is ~9-14 GiB of JSONL
+on the cache volume (measured: 35.7M lines / 576 pods for 20260711,
+22.6M lines / 542 pods for 20261027), so the summit's 200 GiB volume
+holds tonight, last night and about a week of older nights plus slices
+before LRU eviction reclaims the oldest. (BTS nights are 50-150 MiB;
+its 50 GiB volume is ample.) Night mode's own "night so
 far" windows do not accumulate against that: each fetch supersedes the
 last one's, and the fetch-job callback drops the windows it contains
 (see *Night slice* in [caching.md](caching.md)).
@@ -1301,7 +1303,7 @@ Two consequences worth knowing:
 
 - The SFM half is **much bigger**. On a summit night it is ~9 GiB and
   ~35M lines against the AOS half's few hundred MB, so it is a minutes-
-  long fetch and about a minute of parsing (on three parse workers) where
+  long fetch and about a minute of parsing (on the summit's six parse workers) where
   the AOS half is seconds. On a live instance
   it is usually free, because the poller already holds the whole night
   on disk and the request is served by handing that window over.
@@ -1518,7 +1520,8 @@ loaded view carries a `footprint` (`_footprint`: ~700 B per retained
 Event plus ~15 B per parsed line, measured by RSS on 20261027) and a
 `lastUsed` tick, and each `put*State` unloads the least recently used
 views, of any kind, until the total fits `RA_LOG_EXPLORER_MAX_LOADED_BYTES`
-(deployed: 4 GiB of the pod's 8). The view just loaded always stays, even
+(deployed: 8 GiB of the pod's 16 on the summit, sized for two or three
+users each holding a night or two; 4 of 8 on BTS). The view just loaded always stays, even
 alone over the ceiling. What keeps nights inside it at all is that a
 night keeps only the Event kinds its rollups read
 (`night.NIGHT_EVENT_KINDS`, applied in the parse workers): WARN lines
