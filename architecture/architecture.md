@@ -974,7 +974,11 @@ traceback is what led up to it. `contextSource` is `"dataId-block"` or
 
 Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
-`truncated: true`.
+`truncated: true`. The pod's file is entered at the context's start by
+the same timestamp bisection the night slice uses
+(`fetch.firstOffsetAtOrAfter`), not read from the top: a summit pod's
+night is up to ~200k lines, and parsing down to a failure late in it
+cost seconds of request-thread CPU per click.
 
 404 with `{"error": "This night is no longer loaded; reload the page"}`
 when the night has dropped out of memory (the night LRU is capped).

@@ -76,6 +76,7 @@ from .fetch import (
     checkLokiAccess,
     dropLiveSidecarsUnder,
     evictToFit,
+    firstOffsetAtOrAfter,
     getCacheExposureIds,
     getCacheLastViewed,
     getCacheRange,
@@ -1189,10 +1190,18 @@ def _tracebackContextForNight(state: NightState, bodyKey: str) -> dict | None:
         contextSource = "time-window"
 
     logPath = loadPodLogPath(state.cacheDir, targetSummary.pod)
+    # Seek rather than read up to it: a pod's night is up to ~200k lines,
+    # and parsing from the top to a failure late in it is seconds of CPU
+    # on a request thread for every row clicked.
+    try:
+        with open(logPath, "rb") as fh:
+            offset = firstOffsetAtOrAfter(fh, startTs, logPath.stat().st_size)
+    except (OSError, ValueError, KeyError):
+        offset = 0
     lines: list[dict] = []
     truncated = False
     totalChars = 0
-    for ln in parser.iterPodLines(logPath):
+    for ln in parser.iterPodLines(logPath, offset):
         if ln.timestamp < startTs:
             continue
         if ln.timestamp > endTs:

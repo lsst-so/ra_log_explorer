@@ -19,6 +19,7 @@ This module:
 from __future__ import annotations
 
 import datetime as dt
+import io
 import json
 import multiprocessing
 import re
@@ -252,11 +253,14 @@ def parseLogLine(pod: str, jsonObj: dict) -> LogLine | None:
     )
 
 
-def iterPodLines(podLogPath: Path) -> Iterator[LogLine]:
+def iterPodLines(podLogPath: Path, offset: int = 0) -> Iterator[LogLine]:
+    """Parse a pod's JSONL log, from byte ``offset`` (a line start) onwards."""
     pod = podLogPath.stem
     if not podLogPath.exists():
         return
-    with podLogPath.open("r", encoding="utf-8", errors="replace") as fh:
+    with podLogPath.open("rb") as raw:
+        raw.seek(offset)
+        fh = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
         for line in fh:
             line = line.strip()
             if not line:

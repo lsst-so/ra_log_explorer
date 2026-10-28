@@ -13,7 +13,7 @@ import pytest
 
 from ra_log_explorer import config, exposureTimes
 from ra_log_explorer import fetch as fetchModule
-from ra_log_explorer import parse, server, sites
+from ra_log_explorer import night, parse, server, sites
 from ra_log_explorer.jobs import FetchJob, JobManager
 from ra_log_explorer.server import ServerContext, ServerState
 
@@ -898,6 +898,54 @@ def test_tracebackContextForNight_returns_None_for_unknown_key(tmp_path: Path) -
         endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
     )
     assert server._tracebackContextForNight(state, "nope") is None
+
+
+def test_tracebackContextForNight_seeks_to_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit pod's night is up to ~200k lines. Reading from the top to a
+    failure late in it is seconds of CPU per click, on a request thread,
+    holding the GIL the whole time; the drilldown seeks there instead."""
+    pod = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    (tmp_path / "pods").mkdir()
+    t0 = dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc)
+    rows = [(t0 + dt.timedelta(seconds=i), "info", f"{i} unrelated chatter") for i in range(5000)]
+    late = t0 + dt.timedelta(seconds=6000)
+    rows += [
+        (
+            late,
+            "info",
+            "2026-05-21 14:40:00,000 worker fn INFO   Running pipeline for 2026052100050 detector 5",
+        ),
+        (late + dt.timedelta(seconds=10), "error", "Traceback (most recent call last):"),
+        (late + dt.timedelta(seconds=10, milliseconds=1), "error", "RuntimeError: bang"),
+    ]
+    with open(tmp_path / "pods" / f"{pod}.jsonl", "w") as fh:
+        for t, level, raw in rows:
+            fh.write(
+                json.dumps(
+                    {"timestamp": t.isoformat(), "labels": {"detected_level": level}, "line": raw + "\n"}
+                )
+                + "\n"
+            )
+    state = _makeNightState(20260521, cacheDir=tmp_path)
+    state.summaries = parse.summarizeAll(tmp_path)
+    tb = state.summaries[0].tracebacks[0]
+
+    parsed = 0
+    realParse = parse.parseLogLine
+
+    def countingParse(*args: Any) -> Any:
+        nonlocal parsed
+        parsed += 1
+        return realParse(*args)
+
+    monkeypatch.setattr(parse, "parseLogLine", countingParse)
+    out = server._tracebackContextForNight(state, night.makeBodyKey(pod, tb.t))
+    assert out is not None
+    assert out["contextSource"] == "dataId-block"
+    assert [ln["raw"] for ln in out["lines"]][-1] == "RuntimeError: bang"
+    assert parsed < 10, f"parsed {parsed} lines to reach a failure 5000 lines in"
 
 
 # ----- _resolveCacheWindow -------------------------------------------------
