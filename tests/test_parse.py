@@ -7,6 +7,7 @@ import json
 import re
 from collections import Counter
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1368,16 +1369,56 @@ def test_summarizeAll_recovers_from_a_dead_worker(tmp_path: Path, monkeypatch: p
     _plantWindow(tmp_path, _SAMPLE_PODS)
     monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
     monkeypatch.setattr(parse, "_pool", None)
-    pool = parse._parsePool()
-    assert pool is not None
-    pool.submit(int).result()  # start the worker
-    for proc in list(pool._processes.values()):  # type: ignore[attr-defined]
+    dispatcher = parse._parsePool()
+    assert dispatcher is not None
+    dispatcher.pool.submit(int).result()  # start the worker
+    for proc in list(dispatcher.pool._processes.values()):  # type: ignore[attr-defined]
         proc.kill()
         proc.join()
     with pytest.raises(BrokenProcessPool):
         parse.summarizeAll(tmp_path)
     assert len(parse.summarizeAll(tmp_path)) == len(_SAMPLE_PODS)
-    assert parse._pool is not pool
+    assert parse._pool is not dispatcher
+
+
+def test_a_small_parse_is_not_queued_behind_a_big_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pool is shared and first-in first-out. With every pod submitted
+    at once, an exposure opened while a night was being parsed waited for
+    the whole night: 32 s for a parse that takes 1.5 s alone. Each parse
+    keeps only a few pods in flight, so concurrent parses take turns."""
+    import threading
+    import time
+
+    big = {
+        f"s-lsstcam-run-sfm-runner-workerset-{i}": _SAMPLE_PODS["s-lsstcam-run-sfm-runner-workerset-7"]
+        for i in range(40)
+    }
+    _plantWindow(tmp_path / "night", big, copies=60)
+    _plantWindow(tmp_path / "exposure", dict(list(_SAMPLE_PODS.items())[:2]))
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    dispatcher = parse._parsePool()
+    assert dispatcher is not None
+    dispatcher.pool.submit(int).result()
+
+    finished: dict[str, float] = {}
+    nightStarted = threading.Event()
+
+    def parseInto(name: str, **kwargs: Any) -> None:
+        parse.summarizeAll(tmp_path / name, **kwargs)
+        finished[name] = time.perf_counter()
+
+    night = threading.Thread(
+        target=parseInto, args=("night",), kwargs={"progress": lambda i, n: nightStarted.set()}
+    )
+    night.start()
+    assert nightStarted.wait(30)
+    exposure = threading.Thread(target=parseInto, args=("exposure",))
+    exposure.start()
+    night.join(60)
+    exposure.join(60)
+    assert finished["exposure"] < finished["night"]
 
 
 def test_summarizeAll_does_not_stall_other_threads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1394,9 +1435,9 @@ def test_summarizeAll_does_not_stall_other_threads(tmp_path: Path, monkeypatch: 
     probe = tmp_path / "probe"
     probe.write_bytes(b"x")
     monkeypatch.setattr(parse, "PARSE_WORKERS", 2)
-    pool = parse._parsePool()
-    assert pool is not None
-    pool.submit(int).result()  # have a worker up before timing anything
+    dispatcher = parse._parsePool()
+    assert dispatcher is not None
+    dispatcher.pool.submit(int).result()  # have a worker up before timing anything
 
     parsing = threading.Thread(target=parse.summarizeAll, args=(tmp_path / "window",))
     stats = 0

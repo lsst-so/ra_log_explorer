@@ -1452,6 +1452,18 @@ concurrent jobs queue for the same few cores rather than each taking
 all of them; a worker killed mid-parse fails that parse, and the next
 one gets a fresh pool.
 
+The pool is fed through `parse._ParseDispatcher` rather than
+directly, because the executor's own queue is first-in first-out:
+with every pod submitted at once, an exposure opened while a summit
+night was parsing had every worker ahead of it busy with a
+multi-second night pod, and its 2 ms pods waited out the whole night
+(25 s for a 0.5 s parse). The dispatcher keeps the pods itself and
+releases them only as workers free up (one more than there are
+workers, so none waits between pods), always from the queued parse
+with the least total work, biggest pod first within it. Measured on
+20261027: an exposure opened during the SFM half's rebuild parses in
+1.2 s, and the night's own parse is unchanged.
+
 `fetch.fetchAll` additionally takes a **per-window write lock**
 (`fetch.windowWriteLock`, one re-entrant lock per requested window
 directory) for the whole of its decision-and-write path. A cache window
