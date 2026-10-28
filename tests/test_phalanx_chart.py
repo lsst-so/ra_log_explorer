@@ -306,6 +306,17 @@ def test_numeric_settings_are_values_this_code_will_accept(baseDocs: list[dict])
     assert int(env["RA_LOG_EXPLORER_MAX_CACHE_BYTES"]["value"]) > 0
 
 
+def test_parse_workers_leave_the_server_a_core(baseDocs: list[dict], summitDocs: list[dict]) -> None:
+    """Parsing runs in worker processes so it can't hold the serving
+    process's GIL. Give those workers every core the container has and the
+    CPU quota throttles the serving process and the live poller instead,
+    which is a slower version of the same stall."""
+    for docs in (baseDocs, summitDocs):
+        workers = int(_env(docs)["RA_LOG_EXPLORER_PARSE_WORKERS"]["value"])
+        cpuLimit = float(_container(docs)["resources"]["limits"]["cpu"])
+        assert 0 < workers < cpuLimit, (workers, cpuLimit)
+
+
 # ----- the image contract --------------------------------------------------
 
 

@@ -2246,6 +2246,22 @@ def test_night_fetch_keeps_windows_it_does_not_contain(
         assert survivor.exists(), survivor
 
 
+def test_onFetchComplete_reports_parse_progress_per_pod(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit night is ~a minute of parsing after the fetch. The job's
+    progress stream says how far through it is, one event per pod, so the
+    page shows movement rather than a full bar and nothing happening."""
+    ctx = _ctxWithSites(siteCatalog)
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    (current / "pods" / "s-lsstcam-run-aos-worker-2.jsonl").write_text("")
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    parsed = [(e["i"], e["total"]) for e in job.events if e["type"] == "parsed"]
+    assert parsed == [(1, 2), (2, 2)]
+
+
 # ----- the night's two views -----------------------------------------------
 
 

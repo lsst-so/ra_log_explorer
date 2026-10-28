@@ -13,6 +13,8 @@ import pytest
 from ra_log_explorer import parse
 from ra_log_explorer.config import NIGHT_AOS_POD_REGEX
 
+from .conftest import DATA_DIR
+
 # ----- LogLine ------------------------------------------------------------
 
 
@@ -1325,6 +1327,88 @@ def test_summarizeAll_merges_pods_events_dir(tmp_path: Path) -> None:
     summaries = parse.summarizeAll(cacheDir)
     assert len(summaries) == 1
     assert any(e.kind == "POD_RESTARTED" for e in summaries[0].events)
+
+
+def _plantWindow(cacheDir: Path, pods: dict[str, Path], copies: int = 1) -> None:
+    """A window dir whose pods are real captured logs, each repeated ``copies`` times."""
+    (cacheDir / "pods").mkdir(parents=True)
+    for pod, src in pods.items():
+        (cacheDir / "pods" / f"{pod}.jsonl").write_bytes(src.read_bytes() * copies)
+
+
+_SAMPLE_PODS = {
+    "s-lsstcam-run-head-node-0": DATA_DIR / "head_node_sample.jsonl",
+    "s-lsstcam-run-sfm-runner-workerset-7": DATA_DIR / "sfm_worker_sample.jsonl",
+    "s-lsstcam-run-aos-worker-aosworkerset-8": DATA_DIR
+    / "s-lsstcam-run-aos-worker-aosworkerset-8-truncated.jsonl",
+    "s-lsstcam-run-sfm-runner-workerset-12": DATA_DIR / "traceback_sample.jsonl",
+}
+
+
+def test_summarizeAll_in_the_pool_matches_in_process(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The worker processes hand back exactly what parsing in-process
+    would, in pod-name order, with one progress call per pod."""
+    _plantWindow(tmp_path, _SAMPLE_PODS)
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 2)
+    seen: list[tuple[int, int]] = []
+    pooled = parse.summarizeAll(tmp_path, progress=lambda i, n: seen.append((i, n)))
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 0)
+    inProcess = parse.summarizeAll(tmp_path)
+    assert pooled == inProcess
+    assert [s.pod for s in pooled] == sorted(_SAMPLE_PODS)
+    assert seen == [(i, 4) for i in range(1, 5)]
+
+
+def test_summarizeAll_recovers_from_a_dead_worker(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A worker killed mid-parse (the kernel's OOM killer, in practice)
+    breaks the executor for good. That parse fails, but the next one must
+    get a working pool rather than every parse failing until a restart."""
+    from concurrent.futures.process import BrokenProcessPool
+
+    _plantWindow(tmp_path, _SAMPLE_PODS)
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    monkeypatch.setattr(parse, "_pool", None)
+    pool = parse._parsePool()
+    assert pool is not None
+    pool.submit(int).result()  # start the worker
+    for proc in list(pool._processes.values()):  # type: ignore[attr-defined]
+        proc.kill()
+        proc.join()
+    with pytest.raises(BrokenProcessPool):
+        parse.summarizeAll(tmp_path)
+    assert len(parse.summarizeAll(tmp_path)) == len(_SAMPLE_PODS)
+    assert parse._pool is not pool
+
+
+def test_summarizeAll_does_not_stall_other_threads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The reason parsing lives in other processes. A thread busy parsing
+    in this one holds the GIL, and every other thread's syscalls then wait
+    out the switch interval one at a time, ~200 a second. On the summit
+    that turned one night view into a half-hour stall of every fetch, the
+    cache listing and the live poller."""
+    import os
+    import threading
+    import time
+
+    _plantWindow(tmp_path / "window", _SAMPLE_PODS, copies=400)
+    probe = tmp_path / "probe"
+    probe.write_bytes(b"x")
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 2)
+    pool = parse._parsePool()
+    assert pool is not None
+    pool.submit(int).result()  # have a worker up before timing anything
+
+    parsing = threading.Thread(target=parse.summarizeAll, args=(tmp_path / "window",))
+    stats = 0
+    t0 = time.perf_counter()
+    parsing.start()
+    while parsing.is_alive():
+        os.stat(probe)
+        stats += 1
+    rate = stats / (time.perf_counter() - t0)
+    parsing.join()
+    # Measured: ~200/s with the parse in-process, tens of thousands in the pool.
+    assert rate > 5000, f"{rate:.0f} stats/s while a parse ran"
 
 
 def test_podsForTimeline_includes_other_group_even_without_match(tmp_path: Path) -> None:

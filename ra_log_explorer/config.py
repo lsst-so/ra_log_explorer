@@ -62,6 +62,16 @@ def _envFloat(name: str, default: float) -> float:
 # the container sets LOKI_USERNAME and nobody has to type it into the UI.
 DEFAULT_USERNAME = os.environ.get("LOKI_USERNAME") or "merlin"
 DEFAULT_WORKERS = _envInt("RA_LOG_EXPLORER_WORKERS", 8)
+# Worker processes that parse pod logs (see ``parse.summarizeAll``).
+# Parsing is CPU-bound Python, and done on a thread of the server's own
+# process it holds the GIL: every other thread's syscalls then wait out
+# the 5 ms switch interval, one by one, which made a single summit night
+# view stall every fetch, the cache listing and the live poller for half
+# an hour. Deployed, set it below the container's CPU limit so the
+# server and the poller keep a core. 0 parses in-process, for debugging.
+PARSE_WORKERS = _envInt("RA_LOG_EXPLORER_PARSE_WORKERS", min(4, os.process_cpu_count() or 1))
+if PARSE_WORKERS < 0:
+    raise ConfigError(f"RA_LOG_EXPLORER_PARSE_WORKERS must be >= 0; got {PARSE_WORKERS}")
 # Window padding around the user's t-zero. The CLI applies the TAI→UTC
 # conversion internally so t-zero is the actual shutter-close UTC moment;
 # we shouldn't ever need to look at logs from before then for a given

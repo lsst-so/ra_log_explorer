@@ -1066,6 +1066,7 @@ function openProgressStream(jobId) {
   activeEventSource = es;
   let total = 0, done = 0;
   let windowStr = '';  // remembered between events so each pod-count update can re-include the window
+  let parsingStr = '';
   es.onmessage = (msg) => {
     let ev;
     try { ev = JSON.parse(msg.data); } catch (_) { return; }
@@ -1081,9 +1082,14 @@ function openProgressStream(jobId) {
       setProgressFill(pct.toFixed(1) + '%');
       setProgressText(`${windowStr}  ·  ${done}/${total} pods fetched`);
     } else if (ev.type === 'parsing') {
-      setProgressText(
-        `${windowStr}  ·  parsing (${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse})`,
-      );
+      parsingStr = `${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse}`;
+      setProgressFill('0%');
+      setProgressText(`${windowStr}  ·  parsing (${parsingStr})`);
+    } else if (ev.type === 'parsed') {
+      // A whole summit night is a minute of parsing; without this the bar
+      // would sit full from the fetch while nothing appeared to happen.
+      setProgressFill(`${((ev.i / ev.total) * 100).toFixed(1)}%`);
+      setProgressText(`${windowStr}  ·  parsing ${ev.i}/${ev.total} pods (${parsingStr})`);
     } else if (ev.type === 'shutter-close') {
       // Night-mode only: post-parse pass resolving shutter close times for
       // each dataId. May involve a batched ConsDB call.

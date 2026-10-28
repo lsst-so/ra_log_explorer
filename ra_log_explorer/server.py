@@ -1923,7 +1923,9 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
                 for gone in evicted:
                     ctx.evictByCacheDir(gone)
         summaries = parser.summarizeAll(
-            job.cacheDir, keep=_nightPodFilter(job.nightView) if job.kind == "night" else None
+            job.cacheDir,
+            keep=_nightPodFilter(job.nightView) if job.kind == "night" else None,
+            progress=lambda i, n: job.push({"type": "parsed", "i": i, "total": n}),
         )
         # Sites are validated when the request comes in, so this should
         # always succeed for a job we actually started. Bail out on the

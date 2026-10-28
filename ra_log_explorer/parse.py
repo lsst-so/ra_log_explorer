@@ -20,10 +20,16 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import multiprocessing
 import re
+import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+
+from .config import PARSE_WORKERS
 
 # ----- pod flavor classification -------------------------------------------
 
@@ -1261,7 +1267,11 @@ def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSu
     summary.tracebacks.append(record)
 
 
-def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> list[PodSummary]:
+def summarizeAll(
+    cacheDir: Path,
+    keep: Callable[[str], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+) -> list[PodSummary]:
     """Summarize every pod in a window; ``keep`` filters by pod name.
 
     The filter is applied before parsing, not after, because the caller
@@ -1269,12 +1279,16 @@ def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> l
     night unfiltered (see :data:`config.NIGHT_VIEWS`), and parsing the
     AOS pods only to discard them would be most of a minute on a summit
     night.
+
+    Pods are parsed in the worker processes of :func:`_parsePool`, never
+    on the calling thread, and returned in pod-name order. ``progress``
+    is called with ``(done, total)`` as each pod finishes.
     """
     podsDir = cacheDir / "pods"
     eventsDir = cacheDir / "pods_events"
-    summaries: list[PodSummary] = []
     if not podsDir.exists():
-        return summaries
+        return []
+    work: list[tuple[Path, Path | None]] = []
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
             continue
@@ -1283,9 +1297,68 @@ def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> l
         # The sibling pods_events/<pod>.jsonl is optional: absent for a pod
         # that had no lifecycle events in the window. (Not for an older
         # cache: those don't survive the schema flush — see caching.md.)
-        eventsFile = eventsDir / podFile.name
-        summaries.append(summarizePod(podFile, eventsFile if eventsFile.exists() else None))
-    return summaries
+        events = eventsDir / podFile.name
+        work.append((podFile, events if events.exists() else None))
+    pool = _parsePool()
+    if pool is None:
+        summaries = []
+        for i, (podFile, eventsFile) in enumerate(work, 1):
+            summaries.append(summarizePod(podFile, eventsFile))
+            if progress is not None:
+                progress(i, len(work))
+        return summaries
+    try:
+        futures = {
+            pool.submit(summarizePod, podFile, eventsFile): i for i, (podFile, eventsFile) in enumerate(work)
+        }
+        results: list[PodSummary | None] = [None] * len(work)
+        for done, future in enumerate(as_completed(futures), 1):
+            results[futures[future]] = future.result()
+            if progress is not None:
+                progress(done, len(work))
+    except BrokenProcessPool:
+        # A worker died mid-parse (OOM-killed, most likely), which leaves
+        # the executor refusing all further work. Drop it so the next
+        # parse starts a fresh one rather than every parse failing until
+        # the service is restarted.
+        _discardParsePool(pool)
+        raise
+    return [r for r in results if r is not None]
+
+
+# Shared by every parse in the process, so concurrent jobs queue for the
+# same few cores rather than each starting its own and starving the server
+# process and the live poller of CPU. Started lazily: most CLI commands
+# never parse.
+_pool: ProcessPoolExecutor | None = None
+_poolLock = threading.Lock()
+
+
+def _parsePool() -> ProcessPoolExecutor | None:
+    """The process pool parses run on, or ``None`` to parse in-process.
+
+    ``spawn``, not the platform default: on Linux that is ``fork``, and
+    forking the threaded server would copy whatever locks its other
+    threads held at that instant into a child that can never release
+    them.
+    """
+    global _pool
+    if PARSE_WORKERS == 0:
+        return None
+    with _poolLock:
+        if _pool is None:
+            _pool = ProcessPoolExecutor(
+                max_workers=PARSE_WORKERS, mp_context=multiprocessing.get_context("spawn")
+            )
+        return _pool
+
+
+def _discardParsePool(pool: ProcessPoolExecutor) -> None:
+    global _pool
+    with _poolLock:
+        if _pool is pool:
+            _pool = None
+    pool.shutdown(wait=False, cancel_futures=True)
 
 
 # ----- filtering by exposure id --------------------------------------------

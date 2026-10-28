@@ -165,7 +165,7 @@ Sibling docs:
 |--------------------|--------------------------------------------------------------------------------|
 | `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` / `NIGHT_VIEWS` constants, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value — blank included — rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
-| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
+| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. `summarizeAll` runs `summarizePod` in a shared process pool (see *Threading model*). |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
 | `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per site and per dayObs to `<cache_root>/exposure-times/<siteName>/<dayObs>.json` — exposure properties are immutable so the cache never goes stale — and resolves many ids at once with `lookupCachedRecords`, one file read per night. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
@@ -588,6 +588,7 @@ everyone else's fetches behave.
 | `RA_LOG_EXPLORER_CACHE` | `cache_root()` | `~/.cache/ra_log_explorer` |
 | `RA_LOG_EXPLORER_SITES_FILE` | which `sites.toml` to load | the packaged one |
 | `RA_LOG_EXPLORER_WORKERS` | `DEFAULT_WORKERS`, the parallel fetch width | `8` |
+| `RA_LOG_EXPLORER_PARSE_WORKERS` | `PARSE_WORKERS`, processes in the parse pool; `0` parses in-process | `min(4, CPUs)` |
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
@@ -1323,6 +1324,8 @@ is one JSON event (`{"type": ...}`):
   from 1; reaches `total` on the last).
 - `parsing`: `{ cacheReuse, podCount, totalBytes }` — after the
   fetch finishes, before `summarizeAll` runs.
+- `parsed`: `{ i, total }` — once per parsed pod, in completion order
+  (`i` ascends from 1). A summit night is about a minute of these.
 - `shutter-close`: `{ phase, ... }` — night **and range** modes (both
   resolve per-dataId shutter closes post-parse via the shared
   `_resolveShutterClosesInto`). Phases:
@@ -1377,6 +1380,22 @@ The shared `ServerContext` is mutated only while holding
 Each fetch runs on its own daemon thread spawned by
 `JobManager.startJob`. SSE handlers block on
 `FetchJob.condition.wait()` to be notified when new events arrive.
+
+**No thread in the server process parses.** `parse.summarizeAll` hands
+each pod to a shared `ProcessPoolExecutor` (`RA_LOG_EXPLORER_PARSE_WORKERS`
+processes, started with `spawn` so no child inherits a lock some other
+server thread held at fork time) and waits on the futures, which
+releases the GIL. This is the rule the rest of the threading model
+depends on. A CPU-bound thread holds the GIL between switch intervals,
+and every *other* thread's syscalls then wait out the 5 ms interval
+one at a time, ~200 a second. The slice path, the cache walks and the
+live poller are all thousands of small syscalls, so a whole-night parse
+on a request thread once stalled every fetch, the admin page and the
+poller for 37 minutes (measured locally: a 540-pod slice goes from
+0.4 s to 199 s beside one busy thread). The pool is shared so that
+concurrent jobs queue for the same few cores rather than each taking
+all of them; a worker killed mid-parse fails that parse, and the next
+one gets a fresh pool.
 
 `fetch.fetchAll` additionally takes a **per-window write lock**
 (`fetch.windowWriteLock`, one re-entrant lock per requested window
