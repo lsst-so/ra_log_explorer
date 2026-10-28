@@ -470,8 +470,12 @@ one, typically).
   ever being reclaimable. Eviction makes one pass and stops, so a cap
   set below that floor doesn't spin; it just evicts every *other*
   window and stays over. With live mode on, leave the cap comfortably
-  above one night's ~9 GiB, which is what deriving it from the volume
-  size already does.
+  above **two** nights: tonight's, and last night's, which the poller
+  re-pulls whenever it is missing. A summit night is ~9-14 GiB (22.6M
+  lines on 20261027, and 1.5x that is to be expected), so a cap that
+  can't hold both plus the day's slices would evict last night and
+  re-pull it in a loop. The deployed volume is sized for about a week
+  of nights.
 
 ## What's stable across reruns
 

@@ -339,6 +339,7 @@ def cmdRun(args: argparse.Namespace) -> int:
             pollS=args.live_poll_s,
             lagS=LIVE_LAG_S,
             fixedDayObs=args.live_day_obs,
+            backfillPrevious=True,
         )
         ctx.live.start()
         pinned = f" (pinned to dayObs {args.live_day_obs})" if args.live_day_obs else ""

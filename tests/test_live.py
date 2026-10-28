@@ -1983,3 +1983,140 @@ def test_a_consdb_outage_is_logged_once_and_its_end_noted(
         manager.tick(now=_t(30))
     assert caplog.text.count("ConsDB query for dayObs 20260711 failed") == 1
     assert "ConsDB reachable again" in caplog.text
+
+
+# ----- the previous night ---------------------------------------------------
+
+_PREV = 20260710
+
+
+def _prev(hour: int, minute: int = 0) -> dt.datetime:
+    """A timestamp inside the 20260710 night, ``hour`` hours after its noon start."""
+    return dayObsStartUtc(_PREV) + dt.timedelta(hours=hour, minutes=minute)
+
+
+def _backfillManager(
+    monkeypatch: pytest.MonkeyPatch, calls: list[Any], **kwargs: Any
+) -> live.LiveNightManager:
+    """A manager that keeps the previous night, over a Loki holding one pod on both nights."""
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(
+        live, "fetchPodWindowInto", _podFetchStub([_prev(1), _prev(15, 30), _prev(23, 59), _t(3)], calls)
+    )
+    monkeypatch.setattr(live, "fetchEventsWindowInto", lambda spec, a, b, fh: (0, True, ""))
+    monkeypatch.setattr(live, "countPodWindow", lambda spec, pod, a, b: 1)
+    monkeypatch.setattr(
+        live.exposureTimes,
+        "queryExposureRecordsForDayObs",
+        lambda dayObs, token, *, consdbUrl: [
+            {
+                "exposure_id": dayObs * 100000 + 1,
+                "obs_end": "2026-07-11T01:00:00.000000",
+                "instrument": "lsstcam",
+            }
+        ],
+    )
+    return live.LiveNightManager(site=_site(), username="u", workers=2, pollS=60.0, lagS=0.0, **kwargs)
+
+
+def _awaitBackfill(mgr: live.LiveNightManager) -> None:
+    assert mgr._backfill is not None, "no re-pull was started"
+    mgr._backfill.join(30)
+    assert not mgr._backfill.is_alive()
+
+
+def test_a_missing_previous_night_is_re_pulled_beside_tonight(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a cache flush (a schema bump on deploy, the admin page's
+    button, a new volume) last night would be gone, and it is the night
+    people are still asking about. It comes back whole and finalised, an
+    hour per increment so a restart resumes it, while tonight's poll goes
+    on as usual."""
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    prevDir = mgr._nightDir(_PREV)
+    meta = json.loads((prevDir / fetch.META_NAME).read_text())
+    assert meta["pod_lines"] == {"pod-a": 3}
+    sidecar = fetch.readLiveSidecar(prevDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows == [(_prev(h), _prev(h + 1)) for h in range(24)]
+    # Its exposures are cached too, so the night's views resolve offline.
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is not None
+    # Tonight was polled as usual.
+    mgr._publishSnapshot()
+    snap = mgr.snapshot()
+    assert snap["dayObs"] == 20260711 and fetch._parseIso(snap["watermark"]) == _t(10)
+    assert snap["backfillDayObs"] is None and snap["backfillError"] is None
+
+
+def test_a_finalised_previous_night_is_left_alone(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prevDir = _makeNightDir(tmpCacheRoot, dayObs=_PREV, podTimes={"pod-a": [_prev(1)]})
+    sidecar = fetch.readLiveSidecar(prevDir)
+    assert sidecar is not None
+    sidecar["finalised"] = True
+    fetch.writeLiveSidecar(prevDir, sidecar)
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    assert mgr._backfill is None
+
+
+def test_a_half_pulled_previous_night_is_resumed_not_swept(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart mid re-pull leaves the night unfinalised, which also makes
+    it look like an orphan. Exactly one thread may finish it: the re-pull,
+    from where it stopped."""
+    _makeNightDir(tmpCacheRoot, dayObs=_PREV, watermark=_prev(6), podTimes={"pod-a": [_prev(1)]})
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    assert mgr._orphanDirs == []
+    _awaitBackfill(mgr)
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows[0] == (_prev(6), _prev(7))
+    assert json.loads((mgr._nightDir(_PREV) / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+
+
+def test_a_failed_re_pull_is_retried_on_the_next_tick(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    tonight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+
+    def lokiDownForLastNight(spec: FetchSpec) -> list[str]:
+        if spec.fromIso < tonight:
+            raise fetch.FetchError("502 from Loki")
+        return ["pod-a"]
+
+    monkeypatch.setattr(live, "listPods", lokiDownForLastNight)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    mgr._publishSnapshot()
+    assert "502 from Loki" in mgr.snapshot()["backfillError"]
+    assert not (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    mgr.tick(now=_t(20))
+    _awaitBackfill(mgr)
+    assert (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+
+
+def test_no_re_pull_by_default_or_with_a_pinned_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned to a staged dayObs, the night before it is real data nobody
+    asked for; and the capture tool and tests drive the poller directly."""
+    for kwargs in ({}, {"backfillPrevious": True, "fixedDayObs": 20260711}):
+        mgr = _backfillManager(monkeypatch, [], **kwargs)
+        mgr.tick(now=_t(10))
+        assert mgr._backfill is None, kwargs

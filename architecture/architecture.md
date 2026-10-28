@@ -492,6 +492,25 @@ Each tick (every `LIVE_POLL_S` seconds):
    directory is stranded forever: no `_meta.json`, so the cache listing
    skips it and LRU eviction can't reclaim it, while `du` still counts
    its ~9 GiB against the size cap.
+5. **The previous night.** Whenever the night before tonight isn't
+   finalised on disk, a thread of its own (`_ensurePreviousNight` /
+   `_backfillNight`) re-pulls it: an hour per increment through the
+   same `_fetchIncrement` the poller uses, then the same finalisation.
+   That covers every way the cache comes up without it: a deploy that
+   bumps `CACHE_SCHEMA_VERSION` (and so flushes everything), the admin
+   page's *flush entire cache*, a fresh volume, a noon finalisation that
+   failed. The poller only ever fetched tonight, so before this, last
+   night (the night people are still asking about the morning after)
+   was empty after a flush until someone pulled it from Loki a window at
+   a time. Hour-sized increments keep the sidecar current, so a restart
+   resumes the re-pull and the night is sliceable up to its watermark
+   while the rest arrives. The night's ConsDB records are cached as it
+   finishes. The orphan sweep leaves that night (and any night a re-pull
+   is still working on) alone, since two threads finishing one night
+   would interleave bytes in the same files. A failure is retried on the
+   next tick, resuming the same way. Off with `--live-day-obs`: a staged
+   night stands in for tonight, and its real neighbour isn't ours to
+   fetch.
 
 Serving leans on one mechanism: `fetch.fetchAll` tries the night dir
 before the superset path, and any request whose window ends at or
@@ -1096,6 +1115,8 @@ page makes to decide whether to render the Tonight panel. When on:
                                       // a pod; expected to stay 0 (see Live mode)
   "consdbError": null,
   "orphanError": null,                // an earlier night couldn't be finalised
+  "backfillDayObs": 20260710,         // the previous night while it is being re-pulled
+  "backfillError": null,              // its last failure, until a re-pull succeeds
   "lastTick": { "startedAt": "...", "elapsedS": 4.2,
                 "newLines": 73200, "activePods": 431 },
   "lastError": null,                  // traceback if the last cycle blew up

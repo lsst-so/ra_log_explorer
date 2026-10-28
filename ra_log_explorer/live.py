@@ -104,6 +104,11 @@ log = logging.getLogger(__name__)
 VERIFY_TOLERANCE_LINES = 100
 VERIFY_TOLERANCE_DIVISOR = 500  # i.e. 0.2% of the expected count
 
+# How much of a past night each backfill increment covers (see
+# LiveNightManager._backfillNight): small enough that a restart loses
+# little, large enough that the per-increment pod listing is noise.
+_BACKFILL_STEP = dt.timedelta(hours=1)
+
 # Temp files the poller stages through, all created inside the night dir
 # (see _stageWindow). Cleaned up on recovery, since a crash strands them.
 _TEMP_PREFIXES = ("live-inc-", "live-events-", "live-refetch-", "_live-")
@@ -192,6 +197,7 @@ class LiveNightManager:
         lagS: float,
         windowAfterS: float = DEFAULT_WINDOW_AFTER_S,
         fixedDayObs: int | None = None,
+        backfillPrevious: bool = False,
     ) -> None:
         self._site = site
         self._username = username
@@ -204,6 +210,13 @@ class LiveNightManager:
         # plays the role of "tonight" — same code paths, real data —
         # and the noon-UTC rollover never fires.
         self._fixedDayObs = fixedDayObs
+        # Keep the night before tonight on disk too (see _ensurePreviousNight).
+        # Never with a pinned dayObs: a staged night stands in for tonight,
+        # and its real neighbour isn't ours to fetch.
+        self._backfillPrevious = backfillPrevious and fixedDayObs is None
+        self._backfill: threading.Thread | None = None
+        self._backfillDayObs: int | None = None
+        self._backfillError: str | None = None
         self._lock = threading.Lock()
         self._stopEvent = threading.Event()
         self._thread: threading.Thread | None = None
@@ -281,6 +294,7 @@ class LiveNightManager:
             # can run for minutes, and until it finishes the UI should
             # show "catching up from <watermark>" rather than nothing.
             self._publishSnapshot()
+        self._ensurePreviousNight(dayObs)
         tickStats: dict[str, Any] = {"startedAt": now.isoformat()}
         started = time.time()
         if not night.sidecar.get("finalised"):
@@ -310,10 +324,27 @@ class LiveNightManager:
             workers=self._workers,
         )
 
+    def _nightDir(self, dayObs: int) -> Path:
+        spec = self._nightSpec(dayObs)
+        return windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+
     def _openNight(self, dayObs: int, now: dt.datetime) -> _Night:
         """Create or recover the night dir for ``dayObs`` and adopt it."""
+        night = self._openNightDir(dayObs)
+        self._orphanDirs = self._findOrphanNights(dayObs, now)
+        self._exposures = []
+        self._storedExposureKeys = set()
+        self._consdbError = None
+        return night
+
+    def _openNightDir(self, dayObs: int) -> _Night:
+        """Create or recover the night dir for ``dayObs``, touching no other state.
+
+        Separate from :meth:`_openNight` because the previous night's
+        backfill opens a dir too, on its own thread.
+        """
         spec = self._nightSpec(dayObs)
-        nightDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+        nightDir = self._nightDir(dayObs)
         nightDir.mkdir(parents=True, exist_ok=True)
         (nightDir / PODS_DIR_NAME).mkdir(exist_ok=True)
         (nightDir / PODS_EVENTS_DIR_NAME).mkdir(exist_ok=True)
@@ -352,14 +383,9 @@ class LiveNightManager:
                 len(sidecar.get("pods") or {}),
                 sidecar.get("watermarkIso"),
             )
-        night = _Night(dayObs=dayObs, dir=nightDir, sidecar=sidecar)
-        self._orphanDirs = self._findOrphanNights(nightDir, now)
-        self._exposures = []
-        self._storedExposureKeys = set()
-        self._consdbError = None
-        return night
+        return _Night(dayObs=dayObs, dir=nightDir, sidecar=sidecar)
 
-    def _findOrphanNights(self, currentDir: Path, now: dt.datetime) -> list[Path]:
+    def _findOrphanNights(self, dayObs: int, now: dt.datetime) -> list[Path]:
         """Night dirs this site left unfinalised — usually a restart across noon.
 
         Nothing else ever revisits a past dayObs, so without this sweep
@@ -372,19 +398,30 @@ class LiveNightManager:
         real current night's dir is "not the one we're tracking" without
         being finished, and topping it up to an end-time in the future
         would mark a night complete that isn't.
+
+        The night before ``dayObs`` is left out when the backfill owns it
+        (see :meth:`_ensurePreviousNight`), and so is any night a backfill
+        is still pulling (one started before a noon rollover): two threads
+        finishing one night would interleave bytes in the same pod files.
         """
         base = cache_root() / self._site.cluster / self._site.namespace
         out: list[Path] = []
         if not base.exists():
             return out
+        skip = {self._nightDir(dayObs)}
+        if self._backfillPrevious:
+            skip.add(self._nightDir(_previousDayObs(dayObs)))
+        backfilling = self._backfillDayObs
+        if backfilling is not None:
+            skip.add(self._nightDir(backfilling))
         for window in sorted(base.iterdir()):
-            if not window.is_dir() or window == currentDir:
+            if not window.is_dir() or window in skip:
                 continue
             sidecar = readLiveSidecar(window)
             if sidecar is None or sidecar.get("finalised"):
                 continue
-            dayObs = sidecar.get("dayObs")
-            if isinstance(dayObs, int) and dayObsEndUtc(dayObs) <= now:
+            orphanDayObs = sidecar.get("dayObs")
+            if isinstance(orphanDayObs, int) and dayObsEndUtc(orphanDayObs) <= now:
                 out.append(window)
         return out
 
@@ -414,6 +451,73 @@ class LiveNightManager:
                 log.warning("Live: %s", self._orphanError)
                 self._orphanDirs.append(window)
             return
+
+    # ----- the previous night ----------------------------------------------
+    #
+    # The poller only ever fetches tonight. After the cache is emptied (a
+    # deploy that changes the cache schema, the admin page's flush button,
+    # a new volume) last night, which is the night people are still
+    # asking about, would be gone until someone pulled it from Loki a
+    # window at a time. So the night before tonight is kept finalised on
+    # disk as well: whenever it isn't, a thread of its own fetches it, an
+    # hour per increment, and finalises it, while the poller carries on
+    # with tonight.
+
+    def _ensurePreviousNight(self, dayObs: int) -> None:
+        """Start re-pulling the night before ``dayObs`` if it isn't finalised on disk."""
+        if not self._backfillPrevious or (self._backfill is not None and self._backfill.is_alive()):
+            return
+        previous = _previousDayObs(dayObs)
+        sidecar = readLiveSidecar(self._nightDir(previous))
+        if sidecar is not None and sidecar.get("finalised"):
+            return
+        self._backfillDayObs = previous
+        self._backfill = threading.Thread(
+            target=self._backfillNight, args=(previous,), name=f"live-backfill-{previous}", daemon=True
+        )
+        self._backfill.start()
+
+    def _backfillNight(self, dayObs: int) -> None:
+        """Fetch and finalise a whole past night. Runs on its own thread.
+
+        An hour per increment rather than one increment for the night:
+        the sidecar is written after each, so a restart resumes rather
+        than starting over, and the night is sliceable up to its
+        watermark while the rest arrives. A failure is logged and left
+        for the next tick to retry, resuming the same way.
+        """
+        started = time.time()
+        try:
+            night = self._openNightDir(dayObs)
+            log.info("Live: re-pulling dayObs %d from %s", dayObs, night.sidecar["watermarkIso"])
+            end = dayObsEndUtc(dayObs)
+            target = _parseIso(night.sidecar["watermarkIso"])
+            while target < end and not self._stopEvent.is_set():
+                target = min(end, target + _BACKFILL_STEP)
+                self._fetchIncrement(night, target)
+            if self._stopEvent.is_set():
+                return
+            self._finaliseNight(night)
+            self._storeNightRecords(dayObs)
+            self._backfillError = None
+            log.info("Live: re-pulled dayObs %d in %.1f min", dayObs, (time.time() - started) / 60)
+        except Exception as e:  # noqa: BLE001 — retried next tick; tonight must not notice
+            self._backfillError = f"dayObs {dayObs}: {e}"
+            log.exception("Live: re-pulling dayObs %d failed; retrying next poll", dayObs)
+        finally:
+            self._backfillDayObs = None
+
+    def _storeNightRecords(self, dayObs: int) -> None:
+        """Cache a past night's ConsDB exposure records (best-effort)."""
+        try:
+            token = exposureTimes.loadTokenForSite(self._site)
+            records = exposureTimes.queryExposureRecordsForDayObs(
+                dayObs, token, consdbUrl=self._site.consdbUrl
+            )
+        except (exposureTimes.ConsDbError, OSError) as e:
+            log.warning("Live: ConsDB records for dayObs %d not cached: %s", dayObs, e)
+            return
+        exposureTimes.storeCachedRecordList(records, siteName=self._site.name)
 
     def _finaliseNight(self, night: _Night) -> None:
         """Top up to night end, verify per-pod totals, write ``_meta.json``.
@@ -885,12 +989,20 @@ class LiveNightManager:
             "eventsUnfiled": int(sidecar.get("eventsUnfiled") or 0),
             "consdbError": self._consdbError,
             "orphanError": self._orphanError,
+            # The previous night's re-pull: its dayObs while one runs, and
+            # the last failure until one succeeds.
+            "backfillDayObs": self._backfillDayObs,
+            "backfillError": self._backfillError,
             "lastTick": self._lastTick,
             "lastError": self._lastError,
             "exposures": self._exposureRows(watermark),
         }
         with self._lock:
             self._snapshot = snapshot
+
+
+def _previousDayObs(dayObs: int) -> int:
+    return currentDayObs(dayObsStartUtc(dayObs) - dt.timedelta(hours=12))
 
 
 def _logTick(night: _Night, tickStats: dict[str, Any]) -> None:
