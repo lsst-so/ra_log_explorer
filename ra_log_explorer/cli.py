@@ -50,6 +50,8 @@ from .config import (
     LIVE_POLL_S,
     LOG_LEVEL,
     MAX_CACHE_BYTES,
+    MAX_LOADED_BYTES,
+    PARSE_WORKERS,
     FetchSpec,
     cache_root,
     defaultBasePath,
@@ -287,10 +289,13 @@ def _logConfiguration(args: argparse.Namespace, site: Site) -> None:
         site.consdbUrl,
     )
     log.info(
-        "Cache %s (cap %s); %d fetch workers; window -%gs/+%gs; log level %s",
+        "Cache %s (cap %s); %d fetch workers, %d parse workers; loaded views cap %s; window -%gs/+%gs;"
+        " log level %s",
         cache_root(),
         humanBytes(MAX_CACHE_BYTES).strip(),
         args.workers,
+        PARSE_WORKERS,
+        humanBytes(MAX_LOADED_BYTES).strip(),
         args.window_before,
         args.window_after,
         LOG_LEVEL,

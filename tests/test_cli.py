@@ -573,3 +573,18 @@ def test_the_startup_configuration_never_logs_the_password(
         cli._logConfiguration(args, site)
     assert "password set" in caplog.text
     assert "hunter2-secret" not in caplog.text
+
+
+def test_the_startup_configuration_names_the_parse_and_memory_settings(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Both decide whether a summit night can stall or OOM the service, so
+    an operator reading the pod log should not have to go to the chart."""
+    monkeypatch.setattr(cli, "PARSE_WORKERS", 3)
+    monkeypatch.setattr(cli, "MAX_LOADED_BYTES", 4 * 1024**3)
+    args = cli.build_parser().parse_args(["run", "--no-browser"])
+    site, _ = cli._resolveSite(args)
+    with caplog.at_level(logging.INFO, logger="ra_log_explorer.cli"):
+        cli._logConfiguration(args, site)
+    assert "3 parse workers" in caplog.text
+    assert "loaded views cap 4.0 GiB" in caplog.text
