@@ -602,6 +602,54 @@ def test_lru_eviction_at_max_states(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.getExposureState(4) is not None
 
 
+def _weighing(eventCount: int) -> list[parse.PodSummary]:
+    """Summaries a loaded view's footprint counts as holding ``eventCount`` events."""
+    summary = parse.PodSummary(
+        pod="p",
+        group="sfm",
+        instrument=None,
+        ordinal=None,
+        nLines=0,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+    )
+    t = dt.datetime(2026, 5, 20, tzinfo=dt.timezone.utc)
+    summary.events = [parse.Event(pod="p", t=t, kind="WARN", level="warn")] * eventCount
+    return [summary]
+
+
+def test_loaded_views_are_unloaded_to_fit_the_memory_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A count of loaded views bounds nothing when one summit night's SFM
+    half is ~1 GiB: eight of them OOM-kill the pod, and with it the live
+    poller and every user. Past MAX_LOADED_BYTES the least recently used
+    go, whatever their kind, and the view just loaded always stays."""
+    perView = 1000 * server._BYTES_PER_EVENT
+    monkeypatch.setattr(server, "MAX_LOADED_BYTES", int(2.5 * perView))
+    ctx = _emptyCtx()
+    a = _makeExposureState(1)
+    a.summaries = _weighing(1000)
+    n = _makeNightState(20260521)
+    n.summaries = _weighing(1000)
+    ctx.putExposureState(a)
+    ctx.putNightState(n)
+    ctx.getExposureState(1)  # the night is now the least recently used
+    r = _makeRangeState(2026051900722, 2026051900750)
+    r.summaries = _weighing(1000)
+    ctx.putRangeState(r)
+    assert ctx.getNightState(20260521) is None
+    assert ctx.getExposureState(1) is a
+    # Alone over the ceiling: kept, everything else goes.
+    huge = _makeExposureState(2)
+    huge.summaries = _weighing(5000)
+    ctx.putExposureState(huge)
+    assert ctx.getExposureState(2) is huge
+    assert ctx.getExposureState(1) is None
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is None
+
+
 def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
     """Deleting a cache window drops any state pointed at it."""
     ctx = _emptyCtx()

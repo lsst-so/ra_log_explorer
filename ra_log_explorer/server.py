@@ -58,6 +58,7 @@ from .config import (
     DEFAULT_WINDOW_BEFORE_S,
     DEFAULT_WORKERS,
     MAX_CACHE_BYTES,
+    MAX_LOADED_BYTES,
     MAX_RANGE_SPAN,
     NIGHT_AOS_POD_REGEX,
     NIGHT_VIEW_AOS,
@@ -79,6 +80,7 @@ from .fetch import (
     getCacheLastViewed,
     getCacheRange,
     getCacheRangeInstrument,
+    humanBytes,
     loadCacheMeta,
     loadPodLogPath,
     markCacheRange,
@@ -186,6 +188,9 @@ class ServerState:
     # None if ConsDB never resolved it (no token, unknown dataId).
     exposureInfo: exposureTimes.ExposureRecord | None = None
     referencePoints: list[dict] = field(default_factory=list)
+    # See ``ServerContext._fitMemory``.
+    footprint: int = 0
+    lastUsed: int = 0
 
 
 @dataclass
@@ -212,6 +217,9 @@ class NightState:
     # dataId -> curated ConsDB exposure record, resolved alongside the
     # shutter closes — used for the dataId-link tooltips in the night view.
     exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
+    # See ``ServerContext._fitMemory``.
+    footprint: int = 0
+    lastUsed: int = 0
 
 
 @dataclass
@@ -246,6 +254,9 @@ class RangeState:
     # dataId -> curated ConsDB exposure record, resolved alongside the
     # shutter closes — used for the navigator chip tooltips.
     exposureInfoByExpId: dict[int, exposureTimes.ExposureRecord] = field(default_factory=dict)
+    # See ``ServerContext._fitMemory``.
+    footprint: int = 0
+    lastUsed: int = 0
 
 
 def rangeKey(startId: int, stopId: int) -> str:
@@ -253,11 +264,22 @@ def rangeKey(startId: int, stopId: int) -> str:
     return f"{startId}-{stopId}"
 
 
-# How many parsed exposures / nights we keep loaded in memory at once.
-# Big enough to support a handful of open tabs, small enough that we
-# don't accumulate megabytes per loaded state. Oldest by last-access
-# wins eviction when we go over.
+# How many parsed exposures / nights / ranges of each kind we keep loaded
+# at once: enough for a handful of open tabs. Oldest by last access is
+# unloaded first. Memory is bounded separately, by MAX_LOADED_BYTES.
 _MAX_LOADED_STATES = 8
+
+# What a loaded view costs, measured on a summit night (20261027) by RSS:
+# ~680 B per Event a summary keeps, and ~15 B per parsed line for
+# everything else (per-dataId spans and waits, traceback bodies, ids
+# seen). Only the ratio to MAX_LOADED_BYTES matters, so rough is fine.
+_BYTES_PER_EVENT = 700
+_BYTES_PER_LINE = 15
+
+
+def _footprint(summaries: Iterable[parser.PodSummary]) -> int:
+    """Approximate bytes a loaded view's summaries hold."""
+    return sum(len(s.events) * _BYTES_PER_EVENT + s.nLines * _BYTES_PER_LINE for s in summaries)
 
 
 @dataclass
@@ -267,7 +289,8 @@ class ServerContext:
     Multiple exposures and nights can be loaded at once — one per open
     tab. Each maps a key (exposureId / dayObs) to its parsed state.
     Access is LRU-ordered so the least-recently-used entries are first
-    to be evicted when we go over :data:`_MAX_LOADED_STATES`.
+    to be evicted when we go over :data:`_MAX_LOADED_STATES`, or when
+    all of them together go over :data:`config.MAX_LOADED_BYTES`.
 
     ``sites`` is the catalog (see :mod:`.sites`), loaded once at process
     start; ``siteName`` picks the one entry this process serves.
@@ -288,6 +311,9 @@ class ServerContext:
     nightStates: "OrderedDict[tuple[int, str], NightState]" = field(default_factory=OrderedDict)
     # Keyed by ``rangeKey(startId, stopId)``.
     rangeStates: "OrderedDict[str, RangeState]" = field(default_factory=OrderedDict)
+    # Ticks once per get/put; a view's ``lastUsed`` is the tick it was last
+    # touched at, which orders unloading across the three kinds.
+    _clock: int = field(default=0, init=False)
 
     def site(self) -> Site:
         """Return the one site this server serves.
@@ -301,42 +327,84 @@ class ServerContext:
         """
         return siteByName(self.sites, self.siteName)
 
+    def _touch(self, state: ServerState | NightState | RangeState) -> None:
+        self._clock += 1
+        state.lastUsed = self._clock
+
     def getExposureState(self, expId: int) -> ServerState | None:
         s = self.exposureStates.get(expId)
         if s is not None:
             self.exposureStates.move_to_end(expId)
+            self._touch(s)
         return s
 
     def getNightState(self, dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> NightState | None:
         s = self.nightStates.get((dayObs, view))
         if s is not None:
             self.nightStates.move_to_end((dayObs, view))
+            self._touch(s)
         return s
 
     def putExposureState(self, state: ServerState) -> None:
+        state.footprint = _footprint(state.summaries)
+        self._touch(state)
         self.exposureStates[state.expId] = state
         self.exposureStates.move_to_end(state.expId)
         while len(self.exposureStates) > _MAX_LOADED_STATES:
             self.exposureStates.popitem(last=False)
+        self._fitMemory(keep=state)
 
     def putNightState(self, state: NightState) -> None:
+        state.footprint = _footprint(state.summaries)
+        self._touch(state)
         self.nightStates[(state.dayObs, state.view)] = state
         self.nightStates.move_to_end((state.dayObs, state.view))
         while len(self.nightStates) > _MAX_LOADED_STATES:
             self.nightStates.popitem(last=False)
+        self._fitMemory(keep=state)
 
     def getRangeState(self, key: str) -> RangeState | None:
         s = self.rangeStates.get(key)
         if s is not None:
             self.rangeStates.move_to_end(key)
+            self._touch(s)
         return s
 
     def putRangeState(self, state: RangeState) -> None:
+        state.footprint = _footprint(state.summaries)
+        self._touch(state)
         key = rangeKey(state.startId, state.stopId)
         self.rangeStates[key] = state
         self.rangeStates.move_to_end(key)
         while len(self.rangeStates) > _MAX_LOADED_STATES:
             self.rangeStates.popitem(last=False)
+        self._fitMemory(keep=state)
+
+    def _fitMemory(self, keep: ServerState | NightState | RangeState) -> None:
+        """Unload the least recently used views until the rest fit :data:`MAX_LOADED_BYTES`.
+
+        Across all three kinds, since they share one process's memory
+        (an OOM kill takes the live poller and every user with it). The
+        view just loaded always stays, even alone over the ceiling: the
+        request that loaded it is waiting to show it.
+        """
+        held: list[tuple[OrderedDict[Any, Any], Any, ServerState | NightState | RangeState]] = [
+            (d, k, s) for d in (self.exposureStates, self.nightStates, self.rangeStates) for k, s in d.items()
+        ]
+        total = sum(s.footprint for _, _, s in held)
+        for d, k, s in sorted(held, key=lambda entry: entry[2].lastUsed):
+            if total <= MAX_LOADED_BYTES:
+                break
+            if s is keep:
+                continue
+            del d[k]
+            total -= s.footprint
+            log.info(
+                "Unloaded %s (~%s) to keep loaded views under %s",
+                s.cacheDir.name,
+                humanBytes(s.footprint),
+                humanBytes(MAX_LOADED_BYTES),
+            )
 
     def evictByCacheDir(self, target: Path) -> None:
         """Evict any loaded state whose cacheDir matches ``target``.
@@ -1879,6 +1947,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             job.cacheDir,
             keep=_nightPodFilter(job.nightView) if job.kind == "night" else None,
             progress=lambda i, n: job.push({"type": "parsed", "i": i, "total": n}),
+            eventKinds=night.NIGHT_EVENT_KINDS if job.kind == "night" else None,
         )
         # Sites are validated when the request comes in, so this should
         # always succeed for a job we actually started. Bail out on the

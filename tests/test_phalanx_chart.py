@@ -317,6 +317,20 @@ def test_parse_workers_leave_the_server_a_core(baseDocs: list[dict], summitDocs:
         assert 0 < workers < cpuLimit, (workers, cpuLimit)
 
 
+def test_loaded_views_fit_well_inside_the_memory_limit(baseDocs: list[dict], summitDocs: list[dict]) -> None:
+    """The ceiling on parsed views is what stands between a few open summit
+    nights and an OOM kill, which takes the live poller and every user's
+    session with it. It needs headroom under the container's limit: a
+    parse briefly holds a view twice, and the parse workers live there
+    too."""
+    units = {"Gi": 1024**3, "Mi": 1024**2}
+    for docs in (baseDocs, summitDocs):
+        limit = str(_container(docs)["resources"]["limits"]["memory"])
+        limitBytes = int(limit[:-2]) * units[limit[-2:]]
+        loaded = int(_env(docs)["RA_LOG_EXPLORER_MAX_LOADED_BYTES"]["value"])
+        assert 0 < loaded <= limitBytes // 2, (loaded, limit)
+
+
 # ----- the image contract --------------------------------------------------
 
 

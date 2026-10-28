@@ -218,6 +218,17 @@ def failureRows(
 # only the *re*-starts and deaths carry signal.
 _NIGHT_LIFECYCLE_KINDS: frozenset[str] = parse.LIFECYCLE_EVENT_KINDS - {"POD_STARTED"}
 
+# Whichever of these fires first for a dataId marks its first task pickup.
+_TASK_START_KINDS: frozenset[str] = frozenset({"QUANTUM_PREP", "WORKER_PICKUP", "WORKER_QG_START"})
+
+# Every Event kind the rollups in this module read, and so the only ones a
+# loaded night keeps (``parse.summarizeAll``'s ``eventKinds``). The rest,
+# WARN lines above all, are ~80% of a night's events and only the
+# per-exposure timeline reads them. Kept, they made a summit night's SFM
+# half over 3 GiB in memory. A rollup that starts reading another kind
+# has to add it here, or it will see none.
+NIGHT_EVENT_KINDS: frozenset[str] = _TASK_START_KINDS | {"QUANTUM_DONE"} | parse.LIFECYCLE_EVENT_KINDS
+
 
 def _dataIdProcessedAt(summary: parse.PodSummary, t: dt.datetime) -> int | None:
     """Return the dataId this pod was processing at time ``t``, if any.
@@ -299,10 +310,9 @@ def firstTaskStartByDataId(
     for each dataId.
     """
     starts: dict[int, dt.datetime] = {}
-    startKinds = {"QUANTUM_PREP", "WORKER_PICKUP", "WORKER_QG_START"}
     for s in summaries:
         for ev in s.events:
-            if ev.expId is None or ev.kind not in startKinds:
+            if ev.expId is None or ev.kind not in _TASK_START_KINDS:
                 continue
             existing = starts.get(ev.expId)
             if existing is None or ev.t < existing:

@@ -88,6 +88,13 @@ DEFAULT_WINDOW_AFTER_S = _envFloat("RA_LOG_EXPLORER_WINDOW_AFTER_S", 5 * 60.0)
 # never trips it but small enough that a forgotten browser tab can't fill
 # the disk over weeks.
 MAX_CACHE_BYTES = _envInt("RA_LOG_EXPLORER_MAX_CACHE_BYTES", 5 * 1024 * 1024 * 1024)
+# Ceiling on the memory parsed views (exposures, nights, ranges) hold in
+# the serving process; past it the least recently used are unloaded (see
+# ``server.ServerContext``). The SFM half of a summit night is ~1 GiB
+# parsed, so a count of loaded views bounds nothing. Deployed, keep it
+# well under the container's memory limit: a parse briefly holds a view
+# twice, and the parse workers need room as well.
+MAX_LOADED_BYTES = _envInt("RA_LOG_EXPLORER_MAX_LOADED_BYTES", 2 * 1024 * 1024 * 1024)
 DEFAULT_HTTP_PORT = 8780
 # Env var naming the URL prefix the app is served under. Empty (the local
 # default) means "served at the root"; a deployment sharing a hostname with

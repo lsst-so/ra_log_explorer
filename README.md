@@ -608,6 +608,7 @@ last change how everyone else's fetches behave.
 | `LOKI_USERNAME` | Loki basic-auth user | `merlin` |
 | `RA_LOG_EXPLORER_CACHE` | cache root | `~/.cache/ra_log_explorer` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling | 5 GiB |
+| `RA_LOG_EXPLORER_MAX_LOADED_BYTES` | memory parsed views may hold before the least recently used are unloaded | 2 GiB |
 | `RA_LOG_EXPLORER_WORKERS` | parallel fetch workers | `8` |
 | `RA_LOG_EXPLORER_PARSE_WORKERS` | processes that parse pod logs; keep below the CPU limit; `0` parses in-process | `min(4, CPUs)` |
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |

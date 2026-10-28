@@ -273,7 +273,7 @@ def iterPodLines(podLogPath: Path) -> Iterator[LogLine]:
 # ----- event classification -------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class Event:
     pod: str
     t: dt.datetime
@@ -1271,6 +1271,7 @@ def summarizeAll(
     cacheDir: Path,
     keep: Callable[[str], bool] | None = None,
     progress: Callable[[int, int], None] | None = None,
+    eventKinds: frozenset[str] | None = None,
 ) -> list[PodSummary]:
     """Summarize every pod in a window; ``keep`` filters by pod name.
 
@@ -1279,6 +1280,11 @@ def summarizeAll(
     night unfiltered (see :data:`config.NIGHT_VIEWS`), and parsing the
     AOS pods only to discard them would be most of a minute on a summit
     night.
+
+    ``eventKinds``, if given, is the only :class:`Event` kinds the
+    summaries keep. Applied in the worker, before a summary is sent back,
+    because a summary's events are most of its size, and so most of what
+    a loaded view holds in memory.
 
     Pods are parsed in the worker processes of :func:`_parsePool`, never
     on the calling thread, and returned in pod-name order. ``progress``
@@ -1303,13 +1309,14 @@ def summarizeAll(
     if pool is None:
         summaries = []
         for i, (podFile, eventsFile) in enumerate(work, 1):
-            summaries.append(summarizePod(podFile, eventsFile))
+            summaries.append(_summarizePodKeeping(podFile, eventsFile, eventKinds))
             if progress is not None:
                 progress(i, len(work))
         return summaries
     try:
         futures = {
-            pool.submit(summarizePod, podFile, eventsFile): i for i, (podFile, eventsFile) in enumerate(work)
+            pool.submit(_summarizePodKeeping, podFile, eventsFile, eventKinds): i
+            for i, (podFile, eventsFile) in enumerate(work)
         }
         results: list[PodSummary | None] = [None] * len(work)
         for done, future in enumerate(as_completed(futures), 1):
@@ -1324,6 +1331,16 @@ def summarizeAll(
         _discardParsePool(pool)
         raise
     return [r for r in results if r is not None]
+
+
+def _summarizePodKeeping(
+    podLogPath: Path, eventsLogPath: Path | None, eventKinds: frozenset[str] | None
+) -> PodSummary:
+    """:func:`summarizePod`, keeping only ``eventKinds`` (all, if ``None``)."""
+    summary = summarizePod(podLogPath, eventsLogPath)
+    if eventKinds is not None:
+        summary.events = [ev for ev in summary.events if ev.kind in eventKinds]
+    return summary
 
 
 # Shared by every parse in the process, so concurrent jobs queue for the

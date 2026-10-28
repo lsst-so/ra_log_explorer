@@ -171,7 +171,7 @@ Sibling docs:
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
-| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
+| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) of a kind is exceeded, or when all of them together exceed `RA_LOG_EXPLORER_MAX_LOADED_BYTES` (see *Multi-tab support*). |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
 | `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId), plus the two images the page draws: `favicon.png` (the tab icon, declared in the template's `<link rel=icon>`) and `logo.png` (the observatory lockup, shown whole at the top-left of every view's topbar, which is what sets the bar's ~73 px height). Both are downscaled copies of the full-resolution art in `assets/`, because static files are sent with `Cache-Control: no-store` and are therefore re-fetched on every page load. One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
 
@@ -592,6 +592,7 @@ everyone else's fetches behave.
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
+| `RA_LOG_EXPLORER_MAX_LOADED_BYTES` | ceiling on the memory parsed views hold; past it the least recently used are unloaded | 2 GiB |
 | `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables live mode | `0` (off) |
 | `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* each live increment stops (Loki ingestion lag) | `60` |
 | `RA_LOG_EXPLORER_LOG_LEVEL` | stdlib `logging` level for the server's stderr log (`DEBUG` adds every `logcli` call and HTTP request) | `INFO` |
@@ -1275,7 +1276,8 @@ Two consequences worth knowing:
 
 - The SFM half is **much bigger**. On a summit night it is ~9 GiB and
   ~35M lines against the AOS half's few hundred MB, so it is a minutes-
-  long fetch and parse where the AOS half is seconds. On a live instance
+  long fetch and about a minute of parsing (on three parse workers) where
+  the AOS half is seconds. On a live instance
   it is usually free, because the poller already holds the whole night
   on disk and the request is served by handing that window over.
 - On a night that is still in progress, the SFM half can be *fetched*
@@ -1480,7 +1482,20 @@ several open tabs (different dataIds / dayObses / ranges) sees each one
 keep its state until 9+ tabs of that kind are in play; the
 least-recently-opened gets evicted then. The browser's URL carries the
 routing key so reload / back-button on an evicted tab triggers a fresh
-`/api/summary` fetch against the cache.
+`/api/summary`, which rebuilds the view from the cache as a job.
+
+A count bounds nothing at summit scale, so memory is capped too. Every
+loaded view carries a `footprint` (`_footprint`: ~700 B per retained
+Event plus ~15 B per parsed line, measured by RSS on 20261027) and a
+`lastUsed` tick, and each `put*State` unloads the least recently used
+views, of any kind, until the total fits `RA_LOG_EXPLORER_MAX_LOADED_BYTES`
+(deployed: 4 GiB of the pod's 8). The view just loaded always stays, even
+alone over the ceiling. What keeps nights inside it at all is that a
+night keeps only the Event kinds its rollups read
+(`night.NIGHT_EVENT_KINDS`, applied in the parse workers): WARN lines
+alone are ~60% of a night's events, and kept, the SFM half of 20261027
+measured ~145 B per line, ~3 GiB, where filtered it is ~40 B per line,
+~0.9 GiB.
 
 Pod detail and traceback drilldown responses re-read the JSONL
 files from disk on each request rather than buffering them in
