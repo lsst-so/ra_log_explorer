@@ -567,11 +567,11 @@ that just ended.
 From then on the dir is a
 complete, trustworthy all-pods night window (still sliced, never
 superset-parsed), subject to ordinary LRU eviction; the poller moves on
-to the new night. On the summit, one busy night is ~9-14 GiB of JSONL
-on the cache volume (measured: 35.7M lines / 576 pods for 20260711,
-22.6M lines / 542 pods for 20261027), so the summit's 200 GiB volume
-holds tonight, last night and about a week of older nights plus slices
-before LRU eviction reclaims the oldest. (BTS nights are 50-150 MiB;
+to the new night. On the summit, one busy night is ~6-9 GiB of JSONL
+on the cache volume (measured: 5.6 GiB for 20261027's 22.7M lines / 542
+pods, 9.25 GiB for 20260711's 35.7M / 576), so the summit's 200 GiB
+volume holds tonight, last night and a couple of weeks of older nights
+plus slices before LRU eviction reclaims the oldest. (BTS nights are 50-150 MiB;
 its 50 GiB volume is ample.) Night mode's own "night so
 far" windows do not accumulate against that: each fetch supersedes the
 last one's, and the fetch-job callback drops the windows it contains
