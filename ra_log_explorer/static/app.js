@@ -56,7 +56,7 @@ async function bootstrap() {
     if (summary && summary.loaded) {
       window.showRange(summary);
     } else {
-      window.showHome();
+      showHomeFollowing(summary, 'range');
     }
     return;
   }
@@ -80,7 +80,7 @@ async function bootstrap() {
     if (summary && summary.loaded) {
       window.showExplore(summary);
     } else {
-      window.showHome();
+      showHomeFollowing(summary, 'exposure');
     }
     return;
   }
@@ -98,11 +98,19 @@ async function bootstrap() {
     if (summary && summary.loaded) {
       window.showNight(summary);
     } else {
-      window.showHome();
+      showHomeFollowing(summary, 'night');
     }
     return;
   }
   window.showHome();
+}
+
+// Not in the server's memory: land on home, with the form prefilled from
+// the URL, and if the server is rebuilding the view from its cache, follow
+// that job until it opens the view.
+function showHomeFollowing(summary, kind) {
+  window.showHome();
+  if (summary && summary.rebuildJobId) window.followRebuild(summary.rebuildJobId, kind);
 }
 
 // ----- history --------------------------------------------------------------
@@ -131,6 +139,10 @@ window.navigateTo = function navigateTo(query, opts) {
     window.history.pushState({}, '', url);
   }
 };
+
+// Route again from the URL as it stands, e.g. once a view the URL names
+// has finished loading on the server.
+window.reroute = bootstrap;
 
 window.addEventListener('popstate', () => {
   // The URL is the router's only input, so re-running the router *is*

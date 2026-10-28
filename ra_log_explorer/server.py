@@ -71,7 +71,6 @@ from .fetch import (
     META_NAME,
     PARTIAL_FLAG,
     addExposureToCache,
-    cacheDuSizeBytes,
     cacheSizes,
     checkLokiAccess,
     dropLiveSidecarsUnder,
@@ -1539,63 +1538,62 @@ def _pickExposureCache(
     return None
 
 
-def _loadExposureFromCache(
-    ctx: ServerContext, expId: int, instrument: str | None = None
-) -> ServerState | None:
-    """Reconstruct a :class:`ServerState` from disk for ``expId``, if possible.
+# ----- rebuilding a view from the cache ------------------------------------
+#
+# A view that is on disk but not in memory (a deep link, a reload after a
+# restart, a ninth exposure pushing the first out) is rebuilt by a job:
+# the same job a fetch runs, minus the fetch. Never inline in the request.
+# Parsing a summit night takes a minute, and a GET that does it leaves the
+# page showing nothing while it happens, times out at the ingress, and
+# starts the whole parse again when the user reloads. The handler answers
+# ``{loaded: false, rebuildJobId}`` and the page follows the job's
+# progress exactly as it follows a fetch's.
 
-    Lets the user open a deep-linked exposure URL (e.g. from the cache
-    table in another tab) without forcing a re-fetch — the cache + the
-    on-disk exposure-time record together carry everything we need to
-    rebuild the in-memory state. Returns ``None`` if either is missing.
 
-    The site is derived from the cache path's cluster component (the
-    layout is ``<cache_root>/<cluster>/<namespace>/<window>/…``), so the
-    right per-site exposure-time cache gets consulted for the shutter
-    close. ``instrument`` pins that lookup, and the cache window found
-    for the bare id must actually contain the pinned t₀ — the sidecar
-    lists bare ids, so on a colliding id it could name the *other*
-    instrument's window, whose logs would be a different exposure's.
+def _notLoaded(rebuild: FetchJob | None) -> dict:
+    """The summary route's answer for a view that isn't in memory."""
+    return {"loaded": False, "rebuildJobId": rebuild.jobId} if rebuild is not None else {"loaded": False}
+
+
+def _rebuildSpec(meta: dict, site: Site) -> FetchSpec:
+    """The spec of the fetch that wrote a cache window, for a job rebuilding it."""
+    spec = meta.get("spec") or {}
+    return FetchSpec(
+        lokiAddr=site.lokiAddr,
+        username=DEFAULT_USERNAME,
+        cluster=site.cluster,
+        namespace=site.namespace,
+        fromIso=str(spec.get("fromIso")),
+        toIso=str(spec.get("toIso")),
+        workers=DEFAULT_WORKERS,
+        podRegex=spec.get("podRegex"),
+    )
+
+
+def _startExposureRebuild(ctx: ServerContext, expId: int, instrument: str | None = None) -> FetchJob | None:
+    """Start (or join) the job rebuilding ``expId``'s view from disk, if it's cached.
+
+    The window is the one :func:`_pickExposureCache` vouches for, and the
+    rebuilt state is pinned to ``instrument`` or, unpinned, to the
+    instrument of the record that anchored it.
     """
     found = _pickExposureCache(ctx, expId, instrument)
     if found is None:
         return None
     cacheDir, site, record, meta, tZero = found
-    summaries = parser.summarizeAll(cacheDir)
-    state = ServerState(
-        cacheDir=cacheDir,
-        cacheBytes=cacheDuSizeBytes(cache_root()),
-        meta=meta,
-        summaries=summaries,
-        expId=expId,
-        tZero=tZero,
+    job = ctx.jobs.createJob(
+        _rebuildSpec(meta, site),
+        expId,
+        tZero,
         siteName=site.name,
         instrument=instrument or exposureTimes.recordInstrument(record),
-        exposureInfo=record,
-        referencePoints=[
-            {
-                "label": _shutterCloseLabel(record),
-                "t": tZero.isoformat(),
-                "offsetS": 0.0,
-                "source": "shutter close",
-            }
-        ],
     )
-    with ctx.jobs.stateLock:
-        ctx.putExposureState(state)
-    markCacheViewed(cacheDir)
-    return state
+    job.rebuildFrom = cacheDir
+    return ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
 
 
-def _loadNightFromCache(ctx: ServerContext, dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> NightState | None:
-    """Reconstruct a :class:`NightState` from disk for ``dayObs``, if possible.
-
-    Mirrors :func:`_loadExposureFromCache` for the night-mode view. Shutter
-    closes are populated from the on-disk exposure-time cache only — no
-    ConsDB call is made (it's synchronous and we have no progress stream
-    here). Any dataId not already in the local cache stays absent until a
-    real fetch fills it in.
-    """
+def _startNightRebuild(ctx: ServerContext, dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> FetchJob | None:
+    """Start (or join) the job rebuilding one half of a night from disk, if it's cached."""
     cacheDir = _findNightCacheDir(dayObs, view)
     if cacheDir is None:
         return None
@@ -1606,34 +1604,9 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int, view: str = DEFAULT_NIG
         meta = loadCacheMeta(cacheDir)
     except (OSError, json.JSONDecodeError, FileNotFoundError):
         return None
-    summaries = parser.summarizeAll(cacheDir, keep=_nightPodFilter(view))
-    state = NightState(
-        cacheDir=cacheDir,
-        cacheBytes=cacheDuSizeBytes(cache_root()),
-        meta=meta,
-        summaries=summaries,
-        dayObs=dayObs,
-        startTime=dayObsStartUtc(dayObs),
-        endTime=dayObsEndUtc(dayObs),
-        siteName=site.name,
-        view=view,
-    )
-    # Pinned to LSSTCam, exactly like _prefetchNightShutterCloses: AOS
-    # runs on LSSTCam only, and on a night where LATISS also observed a
-    # bare lookup for a colliding id could anchor an AOS histogram bar
-    # to the LATISS shutter close.
-    cached = exposureTimes.lookupCachedRecords(
-        _neededDataIdsForNight(summaries), siteName=site.name, instrument="lsstcam"
-    )
-    for needId, record in cached.items():
-        iso = exposureTimes.obsEnd(record)
-        if iso is not None:
-            state.shutterCloseByExpId[needId] = exposureTimes.taiIsoToUtc(iso)
-            state.exposureInfoByExpId[needId] = record
-    with ctx.jobs.stateLock:
-        ctx.putNightState(state)
-    markCacheViewed(cacheDir)
-    return state
+    job = ctx.jobs.createNightJob(_rebuildSpec(meta, site), dayObs, siteName=site.name, nightView=view)
+    job.rebuildFrom = cacheDir
+    return ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
 
 
 def _findRangeCacheDir(startId: int, stopId: int, instrument: str | None = None) -> Path | None:
@@ -1662,26 +1635,21 @@ def _findRangeCacheDir(startId: int, stopId: int, instrument: str | None = None)
     return best[1] if best else None
 
 
-def _loadRangeFromCache(
+def _startRangeRebuild(
     ctx: ServerContext, startId: int, stopId: int, instrument: str | None = None
-) -> RangeState | None:
-    """Reconstruct a :class:`RangeState` from disk, if possible.
-
-    Mirrors :func:`_loadNightFromCache`: shutter closes are read from the
-    on-disk per-site cache only (no ConsDB call — there's no SSE channel
-    on a sync /api/summary request), so any dataId not already cached
-    locally stays absent until a real fetch fills it in.
+) -> FetchJob | None:
+    """Start (or join) the job rebuilding a range from disk, if it's cached.
 
     The instrument comes back from the ``_range.txt`` sidecar and pins
-    both the rebuilt state (so its per-exposure timelines exclude the
-    other instrument's pods) and every per-id lookup here — a bare lookup
-    on a colliding id would anchor that exposure to the *other*
-    instrument's shutter close. A sidecar without one isn't recognised
-    as a range at all, so a found range always carries its pin.
-
-    A caller-supplied ``instrument`` additionally narrows *which* cache
-    is eligible, so a pinned tab rebuilds its own range rather than the
-    twin span another tab fetched more recently.
+    the rebuilt state (so its per-exposure timelines exclude the other
+    instrument's pods) and every shutter-close lookup — a bare lookup on
+    a colliding id would anchor that exposure to the *other*
+    instrument's shutter close. A caller-supplied ``instrument``
+    additionally narrows *which* cache is eligible, so a pinned tab
+    rebuilds its own range rather than the twin span another tab fetched
+    more recently. Both ends' records must be cached, since they anchor
+    the range; without them the user re-fetches from the form, which
+    resolves them.
     """
     cacheDir = _findRangeCacheDir(startId, stopId, instrument)
     if cacheDir is None:
@@ -1693,38 +1661,23 @@ def _loadRangeFromCache(
         meta = loadCacheMeta(cacheDir)
     except (OSError, json.JSONDecodeError, FileNotFoundError):
         return None
-    spec = meta.get("spec") or {}
-    try:
-        fromTime = dt.datetime.fromisoformat(str(spec.get("fromIso")).replace("Z", "+00:00"))
-        toTime = dt.datetime.fromisoformat(str(spec.get("toIso")).replace("Z", "+00:00"))
-    except (TypeError, ValueError):
+    pin = getCacheRangeInstrument(cacheDir)
+    anchors = exposureTimes.lookupCachedRecords([startId, stopId], siteName=site.name, instrument=pin)
+    startIso = exposureTimes.obsEnd(anchors.get(startId))
+    stopIso = exposureTimes.obsEnd(anchors.get(stopId))
+    if startIso is None or stopIso is None:
         return None
-    instrument = getCacheRangeInstrument(cacheDir)
-    summaries = parser.summarizeAll(cacheDir)
-    state = RangeState(
-        cacheDir=cacheDir,
-        cacheBytes=cacheDuSizeBytes(cache_root()),
-        meta=meta,
-        summaries=summaries,
-        startId=startId,
-        stopId=stopId,
-        fromTime=fromTime,
-        toTime=toTime,
+    job = ctx.jobs.createRangeJob(
+        _rebuildSpec(meta, site),
+        startId,
+        stopId,
+        exposureTimes.taiIsoToUtc(startIso),
+        exposureTimes.taiIsoToUtc(stopIso),
         siteName=site.name,
-        instrument=instrument,
+        instrument=pin,
     )
-    cached = exposureTimes.lookupCachedRecords(
-        range(startId, stopId + 1), siteName=site.name, instrument=instrument
-    )
-    for expId, record in cached.items():
-        iso = exposureTimes.obsEnd(record)
-        if iso is not None:
-            state.shutterCloseByExpId[expId] = exposureTimes.taiIsoToUtc(iso)
-            state.exposureInfoByExpId[expId] = record
-    with ctx.jobs.stateLock:
-        ctx.putRangeState(state)
-    markCacheViewed(cacheDir)
-    return state
+    job.rebuildFrom = cacheDir
+    return ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
 
 
 def _siteForCacheDir(ctx: ServerContext, cacheDir: Path) -> Site | None:
@@ -2252,21 +2205,18 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         # other; fall through to the rebuild/fetch path.
                         state = None
                     if state is None:
-                        # Not loaded in memory — try rebuilding from the
-                        # on-disk cache so a deep-linked tab (e.g. the
-                        # dataId column in the cache table) doesn't
-                        # silently fall back to home view.
-                        state = _loadExposureFromCache(ctx, dataId, instrument=instrumentRaw)
-                    if state is not None:
-                        # Touch the LRU sidecar so eviction sees this
-                        # window as freshly used. Done here (rather
-                        # than only on fetch) so re-opening a tab
-                        # bumps the cache up the LRU even if no fetch
-                        # happens.
-                        markCacheViewed(state.cacheDir)
-                        self._send_json(_buildSummaryPayload(state))
+                        # Not loaded in memory: rebuild it from the
+                        # on-disk cache, if it's there, so a deep-linked
+                        # tab (e.g. the dataId column in the cache table)
+                        # doesn't land on an empty form.
+                        self._send_json(_notLoaded(_startExposureRebuild(ctx, dataId, instrumentRaw)))
                         return
-                    self._send_json({"loaded": False})
+                    # Touch the LRU sidecar so eviction sees this window
+                    # as freshly used. Done here (rather than only on
+                    # fetch) so re-opening a tab bumps the cache up the
+                    # LRU even if no fetch happens.
+                    markCacheViewed(state.cacheDir)
+                    self._send_json(_buildSummaryPayload(state))
                     return
                 if dayObsRaw is not None:
                     try:
@@ -2278,12 +2228,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     with ctx.jobs.stateLock:
                         nightState = ctx.getNightState(dayObs, nightView)
                     if nightState is None:
-                        nightState = _loadNightFromCache(ctx, dayObs, nightView)
-                    if nightState is not None:
-                        markCacheViewed(nightState.cacheDir)
-                        self._send_json(_buildNightPayload(nightState))
+                        self._send_json(_notLoaded(_startNightRebuild(ctx, dayObs, nightView)))
                         return
-                    self._send_json({"loaded": False})
+                    markCacheViewed(nightState.cacheDir)
+                    self._send_json(_buildNightPayload(nightState))
                     return
                 self._send_json({"loaded": False})
                 return
@@ -2300,15 +2248,10 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     nightView = _nightViewFromQuery(qs)
                     with ctx.jobs.stateLock:
                         nightState = ctx.getNightState(dayObs, nightView)
-                    if nightState is None:
-                        # Same rebuild-from-disk attempt the summary and
-                        # pod routes make. Without it, opening a ninth
-                        # night evicts the first and every failure row
-                        # already on that page 404s until the user
-                        # happens to reload the summary.
-                        nightState = _loadNightFromCache(ctx, dayObs, nightView)
                 if nightState is None:
-                    self._send_error_json(404, "No night loaded for the requested dayObs")
+                    # No rebuild from here: that is a job the page has to
+                    # follow, and only the summary route hands one out.
+                    self._send_error_json(404, "This night is no longer loaded; reload the page")
                     return
                 key = unquote(path[len("/api/night/traceback/") :])
                 payload = _tracebackContextForNight(nightState, key)
@@ -2473,9 +2416,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if state is not None and instrument is not None and state.instrument != instrument:
                 state = None
             if state is None:
-                state = _loadRangeFromCache(ctx, startId, stopId, instrument)
-            if state is None:
-                self._send_json({"loaded": False})
+                self._send_json(_notLoaded(_startRangeRebuild(ctx, startId, stopId, instrument)))
                 return
             markCacheViewed(state.cacheDir)
             if dataIdRaw is not None:
@@ -2710,7 +2651,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         bareKey=exposureTimes.isProbeOrderFirst(instrument),
                     )
                 job = ctx.jobs.createJob(spec, expId, tZero, siteName=site.name, instrument=instrument)
-                ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
+                job = ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
             if path == "/api/fetch-night":
@@ -2725,7 +2666,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(400, str(e))
                     return
                 job = ctx.jobs.createNightJob(spec, dayObs, siteName=site.name, nightView=nightView)
-                ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
+                job = ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
             if path == "/api/fetch-range":
@@ -2744,7 +2685,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 job = ctx.jobs.createRangeJob(
                     spec, startId, stopId, tZeroStart, tZeroStop, siteName=site.name, instrument=instrument
                 )
-                ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
+                job = ctx.jobs.startJob(job, onComplete=_onFetchComplete(ctx))
                 self._send_json({"jobId": job.jobId}, status=202)
                 return
             self.send_error(404)

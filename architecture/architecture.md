@@ -325,7 +325,7 @@ Sibling docs:
   `rangeStart=&rangeStop=`: the summary treats the mismatch as
   not-loaded and falls through to the rebuild/fetch path, which
   re-pins; the pod detail 404s and the next summary reload re-pins.
-  The rebuild paths carry the pin too — `_loadExposureFromCache`
+  The rebuild paths carry the pin too — `_pickExposureCache`
   verifies the window it found actually contains the pinned t₀, and
   `_findRangeCacheDir` only matches a cache whose `_range.txt` records
   the same instrument. A range needs this as much as an exposure does:
@@ -703,24 +703,31 @@ return:
   is where that is paid).
 
 If the requested key isn't in the in-memory state dict, the server
-makes one attempt to reconstruct it from disk: it walks the cache root
-for a matching window (an exposure-mode cache whose
-`_exposure_ids.txt` lists the dataId *under the pinned instrument*; a
-night-mode cache whose
+looks for it on disk: an exposure-mode cache whose `_exposure_ids.txt`
+lists the dataId *under the pinned instrument*; a night-mode cache whose
 window starts at noon UTC of the dayObs; or a range cache whose
-`_range.txt` records the `[startId, stopId]` bounds), reparses it with
-`parser.summarizeAll`, and returns the rebuilt payload. This lets a
-deep-linked tab (e.g. opening the dataId column in the admin view's
-cache table) land directly on its explore/night view without an
-intervening home → fetch click — the cache is the source of truth, so
-no re-fetch is needed. For exposure caches the shutter close must
-already be in the local exposure-time cache (it always is whenever
-the cache itself exists, because the fetch path stores both); if it
-isn't, the server falls back to `{loaded: false}` and the home view
-takes over. Night-mode rebuilds skip the ConsDB fallback (there's no
-SSE channel to report progress on a sync request) — any dataId not
-already locally cached stays absent in the histograms until a real
-fetch fills it in.
+`_range.txt` records the `[startId, stopId]` bounds. If there is one, it
+starts (or joins) a **rebuild job** and answers at once:
+
+```jsonc
+{ "loaded": false, "rebuildJobId": "a1b2c3d4e5f6" }
+```
+
+A rebuild job is an ordinary fetch job (`FetchJob.rebuildFrom` set)
+whose fetch step is skipped: it parses the window it was pointed at,
+resolves shutter closes, and publishes the state, with the usual SSE
+progress and a `done` event whose `cacheReuse` is `"rebuild"`. The page
+lands on home with the form prefilled from the URL, follows the job,
+and re-routes when it finishes, so a deep-linked tab (e.g. the dataId
+column in the admin view's cache table) still opens its view without
+an intervening click, and the cache stays the source of truth. The
+summary request itself never parses: a summit night's SFM half is a
+minute of parsing, and done inline it once ran for 37 minutes after the
+browser had given up (see *Threading model*). For exposure caches the
+shutter close must already be in the local exposure-time cache, and for
+range caches both ends' (it always is whenever the cache itself exists,
+because the fetch path stores both); without it the answer is plain
+`{loaded: false}` and the form takes over.
 
 On a hit, the cache's `_last_viewed.txt` sidecar is touched so re-opening
 a tab bumps that window up the LRU even without a fresh fetch.
@@ -968,6 +975,11 @@ Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
 `truncated: true`.
 
+404 with `{"error": "This night is no longer loaded; reload the page"}`
+when the night has dropped out of memory (the night LRU is capped).
+This route never rebuilds: a rebuild is a job the page has to follow,
+and only `/api/summary` hands one out.
+
 ### `GET /api/exposure-time/<dataId>[?instrument=<name>]`
 
 dataId → curated ConsDB exposure record, used by the home form to
@@ -1213,6 +1225,16 @@ instead of `shutter close (caller-supplied)`. See
 Response: `202 Accepted`, `{"jobId": "<12-char hex>"}`. Validation
 errors return `400` with `{"error": "..."}`.
 
+The same applies to all three `POST /api/fetch*` routes and to the
+rebuild jobs `/api/summary` starts: **one job per piece of work.** If a
+job for the same view is already running (`FetchJob.key`: the
+instrument, id and window for an exposure or range, the dayObs and half
+for a night), its `jobId` comes back instead of a new one, and the
+caller follows that job. A reload, a second user, or a rebuild racing a
+fetch would otherwise each parse the same window, which for a summit
+night is a minute of CPU and a second copy of the parsed night in
+memory.
+
 ### `POST /api/fetch-night`  (dayObs)
 
 ```jsonc
@@ -1308,7 +1330,7 @@ JSON snapshot of one job:
   "fromIso": "...", "toIso": "...",
   "startedAt": "...", "finishedAt": "...",
   "cacheDir":  "...",
-  "cacheReuse": "exact" | "superset" | "none" | null,
+  "cacheReuse": "exact" | "superset" | "night-slice" | "rebuild" | "none" | null,
   "error":   null | "...",
   "eventCount": 5
 }

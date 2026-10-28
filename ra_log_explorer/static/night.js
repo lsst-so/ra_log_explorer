@@ -516,7 +516,9 @@ async function toggleFailureExpansion(tr, row) {
         + `&nightView=${encodeURIComponent(nightSummary.view || 'aos')}`),
     );
     if (!r.ok) {
-      td.firstChild.textContent = `(failed to load: HTTP ${r.status})`;
+      let why = `HTTP ${r.status}`;
+      try { why = (await r.json()).error || why; } catch (_) { /* not JSON */ }
+      td.firstChild.textContent = `(failed to load: ${why})`;
       return;
     }
     const data = await r.json();

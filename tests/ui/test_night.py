@@ -295,3 +295,36 @@ def test_a_night_that_found_no_pods_says_so(app: Any, corpus: StagedCorpus) -> N
     expect(banner).to_contain_text("No pods found")
     # It names the likely cause rather than just the symptom.
     expect(banner).to_contain_text("other site")
+
+
+def test_a_night_on_disk_but_not_in_memory_is_rebuilt_in_view(
+    app: Any, corpus: StagedCorpus, monkeypatch: Any
+) -> None:
+    """A deep link (or a reload after a restart) to a night the server has
+    cached but not loaded is rebuilt by a job, not inside the request. The
+    page shows that job's progress on the night card, then opens the night
+    the URL named. A summit night is a minute of parsing, and the page used
+    to show nothing at all while the request did it."""
+    import threading
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def heldParse(*args: Any, **kwargs: Any) -> Any:
+        release.wait(10)
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", heldParse)
+    try:
+        app.goto(f"/?dayObs={DAY_OBS}")
+        expect(app.page.locator("#night-progress")).to_be_visible()
+        expect(app.page.locator("#night-message")).to_contain_text("Loading from the cache")
+        expect(app.page.locator("#night-submit")).to_be_disabled()
+    finally:
+        release.set()
+    expect(app.page.locator("#night-view")).to_be_visible()
+    expect(app.page.locator("#night-dayobs-display")).to_contain_text(str(DAY_OBS))
+    assert f"dayObs={DAY_OBS}" in app.page.url

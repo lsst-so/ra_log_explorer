@@ -111,6 +111,30 @@ def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     return resp.status, parsed
 
 
+def _awaitJob(host: str, port: int, jobId: str) -> dict:
+    """Poll a job's status until it finishes; return the final status."""
+    body: dict = {}
+    for _ in range(250):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200, body
+        if body["status"] in ("done", "error"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {jobId} still {body.get('status')} after 5 s")
+
+
+def _getRebuilt(host: str, port: int, path: str) -> dict:
+    """GET a summary that isn't in memory: it answers with a rebuild job,
+    and once that job is done the same GET answers with the view."""
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    assert body["loaded"] is False and "rebuildJobId" in body, body
+    assert _awaitJob(host, port, body["rebuildJobId"])["status"] == "done"
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    return body
+
+
 def _delete(host: str, port: int, path: str) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("DELETE", path)
@@ -698,10 +722,10 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     Exercises the deep-link / post-eviction path end to end:
     ``_findRangeCacheDir`` (matches the ``_range.txt`` bounds),
     ``_siteForCacheDir`` (derives the site from the ``yagan`` cluster
-    path component), and ``_loadRangeFromCache`` (reads each in-range
-    shutter close from the per-site exposure-time cache only — no
-    ConsDB call on a sync request). None of this is touched by the
-    in-memory range tests above.
+    path component), and the rebuild job ``_startRangeRebuild`` starts
+    (anchored on the cached start/stop records, resolving the rest the
+    way a fetch does; with no token, from the per-site cache only).
+    None of this is touched by the in-memory range tests above.
     """
     from ra_log_explorer.fetch import markCacheRange
 
@@ -762,8 +786,7 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
 
     # Fresh server: nothing loaded in memory, so this must rebuild from disk.
     assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is None
-    status, body = _get(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
-    assert status == 200, body
+    body = _getRebuilt(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
     assert body["loaded"] is True
     assert body["mode"] == "range"
     assert body["site"] == "summit"  # derived from the yagan cluster path component
@@ -1466,17 +1489,17 @@ def test_night_traceback_endpoint_returns_dataId_block(
     assert not any("2026052100013" in r for r in rawTexts)
 
 
-def test_night_traceback_rebuilds_the_night_from_disk(
+def test_night_traceback_waits_for_the_summary_to_rebuild_the_night(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:
-    """The drilldown survives its night being evicted.
+    """The drilldown never parses a night itself.
 
     Failure rows are the whole point of the night view, and the state
-    behind them is an LRU slot capped at 8. Opening a ninth night — or
-    any window — evicted the first, and every row already on that page
-    then 404'd until the user happened to reload the summary, which is
-    not a connection anyone would make. Every other keyed route already
-    rebuilt from the cache; this one just never tried.
+    behind them is an LRU slot capped at 8, so a row can outlive its
+    night in memory. Rebuilding inline here is what a GET must not do (a
+    summit night is a minute of parsing), so the route says to reload;
+    the summary route then rebuilds the night as a job, after which the
+    drilldown answers.
     """
     from ra_log_explorer import parse as _parse
 
@@ -1527,14 +1550,66 @@ def test_night_traceback_rebuilds_the_night_from_disk(
     with ctx.jobs.stateLock:
         assert ctx.getNightState(dayObs) is None
 
-    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}")
+    tracebackPath = f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}"
+    status, body = _get(host, port, tracebackPath)
+    assert status == 404
+    assert "reload" in body["error"]
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is None
+
+    assert _getRebuilt(host, port, f"/api/summary?dayObs={dayObs}")["loaded"] is True
+    status, body = _get(host, port, tracebackPath)
     assert status == 200, body
     assert body["expId"] == 2026052100012
     assert body["excClass"] == "RuntimeError"
-    # And the rebuilt night is resident, so the rest of the page's rows
-    # do not each pay for their own reparse.
-    with ctx.jobs.stateLock:
-        assert ctx.getNightState(dayObs) is not None
+
+
+def test_summary_answers_without_waiting_for_a_rebuild(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night on disk but not in memory must not be parsed inside the
+    request. On 2026-10-28 one such GET (a summit night's SFM half, 22.6M
+    lines) parsed for 37 minutes, the browser gave up long before, and a
+    reload would have started a second parse. The GET answers at once with
+    the job doing the work, and asking again joins that same job."""
+    import threading
+
+    host, port, ctx = runningServer
+    dayObs = 20260521
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night-win" / "pods=__aos__"
+    (cacheDir / "pods").mkdir(parents=True)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "fromIso": "2026-05-21T12:00:00.000000Z",
+                    "toIso": "2026-05-22T12:00:00.000000Z",
+                    "podRegex": ".*aos.*",
+                },
+                "fetched_at": "2026-05-22T15:00:00+00:00",
+                "pod_count": 0,
+            }
+        )
+    )
+    release = threading.Event()
+    parsedOn: list[str] = []
+
+    def slowParse(*_a: Any, **_kw: Any) -> list:
+        parsedOn.append(threading.current_thread().name)
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(serverModule.parser, "summarizeAll", slowParse)
+    try:
+        status, first = _get(host, port, f"/api/summary?dayObs={dayObs}")
+        assert status == 200 and first["loaded"] is False
+        status, second = _get(host, port, f"/api/summary?dayObs={dayObs}")
+        assert second["rebuildJobId"] == first["rebuildJobId"]
+    finally:
+        release.set()
+    assert _awaitJob(host, port, first["rebuildJobId"])["status"] == "done"
+    assert parsedOn == [f"fetchjob-{first['rebuildJobId']}"]
+    assert _get(host, port, f"/api/summary?dayObs={dayObs}")[1]["loaded"] is True
 
 
 def test_delete_cache_window_clears_loaded_state_if_match(

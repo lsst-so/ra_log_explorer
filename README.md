@@ -297,7 +297,12 @@ The browser app has three views:
   with a single *advanced options* disclosure holding the shared window
   pads and the range-of-exposures form) and **Night processing**
   (investigate a whole night, AOS pods or everything else), each with
-  its own inline progress bar.
+  its own inline progress bar. A link or reload to a view the server
+  has cached but not loaded (after a restart, or once other views have
+  pushed it out of memory) also lands here, showing *Loading from the
+  cache...* on the matching card while the server re-reads it, then
+  opens the view. On the summit the SFM half of a night takes about a
+  minute.
   Below them, on a deployment running live mode, sits the **Tonight**
   panel: every exposure taken so far tonight, newest first, with a
   ready/wait status chip, refreshing itself every 30 s while the page

@@ -314,3 +314,63 @@ def test_a_failed_job_is_logged_with_its_traceback(
     assert job.status == "error"
     assert "(night 20261014 (aos)) failed" in caplog.text
     assert "Loki went away" in caplog.text
+
+
+# ----- one job per piece of work --------------------------------------------
+
+
+def _blockingFetch(release: Any, tmp_path: Path) -> Callable[..., tuple[Path, dict]]:
+    def fetch(
+        spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False
+    ) -> tuple[Path, dict]:
+        release.wait(10)
+        return tmp_path, {"spec": {}, "cacheReuse": "none", "pod_count": 0}
+
+    return fetch
+
+
+def test_startJob_joins_an_identical_running_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A reload, a second user, or a rebuild racing a fetch must not parse
+    the same window twice: for a summit night that is a minute of CPU and
+    a second copy of the parsed night in memory."""
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(jobs, "fetchAll", _blockingFetch(release, tmp_path))
+    completions: list[jobs.FetchJob] = []
+    mgr = jobs.JobManager()
+    first = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam"), completions.append)
+    duplicate = mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam")
+    assert mgr.startJob(duplicate, completions.append) is first
+    assert mgr.getJob(duplicate.jobId) is None, "the joined job is dropped, never started"
+    # The same exposure under the other instrument is different work.
+    other = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="latiss"), completions.append)
+    assert other is not first
+    release.set()
+    for job in (first, other):
+        with job.condition:
+            job.condition.wait_for(job.isTerminal, timeout=10)
+    assert sorted(j.jobId for j in completions) == sorted([first.jobId, other.jobId])
+
+    # Once finished, the same request is new work again.
+    again = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam"), completions.append)
+    assert again is not first
+
+
+def test_a_rebuild_job_never_fetches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A rebuild re-parses a window already on disk. Reaching Loki from one
+    would turn a deep link into an unasked-for fetch."""
+
+    def noFetch(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
+        raise AssertionError("a rebuild called fetchAll")
+
+    monkeypatch.setattr(jobs, "fetchAll", noFetch)
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "cacheReuse": "none"}')
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20260520, nightView="sfm")
+    job.rebuildFrom = tmp_path
+    seen: list[dict] = []
+    mgr.runJob(job, onComplete=lambda j: seen.append(j.meta))
+    assert job.status == "done", job.error
+    assert job.cacheDir == tmp_path
+    assert seen[0]["cacheReuse"] == "rebuild" and seen[0]["pod_count"] == 3

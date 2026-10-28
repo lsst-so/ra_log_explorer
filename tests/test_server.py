@@ -15,7 +15,7 @@ from ra_log_explorer import config, exposureTimes
 from ra_log_explorer import fetch as fetchModule
 from ra_log_explorer import parse, server, sites
 from ra_log_explorer.jobs import FetchJob, JobManager
-from ra_log_explorer.server import ServerContext, _loadExposureFromCache
+from ra_log_explorer.server import ServerContext, ServerState
 
 from .conftest import FakeSiteCatalog
 
@@ -1732,6 +1732,22 @@ def test_resolveShutterCloses_lsstcam_pin_still_writes_the_bare_key(
 # ----- instrument on the cache-rebuild path ---------------------------------
 
 
+def _awaitJob(job: FetchJob) -> None:
+    with job.condition:
+        job.condition.wait_for(job.isTerminal, timeout=30)
+    assert job.status == "done", job.error
+
+
+def _rebuildExposure(ctx: ServerContext, expId: int, instrument: str | None) -> ServerState | None:
+    """Run the rebuild a deep link would start; ``None`` if there's nothing to rebuild."""
+    job = server._startExposureRebuild(ctx, expId, instrument)
+    if job is None:
+        return None
+    _awaitJob(job)
+    with ctx.jobs.stateLock:
+        return ctx.getExposureState(expId)
+
+
 def _plantExposureCache(
     root: Path,
     expId: int,
@@ -1758,7 +1774,7 @@ def _plantExposureCache(
     return windowDir
 
 
-def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
+def test_exposure_rebuild_refuses_a_window_that_misses_the_pinned_t0(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
 ) -> None:
     """Being recorded under an instrument is not enough on its own: the
@@ -1789,15 +1805,15 @@ def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
     )
     ctx = _ctxWithSites(siteCatalog)
     # LATISS pin: its 04:58 t0 is outside the window on disk -> refuse.
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    assert _rebuildExposure(ctx, collidingId, "latiss") is None
     # LSSTCam pin: t0 inside the window -> rebuilt, stamped with the pin.
-    state = server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam")
+    state = _rebuildExposure(ctx, collidingId, "lsstcam")
     assert state is not None
     assert state.instrument == "lsstcam"
     assert state.tZero == dt.datetime(2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc)
 
 
-def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument(
+def test_exposure_rebuild_refuses_a_window_fetched_for_the_other_instrument(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
 ) -> None:
     """The recorded pin rules a window out even when the t0 falls inside
@@ -1824,8 +1840,8 @@ def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument
         siteName=site.name,
     )
     ctx = _ctxWithSites(siteCatalog)
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam") is not None
+    assert _rebuildExposure(ctx, collidingId, "latiss") is None
+    assert _rebuildExposure(ctx, collidingId, "lsstcam") is not None
 
 
 # ----- instrument through the range per-exposure view -----------------------
@@ -1899,7 +1915,7 @@ def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
         )
 
     for instrument, (fromIso, _toIso, _obsEnd) in windows.items():
-        state = _loadExposureFromCache(ctx, expId, instrument=instrument)
+        state = _rebuildExposure(ctx, expId, instrument)
         assert state is not None, f"{instrument} deep link fell back to a re-fetch"
         assert state.cacheDir.name.startswith(fromIso.replace(":", "")[:17])
         assert state.instrument == instrument
@@ -1938,16 +1954,16 @@ def test_exposure_cache_lookup_tries_the_next_sites_window(
         siteName="summit",
     )
 
-    state = _loadExposureFromCache(ctx, expId, instrument="lsstcam")
+    state = _rebuildExposure(ctx, expId, "lsstcam")
     assert state is not None, "the resolvable yagan window was abandoned"
     assert state.siteName == "summit"
 
 
-def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
+def test_night_rebuild_pins_shutter_lookups_to_lsstcam(
     tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
 ) -> None:
-    """The rebuild path resolves the same lookups _prefetchNightShutterCloses
-    does, and must pin them the same way: AOS is LSSTCam-only, and the bare
+    """The rebuild resolves its shutter closes through
+    _prefetchNightShutterCloses, and must pin them the same way: AOS is LSSTCam-only, and the bare
     key can legitimately hold the other instrument's record for a colliding
     id (probe order is evaluated at query time, and the LSSTCam row can
     land later). An unpinned rebuild would anchor the histograms an hour
@@ -2011,7 +2027,11 @@ def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
     )
 
     ctx = _ctxWithSites(siteCatalog)
-    state = server._loadNightFromCache(ctx, dayObs)
+    job = server._startNightRebuild(ctx, dayObs)
+    assert job is not None
+    _awaitJob(job)
+    with ctx.jobs.stateLock:
+        state = ctx.getNightState(dayObs)
     assert state is not None
     # Anchored to the LSSTCam shutter close (TAI -37 s), not the bare key's.
     assert state.shutterCloseByExpId[collidingId] == dt.datetime(

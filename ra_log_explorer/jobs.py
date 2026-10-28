@@ -29,7 +29,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from .config import FetchSpec
-from .fetch import fetchAll
+from .fetch import fetchAll, loadCacheMeta
 
 JobStatus = Literal["pending", "running", "parsing", "done", "error"]
 JobKind = Literal["exposure", "night", "range"]
@@ -83,6 +83,10 @@ class FetchJob:
     stopId: int | None = None
     tZeroStart: dt.datetime | None = None
     tZeroStop: dt.datetime | None = None
+    # Set for a job that rebuilds a view from a window already on disk
+    # rather than fetching one: the fetch is skipped and everything after
+    # it runs as for any other job.
+    rebuildFrom: Path | None = None
     status: JobStatus = "pending"
     startedAt: dt.datetime | None = None
     finishedAt: dt.datetime | None = None
@@ -101,6 +105,14 @@ class FetchJob:
 
     def isTerminal(self) -> bool:
         return self.status in ("done", "error")
+
+    def key(self) -> tuple[object, ...]:
+        """What makes two jobs the same piece of work (see :meth:`JobManager.startJob`)."""
+        if self.kind == "night":
+            return ("night", self.dayObs, self.nightView)
+        if self.kind == "range":
+            return ("range", self.instrument, self.startId, self.stopId, self.spec.fromIso, self.spec.toIso)
+        return ("exposure", self.instrument, self.expId, self.spec.fromIso, self.spec.toIso)
 
     def describe(self) -> str:
         """Short human label for log lines, e.g. ``exposure lsstcam:2026051900722``."""
@@ -126,6 +138,8 @@ class JobManager:
 
     def __init__(self) -> None:
         self._jobs: dict[str, FetchJob] = {}
+        # Started and not yet terminal, by FetchJob.key.
+        self._running: dict[tuple[object, ...], FetchJob] = {}
         self._lock = threading.Lock()
         self.stateLock = threading.Lock()
 
@@ -209,10 +223,23 @@ class JobManager:
         SSE consumer waiting on the `done`/`error` signal will only see it
         after the server state has been updated.
         """
+        try:
+            self._run(job, onComplete)
+        finally:
+            with self._lock:
+                if self._running.get(job.key()) is job:
+                    del self._running[job.key()]
+
+    def _run(self, job: FetchJob, onComplete: OnComplete) -> None:
         job.status = "running"
         startedAt = job.startedAt = dt.datetime.now(dt.timezone.utc)
         job.push({"type": "start", "fromIso": job.spec.fromIso, "toIso": job.spec.toIso})
-        log.info("Job %s: %s, window %s to %s", job.jobId, job.describe(), job.spec.fromIso, job.spec.toIso)
+        if job.rebuildFrom is not None:
+            log.info("Job %s: %s, rebuilding from %s", job.jobId, job.describe(), job.rebuildFrom)
+        else:
+            log.info(
+                "Job %s: %s, window %s to %s", job.jobId, job.describe(), job.spec.fromIso, job.spec.toIso
+            )
 
         def cb(pod: str, i: int, total: int) -> None:
             # fetchAll loops over completed futures sequentially, so this
@@ -220,7 +247,12 @@ class JobManager:
             job.push({"type": "pod-done", "pod": pod, "i": i, "total": total})
 
         try:
-            cacheDir, meta = fetchAll(job.spec, progress=cb)
+            if job.rebuildFrom is not None:
+                cacheDir, meta = job.rebuildFrom, loadCacheMeta(job.rebuildFrom)
+                meta["fromCache"] = True
+                meta["cacheReuse"] = "rebuild"
+            else:
+                cacheDir, meta = fetchAll(job.spec, progress=cb)
             job.cacheDir = cacheDir
             job.meta = meta
             job.status = "parsing"
@@ -277,8 +309,22 @@ class JobManager:
             log.exception("Job %s (%s) failed", job.jobId, job.describe())
             job.push({"type": "error", "error": job.error})
 
-    def startJob(self, job: FetchJob, onComplete: OnComplete) -> None:
-        """Run `runJob` in a background daemon thread."""
+    def startJob(self, job: FetchJob, onComplete: OnComplete) -> FetchJob:
+        """Run `runJob` in a background daemon thread, or join an identical job.
+
+        Returns the job to follow: ``job`` itself, or the one already
+        running for the same :meth:`FetchJob.key`, in which case ``job``
+        is dropped unstarted. A reload, a second user, or a rebuild racing
+        a fetch would otherwise each parse the same window, and for a
+        summit night that is a minute of CPU and a second copy of the
+        parsed night in memory.
+        """
+        with self._lock:
+            running = self._running.get(job.key())
+            if running is not None:
+                self._jobs.pop(job.jobId, None)
+                return running
+            self._running[job.key()] = job
         thread = threading.Thread(
             target=self.runJob,
             args=(job, onComplete),
@@ -286,3 +332,4 @@ class JobManager:
             daemon=True,
         )
         thread.start()
+        return job

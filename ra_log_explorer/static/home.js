@@ -965,6 +965,9 @@ function useCacheSettings(w) {
 
 let activeJobId = null;
 let activeEventSource = null;
+// The active job is rebuilding the view the URL already names, so when it
+// finishes the router opens it; nothing about the URL needs working out.
+let followingRebuild = false;
 // Which card launched the active fetch. The inline progress region for
 // each form is rendered next to its own submit button, so when an SSE
 // update comes in we know which DOM element to update without having
@@ -1020,6 +1023,28 @@ async function startFetch(ev) {
   activeJobId = jobId;
   openProgressStream(jobId);
 }
+
+// A view the server has on disk but not in memory comes back from
+// /api/summary as {loaded: false, rebuildJobId}: it is being rebuilt by a
+// job (parsing a summit night takes about a minute), which this page
+// follows exactly as it follows a fetch the user started, and which opens
+// the view when it is done.
+window.followRebuild = function followRebuild(jobId, kind) {
+  if (activeJobId) return;
+  const msgId = kind === 'night' ? 'night-message' : kind === 'range' ? 'range-message' : 'fetch-message';
+  const msgEl = document.getElementById(msgId);
+  msgEl.textContent = 'Loading from the cache...';
+  msgEl.classList.remove('error');
+  for (const id of ['fetch-submit', 'night-submit', 'range-submit']) {
+    document.getElementById(id).disabled = true;
+  }
+  activeProgressKind = kind;
+  showInlineProgress(kind, true);
+  resetInlineProgress(kind);
+  activeJobId = jobId;
+  followingRebuild = true;
+  openProgressStream(jobId);
+};
 
 function showMessage(text, isError) {
   const el = document.getElementById('fetch-message');
@@ -1116,6 +1141,11 @@ function openProgressStream(jobId) {
       updateSubmitButton();
       document.getElementById('night-submit').disabled = false;
       document.getElementById('range-submit').disabled = false;
+      if (followingRebuild) {
+        followingRebuild = false;
+        window.reroute();
+        return;
+      }
       transitionToExplore({
         kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs, startId: ev.startId, stopId: ev.stopId,
         instrument: ev.instrument, nightView: ev.nightView,
@@ -1136,6 +1166,7 @@ function openProgressStream(jobId) {
       activeEventSource = null;
       activeJobId = null;
       activeProgressKind = null;
+      followingRebuild = false;
       updateSubmitButton();
     }
   };

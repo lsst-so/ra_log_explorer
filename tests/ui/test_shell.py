@@ -169,7 +169,15 @@ def test_everything_resolves_under_a_base_path(appFactory: Any, corpus: StagedCo
         if url.startswith(app.origin):
             failed.append(f"{label} {url}")
 
-    app.page.on("requestfailed", lambda r: note(r.url, "failed"))
+    def noteFailure(request: Any) -> None:
+        # The page closes a job's progress stream itself on the job's last
+        # event (an EventSource left open would reconnect), which the
+        # browser reports as an aborted request rather than a finished one.
+        if request.url.endswith("/progress") and request.failure == "net::ERR_ABORTED":
+            return
+        note(request.url, "failed")
+
+    app.page.on("requestfailed", noteFailure)
     app.page.on("response", lambda r: note(r.url, str(r.status)) if r.status >= 400 else None)
 
     app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
