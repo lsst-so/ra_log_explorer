@@ -427,8 +427,8 @@ reused instead, so the flagged directory is never revisited.
   by `markCacheRange` when a range fetch completes. This is the sole
   marker that tells the `/api/cache` listing to label the window
   `kind: "range"` (rather than `"exposure"`) and deep-link it back to
-  `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it to
-  rehydrate a `RangeState` from disk on a reload / deep link, and the
+  `/?rangeStart=…&rangeStop=…`; `_startRangeRebuild` uses it to
+  rebuild a `RangeState` from disk on a reload / deep link, and the
   recorded instrument re-pins the rebuilt state's shutter-close
   lookups — a range is a run of *one* instrument's exposures, and a
   bare lookup on a colliding id would anchor that exposure to the
