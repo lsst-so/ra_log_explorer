@@ -16,7 +16,7 @@ yagan/rapid-analysis/2026-07-11T120000_000000Z__2026-07-12T120000_000000Z/
     pods.txt
     pods/<pod>.jsonl      32 pods, ~93k lines of app logs
     pods_events/<pod>.jsonl   the whole night's k8s lifecycle events
-exposure-times/summit.json    the ConsDB records for those exposures
+exposure-times/summit/<dayObs>.json   the ConsDB records for those exposures
 ```
 
 That shape is deliberate: every other window a test needs — one

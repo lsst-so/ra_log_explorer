@@ -766,8 +766,9 @@ def _resolveShutterClosesInto(
     misses: list[int] = []
     cachedHits = 0
     manualStandins = 0
+    cached = exposureTimes.lookupCachedRecords(needIds, siteName=site.name, instrument=instrument)
     for expId in needIds:
-        rec = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
+        rec = cached.get(expId)
         iso = exposureTimes.obsEnd(rec)
         if rec is None or iso is None:
             misses.append(expId)
@@ -1614,10 +1615,12 @@ def _loadNightFromCache(ctx: ServerContext, dayObs: int, view: str = DEFAULT_NIG
     # runs on LSSTCam only, and on a night where LATISS also observed a
     # bare lookup for a colliding id could anchor an AOS histogram bar
     # to the LATISS shutter close.
-    for needId in _neededDataIdsForNight(summaries):
-        record = exposureTimes.lookupCachedRecord(needId, siteName=site.name, instrument="lsstcam")
+    cached = exposureTimes.lookupCachedRecords(
+        _neededDataIdsForNight(summaries), siteName=site.name, instrument="lsstcam"
+    )
+    for needId, record in cached.items():
         iso = exposureTimes.obsEnd(record)
-        if record is not None and iso is not None:
+        if iso is not None:
             state.shutterCloseByExpId[needId] = exposureTimes.taiIsoToUtc(iso)
             state.exposureInfoByExpId[needId] = record
     with ctx.jobs.stateLock:
@@ -1703,10 +1706,12 @@ def _loadRangeFromCache(
         siteName=site.name,
         instrument=instrument,
     )
-    for expId in range(startId, stopId + 1):
-        record = exposureTimes.lookupCachedRecord(expId, siteName=site.name, instrument=instrument)
+    cached = exposureTimes.lookupCachedRecords(
+        range(startId, stopId + 1), siteName=site.name, instrument=instrument
+    )
+    for expId, record in cached.items():
         iso = exposureTimes.obsEnd(record)
-        if record is not None and iso is not None:
+        if iso is not None:
             state.shutterCloseByExpId[expId] = exposureTimes.taiIsoToUtc(iso)
             state.exposureInfoByExpId[expId] = record
     with ctx.jobs.stateLock:

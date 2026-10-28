@@ -113,11 +113,13 @@ log = logging.getLogger(__name__)
 # no-backwards-compatibility rule in caching.md, and this flush is what
 # makes that safe; v6 qualifies every _exposure_ids.txt entry with the
 # instrument it was fetched under, since a bare id names a different
-# exposure on each and the cache listing links back to one of them.
+# exposure on each and the cache listing links back to one of them; v7
+# splits the per-site exposure-time file into one file per dayObs
+# (``exposure-times/<site>/<dayObs>.json``).
 # Bumping this value flushes the whole cache (see
 # ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
 # individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so

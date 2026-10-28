@@ -295,7 +295,7 @@ application never looks: `pods/`, `pods_events/`, `pods.txt`, a
 (`aug11-night-bts` — month, day, `night`, site, because the same dayObs
 exists on both clusters and they are different data). The ConsDB records
 for every captured night accumulate beside them in
-`<out>/exposure-times/<site>.json`, mirroring the cache root's own
+`<out>/exposure-times/<site>/<dayObs>.json`, mirroring the cache root's own
 layout so staging is a straight copy — without them the Tonight panel
 has no shutter closes to resolve against.
 

@@ -105,7 +105,7 @@ chmod 600 ~/.lsst/manke-token.txt
 ```
 
 Once a dataId has been resolved on this machine it is cached on disk
-per-site (under `~/.cache/ra_log_explorer/exposure-times/<site>.json`),
+per site and night (under `~/.cache/ra_log_explorer/exposure-times/<site>/<dayObs>.json`),
 so subsequent lookups for the same id work without the token. Exposure
 end-times are immutable once recorded, so the cache never goes stale.
 Sites have separate cache files so a colliding bare dataId between

@@ -146,7 +146,7 @@ Sibling docs:
                           sites.toml (see below), so the same dataId can
                           resolve to a different record depending on the
                           active site. Persistent per-site on-disk cache
-                          at <cache_root>/exposure-times/<site>.json so
+                          at <cache_root>/exposure-times/<site>/<dayObs>.json so
                           once-resolved dataIds work offline.
 
        sites.py           Site catalog. A *site* pairs a Loki cluster
@@ -167,7 +167,7 @@ Sibling docs:
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
 | `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
-| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per site and per dayObs to `<cache_root>/exposure-times/<siteName>/<dayObs>.json` — exposure properties are immutable so the cache never goes stale — and resolves many ids at once with `lookupCachedRecords`, one file read per night. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
@@ -710,7 +710,7 @@ deep-linked tab (e.g. opening the dataId column in the admin view's
 cache table) land directly on its explore/night view without an
 intervening home → fetch click — the cache is the source of truth, so
 no re-fetch is needed. For exposure caches the shutter close must
-already be in the local `exposure-times.json` (it always is whenever
+already be in the local exposure-time cache (it always is whenever
 the cache itself exists, because the fetch path stores both); if it
 isn't, the server falls back to `{loaded: false}` and the home view
 takes over. Night-mode rebuilds skip the ConsDB fallback (there's no
@@ -1006,7 +1006,7 @@ hand back a *different exposure* that happens to share the id.
 There is no site-related error, because there is no site parameter to
 get wrong: one process serves one site, and a `?site=` is ignored.
 
-The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
+The per-site on-disk cache at `<cache_root>/exposure-times/<site>/<dayObs>.json`
 is checked first; a *ConsDB-sourced* cache hit returns immediately with
 `fromCache: true` and no network call. Sites have separate cache files
 so a colliding bare dataId between scopes (BTS simulated vs. summit real)

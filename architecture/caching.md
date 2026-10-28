@@ -13,9 +13,10 @@ repeat runs into instant loads.
 ├── _cache_schema_version.txt                      ← schema the cache was built with; a
 │                                                    mismatch flushes the whole tree at startup
 ├── exposure-times/                                ← persistent dataId → ConsDB exposure record
-│   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
-│   └── bts.json                                     per site so a colliding dataId between scopes
-│                                                    can't return the wrong record
+│   ├── summit/                                      (obs_end + filter/exp time/img type/…), split
+│   │   ├── 20261026.json                            per site so a colliding dataId between scopes
+│   │   └── 20261027.json                            can't return the wrong record, and per dayObs
+│   └── bts/…                                        so no read or write touches the whole history
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
         ├── _meta.json                             ← FetchSpec + fetchSchemaVersion + per-pod
@@ -521,8 +522,9 @@ poller opens it again from scratch.
 
 ## The exposure-time cache
 
-`<cache_root>/exposure-times/<siteName>.json` maps `dataId → curated
-ConsDB exposure record` across runs, split per site. Each record is the
+`<cache_root>/exposure-times/<siteName>/<dayObs>.json` maps `dataId →
+curated ConsDB exposure record` across runs, split per site and per
+night. Each record is the
 `EXPOSURE_RECORD_COLUMNS` projection of the row — `obs_end` (the
 shutter-close TAI t-zero) plus the human-facing properties (filter, exp
 time, image type, program, reason, group/index, pointing, seeing) that
@@ -537,16 +539,27 @@ outside the cluster/namespace tree because:
   what makes the home page work for users who don't have an RSP
   token configured.
 
-The cache is split per site (`exposure-times/summit.json`,
-`exposure-times/bts.json`) because a 13-digit dataId is meaningful
+The cache is split per site (`exposure-times/summit/`,
+`exposure-times/bts/`) because a 13-digit dataId is meaningful
 *within* a site, not globally: BTS simulated exposures can carry an
 id that also exists on the summit, with a completely different record.
-`lookupCachedRecord(..., siteName=...)` and `storeCachedRecord[s](...,
+`lookupCachedRecord[s](..., siteName=...)` and `storeCachedRecord[s](...,
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
 
-Unlike the window caches this file is *not* disposable, so it is the one
-thing here written with care: every merge takes a process-wide lock and
+Within a site it is split again by **dayObs**, the leading eight digits
+of every dataId (`dayObsOfDataId`). A single per-site file grows by a
+night of records every night the live poller runs, and was read whole
+for every lookup and rewritten whole for every store: on the summit
+that meant tens of megabytes of `json.loads`, holding the GIL, once per
+dataId of a night view, plus a full rewrite on every poll that brought
+a new exposure. One file per night bounds both at one night's records
+(~1-2 MB). Anything resolving many ids at once (a night view, a range,
+the shutter-close prefetch) goes through `lookupCachedRecords`, which
+reads each night's file once rather than once per id.
+
+Unlike the window caches these files are *not* disposable, so they are the
+one thing here written with care: every merge takes a process-wide lock and
 lands via a temp file and `os.replace`. Several threads write it in a
 deployed process — request threads resolving a dataId, a fetch job's
 night/range prefetch, the live poller's per-tick exposure list — and two
