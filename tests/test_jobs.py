@@ -374,3 +374,23 @@ def test_a_rebuild_job_never_fetches(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert job.status == "done", job.error
     assert job.cacheDir == tmp_path
     assert seen[0]["cacheReuse"] == "rebuild" and seen[0]["pod_count"] == 3
+
+
+def test_only_the_newest_finished_jobs_are_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each job keeps its full progress log (~900 events for a summit
+    exposure), so a registry that never forgets is a slow leak in a
+    process that runs for weeks. Running jobs are never dropped."""
+    monkeypatch.setattr(jobs, "_MAX_FINISHED_JOBS", 3)
+    mgr = jobs.JobManager()
+    running = mgr.createJob(_spec(), 0, _tZero())
+    finished = []
+    for i in range(1, 6):
+        job = mgr.createJob(_spec(), i, _tZero())
+        job.status = "done"
+        job.finishedAt = _tZero() + dt.timedelta(minutes=i)
+        finished.append(job)
+    mgr.createJob(_spec(), 99, _tZero())
+    kept = {j.jobId for j in mgr.listJobs()}
+    assert running.jobId in kept
+    assert {j.jobId for j in finished[-3:]} <= kept
+    assert not {j.jobId for j in finished[:2]} & kept

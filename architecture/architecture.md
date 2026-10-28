@@ -1387,7 +1387,11 @@ is one JSON event (`{"type": ...}`):
 History is replayable: the SSE handler emits every event already in
 the job's log on connection, then waits for new ones. Multiple
 concurrent readers are fine — each iterates the log independently,
-including reattaching *after* the job has already finished.
+including reattaching *after* the job has already finished. Only the 50
+most recently finished jobs are kept (`jobs._MAX_FINISHED_JOBS`): a
+summit exposure's log is ~900 events, and a registry that kept every
+job would grow for as long as the process runs. An older job's status
+and progress routes 404.
 
 Keepalive comments (`: keepalive\n\n`) are emitted every 15 s so
 intermediate proxies don't time the stream out.

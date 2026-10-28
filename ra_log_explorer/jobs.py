@@ -37,6 +37,9 @@ ProgressEvent = dict[str, Any]
 
 log = logging.getLogger(__name__)
 
+# Finished jobs kept for late readers of their progress (see JobManager._register).
+_MAX_FINISHED_JOBS = 50
+
 
 @dataclass
 class FetchJob:
@@ -162,7 +165,7 @@ class JobManager:
                 expId=expId,
                 tZero=tZero,
             )
-            self._jobs[jobId] = job
+            self._register(job)
             return job
 
     def createNightJob(
@@ -178,7 +181,7 @@ class JobManager:
                 dayObs=dayObs,
                 nightView=nightView,
             )
-            self._jobs[jobId] = job
+            self._register(job)
             return job
 
     def createRangeJob(
@@ -204,8 +207,25 @@ class JobManager:
                 tZeroStart=tZeroStart,
                 tZeroStop=tZeroStop,
             )
-            self._jobs[jobId] = job
+            self._register(job)
             return job
+
+    def _register(self, job: FetchJob) -> None:
+        """Add ``job``, forgetting all but the newest finished jobs. Call under ``_lock``.
+
+        A job keeps its whole progress log, one event per pod fetched and
+        another per pod parsed: ~900 for a summit exposure. Kept forever,
+        that is tens of megabytes a day of a long-running process. What
+        is still worth keeping after a job ends is only a page coming
+        back for its last events.
+        """
+        self._jobs[job.jobId] = job
+        finished = sorted(
+            (j for j in self._jobs.values() if j.isTerminal()),
+            key=lambda j: j.finishedAt or dt.datetime.min.replace(tzinfo=dt.timezone.utc),
+        )
+        for old in finished[: max(0, len(finished) - _MAX_FINISHED_JOBS)]:
+            del self._jobs[old.jobId]
 
     def getJob(self, jobId: str) -> FetchJob | None:
         with self._lock:
