@@ -12,6 +12,8 @@ from typing import Any
 
 from playwright.sync_api import expect
 
+from ra_log_explorer import fetch
+
 from .corpus import DAY_OBS, RANGE_START, RANGE_STOP, SHARED_ID, StagedCorpus
 
 
@@ -31,8 +33,23 @@ def test_cached_windows_are_listed_with_their_kind(app: Any, corpus: StagedCorpu
     kinds = sorted(t.lower() for t in app.page.locator("#cache-tbody .cache-kind").all_inner_texts())
     assert kinds == ["exposure", "night", "range"], kinds
     expect(app.page.locator("#cache-summary")).to_contain_text("3")
-    # A total row, so "how much is this costing me" is one glance.
-    expect(app.page.locator("#cache-tfoot .cache-total-row")).to_be_visible()
+    # A total row, so "how much is this costing me" is one glance. It is
+    # the volume's real total: summing the rows would count the AOS night
+    # twice (its window is nested in the night dir's) and miss everything
+    # that isn't a row, like the live night itself.
+    total = _jsHumanBytes(fetch.cacheDuSizeBytes(corpus.root))
+    expect(app.page.locator("#cache-tfoot .cache-total-row")).to_contain_text(total)
+    expect(app.page.locator("#cache-summary")).to_contain_text(f"{total} total")
+
+
+def _jsHumanBytes(n: int) -> str:
+    """explore.js's ``humanBytes``, for comparing against rendered text."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    x, i = float(n), 0
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024
+        i += 1
+    return f"{x:.1f} {units[i]}"
 
 
 def test_each_row_links_back_to_the_run_it_holds(app: Any, corpus: StagedCorpus) -> None:

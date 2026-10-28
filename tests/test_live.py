@@ -1134,7 +1134,7 @@ def test_evictToFit_drops_the_live_sidecar_before_removing_a_night(
         realRmtree(path, *a, **k)
 
     monkeypatch.setattr(fetch.shutil, "rmtree", wedgedRmtree)
-    removed = fetch.evictToFit(maxBytes=0)
+    removed, _ = fetch.evictToFit(maxBytes=0)
     assert removed == []  # the rmtree failed...
     assert nightDir.exists()
     # ...but the sidecar went first, so the survivor can't pass for a

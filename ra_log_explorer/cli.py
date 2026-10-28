@@ -65,6 +65,7 @@ from .config import (
 from .exposureTimes import INSTRUMENTS_BY_PROBE_ORDER, TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    cacheSizes,
     dropLiveSidecarsUnder,
     ensureCacheSchemaCurrent,
     fetchAll,
@@ -366,7 +367,7 @@ def cmdRun(args: argparse.Namespace) -> int:
 
 def cmdCacheInfo(args: argparse.Namespace) -> int:
     root = cache_root()
-    total = cacheDuSizeBytes(root)
+    total, sizes = cacheSizes(root)
     print(f"Cache root: {root}")
     print(f"Total size: {humanBytes(total)}")
     print()
@@ -391,10 +392,10 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
                     if inner.is_dir() and inner.name.startswith("pods=") and (inner / "_meta.json").exists()
                 ]
                 if outerHasMeta:
-                    size = cacheDuSizeBytes(window)
+                    size = sizes.get(window, 0)
                     print(f"  [ok ] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
                 for inner in nightInners:
-                    size = cacheDuSizeBytes(inner)
+                    size = sizes.get(inner, 0)
                     print(
                         f"  [ok ] {humanBytes(size):>10}  "
                         f"{cluster.name}/{ns.name}/{window.name}/{inner.name}"
@@ -402,7 +403,7 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
                 if not outerHasMeta and not nightInners:
                     # Neither layer has a usable meta — a half-finished
                     # fetch. Show one partial row for the window.
-                    size = cacheDuSizeBytes(window)
+                    size = sizes.get(window, 0)
                     print(f"  [partial] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
     return 0
 

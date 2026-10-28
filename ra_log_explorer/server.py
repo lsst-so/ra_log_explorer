@@ -72,6 +72,7 @@ from .fetch import (
     PARTIAL_FLAG,
     addExposureToCache,
     cacheDuSizeBytes,
+    cacheSizes,
     checkLokiAccess,
     dropLiveSidecarsUnder,
     evictToFit,
@@ -1210,7 +1211,17 @@ def _iterCompletedCaches(nightMode: bool) -> Iterator[tuple[Path, dict]]:
                         yield candidate, meta
 
 
-def _listCacheWindows() -> list[dict]:
+def _cacheListing() -> dict:
+    """The ``/api/cache`` payload: the root's total and every completed window.
+
+    One walk of the tree feeds both the total and every row's size.
+    """
+    root = cache_root()
+    total, sizes = cacheSizes(root)
+    return {"root": {"path": str(root), "totalBytes": total}, "windows": _listCacheWindows(sizes)}
+
+
+def _listCacheWindows(sizes: dict[Path, int]) -> list[dict]:
     """Inspect the cache root and summarise each completed window.
 
     Walks two depths:
@@ -1221,7 +1232,8 @@ def _listCacheWindows() -> list[dict]:
     Both are returned as rows. The ``podFilter`` field is the regex
     string from the cached spec (or ``None`` for unfiltered exposure
     caches); the ``relPath`` joins ``<window>`` and ``pods=<slug>`` when
-    relevant so the JS can DELETE the right sub-path.
+    relevant so the JS can DELETE the right sub-path. ``sizes`` is
+    :func:`fetch.cacheSizes`'s per-window map.
     """
     root = cache_root()
     rows: list[dict] = []
@@ -1230,7 +1242,7 @@ def _listCacheWindows() -> list[dict]:
     for cluster in sorted(p for p in root.iterdir() if p.is_dir()):
         for ns in sorted(p for p in cluster.iterdir() if p.is_dir()):
             for window in sorted(p for p in ns.iterdir() if p.is_dir()):
-                _appendCacheRow(rows, cluster.name, ns.name, window, relPath=window.name)
+                _appendCacheRow(rows, cluster.name, ns.name, window, relPath=window.name, sizes=sizes)
                 # Night-mode caches nest one level deeper under
                 # `pods=<slug>/`. List them alongside the top-level
                 # window so the user can manage them independently.
@@ -1242,12 +1254,15 @@ def _listCacheWindows() -> list[dict]:
                             ns.name,
                             inner,
                             relPath=f"{window.name}/{inner.name}",
+                            sizes=sizes,
                         )
     rows.sort(key=lambda r: r.get("fetchedAt") or "", reverse=True)
     return rows
 
 
-def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, relPath: str) -> None:
+def _appendCacheRow(
+    rows: list[dict], cluster: str, ns: str, window: Path, *, relPath: str, sizes: dict[Path, int]
+) -> None:
     meta = _completedCacheMeta(window)
     if meta is None:
         return
@@ -1309,7 +1324,7 @@ def _appendCacheRow(rows: list[dict], cluster: str, ns: str, window: Path, *, re
             "lastViewedAt": lastViewed.isoformat() if lastViewed else None,
             "podCount": meta.get("pod_count", 0),
             "totalBytes": meta.get("total_bytes", 0),
-            "sizeOnDisk": cacheDuSizeBytes(window),
+            "sizeOnDisk": sizes.get(window, 0),
         }
     )
 
@@ -1373,14 +1388,6 @@ def _supersededNightSlices(job: FetchJob) -> list[Path]:
         except (TypeError, ValueError):
             continue
     return stale
-
-
-def _cacheRootInfo() -> dict:
-    root = cache_root()
-    return {
-        "path": str(root),
-        "totalBytes": cacheDuSizeBytes(root),
-    }
 
 
 def _findExposureCacheDirs(expId: int, instrument: str | None = None) -> list[Path]:
@@ -1910,7 +1917,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         # evicted is dropped with it — a state held in memory over a
         # deleted directory would keep serving its summary while every
         # pod drilldown came back silently empty.
-        evicted = evictToFit(MAX_CACHE_BYTES, exempt=[job.cacheDir])
+        evicted, cacheBytes = evictToFit(MAX_CACHE_BYTES, exempt=[job.cacheDir])
         if evicted:
             with ctx.jobs.stateLock:
                 for gone in evicted:
@@ -1930,7 +1937,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             assert job.dayObs is not None
             newNight = NightState(
                 cacheDir=job.cacheDir,
-                cacheBytes=cacheDuSizeBytes(cache_root()),
+                cacheBytes=cacheBytes,
                 meta=job.meta,
                 summaries=summaries,
                 dayObs=job.dayObs,
@@ -1955,7 +1962,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             assert job.instrument is not None  # every range job is created with one
             newRange = RangeState(
                 cacheDir=job.cacheDir,
-                cacheBytes=cacheDuSizeBytes(cache_root()),
+                cacheBytes=cacheBytes,
                 meta=job.meta,
                 summaries=summaries,
                 startId=job.startId,
@@ -1987,7 +1994,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
         )
         newState = ServerState(
             cacheDir=job.cacheDir,
-            cacheBytes=cacheDuSizeBytes(cache_root()),
+            cacheBytes=cacheBytes,
             meta=job.meta,
             summaries=summaries,
             expId=job.expId,
@@ -2257,7 +2264,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         markCacheViewed(state.cacheDir)
                         self._send_json(_buildSummaryPayload(state))
                         return
-                    self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                    self._send_json({"loaded": False})
                     return
                 if dayObsRaw is not None:
                     try:
@@ -2274,9 +2281,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                         markCacheViewed(nightState.cacheDir)
                         self._send_json(_buildNightPayload(nightState))
                         return
-                    self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                    self._send_json({"loaded": False})
                     return
-                self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                self._send_json({"loaded": False})
                 return
             if path.startswith("/api/night/traceback/"):
                 qs = parse_qs(url.query)
@@ -2368,7 +2375,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 )
                 return
             if path == "/api/cache":
-                self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
+                self._send_json(_cacheListing())
                 return
             if path == "/api/site":
                 # Which observatory's logs these are. Read-only: the UI
@@ -2466,7 +2473,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             if state is None:
                 state = _loadRangeFromCache(ctx, startId, stopId, instrument)
             if state is None:
-                self._send_json({"loaded": False, "cache": _cacheRootInfo()})
+                self._send_json({"loaded": False})
                 return
             markCacheViewed(state.cacheDir)
             if dataIdRaw is not None:
@@ -2642,7 +2649,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
             path = routed
             if path == "/api/cache":
                 _deleteCacheRoot(ctx)
-                self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
+                self._send_json(_cacheListing())
                 return
             m = re.match(r"^/api/cache/([^/]+)/([^/]+)/([^/]+)(?:/([^/]+))?$", path)
             if m:
@@ -2658,7 +2665,7 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                     self._send_error_json(404, "No such cache directory")
                     return
                 _deleteCacheDir(ctx, target)
-                self._send_json({"root": _cacheRootInfo(), "windows": _listCacheWindows()})
+                self._send_json(_cacheListing())
                 return
             self.send_error(404)
 

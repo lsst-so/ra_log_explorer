@@ -671,20 +671,20 @@ The view-state lookup. The query string picks which loaded state to
 return:
 
 - `?dataId=<int>[&instrument=<name>]` — return that exposure's payload,
-  or `{loaded: false, cache}` if not loaded. With `instrument` given, a
+  or `{loaded: false}` if not loaded. With `instrument` given, a
   loaded state pinned to a *different* instrument is treated as not
   loaded rather than served — the same bare id names a different
   exposure per instrument — and the rebuild path resolves under the
   pin. 400 for an unknown instrument name.
 - `?dayObs=<int>[&nightView=aos|sfm]` — return that night's payload for
-  the named half, or `{loaded: false, cache}` if that half isn't loaded.
+  the named half, or `{loaded: false}` if that half isn't loaded.
   `nightView` defaults to `aos` and an unrecognised value falls back to
   it rather than erroring: this is a query string a person can type, and
   a 400 there helps nobody. The two halves are separate states, so the
   same dayObs can have one loaded and not the other.
 - `?rangeStart=<int>&rangeStop=<int>[&instrument=<name>]` — return that
-  range's **index** payload (`mode: "range"`), or `{loaded: false,
-  cache}` if not loaded.
+  range's **index** payload (`mode: "range"`), or `{loaded: false}` if
+  not loaded.
 - `?rangeStart=<int>&rangeStop=<int>&dataId=<int>[&instrument=<name>]` —
   return one in-range exposure's timeline (`mode: "range-exposure"`, the
   same shape as the exposure payload plus a `podDetailQuery`). 404 if
@@ -696,7 +696,10 @@ return:
   loaded state pinned elsewhere is treated as not loaded and the
   rebuild re-pins (`_findRangeCacheDir` matching on the instrument
   `_range.txt` records). 400 for an unknown instrument name.
-- no params — home view shape (`{loaded: false, cache}`).
+- no params — home view shape (`{loaded: false}`). Deliberately nothing
+  about the cache: this answers every home-page load, and the cache's
+  size costs a walk of the whole tree (the admin view's `/api/cache`
+  is where that is paid).
 
 If the requested key isn't in the in-memory state dict, the server
 makes one attempt to reconstruct it from disk: it walks the cache root
@@ -1132,6 +1135,11 @@ flag or a missing/corrupt `_meta.json`. Night caches nest one level
 deeper than exposure caches (`<window>/pods=<slug>`) so a same-window
 exposure-mode and night-mode cache can coexist; both flavours are
 listed independently here.
+
+`root.totalBytes` and every row's `sizeOnDisk` come from one walk of the
+tree (`fetch.cacheSizes`). A window's `sizeOnDisk` includes any night
+caches nested in it, so the rows don't sum to the total; the admin view
+shows `root.totalBytes`.
 
 ### `DELETE /api/cache`
 

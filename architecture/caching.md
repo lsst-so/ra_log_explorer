@@ -458,6 +458,11 @@ one, typically).
   over-cap states during a fetch are acceptable.
 - Empty per-cluster, per-namespace, and (for night mode) per-window
   parent directories are pruned as their child windows go away.
+- The tree is walked **once** per pass (`fetch.cacheSizes`, which sizes
+  the total and every window together) and the post-eviction total is
+  returned, so the caller's state can report the cache size without a
+  second walk. At summit scale that matters: a night is ~1,100 files and
+  each exposure slice several hundred.
 - **Not everything on the volume is evictable.** The total is measured
   over the whole tree, but only directories carrying a `_meta.json` are
   candidates — so the in-progress live night (which has none until

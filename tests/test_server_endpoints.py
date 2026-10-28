@@ -131,8 +131,9 @@ def test_summary_empty_when_no_exposure(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/summary")
     assert status == 200
-    assert body["loaded"] is False
-    assert "cache" in body
+    # Nothing else: this answers every home-page load, and the cache's size
+    # costs a walk of the whole tree.
+    assert body == {"loaded": False}
 
 
 # ----- /api/cache --------------------------------------------------------

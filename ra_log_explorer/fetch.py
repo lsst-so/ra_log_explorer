@@ -1685,14 +1685,49 @@ def loadCacheMeta(cacheDir: Path) -> dict:
 
 def cacheDuSizeBytes(root: Path) -> int:
     """Return on-disk size of the entire cache tree under `root`."""
+    return cacheSizes(root)[0]
+
+
+def cacheSizes(root: Path) -> tuple[int, dict[Path, int]]:
+    """Total bytes under the cache root, and per cache window, in one walk.
+
+    The per-window map is keyed by every ``<cluster>/<ns>/<window>`` dir
+    (inclusive of any night caches nested in it) and every
+    ``.../<window>/pods=<slug>`` dir. Callers needing several sizes take
+    them all from one call: a summit night is over a thousand files and
+    an exposure slice several hundred, so the walk is the expensive part
+    of a cache listing or an eviction pass.
+
+    ``os.scandir`` rather than ``Path.rglob``: the file type comes from
+    the directory entry, so each file costs one ``stat`` instead of two.
+    """
     total = 0
-    for p in root.rglob("*"):
-        if p.is_file():
-            try:
-                total += p.stat().st_size
-            except OSError:
-                pass
-    return total
+    sizes: dict[Path, int] = {}
+    stack: list[tuple[str, int, tuple[Path, ...]]] = [(str(root), 0, ())]
+    while stack:
+        path, depth, owners = stack.pop()
+        try:
+            it = os.scandir(path)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        inner = owners
+                        if depth == 2 or (depth == 3 and entry.name.startswith("pods=")):
+                            key = Path(entry.path)
+                            sizes[key] = 0
+                            inner = owners + (key,)
+                        stack.append((entry.path, depth + 1, inner))
+                    elif entry.is_file(follow_symlinks=False):
+                        n = entry.stat(follow_symlinks=False).st_size
+                        total += n
+                        for owner in owners:
+                            sizes[owner] += n
+                except OSError:
+                    pass
+    return total, sizes
 
 
 def humanBytes(n: int) -> str:
@@ -1914,7 +1949,7 @@ def dropLiveSidecarsUnder(target: Path) -> None:
             pass
 
 
-def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], int]:
     """Evict the least-recently-viewed cache windows until the on-disk
     total is at or below ``maxBytes``.
 
@@ -1925,14 +1960,15 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
     Caches without a ``_last_viewed.txt`` sidecar are treated as
     oldest — they've never been opened, so they're the safest to drop.
 
-    Returns the list of directories that were removed, for logging
-    / debugging.
+    Returns the directories that were removed and the cache's total
+    size afterwards, so a caller that wants the total needn't walk the
+    tree a second time.
     """
     root = cache_root()
     exemptR = {p.resolve() for p in exempt}
-    total = cacheDuSizeBytes(root)
+    total, sizes = cacheSizes(root)
     if total <= maxBytes:
-        return []
+        return [], total
     # Sort by (last-viewed ASC, dir name) so untouched caches go first
     # and ties are broken stably. Untouched caches get an epoch-zero
     # sentinel so they precede everything.
@@ -1948,7 +1984,9 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
     for _, d in candidates:
         if total <= maxBytes:
             break
-        sz = cacheDuSizeBytes(d)
+        if not d.exists():
+            continue  # a night cache nested in a window evicted before it
+        sz = sizes.get(d, 0)
         # Sidecar first: a finalised live night is an ordinary evictable
         # window, but if its rmtree fails part-way the surviving sidecar
         # would vouch for files that are gone — and every slice taken
@@ -1960,6 +1998,9 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
             continue
         removed.append(d)
         total -= sz
+        if d.parent in sizes:
+            # The enclosing window's size counts its nested night caches.
+            sizes[d.parent] -= sz
         # Tidy up newly-empty parents (cluster/, namespace/, and the
         # window dir for night caches whose pods= subdir we just
         # removed).
@@ -1970,4 +2011,4 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
             except OSError:
                 break
             parent = parent.parent
-    return removed
+    return removed, total

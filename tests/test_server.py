@@ -2046,7 +2046,7 @@ def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
 
     newDir = tmpCacheRoot / "summit-cluster" / "ra" / "new-window"
     (newDir / "pods").mkdir(parents=True)
-    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): [oldDir])
+    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): ([oldDir], 0))
     job = FetchJob(
         jobId="j1",
         spec=config.FetchSpec(
@@ -2193,9 +2193,9 @@ def test_the_superseded_window_is_reclaimed_before_eviction_looks(
     current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
     sawStale: list[bool] = []
 
-    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], int]:
         sawStale.append(stale.exists())
-        return []
+        return [], 0
 
     monkeypatch.setattr(server, "evictToFit", recordingEvict)
     job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)

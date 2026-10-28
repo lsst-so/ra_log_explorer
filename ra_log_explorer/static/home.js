@@ -748,10 +748,11 @@ async function refreshCache() {
 }
 
 function renderCache(data) {
-  const sumBytes = data.windows.reduce((acc, w) => acc + (w.sizeOnDisk || 0), 0);
+  // The server's own total, not a sum of the rows: a window's size
+  // includes the night caches nested in it, which are rows of their own.
   document.getElementById('cache-summary').textContent =
     `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`
-    + ` · ${humanBytes(sumBytes)} total`;
+    + ` · ${humanBytes(data.root.totalBytes)} total`;
   const tbody = document.getElementById('cache-tbody');
   tbody.innerHTML = '';
   const tfoot = document.getElementById('cache-tfoot');
@@ -839,7 +840,7 @@ function renderCache(data) {
     tr.innerHTML =
       `<td colspan="5" class="total-label">total</td>`
       + `<td>${data.windows.length}</td>`
-      + `<td>${humanBytes(sumBytes)}</td>`
+      + `<td>${humanBytes(data.root.totalBytes)}</td>`
       + `<td></td>`;
     tfoot.appendChild(tr);
   }
