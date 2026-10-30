@@ -1196,7 +1196,7 @@ def _tracebackContextForNight(state: NightState, bodyKey: str) -> dict | None:
     try:
         with open(logPath, "rb") as fh:
             offset = firstOffsetAtOrAfter(fh, startTs, logPath.stat().st_size)
-    except (OSError, ValueError, KeyError):
+    except (OSError, ValueError, KeyError, TypeError):
         offset = 0
     lines: list[dict] = []
     truncated = False

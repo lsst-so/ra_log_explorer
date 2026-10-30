@@ -1015,6 +1015,20 @@ def test_tracebackContextForNight_reads_from_the_top_when_the_seek_cannot(tmp_pa
     assert not any("unrelated chatter" in r for r in raws)
 
 
+def test_tracebackContextForNight_survives_a_row_with_no_timestamp(tmp_path: Path) -> None:
+    """A JSON row whose timestamp is null is a row the parser skips, but
+    the seek's bisection indexes it and gets a TypeError, not the
+    JSONDecodeError the unreadable-line case raises. The same fallback
+    applies: read from the top."""
+    nullStamped = (json.dumps({"timestamp": None, "line": "no stamp\n"}) + "\n").encode() * 2000
+    state, bodyKey = _failingPodNight(tmp_path, prefix=nullStamped)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    raws = [ln["raw"] for ln in out["lines"]]
+    assert raws[0].endswith("Running pipeline for 2026052100050 detector 5")
+    assert raws[-1] == "RuntimeError: bang"
+
+
 def test_tracebackContextForNight_caps_a_huge_block_and_says_so(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
