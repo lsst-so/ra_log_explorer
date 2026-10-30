@@ -2432,6 +2432,31 @@ def test_night_fetch_drops_the_night_so_far_windows_it_supersedes(
     assert state is not None and state.cacheDir == current
 
 
+def test_a_night_that_has_ended_is_only_rebuilt_whole(tmpCacheRoot: Path) -> None:
+    """The "night so far" slices a night leaves behind are the newest AOS
+    caches for its dayObs. While it is in progress the newest is the
+    right rebuild source; after noon it is a truncated night, and a deep
+    link would rebuild it as the night until someone fetched again."""
+    start, end = config.dayObsStartUtc(20260711), config.dayObsEndUtc(20260711)
+    clamped = _plantNightSlice(
+        tmpCacheRoot, server._isoForLogcli(start), server._isoForLogcli(start + dt.timedelta(hours=3))
+    )
+    assert server._findNightCacheDir(20260711, "aos") is None, "a slice stood in for the whole night"
+    whole = _plantNightSlice(tmpCacheRoot, server._isoForLogcli(start), server._isoForLogcli(end))
+    assert server._findNightCacheDir(20260711, "aos") == whole
+    assert clamped.exists()
+    # Tonight's slices are still what a reload rebuilds.
+    now = dt.datetime.now(dt.timezone.utc)
+    tonight = config.currentDayObs(now)
+    tonightStart = config.dayObsStartUtc(tonight)
+    tonightSlice = _plantNightSlice(
+        tmpCacheRoot,
+        server._isoForLogcli(tonightStart),
+        server._isoForLogcli(min(now, tonightStart + dt.timedelta(minutes=1))),
+    )
+    assert server._findNightCacheDir(tonight, "aos") == tonightSlice
+
+
 def test_the_superseded_window_is_reclaimed_before_eviction_looks(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

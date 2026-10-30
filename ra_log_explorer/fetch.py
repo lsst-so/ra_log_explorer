@@ -1259,6 +1259,33 @@ def liveNightMeta(
     }
 
 
+def _utcNow() -> dt.datetime:
+    """The wall clock, as one function so tests can stand in for it."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _nightHasEnded(sidecar: dict) -> bool:
+    """True once the night a sidecar describes is over by the clock."""
+    try:
+        return _parseIso(sidecar["toIso"]) <= _utcNow()
+    except (KeyError, ValueError):
+        return False
+
+
+def _liveDirRefusal(requestedDir: Path) -> str:
+    """Why a fresh fetch into ``requestedDir``, a live night dir, is refused."""
+    sidecar = readLiveSidecar(requestedDir)
+    if sidecar is not None and not sidecar.get("finalised") and _nightHasEnded(sidecar):
+        return (
+            f"dayObs {sidecar.get('dayObs')} has ended but its logs are still being pulled from Loki "
+            f"(on disk through {sidecar.get('watermarkIso')}); try again in a few minutes"
+        )
+    return (
+        f"{requestedDir} is a live night directory maintained by the poller; "
+        "refusing to overwrite it with a fresh fetch"
+    )
+
+
 def _findNightDirTouching(cluster: str, namespace: str, fromT: dt.datetime) -> tuple[Path, dict] | None:
     """Return the ``(dir, sidecar)`` of the night dir whose span holds ``fromT``.
 
@@ -1321,7 +1348,13 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
         return None
     if _parseIso(spec.toIso) <= watermark:
         sliceSpec = spec
-    elif spec.fromIso == sidecar["fromIso"] and spec.toIso == sidecar["toIso"]:
+    elif (
+        spec.fromIso == sidecar["fromIso"] and spec.toIso == sidecar["toIso"] and not _nightHasEnded(sidecar)
+    ):
+        # Only while the night is in progress. A night that has ended
+        # with its watermark short of its end is being re-pulled from
+        # Loki (or awaits the orphan sweep); the user asked for the whole
+        # night, and a clamped slice would be served as it, complete.
         if watermark <= _parseIso(spec.fromIso):
             return None  # nothing fetched yet
         sliceSpec = replace(spec, toIso=sidecar["watermarkIso"])
@@ -1476,8 +1509,7 @@ def _fetchAllLocked(
     partialPath = requestedDir / PARTIAL_FLAG
 
     windowEnd = _parseIso(spec.toIso)
-    now = dt.datetime.now(dt.timezone.utc)
-    windowInPast = now > windowEnd
+    windowInPast = _utcNow() > windowEnd
 
     # Cache eligibility is the same for both modes: only honour a cache
     # if the window is fully in the past. For night mode this means the
@@ -1543,10 +1575,7 @@ def _fetchAllLocked(
     # night. (Normally unreachable — the slice path above serves these —
     # but forceRefresh skips it, and so does an unparseable sidecar.)
     if (requestedDir / LIVE_SIDECAR_NAME).exists():
-        raise FetchError(
-            f"{requestedDir} is a live night directory maintained by the poller; "
-            "refusing to overwrite it with a fresh fetch"
-        )
+        raise FetchError(_liveDirRefusal(requestedDir))
     ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
     podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME

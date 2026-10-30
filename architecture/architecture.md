@@ -537,9 +537,16 @@ night's *own* window — which is exactly what night mode asks for on the
 current dayObs — is served **clamped to the watermark**, i.e. "the
 night so far", so opening the night view during observing costs no Loki
 fetch (the parse still takes its normal time). Only the night's own
-window is clamped; an arbitrary user window extending past the
-watermark falls through to a real fetch rather than silently coming
-back short. Successive opens as the watermark advances each materialize
+window is clamped, and only while the night is in progress by the
+clock; an arbitrary user window extending past the watermark falls
+through to a real fetch rather than silently coming back short, and so
+does a night that has ended but isn't finalised (one the previous-night
+re-pull is working on): its AOS half is fetched from Loki into its own
+nested dir, and its SFM half, the night dir itself, is refused with the
+re-pull named until the re-pull finishes. Rebuilding a night from disk
+follows the same line: while the night is in progress the newest
+"night so far" slice is its rebuild source, and once it has ended only
+a whole-night cache is. Successive opens as the watermark advances each materialize
 a fresh clamped slice (an unchanged watermark reuses the previous one);
 the stale ones are ordinary windows that LRU eviction reclaims.
 

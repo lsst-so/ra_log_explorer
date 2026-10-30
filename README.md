@@ -681,7 +681,10 @@ pod log says when it starts and finishes (`Live: re-pulling dayObs …`,
 `Live: re-pulled dayObs … in N min`), and `/api/live` shows it as
 `backfillDayObs` / `backfillError`. Until it finishes, an exposure from
 last night beyond what has arrived is fetched from Loki as it would be
-without live mode.
+without live mode, and so is last night's AOS night view; its SFM view
+answers *"dayObs N has ended but its logs are still being pulled from
+Loki"* until the re-pull is done, rather than showing part of the night
+as if it were all of it.
 
 The night view benefits too: opening the *current* night's dayObs no
 longer re-fetches hours of AOS logs from Loki — it slices "the night so
@@ -726,6 +729,14 @@ and user. Check also that the window is inside Loki's retention (about
 lines from the pod's log in Grafana/Loki or Argo CD. Set
 `RA_LOG_EXPLORER_LOG_LEVEL=DEBUG` to also log every `logcli` call and
 HTTP request.
+
+**"dayObs N has ended but its logs are still being pulled from Loki
+(on disk through …); try again in a few minutes"** — the server is
+re-pulling that night in the background (see [Live mode](#live-mode-deployments))
+and the SFM night view needs all of it. The message names how far the
+re-pull has got; `/api/live` shows the same as `backfillDayObs`. Wait
+for it to finish, or look at the AOS view or an exposure, which fetch
+what they need from Loki directly.
 
 **"No exposure-time record for dataId=N" / ConsDB unreachable** — ConsDB
 either has no row for that id yet or is down. The **manual shutter close**

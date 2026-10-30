@@ -221,7 +221,14 @@ duplicated. It then decides in order:
    dayObs), which is served clamped to the watermark — "the night so
    far". This step deliberately sits **outside** the window-in-the-past
    gate so the in-progress night qualifies; only `forceRefresh`
-   disables it. The window is materialized by slicing (see *Live night
+   disables it. The clamp applies only while the night is in progress
+   by the clock. A night that has *ended* with its watermark short of
+   its end is being re-pulled from Loki (the previous-night backfill) or
+   awaits the orphan sweep, and the request is for the whole night: a
+   `podRegex` request falls through to a fresh fetch into its own
+   nested `pods=` dir, and the night's own unfiltered window is refused
+   (step 4) with a message naming the re-pull and its watermark, rather
+   than served short and marked complete. The window is materialized by slicing (see *Live night
    dirs*) and returned with `cacheReuse = "night-slice"`; a repeat
    against an unchanged watermark reuses the previous slice as an exact
    hit. When the window to slice *is* the night's own — the watermark
@@ -269,7 +276,10 @@ duplicated. It then decides in order:
    Returns the requested directory with `cacheReuse = "none"`. A
    requested directory carrying a `_live.json` is refused outright: it
    belongs to the poller, and a fresh fetch would truncate files it is
-   appending to.
+   appending to. When that night has already ended, the refusal says
+   instead that its logs are still being pulled from Loki, with the
+   watermark they have reached, since that is what the user needs to
+   know (try again in a few minutes).
 
 Steps 2 and 3 ignore any cache whose `fetchSchemaVersion` doesn't match
 the current `CACHE_SCHEMA_VERSION`. That's what keeps a stale snapshot

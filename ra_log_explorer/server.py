@@ -1542,6 +1542,11 @@ def _findNightCacheDir(dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> Path | No
     """
     aos = view == NIGHT_VIEW_AOS
     want = (_isoForLogcli(dayObsStartUtc(dayObs)), _isoForLogcli(dayObsEndUtc(dayObs)))
+    # While the night is in progress the newest "night so far" slice is
+    # the best there is. Once it has ended only the whole night will do:
+    # the slices it left behind are truncated nights, and the newest of
+    # them would be rebuilt as the night until someone fetched it again.
+    inProgress = dt.datetime.now(dt.timezone.utc) < dayObsEndUtc(dayObs)
     best: tuple[str, Path] | None = None
     for inner, meta in _iterCompletedCaches(nightMode=aos):
         spec = meta.get("spec") or {}
@@ -1553,9 +1558,12 @@ def _findNightCacheDir(dayObs: int, view: str = DEFAULT_NIGHT_VIEW) -> Path | No
                 continue
             try:
                 windowFrom = dt.datetime.fromisoformat(fromIso.replace("Z", "+00:00"))
+                windowTo = dt.datetime.fromisoformat(str(spec.get("toIso")).replace("Z", "+00:00"))
             except ValueError:
                 continue
             if int(windowFrom.strftime("%Y%m%d")) != dayObs:
+                continue
+            if not inProgress and windowTo != dayObsEndUtc(dayObs):
                 continue
         else:
             # Unfiltered, and *exactly* this night: an exposure or range

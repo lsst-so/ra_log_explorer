@@ -47,6 +47,11 @@ def _eventLine(ts: dt.datetime, name: str, body: str = "reason=Started kind=Pod 
     return (json.dumps({"labels": {"name": name}, "line": body, "timestamp": stamp}) + "\n").encode()
 
 
+def _pretendInProgress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make fetch's clock read 12:59 on 20260711, so that night is still in progress."""
+    monkeypatch.setattr(fetch, "_utcNow", lambda: _t(59))
+
+
 def _t(minute: int, second: int = 0) -> dt.datetime:
     """A timestamp inside the 20260711 night (12:xx UTC)."""
     return dt.datetime(2026, 7, 11, 12, minute, second, tzinfo=UTC)
@@ -278,10 +283,10 @@ def test_fetchAll_serves_inprogress_night_clamped_to_watermark(
         raise AssertionError("in-progress night should be sliced, not fetched")
 
     monkeypatch.setattr(fetch, "_run_logcli", boom)
+    _pretendInProgress(monkeypatch)
     # The night's own window, exactly as the night-mode fetch path
-    # builds it. The clamping logic keys off "request == the night's own
-    # window, watermark short of its end" and never consults the clock,
-    # so this exercises the in-progress-night path as production runs it.
+    # builds it: the clamp keys off "request == the night's own window,
+    # watermark short of its end, night not over".
     spec = replace(
         _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711)),
         podRegex=".*aos.*",
@@ -336,6 +341,7 @@ def test_a_night_refetch_reclaims_the_window_it_supersedes(
         "_run_logcli",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must be sliced, not fetched")),
     )
+    _pretendInProgress(monkeypatch)
     spec = replace(_sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711)), podRegex=".*aos.*")
 
     def watermarkTo(when: dt.datetime) -> None:
@@ -519,9 +525,45 @@ def test_fetchAll_refuses_to_fetch_over_a_live_night_dir(
     poller is appending to that is silent corruption, so it is refused."""
     _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"pod-a": [_t(3)]})
     monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: b"")
+    _pretendInProgress(monkeypatch)
     spec = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))
     with pytest.raises(fetch.FetchError, match="live night directory"):
         fetch.fetchAll(spec, forceRefresh=True)
+
+
+def test_a_night_that_has_ended_is_not_served_clamped(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clamping is for the night in progress. A night that is over with
+    its watermark short of its end is being re-pulled from Loki (or
+    awaits the orphan sweep), and whoever asks for it wants all of it:
+    the AOS half goes to Loki like any other fetch, into its own nested
+    dir, and the SFM half, which is the night dir itself, is refused
+    with the re-pull named rather than handed a truncated night marked
+    complete."""
+    nightDir = _makeNightDir(
+        tmpCacheRoot, watermark=_t(30), podTimes={"s-lsstcam-run-aos-worker-1": [_t(6), _t(40)]}
+    )
+    monkeypatch.setattr(fetch, "_utcNow", lambda: dayObsEndUtc(20260711) + dt.timedelta(hours=1))
+    calls: list[str] = []
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        calls.append(extraArgs[0])
+        return b""
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    own = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))
+    aosDir, aosMeta = fetch.fetchAll(replace(own, podRegex=".*aos.*"))
+    assert aosMeta["cacheReuse"] == "none" and calls, "the AOS half did not go to Loki"
+    assert aosDir.parent == nightDir and aosDir.name.startswith("pods=")
+    with pytest.raises(fetch.FetchError, match="still being pulled from Loki") as refused:
+        fetch.fetchAll(own)
+    assert fetch._fmtLogcliTime(_t(30)) in str(refused.value)
+    clamped = windowCachePath(
+        "yagan", "rapid-analysis", own.fromIso, fetch._fmtLogcliTime(_t(30)), podRegex=None
+    )
+    assert not clamped.exists(), "a slice of the ended night was written after all"
+    assert (nightDir / fetch.PODS_DIR_NAME / "s-lsstcam-run-aos-worker-1.jsonl").exists()
 
 
 def test_fetchAll_prefers_an_exact_cache_over_slicing(
@@ -646,6 +688,7 @@ def test_clamped_slice_and_direct_window_fetch_are_serialised(
     import threading
 
     _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"pod-a": [_t(6), _t(7), _t(8)]})
+    _pretendInProgress(monkeypatch)
     nightOwn = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))  # clamps to the watermark
     direct = _sliceSpec(dayObsStartUtc(20260711), _t(30))  # the clamped target, asked for directly
     inFlight = {"n": 0, "maxConcurrent": 0}
