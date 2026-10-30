@@ -1452,6 +1452,160 @@ def test_summarizeAll_does_not_stall_other_threads(tmp_path: Path, monkeypatch: 
     assert rate > 5000, f"{rate:.0f} stats/s while a parse ran"
 
 
+def test_parsing_in_process_answers_as_the_pool_does(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``PARSE_WORKERS=0`` exists to debug the parser, which is only any
+    use if it gives the same answer as the pool: the same summaries, the
+    same event filtering and the same progress calls."""
+    from ra_log_explorer import night
+
+    _plantWindow(tmp_path, _SAMPLE_PODS)
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 2)
+    pooledProgress: list[tuple[int, int]] = []
+    pooled = parse.summarizeAll(
+        tmp_path, progress=lambda i, n: pooledProgress.append((i, n)), eventKinds=night.NIGHT_EVENT_KINDS
+    )
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 0)
+    inProcessProgress: list[tuple[int, int]] = []
+    inProcess = parse.summarizeAll(
+        tmp_path, progress=lambda i, n: inProcessProgress.append((i, n)), eventKinds=night.NIGHT_EVENT_KINDS
+    )
+    assert inProcess == pooled
+    assert inProcessProgress == pooledProgress == [(i, 4) for i in range(1, 5)]
+    kept = {ev.kind for s in inProcess for ev in s.events}
+    assert kept and kept <= night.NIGHT_EVENT_KINDS
+
+
+def _summarizeWithin(cacheDir: Path, seconds: float = 20.0) -> list[parse.PodSummary]:
+    """``summarizeAll``, failing the test rather than hanging it if the parse never finishes."""
+    import threading
+    from concurrent.futures import Future
+
+    out: Future[list[parse.PodSummary]] = Future()
+
+    def run() -> None:
+        try:
+            out.set_result(parse.summarizeAll(cacheDir))
+        except BaseException as e:  # noqa: BLE001 (handed to the test thread)
+            out.set_exception(e)
+
+    threading.Thread(target=run, daemon=True).start()
+    return out.result(timeout=seconds)
+
+
+def test_a_pod_that_cannot_be_read_fails_the_parse_and_spares_the_pool(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pod's own error comes back to the parse as itself, rather than
+    leaving it waiting on a result that never arrives. Only a dead worker
+    replaces the pool: anything else leaves it serving the next parse."""
+    _plantWindow(tmp_path, _SAMPLE_PODS)
+    unreadable = tmp_path / "pods" / "s-lsstcam-run-sfm-runner-workerset-99.jsonl"
+    unreadable.mkdir()
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    dispatcher = parse._parsePool()
+    with pytest.raises(IsADirectoryError):
+        _summarizeWithin(tmp_path)
+    assert parse._pool is dispatcher
+    unreadable.rmdir()
+    assert len(_summarizeWithin(tmp_path)) == len(_SAMPLE_PODS)
+
+
+def _threadDispatcher(slots: int) -> tuple[parse._ParseDispatcher, list[str]]:
+    """A dispatcher over a thread pool, so patches to the parser reach the
+    "workers"; also returns the names of the pods handed to them, in order."""
+    from concurrent.futures import Future, ThreadPoolExecutor
+
+    handed: list[str] = []
+    threads = ThreadPoolExecutor(max_workers=slots)
+
+    class RecordingPool:
+        def submit(self, fn: Any, *args: Any) -> Future[Any]:
+            handed.append(args[0].stem)
+            return threads.submit(fn, *args)
+
+        def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
+            threads.shutdown(wait=wait, cancel_futures=cancel_futures)
+
+    pool: Any = RecordingPool()
+    return parse._ParseDispatcher(pool, slots=slots), handed
+
+
+def test_closing_the_dispatcher_fails_the_pods_still_queued(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When a worker dies the pool is replaced, and the old dispatcher can
+    still hold pods queued by other parses. Those must fail at once: each
+    one waiting on it is a job thread, and a page following that job."""
+    import threading
+    from concurrent.futures.process import BrokenProcessPool
+
+    started, release = threading.Event(), threading.Event()
+    realSummarize = parse.summarizePod
+
+    def busyParse(podLogPath: Path, eventsLogPath: Path | None) -> parse.PodSummary:
+        started.set()
+        release.wait(10)
+        return realSummarize(podLogPath, eventsLogPath)
+
+    monkeypatch.setattr(parse, "summarizePod", busyParse)
+    dispatcher, handed = _threadDispatcher(slots=1)
+    try:
+        running = dispatcher.submit((0, 0), (tmp_path / "a.jsonl", None, None))
+        assert started.wait(10)
+        queued = [dispatcher.submit((0, 0), (tmp_path / f"{name}.jsonl", None, None)) for name in "bc"]
+        dispatcher.close()
+        for future in queued:
+            assert isinstance(future.exception(timeout=5), BrokenProcessPool)
+        assert handed == ["a"]
+    finally:
+        release.set()
+    assert running.result(timeout=5).pod == "a", "the pod already being parsed still finishes"
+
+
+def test_a_failed_parse_hands_no_more_of_its_pods_to_the_workers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One pod failing fails its parse, and the parse's other pods are
+    cancelled rather than parsed for nobody: on a summit night that is up
+    to a minute of every worker, taken from whichever parse is next."""
+    import threading
+    import time
+
+    pods = {
+        f"s-lsstcam-run-sfm-runner-workerset-{i}": _SAMPLE_PODS["s-lsstcam-run-head-node-0"]
+        for i in range(10)
+    }
+    _plantWindow(tmp_path, pods)
+    release = threading.Event()
+    realSummarize = parse.summarizePod
+    calls = 0
+
+    def failingFirst(podLogPath: Path, eventsLogPath: Path | None) -> parse.PodSummary:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("corrupt pod log")
+        release.wait(10)  # the rest are slow: what the caller cancels is still queued
+        return realSummarize(podLogPath, eventsLogPath)
+
+    monkeypatch.setattr(parse, "summarizePod", failingFirst)
+    dispatcher, handed = _threadDispatcher(slots=1)
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    monkeypatch.setattr(parse, "_pool", dispatcher)
+    try:
+        with pytest.raises(RuntimeError, match="corrupt pod log"):
+            _summarizeWithin(tmp_path)
+    finally:
+        release.set()
+    deadline = time.monotonic() + 10
+    while (dispatcher._queue or dispatcher._inFlight) and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert not dispatcher._queue and not dispatcher._inFlight
+    # The failed pod, and at most the one handed out before the failure was seen.
+    assert len(handed) <= 2, handed
+    dispatcher.close()
+
+
 def test_podsForTimeline_includes_other_group_even_without_match(tmp_path: Path) -> None:
     """``"other"``-group pods are deliberately surfaced regardless of
     whether they touched the dataId — the UI safety net for unknown /
