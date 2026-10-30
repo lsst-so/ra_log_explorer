@@ -308,8 +308,10 @@ The browser app has three views:
   ready/wait status chip, refreshing itself every 30 s while the page
   is open — see *Live mode (deployments)* below.
 - **Admin view** — `/?admin=1`, linked from the home topbar (no
-  separate permissions; anyone can open it). Hosts the cached-windows
-  table — every log window on disk, per-row delete — and a *flush
+  separate permissions; anyone can open it). A *Deployment* panel at
+  the top names the running build — package version and the git commit
+  it was built from, linked to that commit on GitHub. Below it, the
+  cached-windows table — every log window on disk, per-row delete — and a *flush
   entire cache* button. Caching is invisible to day-to-day use; this
   page is for operators.
 - **Explore view** — the timeline + detail drawer for one loaded

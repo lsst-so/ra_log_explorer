@@ -101,6 +101,7 @@ jobs:
           push: false
           load: true
           tags: "ra-log-explorer:ci"
+          build-args: "GIT_HASH=${{ github.sha }}"
           cache-from: "type=gha"
           cache-to: "type=gha,mode=max"
 
@@ -170,6 +171,10 @@ jobs:
           # Writable despite the read-only root filesystem.
           curl -fsS localhost:8080/log-explorer/api/cache >/dev/null \
             || fail "cache root is not usable"
+
+          # The admin page's build panel names the commit actually deployed.
+          [ "$(curl -fsS localhost:8080/log-explorer/api/version | jq -r .gitHash)" = "${{ github.sha }}" ] \
+            || fail "the image does not report the commit it was built from"
 
           # logcli is present and is the pinned version the fetch path needs.
           docker exec ra-le-ci logcli --version 2>&1 | head -1
@@ -295,5 +300,6 @@ jobs:
         with:
           image: ${{ github.repository }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
+          build-args: "GIT_HASH=${{ github.sha }}"
 
       - run: echo "pushed ghcr.io/${{ github.repository }}:${{ steps.build.outputs.tag }}"

@@ -1379,6 +1379,34 @@ function startAdmin() {
     adminListenersWired = true;
   }
   loadSite();
+  loadBuildInfo();
   refreshCache();
 }
 window.startAdmin = startAdmin;
+
+const REPO_URL = 'https://github.com/lsst-so/ra_log_explorer';
+
+async function loadBuildInfo() {
+  const versionEl = document.getElementById('build-version');
+  const hashEl = document.getElementById('build-hash');
+  let build;
+  try {
+    const r = await fetch(apiUrl('/api/version'));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    build = await r.json();
+  } catch (_) {
+    versionEl.textContent = hashEl.textContent = 'unavailable';
+    return;
+  }
+  versionEl.textContent = build.version;
+  if (!build.gitHash) {
+    hashEl.textContent = 'unknown';
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = `${REPO_URL}/commit/${build.gitHash}`;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = build.gitHash;
+  hashEl.replaceChildren(a);
+}

@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import config, exposureTimes
+from ra_log_explorer import __version__, buildInfo, config, exposureTimes
 from ra_log_explorer import jobs as jobsModule
 from ra_log_explorer import parse
 from ra_log_explorer import server as serverModule
@@ -1260,6 +1260,16 @@ def test_site_endpoint_returns_the_served_site(runningServer: RunningServer) -> 
     assert body["consdbUrl"]
     assert "consdbTokenFile" not in body
     assert "tokenFile" not in body
+
+
+def test_version_endpoint_reports_the_build(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(buildInfo, "GIT_HASH", "0123abcd")
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/version")
+    assert status == 200
+    assert body == {"version": __version__, "gitHash": "0123abcd"}
 
 
 def test_sites_endpoint_is_gone(runningServer: RunningServer) -> None:

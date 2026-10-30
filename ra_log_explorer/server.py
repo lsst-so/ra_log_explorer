@@ -24,6 +24,7 @@ every route is mounted under ``ServerContext.basePath``):
   DELETE /api/cache/<cluster>/<ns>/<slug>[/<pods=…>]  delete one cached window
   GET    /api/exposure-time/<dataId>[?instrument=<>]  dataId -> ConsDB exposure record (TAI t-zero)
   GET    /api/site                                the one site this server serves (read-only)
+  GET    /api/version                             the running build: package version + git hash
   GET    /api/live                                live poller snapshot ({enabled: false} when off)
   POST   /api/fetch                               start an exposure fetch; returns {jobId}
   POST   /api/fetch-night                         start a night fetch; returns {jobId}
@@ -50,7 +51,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 
-from . import exposureTimes, night
+from . import buildInfo, exposureTimes, night
 from . import parse as parser
 from .config import (
     DEFAULT_NIGHT_VIEW,
@@ -2446,6 +2447,9 @@ def _makeHandler(ctx: ServerContext) -> type[BaseHTTPRequestHandler]:
                 return
             if path == "/api/cache":
                 self._send_json(_cacheListing())
+                return
+            if path == "/api/version":
+                self._send_json({"version": buildInfo.VERSION, "gitHash": buildInfo.GIT_HASH})
                 return
             if path == "/api/site":
                 # Which observatory's logs these are. Read-only: the UI

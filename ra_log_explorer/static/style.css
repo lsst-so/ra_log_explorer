@@ -268,6 +268,20 @@ body[data-site="bts"]    { --site-accent: #ff8a3a; }
   min-width: 0;
 }
 
+.build-info {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 4px 16px;
+  margin: 0;
+  font-size: 13px;
+}
+.build-info dt { color: var(--text-muted); }
+.build-info dd {
+  margin: 0;
+  font-family: var(--font-mono);
+  overflow-wrap: anywhere;
+}
+
 /* The two fetch modes sit side by side so they read as alternatives —
    "All RA processing" (one exposure / a range) vs "AOS processing" (a
    whole night). Wraps to a column when the viewport is too narrow. */

@@ -19,6 +19,9 @@ venv/
 .idea/
 .DS_Store
 
+# Written by the image build; a stray copy here would mask `git rev-parse`
+ra_log_explorer/_gitHash.txt
+
 # Tool output
 *.log
 /tmp/

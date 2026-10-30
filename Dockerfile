@@ -46,6 +46,12 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY --from=logcli /out/logcli /usr/local/bin/logcli
 COPY ra_log_explorer/ ./ra_log_explorer/
+# The commit the image was built from, shown on the admin page. A file in
+# the package rather than an ENV: it describes the build, not the
+# deployment, so nothing in the chart should be able to override it. It
+# goes in before the install so both copies of the package carry it.
+ARG GIT_HASH=""
+RUN printf '%s\n' "${GIT_HASH}" > ra_log_explorer/_gitHash.txt
 RUN python -m pip install --no-cache-dir --no-deps .
 
 # Matches the securityContext the deployment runs with. Nothing in the image

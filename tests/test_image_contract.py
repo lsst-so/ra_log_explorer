@@ -75,3 +75,15 @@ def test_bakes_in_no_environment() -> None:
     body = _dockerfile()
     envLines = [ln.strip() for ln in body.splitlines() if ln.strip().startswith("ENV ")]
     assert envLines == [], f"image bakes in environment: {envLines}"
+
+
+def test_every_image_build_records_its_commit() -> None:
+    """The admin page names the deployed commit from a file the build
+    writes from ``GIT_HASH``. A build that forgets the arg still succeeds
+    and deploys, and the page then says "unknown" exactly when someone
+    needs to know what is running."""
+    assert re.search(r'^ARG GIT_HASH=""$', _dockerfile(), re.MULTILINE)
+    assert "> ra_log_explorer/_gitHash.txt" in _dockerfile()
+    workflow = (DOCKERFILE.parent / ".github" / "workflows" / "build.yaml").read_text()
+    # The smoke test's image and the pushed one.
+    assert workflow.count('build-args: "GIT_HASH=${{ github.sha }}"') == 2
