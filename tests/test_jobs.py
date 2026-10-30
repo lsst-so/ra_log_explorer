@@ -394,3 +394,34 @@ def test_only_the_newest_finished_jobs_are_kept(monkeypatch: pytest.MonkeyPatch)
     assert running.jobId in kept
     assert {j.jobId for j in finished[-3:]} <= kept
     assert not {j.jobId for j in finished[:2]} & kept
+
+
+def test_a_finished_job_is_never_joined(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job sends its last event a moment before it stops counting as
+    running. A request in that moment, a retry straight after a failure
+    above all, must start new work rather than be handed the finished
+    job, and with it the same failure again."""
+    import threading
+
+    def lokiDown(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
+        raise RuntimeError("Loki went away")
+
+    monkeypatch.setattr(jobs, "fetchAll", lokiDown)
+    mgr = jobs.JobManager()
+    finished, release = threading.Event(), threading.Event()
+    run = mgr._run
+
+    def runThenLinger(job: jobs.FetchJob, onComplete: jobs.OnComplete) -> None:
+        run(job, onComplete)
+        finished.set()
+        release.wait(10)
+
+    monkeypatch.setattr(mgr, "_run", runThenLinger)
+    try:
+        failed = mgr.startJob(mgr.createJob(_spec(), 1, _tZero()), lambda j: None)
+        assert finished.wait(10)
+        assert failed.status == "error"
+        retry = mgr.startJob(mgr.createJob(_spec(), 1, _tZero()), lambda j: None)
+        assert retry is not failed
+    finally:
+        release.set()

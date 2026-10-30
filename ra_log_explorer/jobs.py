@@ -341,7 +341,9 @@ class JobManager:
         """
         with self._lock:
             running = self._running.get(job.key())
-            if running is not None:
+            # Terminal but not yet forgotten: runJob drops it from _running
+            # only after its last event, so it can still be here, finished.
+            if running is not None and not running.isTerminal():
                 self._jobs.pop(job.jobId, None)
                 return running
             self._running[job.key()] = job
