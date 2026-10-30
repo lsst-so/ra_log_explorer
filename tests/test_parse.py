@@ -1562,6 +1562,26 @@ def test_closing_the_dispatcher_fails_the_pods_still_queued(
     assert running.result(timeout=5).pod == "a", "the pod already being parsed still finishes"
 
 
+def test_a_parse_holding_a_dispatcher_closed_under_it_fails_rather_than_hangs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A parse picks the dispatcher up, then stats its pods before
+    submitting them; another parse can find the pool broken and close the
+    dispatcher in between. Queued after the close, the pods would never be
+    handed out: the job would sit in "parsing" for good, and every later
+    request for that view would join it."""
+    from concurrent.futures.process import BrokenProcessPool
+
+    _plantWindow(tmp_path, _SAMPLE_PODS)
+    dispatcher, handed = _threadDispatcher(slots=1)
+    dispatcher.close()
+    monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    monkeypatch.setattr(parse, "_parsePool", lambda: dispatcher)
+    with pytest.raises(BrokenProcessPool):
+        _summarizeWithin(tmp_path, seconds=5)
+    assert handed == []
+
+
 def test_a_failed_parse_hands_no_more_of_its_pods_to_the_workers(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

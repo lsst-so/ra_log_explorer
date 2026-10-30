@@ -1386,8 +1386,15 @@ class _ParseDispatcher:
         """Queue one pod; lower ``priority`` is handed to a worker sooner."""
         future: Future[PodSummary] = Future()
         with self._ready:
-            heapq.heappush(self._queue, (priority, next(self._seq), future, task))
-            self._ready.notify()
+            if not self._closed:
+                heapq.heappush(self._queue, (priority, next(self._seq), future, task))
+                self._ready.notify()
+                return future
+        # Closed between a parse picking this dispatcher up and submitting
+        # to it (another parse found the pool broken). Nothing would ever
+        # hand the pod to a worker, so fail it as close() fails the queue.
+        future.set_running_or_notify_cancel()
+        future.set_exception(BrokenProcessPool("the parse pool was replaced"))
         return future
 
     def close(self) -> None:

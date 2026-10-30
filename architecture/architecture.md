@@ -1480,7 +1480,11 @@ poller for 37 minutes (measured locally: a 540-pod slice goes from
 0.4 s to 199 s beside one busy thread). The pool is shared so that
 concurrent jobs queue for the same few cores rather than each taking
 all of them; a worker killed mid-parse fails that parse, and the next
-one gets a fresh pool.
+one gets a fresh pool. Every parse still holding the replaced pool
+fails with it, including one that picked the pool up just before it was
+replaced and submits afterwards: its pods would otherwise sit in a
+queue nothing reads, and the job, with every request that joins it,
+would wait for good.
 
 The pool is fed through `parse._ParseDispatcher` rather than
 directly, because the executor's own queue is first-in first-out:
