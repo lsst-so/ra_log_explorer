@@ -395,6 +395,30 @@ def test_fetchAll_does_not_clamp_arbitrary_future_windows(
     assert calls  # it really went to Loki
 
 
+def test_a_slice_that_fails_falls_back_to_a_fetch(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In live mode nearly every view is a slice of the night. Slicing is
+    an optimisation, so one that fails (the volume filling up, say) costs
+    the fetch that would have happened without it, not the view."""
+    _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"sfm-runner-1": [_t(7)]})
+
+    def volumeFull(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
+        raise OSError(28, "No space left on device")
+
+    calls: list[str] = []
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        calls.append(extraArgs[0])
+        return b""
+
+    monkeypatch.setattr(fetch, "materializeNightSlice", volumeFull)
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    _, meta = fetch.fetchAll(_sliceSpec(_t(5), _t(10)))
+    assert meta["cacheReuse"] == "none"
+    assert calls
+
+
 def test_findSupersetCache_skips_live_dirs(tmpCacheRoot: Path) -> None:
     """A live-built night dir must never be handed over as a superset —
     that path parses whole directories, and a night is minutes of parse."""
@@ -2120,3 +2144,70 @@ def test_no_re_pull_by_default_or_with_a_pinned_night(
         mgr = _backfillManager(monkeypatch, [], **kwargs)
         mgr.tick(now=_t(10))
         assert mgr._backfill is None, kwargs
+
+
+def test_a_re_pull_running_across_noon_is_not_also_swept_as_an_orphan(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit night takes the re-pull about an hour, so the noon rollover
+    can land in the middle of one. By then the night it is pulling is two
+    nights back and looks like any other unfinalised orphan; were the
+    sweep to finish it too, two threads would append to the same pod
+    files. The re-pull stays its only writer."""
+    import threading
+
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    stub = live.fetchPodWindowInto
+    pulling, release = threading.Event(), threading.Event()
+
+    def heldMidNight(
+        spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+    ) -> tuple[int, bool, str]:
+        if fromT == _prev(6) and not pulling.is_set():
+            pulling.set()
+            release.wait(10)
+        return stub(spec, pod, fromT, toT, fh)
+
+    monkeypatch.setattr(live, "fetchPodWindowInto", heldMidNight)
+    prevDir = mgr._nightDir(_PREV)
+    try:
+        mgr.tick(now=_t(10))
+        assert pulling.wait(10)
+        mgr.tick(now=dayObsStartUtc(20260712) + dt.timedelta(minutes=10))
+        assert mgr.snapshot()["dayObs"] == 20260712
+        assert mgr.snapshot()["backfillDayObs"] == _PREV
+        assert not (prevDir / fetch.META_NAME).exists(), "the sweep finalised a night still being pulled"
+    finally:
+        release.set()
+    _awaitBackfill(mgr)
+    assert json.loads((prevDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+
+
+def test_a_re_pull_with_consdb_down_still_finalises_the_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The night's ConsDB records only spare its views a lookup later; the
+    logs are the night. ConsDB being down costs the records, with a
+    warning, and never the finalised night, nor a re-pull of all of it."""
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+
+    def consdbDown(dayObs: int, token: str, *, consdbUrl: str) -> list:
+        raise exposureTimes.ConsDbError("ConsDB HTTP 503: Service Unavailable")
+
+    monkeypatch.setattr(live.exposureTimes, "queryExposureRecordsForDayObs", consdbDown)
+    with caplog.at_level(logging.WARNING, logger="ra_log_explorer.live"):
+        mgr.tick(now=_t(10))
+        _awaitBackfill(mgr)
+    assert (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+    mgr._publishSnapshot()
+    assert mgr.snapshot()["backfillError"] is None
+    assert f"ConsDB records for dayObs {_PREV} not cached" in caplog.text
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is None
+    # Finalised, so the next poll leaves it alone.
+    pulled = mgr._backfill
+    mgr.tick(now=_t(20))
+    assert mgr._backfill is pulled

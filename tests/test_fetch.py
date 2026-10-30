@@ -891,6 +891,27 @@ def test_fetchOnePod_flags_incomplete_at_split_floor(monkeypatch: pytest.MonkeyP
     assert res.lines == 12
 
 
+def test_fetchOnePod_flags_a_burst_found_only_after_splitting(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The split floor is usually reached several splits into a wide
+    window. The one burst that can't be split must still mark the whole
+    pod incomplete (the flag the incomplete-fetch banner and the CLI
+    warning read), while every other line of the window still arrives."""
+    spec = _stubSpec()
+    fromT, toT = fetch._parseIso(spec.fromIso), fetch._parseIso(spec.toIso)
+    burstAt = fromT + (toT - fromT) / 3
+    burst = _evenEvents(burstAt, burstAt + dt.timedelta(milliseconds=1), 12)  # 12 >= cap(10) in 1 ms
+    fl = _FakeLoki(_evenEvents(fromT, toT, 20) + burst)
+    _installFakeLoki(monkeypatch, fl)
+    out = tmp_path / "pod.jsonl"
+    res = fetch._fetchOnePod(spec, "pod-x", out)
+    assert res.complete is False
+    assert "can't be split finer" in res.reason
+    assert res.lines == _countFileLines(out) == 32
+    assert len(fl.queryCalls) > 2, "the burst should only have been found by splitting"
+
+
 def test_run_logcli_streams_stdout_to_file_when_stdoutPath_given(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
