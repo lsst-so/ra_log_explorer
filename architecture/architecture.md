@@ -1437,7 +1437,9 @@ is one JSON event (`{"type": ...}`):
   ran under, and the client needs it rather than the topbar's current
   value: the user may have flipped the switch while the fetch ran, and
   by then the bare expId's slot may hold the other instrument's
-  exposure.
+  exposure. `elapsedS` is the job's own wall time, start event to
+  `done`, not the `elapsed_s` of the meta it read: for a rebuild or a
+  cache hit that is the fetch that originally wrote the window.
 - `error`: `{ error }` — terminal; the job failed.
 
 History is replayable: the SSE handler emits every event already in

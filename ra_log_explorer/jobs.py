@@ -290,11 +290,15 @@ class JobManager:
             onComplete(job)
             job.status = "done"
             finishedAt = job.finishedAt = dt.datetime.now(dt.timezone.utc)
+            # This job's own time. The meta's elapsed_s is the fetch that
+            # wrote the window, which for a rebuild or a cache hit could
+            # have been minutes, days ago.
+            elapsedS = (finishedAt - startedAt).total_seconds()
             podCount = meta.get("pod_count", 0)
             log.info(
                 "Job %s done in %.1fs: %d pods, cache %s, %s",
                 job.jobId,
-                (finishedAt - startedAt).total_seconds(),
+                elapsedS,
                 podCount,
                 meta.get("cacheReuse", "none"),
                 cacheDir,
@@ -322,7 +326,7 @@ class JobManager:
                     "cacheReuse": meta.get("cacheReuse", "none"),
                     "podCount": meta.get("pod_count", 0),
                     "totalBytes": meta.get("total_bytes", 0),
-                    "elapsedS": meta.get("elapsed_s", 0.0),
+                    "elapsedS": elapsedS,
                 }
             )
         except Exception as e:  # noqa: BLE001 — we surface every failure

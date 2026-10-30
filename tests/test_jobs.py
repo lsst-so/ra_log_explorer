@@ -376,6 +376,24 @@ def test_a_rebuild_job_never_fetches(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert seen[0]["cacheReuse"] == "rebuild" and seen[0]["pod_count"] == 3
 
 
+def test_done_reports_the_jobs_own_time_not_the_cached_fetchs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The page says "done in <elapsedS>". Read off the cache's meta, a
+    rebuild, or any job served from cache, reported however long the
+    original fetch took: minutes, for a parse of a few seconds."""
+    import time
+
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "elapsed_s": 340.0}')
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20260520, nightView="sfm")
+    job.rebuildFrom = tmp_path
+    mgr.runJob(job, onComplete=lambda j: time.sleep(0.05))
+    done = job.events[-1]
+    assert done["type"] == "done", job.error
+    assert 0.05 <= done["elapsedS"] < 5
+
+
 def test_a_fetch_runs_after_the_rebuild_it_would_have_joined(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
