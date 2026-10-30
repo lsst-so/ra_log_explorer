@@ -38,6 +38,10 @@ def test_stepping_moves_the_selection_and_re_anchors_the_timeline(app: Any, corp
     the reference says as well as which chip is lit."""
     openRange(app, corpus)
     chips = app.page.locator("#range-chips .range-chip")
+    # The chips render before the timeline fills #t0-info, and the text
+    # is read as a snapshot: sampled too early it is '', which every
+    # later reference "differs" from.
+    expect(app.page.locator("#t0-info")).to_contain_text("shutter close")
     firstT0 = app.page.locator("#t0-info").inner_text()
 
     app.page.locator("#range-next").click()
