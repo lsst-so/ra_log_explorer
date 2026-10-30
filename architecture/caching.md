@@ -454,7 +454,9 @@ reused instead, so the flagged directory is never revisited.
 `fetch.evictToFit(maxBytes, exempt=…)` removes the least-recently-
 viewed caches until the on-disk total is at or below `maxBytes`,
 exempting whichever caches the caller passes in (the just-fetched
-one, typically).
+one, typically) and every window that contains one: a night-mode cache
+is nested in its night's window dir, so evicting the window would take
+the exempt cache with it.
 
 - `maxBytes` is `config.MAX_CACHE_BYTES`, from
   `$RA_LOG_EXPLORER_MAX_CACHE_BYTES` (5 GiB if unset). Deployed, the

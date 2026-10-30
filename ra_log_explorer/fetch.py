@@ -1993,7 +1993,9 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], 
 
     Caches in ``exempt`` are never removed — used to spare the cache
     that was just fetched. (It would just be re-fetched on the next
-    request, which defeats the point of having any limit at all.)
+    request, which defeats the point of having any limit at all.) Nor
+    is any window holding one: a night-mode cache is nested in its
+    night's window dir, and removing that removes it too.
 
     Caches without a ``_last_viewed.txt`` sidecar are treated as
     oldest — they've never been opened, so they're the safest to drop.
@@ -2013,7 +2015,8 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], 
     epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
     candidates: list[tuple[dt.datetime, Path]] = []
     for d in _iterCacheDirs(root):
-        if d.resolve() in exemptR:
+        dR = d.resolve()
+        if any(e.is_relative_to(dR) for e in exemptR):
             continue
         lv = getCacheLastViewed(d) or epoch
         candidates.append((lv, d))

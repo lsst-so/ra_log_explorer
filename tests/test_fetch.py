@@ -1511,6 +1511,40 @@ def test_evictToFit_counts_a_nested_night_cache_once(tmpCacheRoot: Path) -> None
     assert total == fetch.cacheDuSizeBytes(tmpCacheRoot) <= 2000
 
 
+def test_evictToFit_spares_the_window_an_exempt_cache_is_nested_in(tmpCacheRoot: Path) -> None:
+    """A night-mode cache lives inside its night's window dir. With only
+    the cache itself exempt, a sweep that reached that window first took
+    the just-fetched night cache with it, and the job went on to parse an
+    empty directory and publish a night of no pods."""
+    base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+    outer = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T12:00:00Z",
+        "2026-05-21T12:00:00Z",
+        3000,
+        lastViewed=base - dt.timedelta(days=1),
+    )
+    inner = outer / "pods=__aos__"
+    (inner / "pods").mkdir(parents=True)
+    (inner / "_meta.json").write_text(json.dumps({"spec": {"podRegex": ".*aos.*"}}))
+    (inner / "pods" / "fake.jsonl").write_bytes(b"x" * 100)
+    fetch.markCacheViewed(inner, when=base)
+    other = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        2000,
+        lastViewed=base - dt.timedelta(hours=1),
+    )
+    removed, _ = fetch.evictToFit(maxBytes=1000, exempt=[inner])
+    assert removed == [other]
+    assert inner.exists() and outer.exists()
+
+
 def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
     unviewed = _plantWindowWithBody(
