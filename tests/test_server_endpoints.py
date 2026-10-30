@@ -1737,30 +1737,45 @@ def _heldParse(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, list[s
     return release, parsedOn
 
 
-def test_fetching_a_night_while_it_is_rebuilt_joins_the_rebuild(
+def test_fetching_a_night_while_it_is_rebuilt_runs_after_the_rebuild(
     runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A deep link is rebuilding a night from the cache when the same night
-    is asked for from the form (another tab, another user). That is the
-    same piece of work: one job, one parse, and no trip to Loki."""
+    is asked for from the form (another tab, another user). The rebuild
+    re-parses whatever is on disk, which for tonight is the last fetch's
+    "night so far"; the form asked for the night now. So the fetch is its
+    own job, run once the rebuild is done, and what it fetched is what is
+    published last."""
     host, port, _ctx = runningServer
-    _plantAosNight(tmpCacheRoot, 20260521)
+    cacheDir = _plantAosNight(tmpCacheRoot, 20260521)
+    fetches: list[str] = []
 
-    def noFetch(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
-        raise AssertionError("joined a rebuild, but fetched anyway")
+    def fetchAfter(spec: FetchSpec, progress: Any = None, forceRefresh: bool = False) -> tuple[Path, dict]:
+        fetches.append(threading.current_thread().name)
+        return cacheDir, json.loads((cacheDir / "_meta.json").read_text())
 
-    monkeypatch.setattr(jobsModule, "fetchAll", noFetch)
+    monkeypatch.setattr(jobsModule, "fetchAll", fetchAfter)
     release, parsedOn = _heldParse(monkeypatch)
     try:
         status, summary = _get(host, port, "/api/summary?dayObs=20260521")
         assert status == 200 and "rebuildJobId" in summary, summary
         status, fetched = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
         assert status == 202, fetched
-        assert fetched["jobId"] == summary["rebuildJobId"]
+        assert fetched["jobId"] != summary["rebuildJobId"]
+        assert not fetches, "the fetch ran alongside the rebuild"
+        # Asked for again from either side meanwhile, it is the fetch they follow.
+        status, again = _get(host, port, "/api/summary?dayObs=20260521")
+        assert again == {"loaded": False, "rebuildJobId": fetched["jobId"]}
+        status, twice = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert twice["jobId"] == fetched["jobId"]
     finally:
         release.set()
-    assert _awaitJob(host, port, summary["rebuildJobId"])["status"] == "done"
-    assert len(parsedOn) == 1
+    rebuilt = _awaitJob(host, port, summary["rebuildJobId"])
+    done = _awaitJob(host, port, fetched["jobId"])
+    assert rebuilt["status"] == done["status"] == "done"
+    assert done["finishedAt"] > rebuilt["finishedAt"]
+    assert fetches == [f"fetchjob-{fetched['jobId']}"]
+    assert len(parsedOn) == 2
 
 
 def test_a_deep_link_to_a_night_being_fetched_follows_the_fetch(

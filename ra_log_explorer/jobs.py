@@ -235,8 +235,8 @@ class JobManager:
         with self._lock:
             return list(self._jobs.values())
 
-    def runJob(self, job: FetchJob, onComplete: OnComplete) -> None:
-        """Execute one job on the calling thread.
+    def runJob(self, job: FetchJob, onComplete: OnComplete, after: FetchJob | None = None) -> None:
+        """Execute one job on the calling thread, once ``after`` (if any) has finished.
 
         Pushes events to ``job.events``; updates ``job.status`` along the way.
         Calls ``onComplete(job)`` *before* the final terminal event so any
@@ -244,6 +244,9 @@ class JobManager:
         after the server state has been updated.
         """
         try:
+            if after is not None:
+                with after.condition:
+                    after.condition.wait_for(after.isTerminal)
             self._run(job, onComplete)
         finally:
             with self._lock:
@@ -338,18 +341,28 @@ class JobManager:
         a fetch would otherwise each parse the same window, and for a
         summit night that is a minute of CPU and a second copy of the
         parsed night in memory.
+
+        A fetch never joins a rebuild, though: a rebuild re-parses what
+        is on disk, which for the night in progress is the "night so far"
+        slice of the *last* fetch, and whoever asked to fetch asked for
+        the night now. The fetch waits for the rebuild to finish and then
+        runs, so what it fetched is what ends up published, and it takes
+        the rebuild's place as the job later requests join.
         """
+        after: FetchJob | None = None
         with self._lock:
             running = self._running.get(job.key())
             # Terminal but not yet forgotten: runJob drops it from _running
             # only after its last event, so it can still be here, finished.
             if running is not None and not running.isTerminal():
-                self._jobs.pop(job.jobId, None)
-                return running
+                if job.rebuildFrom is not None or running.rebuildFrom is None:
+                    self._jobs.pop(job.jobId, None)
+                    return running
+                after = running
             self._running[job.key()] = job
         thread = threading.Thread(
             target=self.runJob,
-            args=(job, onComplete),
+            args=(job, onComplete, after),
             name=f"fetchjob-{job.jobId}",
             daemon=True,
         )

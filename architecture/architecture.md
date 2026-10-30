@@ -760,7 +760,15 @@ starts (or joins) a **rebuild job** and answers at once:
 A rebuild job is an ordinary fetch job (`FetchJob.rebuildFrom` set)
 whose fetch step is skipped: it parses the window it was pointed at,
 resolves shutter closes, and publishes the state, with the usual SSE
-progress and a `done` event whose `cacheReuse` is `"rebuild"`. The page
+progress and a `done` event whose `cacheReuse` is `"rebuild"`. Jobs
+for the same key (`FetchJob.key`) run once: a second rebuild, or a
+rebuild asked for while a fetch runs, follows the job already running.
+A fetch asked for while a *rebuild* runs is the exception: the rebuild
+re-parses what is on disk, which for the night in progress is the last
+fetch's "night so far", and the form asked for the night now. That
+fetch is its own job, started once the rebuild has finished (so the
+rebuild can't publish its older view over the fetched one), and from
+then on the job later requests of either kind follow. The page
 lands on home with the form prefilled from the URL, follows the job,
 and re-routes when it finishes, so a deep-linked tab (e.g. the dataId
 column in the admin view's cache table) still opens its view without

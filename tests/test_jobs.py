@@ -376,6 +376,56 @@ def test_a_rebuild_job_never_fetches(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     assert seen[0]["cacheReuse"] == "rebuild" and seen[0]["pod_count"] == 3
 
 
+def test_a_fetch_runs_after_the_rebuild_it_would_have_joined(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rebuild of the night in progress re-parses the last fetch's
+    "night so far" slice. A fetch asked for while it runs is not that
+    work: it is its own job, run once the rebuild has finished so the
+    rebuild can't publish its older night over the fetched one, and it
+    is the job that later requests of either kind join."""
+    import threading
+
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "cacheReuse": "none"}')
+    rebuildParsing, releaseRebuild = threading.Event(), threading.Event()
+    order: list[str] = []
+    fetched: list[str] = []
+
+    def fetchAll(spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False) -> Any:
+        fetched.append(threading.current_thread().name)
+        return tmp_path, {"spec": {}, "cacheReuse": "none", "pod_count": 0}
+
+    def complete(j: jobs.FetchJob) -> None:
+        if j.rebuildFrom is not None:
+            rebuildParsing.set()
+            releaseRebuild.wait(10)
+        order.append(j.jobId)
+
+    monkeypatch.setattr(jobs, "fetchAll", fetchAll)
+    mgr = jobs.JobManager()
+    rebuild = mgr.createNightJob(_spec(), 20260520, nightView="aos")
+    rebuild.rebuildFrom = tmp_path
+    assert mgr.startJob(rebuild, complete) is rebuild
+    assert rebuildParsing.wait(10)
+
+    fetch = mgr.startJob(mgr.createNightJob(_spec(), 20260520, nightView="aos"), complete)
+    assert fetch is not rebuild, "the fetch was satisfied by the rebuild"
+    assert not fetched, "the fetch ran alongside the rebuild"
+    # Everything else asked for meanwhile joins the fetch, rebuilds included.
+    later = mgr.createNightJob(_spec(), 20260520, nightView="aos")
+    later.rebuildFrom = tmp_path
+    assert mgr.startJob(later, complete) is fetch
+    assert mgr.startJob(mgr.createNightJob(_spec(), 20260520, nightView="aos"), complete) is fetch
+
+    releaseRebuild.set()
+    for job in (rebuild, fetch):
+        with job.condition:
+            assert job.condition.wait_for(job.isTerminal, timeout=10)
+    assert order == [rebuild.jobId, fetch.jobId]
+    assert fetched == [f"fetchjob-{fetch.jobId}"]
+    assert rebuild.status == fetch.status == "done"
+
+
 def test_only_the_newest_finished_jobs_are_kept(monkeypatch: pytest.MonkeyPatch) -> None:
     """Each job keeps its full progress log (~900 events for a summit
     exposure), so a registry that never forgets is a slow leak in a
