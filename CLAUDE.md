@@ -56,6 +56,7 @@ ra_log_explorer/
     exposureTimes.py             dataId → ConsDB exposure record (t-zero + the
                                  info-box properties), per-site on-disk cache
     sites.py, sites.toml         the site catalog: Loki cluster ⇄ its ConsDB
+    buildInfo.py                 version + git hash of the running build
     live.py                      live-mode poller: keeps the current night
                                  fetched so views are served from disk
     jobs.py                      FetchJob + JobManager: a thread per fetch,

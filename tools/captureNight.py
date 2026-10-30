@@ -32,7 +32,7 @@ Usage::
 
 Each night lands in ``<out>/<mon><dd>-night-<site>`` (e.g.
 ``aug11-night-bts``), with the ConsDB exposure records for all captured
-nights accumulating in the shared ``<out>/exposure-times/<site>.json``,
+nights accumulating in the shared ``<out>/exposure-times/<site>/<dayObs>.json``,
 mirroring the cache-root layout so staging is a straight copy.
 """
 

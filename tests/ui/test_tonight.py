@@ -198,7 +198,7 @@ def test_live_mode_serves_a_ready_exposure_by_slicing_the_night(
     monkeypatch.setattr(live, "fetchEventsWindowInto", lambda spec, a, b, fh: (0, True, ""))
     # ConsDB stands in for itself out of the corpus's own records: what
     # the poller would have been told, without a network.
-    cached = json.loads((liveCorpus.root / "exposure-times" / "summit.json").read_text())
+    cached = json.loads((liveCorpus.root / "exposure-times" / "summit" / f"{DAY_OBS}.json").read_text())
     # A handful around the exposure under test: the panel shows the most
     # recent 20, and this keeps the one we are watching on screen.
     records = [

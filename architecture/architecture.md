@@ -109,6 +109,7 @@ Sibling docs:
     │                            │ ◄────── DELETE /api/cache/.../<slug>[/<pods=…>]
     │                            │ ◄────── GET    /api/exposure-time/<id>
     │                            │ ◄────── GET    /api/site                   (read-only label)
+    │                            │ ◄────── GET    /api/version                (build panel)
     │                            │ ◄────── GET    /api/live                   (live-mode snapshot)
     │                            │ ◄────── POST   /api/fetch                  (exposure)
     │                            │ ◄────── POST   /api/fetch-night            (dayObs)
@@ -146,7 +147,7 @@ Sibling docs:
                           sites.toml (see below), so the same dataId can
                           resolve to a different record depending on the
                           active site. Persistent per-site on-disk cache
-                          at <cache_root>/exposure-times/<site>.json so
+                          at <cache_root>/exposure-times/<site>/<dayObs>.json so
                           once-resolved dataIds work offline.
 
        sites.py           Site catalog. A *site* pairs a Loki cluster
@@ -165,15 +166,16 @@ Sibling docs:
 |--------------------|--------------------------------------------------------------------------------|
 | `config.py`        | `FetchSpec` (frozen dataclass), cache-path helpers, dayObs ↔ UTC conversions, the `NIGHT_AOS_POD_REGEX` / `NIGHT_VIEWS` constants, base-path canonicalisation (`normalizeBasePath` / `defaultBasePath`), and **every deployment-varying default**, read from the environment once at import (see *Configuration* below). `_envInt` / `_envFloat` raise `ConfigError` on a malformed value — blank included — rather than falling back, so a typo'd Helm value stops the container instead of silently never taking effect. |
 | `fetch.py`         | `logcli` subprocess wrapper. Lists pods, fetches each pod's JSONL in parallel as count-presized single-batch chunks (works around grafana/loki#17270; see [caching.md](caching.md)), plus a cheap second pass for each pod's `k8s/events` lifecycle stream into `pods_events/`. Manages the on-disk cache (exact / superset / night-slice reuse), the schema-version flush, the `.partial` flag, the `_last_viewed.txt` and `_exposure_ids.txt` sidecars, the per-window write lock, and LRU disk eviction. |
-| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. |
+| `parse.py`         | Parses Loki JSONL → `LogLine` → `Event`. Owns the regex taxonomy in [parsing.md](parsing.md). Also parses the `k8s/events` stream into `POD_*` lifecycle Events (`classifyK8sEvent`), captures `TracebackRecord`s with class + capped body, and the carryover-aware dataId attribution per pod group. `summarizeAll` runs `summarizePod` in a shared process pool (see *Threading model*). |
 | `night.py`         | dayObs-wide rollups computed off `list[PodSummary]`: top stats, errors-by-type and -by-pod, first-task-start and calcZernikes-end histograms, the failure-row drilldown table, and the gather-only completeness check (dataIds with step1b activity but no step1a — impossible, so a dropped-logs tell). No I/O. |
-| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per-site to `<cache_root>/exposure-times/<siteName>.json` — exposure properties are immutable so the cache never goes stale. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
+| `exposureTimes.py` | dataId → curated ConsDB *exposure record* (`{instrument, obs_end, exp_time, physical_filter, img_type, science_program, observation_reason, group_id, cur_index/max_index, …}`, the `EXPOSURE_RECORD_COLUMNS` projection of a `SELECT *` plus the `instrument` the record was read out of). Exposure ids are unique only *within* an instrument, so records are keyed `(instrument, id)` as well as by the bare id; `probeOrderWinners` is the one place that decides what a bare id resolves to, and `queryExposureRecordsForDayObs` returns a list so a shared id can't drop an exposure. `obs_end` is the shutter-close (TAI) t-zero; `obsEnd(record)` pulls it out. Every public helper takes the ConsDB URL and resolved bearer token from the caller, so the same dataId can be queried against multiple sites without crosstalk. Probes `cdb_lsstcam.exposure` first and falls through to LATISS; `INSTRUMENTS_BY_PROBE_ORDER` is exactly those two — the whole set the observatory runs today — so an instrument outside the tuple is rejected rather than probed. Persists records per site and per dayObs to `<cache_root>/exposure-times/<siteName>/<dayObs>.json` — exposure properties are immutable so the cache never goes stale — and resolves many ids at once with `lookupCachedRecords`, one file read per night. Provides `queryExposureRecordBatch` for night/range prefetches (one `IN (…)` query per instrument, chunked). |
 | `sites.py`         | The site catalog (`sites.toml`). Loads at server start into `ServerContext.sites`. Each `Site` carries (`name`, `cluster`, `namespace`, `lokiAddr`, `consdbUrl`, `consdbTokenFile` — the last optional, `None` for a ConsDB that needs no auth). `siteByName` / `siteByCluster` are the lookups; the latter is how cache-rehydration paths figure out which site a window belongs to from its on-disk cluster component. |
+| `buildInfo.py`     | Which build is running: `VERSION` (`git describe --tags`, so a release tag names itself and there is no version number to bump) and `GIT_HASH`, both read once at import and served by `GET /api/version`. The image build has no `.git`, so the workflow computes both and the Dockerfile writes them into the package as `_version.txt` and `_gitHash.txt` from its `VERSION` and `GIT_HASH` build args (files rather than `ENV`, which the image contract forbids and the chart could override); a checkout has no such files and asks git (adding `-dirty` to the version for uncommitted changes). `None` when neither answers. The `version` in `pyproject.toml` is packaging metadata only and is not shown anywhere. |
 | `jobs.py`          | `FetchJob` + `JobManager` — the in-process worker pool the browser uses to kick off fetches. One daemon thread per job, an append-only event log per job (guarded by a `threading.Condition`), and the single `stateLock` that guards the keyed-state dicts. `createJob` (exposure), `createNightJob` (dayObs), and `createRangeJob` (start/stop pair) put a `kind` discriminator on each job. |
 | `live.py`          | `LiveNightManager` — the live-mode poller (deployments only; enabled by `RA_LOG_EXPLORER_LIVE_POLL_S > 0`). One daemon thread that incrementally fetches the current night's all-pods logs into a live night dir every tick, queries ConsDB for tonight's exposures per instrument, computes which are *ready* (shutter close + windowAfter ≤ watermark), finalises the night at noon-UTC rollover (verification pass + `_meta.json`), sweeps up nights an earlier restart left unfinalised, and publishes the snapshot `GET /api/live` serves. See *Live mode* below and [caching.md](caching.md) for the on-disk contract. |
-| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) is exceeded. |
+| `server.py`        | Stdlib `ThreadingHTTPServer` + JSON / SSE endpoints + static files, all mounted under `ServerContext.basePath`. Holds a long-lived `ServerContext` containing the `JobManager` and three LRU `OrderedDict`s of loaded states (`exposureStates: {expId → ServerState}`, `nightStates: {dayObs → NightState}`, `rangeStates: {"start-stop" → RangeState}`). Multiple tabs / dataIds / dayObses / ranges coexist; oldest-by-access gets evicted when `_MAX_LOADED_STATES` (8) of a kind is exceeded, or when all of them together exceed `RA_LOG_EXPLORER_MAX_LOADED_BYTES` (see *Multi-tab support*). |
 | `cli.py`           | Argument parsing + the optional "eager fetch" path (exposure mode only). Builds a `ServerContext` and hands it to `server.serve()`. When `--exposure-id`/`--t-zero` are omitted, hands over an empty context and lets the browser drive. Also hosts the `cache info`/`cache flush` subcommands. |
-| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId), plus the two images the page draws: `favicon.png` (the tab icon, declared in the template's `<link rel=icon>`) and `logo.png` (the observatory lockup, shown whole at the top-left of every view's topbar, which is what sets the bar's ~73 px height). Both are downscaled copies of the full-resolution art in `assets/`, because static files are sent with `Cache-Control: no-store` and are therefore re-fetched on every page load. One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the cached-windows table and the flush-cache button). No build step. |
+| `static/`          | Single-page vanilla JS UI split for clarity: `app.js` (bootstrap, URL routing, browser-history entries, view switching), `home.js` (landing page forms, Tonight panel, progress, site badge, and the admin view's cache browser), `explore.js` (per-exposure timeline + detail drawer), `night.js` (dayObs histograms + failure drilldown), `range.js` (range navigator strip that drives the explore view per selected dataId), plus the two images the page draws: `favicon.png` (the tab icon, declared in the template's `<link rel=icon>`) and `logo.png` (the observatory lockup, shown whole at the top-left of every view's topbar, which is what sets the bar's ~73 px height). Both are downscaled copies of the full-resolution art in `assets/`, because static files are sent with `Cache-Control: no-store` and are therefore re-fetched on every page load. One HTML template (`templates/timeline.html`) holds the home/admin/explore/night sections; the bootstrap shows whichever matches the URL (`/?admin=1` routes to the admin view, which hosts the build panel from `GET /api/version`, the cached-windows table and the flush-cache button). No build step. |
 
 ## Key Concepts
 
@@ -325,7 +327,7 @@ Sibling docs:
   `rangeStart=&rangeStop=`: the summary treats the mismatch as
   not-loaded and falls through to the rebuild/fetch path, which
   re-pins; the pod detail 404s and the next summary reload re-pins.
-  The rebuild paths carry the pin too — `_loadExposureFromCache`
+  The rebuild paths carry the pin too — `_pickExposureCache`
   verifies the window it found actually contains the pinned t₀, and
   `_findRangeCacheDir` only matches a cache whose `_range.txt` records
   the same instrument. A range needs this as much as an exposure does:
@@ -492,6 +494,40 @@ Each tick (every `LIVE_POLL_S` seconds):
    directory is stranded forever: no `_meta.json`, so the cache listing
    skips it and LRU eviction can't reclaim it, while `du` still counts
    its ~9 GiB against the size cap.
+5. **The previous night.** Whenever the night before tonight isn't
+   finalised on disk, a thread of its own (`_ensurePreviousNight` /
+   `_backfillNight`) re-pulls it: an hour per increment through the
+   same `_fetchIncrement` the poller uses, then the same finalisation.
+   That covers every way the cache comes up without it: a deploy that
+   bumps `CACHE_SCHEMA_VERSION` (and so flushes everything), the admin
+   page's *flush entire cache*, a fresh volume, a noon finalisation that
+   failed. The poller only ever fetched tonight, so before this, last
+   night (the night people are still asking about the morning after)
+   was empty after a flush until someone pulled it from Loki a window at
+   a time. Hour-sized increments keep the sidecar current, so a restart
+   resumes the re-pull and the night is sliceable up to its watermark
+   while the rest arrives. The night's ConsDB records are cached as it
+   finishes. The orphan sweep leaves that night (and any night a re-pull
+   is still working on) alone, since two threads finishing one night
+   would interleave bytes in the same files. A failure is retried on the
+   next tick, resuming the same way. Off with `--live-day-obs`: a staged
+   night stands in for tonight, and its real neighbour isn't ours to
+   fetch.
+
+   The night's path is also where a fetch of its own window from the
+   form (the SFM night view) lands, so the re-pull writes only under
+   that window's write lock (`fetch.windowWriteLock`), taken without
+   waiting and held across the open and each increment. A fetch
+   holding the lock, or a `.partial` one left behind, defers the
+   re-pull to the next poll. A window already fetched whole (a
+   current-schema `_meta.json`, no `.partial`) is *adopted* rather than
+   replaced: it gets a finalised `_live.json` built from its files (byte
+   counts from the files themselves, line counts and fall-short maps
+   from the meta), so it slices like any night. Without a sidecar it
+   would be excluded from slicing and reachable only by superset
+   reuse, which parses the whole night to answer a five-minute
+   exposure window; opened as a fresh night it would have been
+   destroyed and pulled again.
 
 Serving leans on one mechanism: `fetch.fetchAll` tries the night dir
 before the superset path, and any request whose window ends at or
@@ -518,9 +554,16 @@ night's *own* window — which is exactly what night mode asks for on the
 current dayObs — is served **clamped to the watermark**, i.e. "the
 night so far", so opening the night view during observing costs no Loki
 fetch (the parse still takes its normal time). Only the night's own
-window is clamped; an arbitrary user window extending past the
-watermark falls through to a real fetch rather than silently coming
-back short. Successive opens as the watermark advances each materialize
+window is clamped, and only while the night is in progress by the
+clock; an arbitrary user window extending past the watermark falls
+through to a real fetch rather than silently coming back short, and so
+does a night that has ended but isn't finalised (one the previous-night
+re-pull is working on): its AOS half is fetched from Loki into its own
+nested dir, and its SFM half, the night dir itself, is refused with the
+re-pull named until the re-pull finishes. Rebuilding a night from disk
+follows the same line: while the night is in progress the newest
+"night so far" slice is its rebuild source, and once it has ended only
+a whole-night cache is. Successive opens as the watermark advances each materialize
 a fresh clamped slice (an unchanged watermark reuses the previous one);
 the stale ones are ordinary windows that LRU eviction reclaims.
 
@@ -548,13 +591,16 @@ that just ended.
 From then on the dir is a
 complete, trustworthy all-pods night window (still sliced, never
 superset-parsed), subject to ordinary LRU eviction; the poller moves on
-to the new night. On the deployments, one busy night is ~9 GiB of JSONL
-on the cache volume (measured: 35.7M lines / 576 pods for 20260711), so
-the chart's 50 GiB volume holds four-or-so finalised nights plus slices
-before LRU eviction reclaims the oldest. Night mode's own "night so
+to the new night. On the summit, one busy night is ~6-9 GiB of JSONL
+on the cache volume (measured: 5.6 GiB for 20261027's 22.7M lines / 542
+pods, 9.25 GiB for 20260711's 35.7M / 576), so the summit's 200 GiB
+volume holds tonight, last night and a couple of weeks of older nights
+plus slices before LRU eviction reclaims the oldest. (BTS nights are 50-150 MiB;
+its 50 GiB volume is ample.) Night mode's own "night so
 far" windows do not accumulate against that: each fetch supersedes the
-last one's, and the fetch-job callback drops the windows it contains
-(see *Night slice* in [caching.md](caching.md)).
+last one's, and the fetch-job callback drops the windows it contains,
+for the SFM half as well as the AOS one (see *Night slice* in
+[caching.md](caching.md)).
 
 The parse cost of the *night view* is deliberately left alone: opening
 the in-progress night slices the AOS subset instantly but still parses
@@ -588,9 +634,11 @@ everyone else's fetches behave.
 | `RA_LOG_EXPLORER_CACHE` | `cache_root()` | `~/.cache/ra_log_explorer` |
 | `RA_LOG_EXPLORER_SITES_FILE` | which `sites.toml` to load | the packaged one |
 | `RA_LOG_EXPLORER_WORKERS` | `DEFAULT_WORKERS`, the parallel fetch width | `8` |
+| `RA_LOG_EXPLORER_PARSE_WORKERS` | `PARSE_WORKERS`, processes in the parse pool; `0` parses in-process | `min(4, CPUs)` |
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling in `fetch.evictToFit` | 5 GiB |
+| `RA_LOG_EXPLORER_MAX_LOADED_BYTES` | ceiling on the memory parsed views hold; past it the least recently used are unloaded | 2 GiB |
 | `RA_LOG_EXPLORER_LIVE_POLL_S` | live-mode poll interval; `0` disables live mode | `0` (off) |
 | `RA_LOG_EXPLORER_LIVE_LAG_S` | how far behind *now* each live increment stops (Loki ingestion lag) | `60` |
 | `RA_LOG_EXPLORER_LOG_LEVEL` | stdlib `logging` level for the server's stderr log (`DEBUG` adds every `logcli` call and HTTP request) | `INFO` |
@@ -671,20 +719,20 @@ The view-state lookup. The query string picks which loaded state to
 return:
 
 - `?dataId=<int>[&instrument=<name>]` — return that exposure's payload,
-  or `{loaded: false, cache}` if not loaded. With `instrument` given, a
+  or `{loaded: false}` if not loaded. With `instrument` given, a
   loaded state pinned to a *different* instrument is treated as not
   loaded rather than served — the same bare id names a different
   exposure per instrument — and the rebuild path resolves under the
   pin. 400 for an unknown instrument name.
 - `?dayObs=<int>[&nightView=aos|sfm]` — return that night's payload for
-  the named half, or `{loaded: false, cache}` if that half isn't loaded.
+  the named half, or `{loaded: false}` if that half isn't loaded.
   `nightView` defaults to `aos` and an unrecognised value falls back to
   it rather than erroring: this is a query string a person can type, and
   a 400 there helps nobody. The two halves are separate states, so the
   same dayObs can have one loaded and not the other.
 - `?rangeStart=<int>&rangeStop=<int>[&instrument=<name>]` — return that
-  range's **index** payload (`mode: "range"`), or `{loaded: false,
-  cache}` if not loaded.
+  range's **index** payload (`mode: "range"`), or `{loaded: false}` if
+  not loaded.
 - `?rangeStart=<int>&rangeStop=<int>&dataId=<int>[&instrument=<name>]` —
   return one in-range exposure's timeline (`mode: "range-exposure"`, the
   same shape as the exposure payload plus a `podDetailQuery`). 404 if
@@ -696,27 +744,50 @@ return:
   loaded state pinned elsewhere is treated as not loaded and the
   rebuild re-pins (`_findRangeCacheDir` matching on the instrument
   `_range.txt` records). 400 for an unknown instrument name.
-- no params — home view shape (`{loaded: false, cache}`).
+- no params — home view shape (`{loaded: false}`). Deliberately nothing
+  about the cache: this answers every home-page load, and the cache's
+  size costs a walk of the whole tree (the admin view's `/api/cache`
+  is where that is paid).
 
 If the requested key isn't in the in-memory state dict, the server
-makes one attempt to reconstruct it from disk: it walks the cache root
-for a matching window (an exposure-mode cache whose
-`_exposure_ids.txt` lists the dataId *under the pinned instrument*; a
-night-mode cache whose
+looks for it on disk: an exposure-mode cache whose `_exposure_ids.txt`
+lists the dataId *under the pinned instrument*; a night-mode cache whose
 window starts at noon UTC of the dayObs; or a range cache whose
-`_range.txt` records the `[startId, stopId]` bounds), reparses it with
-`parser.summarizeAll`, and returns the rebuilt payload. This lets a
-deep-linked tab (e.g. opening the dataId column in the admin view's
-cache table) land directly on its explore/night view without an
-intervening home → fetch click — the cache is the source of truth, so
-no re-fetch is needed. For exposure caches the shutter close must
-already be in the local `exposure-times.json` (it always is whenever
-the cache itself exists, because the fetch path stores both); if it
-isn't, the server falls back to `{loaded: false}` and the home view
-takes over. Night-mode rebuilds skip the ConsDB fallback (there's no
-SSE channel to report progress on a sync request) — any dataId not
-already locally cached stays absent in the histograms until a real
-fetch fills it in.
+`_range.txt` records the `[startId, stopId]` bounds. If there is one, it
+starts (or joins) a **rebuild job** and answers at once:
+
+```jsonc
+{ "loaded": false, "rebuildJobId": "a1b2c3d4e5f6" }
+```
+
+A rebuild job is an ordinary fetch job (`FetchJob.rebuildFrom` set)
+whose fetch step is skipped: it parses the window it was pointed at,
+resolves shutter closes, and publishes the state, with the usual SSE
+progress and a `done` event whose `cacheReuse` is `"rebuild"`. Jobs
+for the same key (`FetchJob.key`) run once: a second rebuild, or a
+rebuild asked for while a fetch runs, follows the job already running.
+A fetch asked for while a *rebuild* runs is the exception: the rebuild
+re-parses what is on disk, which for the night in progress is the last
+fetch's "night so far", and the form asked for the night now. That
+fetch is its own job, started once the rebuild has finished (so the
+rebuild can't publish its older view over the fetched one), and from
+then on the job later requests of either kind follow. The page
+lands on home with the form prefilled from the URL, follows the job,
+and re-routes when it finishes, so a deep-linked tab (e.g. the dataId
+column in the admin view's cache table) still opens its view without
+an intervening click, and the cache stays the source of truth. The
+range navigator's per-exposure request gets the same answer once its
+range has been unloaded under an open tab, and does the same: it points
+the URL at the chip just picked and re-routes, so the page follows the
+rebuild and reopens the range on that exposure, rather than lighting the
+chip over the exposure still on screen. The
+summary request itself never parses: a summit night's SFM half is a
+minute of parsing, and done inline it once ran for 37 minutes after the
+browser had given up (see *Threading model*). For exposure caches the
+shutter close must already be in the local exposure-time cache, and for
+range caches both ends' (it always is whenever the cache itself exists,
+because the fetch path stores both); without it the answer is plain
+`{loaded: false}` and the form takes over.
 
 On a hit, the cache's `_last_viewed.txt` sidecar is touched so re-opening
 a tab bumps that window up the LRU even without a fresh fetch.
@@ -962,7 +1033,16 @@ traceback is what led up to it. `contextSource` is `"dataId-block"` or
 
 Lines are capped at ~4 000 / ~600 kB so a pathological run can't
 generate a multi-megabyte drilldown response. The cap shows up as
-`truncated: true`.
+`truncated: true`. The pod's file is entered at the context's start by
+the same timestamp bisection the night slice uses
+(`fetch.firstOffsetAtOrAfter`), not read from the top: a summit pod's
+night is up to ~200k lines, and parsing down to a failure late in it
+cost seconds of request-thread CPU per click.
+
+404 with `{"error": "This night is no longer loaded; reload the page"}`
+when the night has dropped out of memory (the night LRU is capped).
+This route never rebuilds: a rebuild is a job the page has to follow,
+and only `/api/summary` hands one out.
 
 ### `GET /api/exposure-time/<dataId>[?instrument=<name>]`
 
@@ -1006,7 +1086,7 @@ hand back a *different exposure* that happens to share the id.
 There is no site-related error, because there is no site parameter to
 get wrong: one process serves one site, and a `?site=` is ignored.
 
-The per-site on-disk cache at `<cache_root>/exposure-times/<site>.json`
+The per-site on-disk cache at `<cache_root>/exposure-times/<site>/<dayObs>.json`
 is checked first; a *ConsDB-sourced* cache hit returns immediately with
 `fromCache: true` and no network call. Sites have separate cache files
 so a colliding bare dataId between scopes (BTS simulated vs. summit real)
@@ -1051,6 +1131,17 @@ token-file path is *not* echoed — it's a server-side detail.
 }
 ```
 
+### `GET /api/version`
+
+The running build, for the admin page's *Deployment* panel. `version` is
+`git describe --tags` and `gitHash` the full commit the image was built
+from (see `buildInfo.py`); either is `null` when nothing can say — an
+image built without its build arg.
+
+```jsonc
+{ "version": "v0.2.0-30-ge16e6c9", "gitHash": "e16e6c9…" }
+```
+
 ### `GET /api/live`
 
 Snapshot of the live night poller (see *Live mode*). `{"enabled":
@@ -1075,6 +1166,8 @@ page makes to decide whether to render the Tonight panel. When on:
                                       // a pod; expected to stay 0 (see Live mode)
   "consdbError": null,
   "orphanError": null,                // an earlier night couldn't be finalised
+  "backfillDayObs": 20260710,         // the previous night while it is being re-pulled
+  "backfillError": null,              // its last failure, until a re-pull succeeds
   "lastTick": { "startedAt": "...", "elapsedS": 4.2,
                 "newLines": 73200, "activePods": 431 },
   "lastError": null,                  // traceback if the last cycle blew up
@@ -1133,12 +1226,20 @@ deeper than exposure caches (`<window>/pods=<slug>`) so a same-window
 exposure-mode and night-mode cache can coexist; both flavours are
 listed independently here.
 
+`root.totalBytes` and every row's `sizeOnDisk` come from one walk of the
+tree (`fetch.cacheSizes`). A window's `sizeOnDisk` includes any night
+caches nested in it, so the rows don't sum to the total; the admin view
+shows `root.totalBytes`.
+
 ### `DELETE /api/cache`
 
 Wipe the entire cache root. Always clears every loaded state (since
 they all reference the now-gone cache). Returns the same shape as
 `GET /api/cache`. The root itself is recreated empty so subsequent
-fetches still work.
+fetches still work, with `_cache_schema_version.txt` rewritten in it:
+an empty cache is a current one, and a root without the sentinel would
+be flushed whole at the next start, taking everything rebuilt since the
+delete with it (tonight, and the previous night the poller pulls again).
 
 Every `_live.json` under the target is unlinked *before* the tree goes
 (`_dropLiveSidecars`), and only then is `shutil.rmtree` called — with
@@ -1204,6 +1305,16 @@ instead of `shutter close (caller-supplied)`. See
 Response: `202 Accepted`, `{"jobId": "<12-char hex>"}`. Validation
 errors return `400` with `{"error": "..."}`.
 
+The same applies to all three `POST /api/fetch*` routes and to the
+rebuild jobs `/api/summary` starts: **one job per piece of work.** If a
+job for the same view is already running (`FetchJob.key`: the
+instrument, id and window for an exposure or range, the dayObs and half
+for a night), its `jobId` comes back instead of a new one, and the
+caller follows that job. A reload, a second user, or a rebuild racing a
+fetch would otherwise each parse the same window, which for a summit
+night is a minute of CPU and a second copy of the parsed night in
+memory.
+
 ### `POST /api/fetch-night`  (dayObs)
 
 ```jsonc
@@ -1244,7 +1355,8 @@ Two consequences worth knowing:
 
 - The SFM half is **much bigger**. On a summit night it is ~9 GiB and
   ~35M lines against the AOS half's few hundred MB, so it is a minutes-
-  long fetch and parse where the AOS half is seconds. On a live instance
+  long fetch and about a minute of parsing (on the summit's six parse workers) where
+  the AOS half is seconds. On a live instance
   it is usually free, because the poller already holds the whole night
   on disk and the request is served by handing that window over.
 - On a night that is still in progress, the SFM half can be *fetched*
@@ -1299,7 +1411,7 @@ JSON snapshot of one job:
   "fromIso": "...", "toIso": "...",
   "startedAt": "...", "finishedAt": "...",
   "cacheDir":  "...",
-  "cacheReuse": "exact" | "superset" | "none" | null,
+  "cacheReuse": "exact" | "superset" | "night-slice" | "rebuild" | "none" | null,
   "error":   null | "...",
   "eventCount": 5
 }
@@ -1315,6 +1427,8 @@ is one JSON event (`{"type": ...}`):
   from 1; reaches `total` on the last).
 - `parsing`: `{ cacheReuse, podCount, totalBytes }` — after the
   fetch finishes, before `summarizeAll` runs.
+- `parsed`: `{ i, total }` — once per parsed pod, in completion order
+  (`i` ascends from 1). A summit night is about a minute of these.
 - `shutter-close`: `{ phase, ... }` — night **and range** modes (both
   resolve per-dataId shutter closes post-parse via the shared
   `_resolveShutterClosesInto`). Phases:
@@ -1342,13 +1456,19 @@ is one JSON event (`{"type": ...}`):
   ran under, and the client needs it rather than the topbar's current
   value: the user may have flipped the switch while the fetch ran, and
   by then the bare expId's slot may hold the other instrument's
-  exposure.
+  exposure. `elapsedS` is the job's own wall time, start event to
+  `done`, not the `elapsed_s` of the meta it read: for a rebuild or a
+  cache hit that is the fetch that originally wrote the window.
 - `error`: `{ error }` — terminal; the job failed.
 
 History is replayable: the SSE handler emits every event already in
 the job's log on connection, then waits for new ones. Multiple
 concurrent readers are fine — each iterates the log independently,
-including reattaching *after* the job has already finished.
+including reattaching *after* the job has already finished. Only the 50
+most recently finished jobs are kept (`jobs._MAX_FINISHED_JOBS`): a
+summit exposure's log is ~900 events, and a registry that kept every
+job would grow for as long as the process runs. An older job's status
+and progress routes 404.
 
 Keepalive comments (`: keepalive\n\n`) are emitted every 15 s so
 intermediate proxies don't time the stream out.
@@ -1369,6 +1489,38 @@ The shared `ServerContext` is mutated only while holding
 Each fetch runs on its own daemon thread spawned by
 `JobManager.startJob`. SSE handlers block on
 `FetchJob.condition.wait()` to be notified when new events arrive.
+
+**No thread in the server process parses.** `parse.summarizeAll` hands
+each pod to a shared `ProcessPoolExecutor` (`RA_LOG_EXPLORER_PARSE_WORKERS`
+processes, started with `spawn` so no child inherits a lock some other
+server thread held at fork time) and waits on the futures, which
+releases the GIL. This is the rule the rest of the threading model
+depends on. A CPU-bound thread holds the GIL between switch intervals,
+and every *other* thread's syscalls then wait out the 5 ms interval
+one at a time, ~200 a second. The slice path, the cache walks and the
+live poller are all thousands of small syscalls, so a whole-night parse
+on a request thread once stalled every fetch, the admin page and the
+poller for 37 minutes (measured locally: a 540-pod slice goes from
+0.4 s to 199 s beside one busy thread). The pool is shared so that
+concurrent jobs queue for the same few cores rather than each taking
+all of them; a worker killed mid-parse fails that parse, and the next
+one gets a fresh pool. Every parse still holding the replaced pool
+fails with it, including one that picked the pool up just before it was
+replaced and submits afterwards: its pods would otherwise sit in a
+queue nothing reads, and the job, with every request that joins it,
+would wait for good.
+
+The pool is fed through `parse._ParseDispatcher` rather than
+directly, because the executor's own queue is first-in first-out:
+with every pod submitted at once, an exposure opened while a summit
+night was parsing had every worker ahead of it busy with a
+multi-second night pod, and its 2 ms pods waited out the whole night
+(25 s for a 0.5 s parse). The dispatcher keeps the pods itself and
+releases them only as workers free up (one more than there are
+workers, so none waits between pods), always from the queued parse
+with the least total work, biggest pod first within it. Measured on
+20261027: an exposure opened during the SFM half's rebuild parses in
+1.2 s, and the night's own parse is unchanged.
 
 `fetch.fetchAll` additionally takes a **per-window write lock**
 (`fetch.windowWriteLock`, one re-entrant lock per requested window
@@ -1431,7 +1583,21 @@ several open tabs (different dataIds / dayObses / ranges) sees each one
 keep its state until 9+ tabs of that kind are in play; the
 least-recently-opened gets evicted then. The browser's URL carries the
 routing key so reload / back-button on an evicted tab triggers a fresh
-`/api/summary` fetch against the cache.
+`/api/summary`, which rebuilds the view from the cache as a job.
+
+A count bounds nothing at summit scale, so memory is capped too. Every
+loaded view carries a `footprint` (`_footprint`: ~700 B per retained
+Event plus ~15 B per parsed line, measured by RSS on 20261027) and a
+`lastUsed` tick, and each `put*State` unloads the least recently used
+views, of any kind, until the total fits `RA_LOG_EXPLORER_MAX_LOADED_BYTES`
+(deployed: 8 GiB of the pod's 16 on the summit, sized for two or three
+users each holding a night or two; 4 of 8 on BTS). The view just loaded always stays, even
+alone over the ceiling. What keeps nights inside it at all is that a
+night keeps only the Event kinds its rollups read
+(`night.NIGHT_EVENT_KINDS`, applied in the parse workers): WARN lines
+alone are ~60% of a night's events, and kept, the SFM half of 20261027
+measured ~145 B per line, ~3 GiB, where filtered it is ~40 B per line,
+~0.9 GiB.
 
 Pod detail and traceback drilldown responses re-read the JSONL
 files from disk on each request rather than buffering them in

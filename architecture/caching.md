@@ -13,9 +13,10 @@ repeat runs into instant loads.
 ├── _cache_schema_version.txt                      ← schema the cache was built with; a
 │                                                    mismatch flushes the whole tree at startup
 ├── exposure-times/                                ← persistent dataId → ConsDB exposure record
-│   ├── summit.json                                  (obs_end + filter/exp time/img type/…), split
-│   └── bts.json                                     per site so a colliding dataId between scopes
-│                                                    can't return the wrong record
+│   ├── summit/                                      (obs_end + filter/exp time/img type/…), split
+│   │   ├── 20261026.json                            per site so a colliding dataId between scopes
+│   │   └── 20261027.json                            can't return the wrong record, and per dayObs
+│   └── bts/…                                        so no read or write touches the whole history
 └── <cluster>/<namespace>/
     └── <fromSlug>__<toSlug>/                      ← one directory per window
         ├── _meta.json                             ← FetchSpec + fetchSchemaVersion + per-pod
@@ -90,6 +91,9 @@ of the **entire** cache tree:
   cluster trees, plus `exposure-times/`) and rewrites the sentinel,
   printing a one-line notice so the user understands why the next loads
   re-fetch.
+- `DELETE /api/cache` rewrites the sentinel after emptying the tree, so
+  the flush isn't repeated at the next start over whatever was rebuilt
+  in between.
 
 This is deliberately heavier than the per-cache guard, which only
 re-fetches stale windows lazily — one surprise-slow load at a time —
@@ -220,7 +224,14 @@ duplicated. It then decides in order:
    dayObs), which is served clamped to the watermark — "the night so
    far". This step deliberately sits **outside** the window-in-the-past
    gate so the in-progress night qualifies; only `forceRefresh`
-   disables it. The window is materialized by slicing (see *Live night
+   disables it. The clamp applies only while the night is in progress
+   by the clock. A night that has *ended* with its watermark short of
+   its end is being re-pulled from Loki (the previous-night backfill) or
+   awaits the orphan sweep, and the request is for the whole night: a
+   `podRegex` request falls through to a fresh fetch into its own
+   nested `pods=` dir, and the night's own unfiltered window is refused
+   (step 4) with a message naming the re-pull and its watermark, rather
+   than served short and marked complete. The window is materialized by slicing (see *Live night
    dirs*) and returned with `cacheReuse = "night-slice"`; a repeat
    against an unchanged watermark reuses the previous slice as an exact
    hit. When the window to slice *is* the night's own — the watermark
@@ -239,7 +250,15 @@ duplicated. It then decides in order:
    the same inversion `markCacheViewed` on the night dir guards against,
    arriving from the other side. Only strict subsets go, so a watermark
    that regressed (a cache wipe mid-night, one tick of a newly-seen pod
-   failing) leaves the wider directory alone. Any slice failure
+   failing) leaves the wider directory alone. Both halves' slices go:
+   the AOS half's nest at `<window>/pods=<slug>/`, and the SFM half's,
+   unfiltered, are top-level windows of their own, the night so far
+   copied whole, which on the summit is several GiB a click. Top-level
+   windows are also night dirs and exposure and range windows, so an
+   unfiltered one is reclaimed only when its meta records the night it
+   was cut from (`sliceSource`) and it carries no `_live.json`,
+   `_exposure_ids.txt` or `_range.txt` and no nested night cache, which
+   deleting the window would take with it. Any slice failure
    falls through to the steps below (leaving `.partial` in place, so a
    half-copied window can never pass for a hit) — worst case is the
    fetch that would have happened anyway.
@@ -268,7 +287,10 @@ duplicated. It then decides in order:
    Returns the requested directory with `cacheReuse = "none"`. A
    requested directory carrying a `_live.json` is refused outright: it
    belongs to the poller, and a fresh fetch would truncate files it is
-   appending to.
+   appending to. When that night has already ended, the refusal says
+   instead that its logs are still being pulled from Loki, with the
+   watermark they have reached, since that is what the user needs to
+   know (try again in a few minutes).
 
 Steps 2 and 3 ignore any cache whose `fetchSchemaVersion` doesn't match
 the current `CACHE_SCHEMA_VERSION`. That's what keeps a stale snapshot
@@ -426,8 +448,8 @@ reused instead, so the flagged directory is never revisited.
   by `markCacheRange` when a range fetch completes. This is the sole
   marker that tells the `/api/cache` listing to label the window
   `kind: "range"` (rather than `"exposure"`) and deep-link it back to
-  `/?rangeStart=…&rangeStop=…`; `_loadRangeFromCache` uses it to
-  rehydrate a `RangeState` from disk on a reload / deep link, and the
+  `/?rangeStart=…&rangeStop=…`; `_startRangeRebuild` uses it to
+  rebuild a `RangeState` from disk on a reload / deep link, and the
   recorded instrument re-pins the rebuilt state's shutter-close
   lookups — a range is a run of *one* instrument's exposures, and a
   bare lookup on a colliding id would anchor that exposure to the
@@ -440,7 +462,9 @@ reused instead, so the flagged directory is never revisited.
 `fetch.evictToFit(maxBytes, exempt=…)` removes the least-recently-
 viewed caches until the on-disk total is at or below `maxBytes`,
 exempting whichever caches the caller passes in (the just-fetched
-one, typically).
+one, typically) and every window that contains one: a night-mode cache
+is nested in its night's window dir, so evicting the window would take
+the exempt cache with it.
 
 - `maxBytes` is `config.MAX_CACHE_BYTES`, from
   `$RA_LOG_EXPLORER_MAX_CACHE_BYTES` (5 GiB if unset). Deployed, the
@@ -457,6 +481,11 @@ one, typically).
   over-cap states during a fetch are acceptable.
 - Empty per-cluster, per-namespace, and (for night mode) per-window
   parent directories are pruned as their child windows go away.
+- The tree is walked **once** per pass (`fetch.cacheSizes`, which sizes
+  the total and every window together) and the post-eviction total is
+  returned, so the caller's state can report the cache size without a
+  second walk. At summit scale that matters: a night is ~1,100 files and
+  each exposure slice several hundred.
 - **Not everything on the volume is evictable.** The total is measured
   over the whole tree, but only directories carrying a `_meta.json` are
   candidates — so the in-progress live night (which has none until
@@ -464,8 +493,12 @@ one, typically).
   ever being reclaimable. Eviction makes one pass and stops, so a cap
   set below that floor doesn't spin; it just evicts every *other*
   window and stays over. With live mode on, leave the cap comfortably
-  above one night's ~9 GiB, which is what deriving it from the volume
-  size already does.
+  above **two** nights: tonight's, and last night's, which the poller
+  re-pulls whenever it is missing. A summit night is ~6-9 GiB (5.6 GiB
+  for 20261027's 22.7M lines, and 1.5x that is to be expected), so a
+  cap that can't hold both plus the day's slices would evict last night
+  and re-pull it in a loop. The deployed volume is sized for a couple
+  of weeks of nights.
 
 ## What's stable across reruns
 
@@ -521,8 +554,9 @@ poller opens it again from scratch.
 
 ## The exposure-time cache
 
-`<cache_root>/exposure-times/<siteName>.json` maps `dataId → curated
-ConsDB exposure record` across runs, split per site. Each record is the
+`<cache_root>/exposure-times/<siteName>/<dayObs>.json` maps `dataId →
+curated ConsDB exposure record` across runs, split per site and per
+night. Each record is the
 `EXPOSURE_RECORD_COLUMNS` projection of the row — `obs_end` (the
 shutter-close TAI t-zero) plus the human-facing properties (filter, exp
 time, image type, program, reason, group/index, pointing, seeing) that
@@ -537,16 +571,27 @@ outside the cluster/namespace tree because:
   what makes the home page work for users who don't have an RSP
   token configured.
 
-The cache is split per site (`exposure-times/summit.json`,
-`exposure-times/bts.json`) because a 13-digit dataId is meaningful
+The cache is split per site (`exposure-times/summit/`,
+`exposure-times/bts/`) because a 13-digit dataId is meaningful
 *within* a site, not globally: BTS simulated exposures can carry an
 id that also exists on the summit, with a completely different record.
-`lookupCachedRecord(..., siteName=...)` and `storeCachedRecord[s](...,
+`lookupCachedRecord[s](..., siteName=...)` and `storeCachedRecord[s](...,
 siteName=...)` enforce the split at every call site, so the wrong-site
 value can never leak in.
 
-Unlike the window caches this file is *not* disposable, so it is the one
-thing here written with care: every merge takes a process-wide lock and
+Within a site it is split again by **dayObs**, the leading eight digits
+of every dataId (`dayObsOfDataId`). A single per-site file grows by a
+night of records every night the live poller runs, and was read whole
+for every lookup and rewritten whole for every store: on the summit
+that meant tens of megabytes of `json.loads`, holding the GIL, once per
+dataId of a night view, plus a full rewrite on every poll that brought
+a new exposure. One file per night bounds both at one night's records
+(~1-2 MB). Anything resolving many ids at once (a night view, a range,
+the shutter-close prefetch) goes through `lookupCachedRecords`, which
+reads each night's file once rather than once per id.
+
+Unlike the window caches these files are *not* disposable, so they are the
+one thing here written with care: every merge takes a process-wide lock and
 lands via a temp file and `os.replace`. Several threads write it in a
 deployed process — request threads resolving a dataId, a fetch job's
 night/range prefetch, the live poller's per-tick exposure list — and two

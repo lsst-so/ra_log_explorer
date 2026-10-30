@@ -314,3 +314,182 @@ def test_a_failed_job_is_logged_with_its_traceback(
     assert job.status == "error"
     assert "(night 20261014 (aos)) failed" in caplog.text
     assert "Loki went away" in caplog.text
+
+
+# ----- one job per piece of work --------------------------------------------
+
+
+def _blockingFetch(release: Any, tmp_path: Path) -> Callable[..., tuple[Path, dict]]:
+    def fetch(
+        spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False
+    ) -> tuple[Path, dict]:
+        release.wait(10)
+        return tmp_path, {"spec": {}, "cacheReuse": "none", "pod_count": 0}
+
+    return fetch
+
+
+def test_startJob_joins_an_identical_running_job(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A reload, a second user, or a rebuild racing a fetch must not parse
+    the same window twice: for a summit night that is a minute of CPU and
+    a second copy of the parsed night in memory."""
+    import threading
+
+    release = threading.Event()
+    monkeypatch.setattr(jobs, "fetchAll", _blockingFetch(release, tmp_path))
+    completions: list[jobs.FetchJob] = []
+    mgr = jobs.JobManager()
+    first = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam"), completions.append)
+    duplicate = mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam")
+    assert mgr.startJob(duplicate, completions.append) is first
+    assert mgr.getJob(duplicate.jobId) is None, "the joined job is dropped, never started"
+    # The same exposure under the other instrument is different work.
+    other = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="latiss"), completions.append)
+    assert other is not first
+    release.set()
+    for job in (first, other):
+        with job.condition:
+            job.condition.wait_for(job.isTerminal, timeout=10)
+    assert sorted(j.jobId for j in completions) == sorted([first.jobId, other.jobId])
+
+    # Once finished, the same request is new work again.
+    again = mgr.startJob(mgr.createJob(_spec(), 1, _tZero(), instrument="lsstcam"), completions.append)
+    assert again is not first
+
+
+def test_a_rebuild_job_never_fetches(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A rebuild re-parses a window already on disk. Reaching Loki from one
+    would turn a deep link into an unasked-for fetch."""
+
+    def noFetch(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
+        raise AssertionError("a rebuild called fetchAll")
+
+    monkeypatch.setattr(jobs, "fetchAll", noFetch)
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "cacheReuse": "none"}')
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20260520, nightView="sfm")
+    job.rebuildFrom = tmp_path
+    seen: list[dict] = []
+    mgr.runJob(job, onComplete=lambda j: seen.append(j.meta))
+    assert job.status == "done", job.error
+    assert job.cacheDir == tmp_path
+    assert seen[0]["cacheReuse"] == "rebuild" and seen[0]["pod_count"] == 3
+
+
+def test_done_reports_the_jobs_own_time_not_the_cached_fetchs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The page says "done in <elapsedS>". Read off the cache's meta, a
+    rebuild, or any job served from cache, reported however long the
+    original fetch took: minutes, for a parse of a few seconds."""
+    import time
+
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "elapsed_s": 340.0}')
+    mgr = jobs.JobManager()
+    job = mgr.createNightJob(_spec(), 20260520, nightView="sfm")
+    job.rebuildFrom = tmp_path
+    mgr.runJob(job, onComplete=lambda j: time.sleep(0.05))
+    done = job.events[-1]
+    assert done["type"] == "done", job.error
+    assert 0.05 <= done["elapsedS"] < 5
+
+
+def test_a_fetch_runs_after_the_rebuild_it_would_have_joined(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A rebuild of the night in progress re-parses the last fetch's
+    "night so far" slice. A fetch asked for while it runs is not that
+    work: it is its own job, run once the rebuild has finished so the
+    rebuild can't publish its older night over the fetched one, and it
+    is the job that later requests of either kind join."""
+    import threading
+
+    (tmp_path / "_meta.json").write_text('{"spec": {}, "pod_count": 3, "cacheReuse": "none"}')
+    rebuildParsing, releaseRebuild = threading.Event(), threading.Event()
+    order: list[str] = []
+    fetched: list[str] = []
+
+    def fetchAll(spec: FetchSpec, progress: ProgressCb | None = None, forceRefresh: bool = False) -> Any:
+        fetched.append(threading.current_thread().name)
+        return tmp_path, {"spec": {}, "cacheReuse": "none", "pod_count": 0}
+
+    def complete(j: jobs.FetchJob) -> None:
+        if j.rebuildFrom is not None:
+            rebuildParsing.set()
+            releaseRebuild.wait(10)
+        order.append(j.jobId)
+
+    monkeypatch.setattr(jobs, "fetchAll", fetchAll)
+    mgr = jobs.JobManager()
+    rebuild = mgr.createNightJob(_spec(), 20260520, nightView="aos")
+    rebuild.rebuildFrom = tmp_path
+    assert mgr.startJob(rebuild, complete) is rebuild
+    assert rebuildParsing.wait(10)
+
+    fetch = mgr.startJob(mgr.createNightJob(_spec(), 20260520, nightView="aos"), complete)
+    assert fetch is not rebuild, "the fetch was satisfied by the rebuild"
+    assert not fetched, "the fetch ran alongside the rebuild"
+    # Everything else asked for meanwhile joins the fetch, rebuilds included.
+    later = mgr.createNightJob(_spec(), 20260520, nightView="aos")
+    later.rebuildFrom = tmp_path
+    assert mgr.startJob(later, complete) is fetch
+    assert mgr.startJob(mgr.createNightJob(_spec(), 20260520, nightView="aos"), complete) is fetch
+
+    releaseRebuild.set()
+    for job in (rebuild, fetch):
+        with job.condition:
+            assert job.condition.wait_for(job.isTerminal, timeout=10)
+    assert order == [rebuild.jobId, fetch.jobId]
+    assert fetched == [f"fetchjob-{fetch.jobId}"]
+    assert rebuild.status == fetch.status == "done"
+
+
+def test_only_the_newest_finished_jobs_are_kept(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each job keeps its full progress log (~900 events for a summit
+    exposure), so a registry that never forgets is a slow leak in a
+    process that runs for weeks. Running jobs are never dropped."""
+    monkeypatch.setattr(jobs, "_MAX_FINISHED_JOBS", 3)
+    mgr = jobs.JobManager()
+    running = mgr.createJob(_spec(), 0, _tZero())
+    finished = []
+    for i in range(1, 6):
+        job = mgr.createJob(_spec(), i, _tZero())
+        job.status = "done"
+        job.finishedAt = _tZero() + dt.timedelta(minutes=i)
+        finished.append(job)
+    mgr.createJob(_spec(), 99, _tZero())
+    kept = {j.jobId for j in mgr.listJobs()}
+    assert running.jobId in kept
+    assert {j.jobId for j in finished[-3:]} <= kept
+    assert not {j.jobId for j in finished[:2]} & kept
+
+
+def test_a_finished_job_is_never_joined(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job sends its last event a moment before it stops counting as
+    running. A request in that moment, a retry straight after a failure
+    above all, must start new work rather than be handed the finished
+    job, and with it the same failure again."""
+    import threading
+
+    def lokiDown(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
+        raise RuntimeError("Loki went away")
+
+    monkeypatch.setattr(jobs, "fetchAll", lokiDown)
+    mgr = jobs.JobManager()
+    finished, release = threading.Event(), threading.Event()
+    run = mgr._run
+
+    def runThenLinger(job: jobs.FetchJob, onComplete: jobs.OnComplete) -> None:
+        run(job, onComplete)
+        finished.set()
+        release.wait(10)
+
+    monkeypatch.setattr(mgr, "_run", runThenLinger)
+    try:
+        failed = mgr.startJob(mgr.createJob(_spec(), 1, _tZero()), lambda j: None)
+        assert finished.wait(10)
+        assert failed.status == "error"
+        retry = mgr.startJob(mgr.createJob(_spec(), 1, _tZero()), lambda j: None)
+        assert retry is not failed
+    finally:
+        release.set()

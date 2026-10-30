@@ -531,7 +531,7 @@ def test_lookupCachedRecord_ignores_a_non_record_entry(
     deploy anyway. A miss falls through to a fresh ConsDB query, which
     overwrites the entry with the real shape."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath("summit")
+    p = exposureTimes.cachedExposureTimesPath("summit", 20260519)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"2026051900722": "2026-05-20T08:46:16.267000"}))
     assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
@@ -549,7 +549,7 @@ def test_storeCachedRecords_batches_one_write(monkeypatch: pytest.MonkeyPatch, t
 def test_storeCachedRecords_empty_is_noop(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
     exposureTimes.storeCachedRecords({}, siteName="summit")
-    assert not exposureTimes.cachedExposureTimesPath("summit").exists()
+    assert not exposureTimes.cachedExposureTimesPath("summit", 20260519).exists()
 
 
 def test_storeCachedRecord_appends_without_clobbering(
@@ -576,13 +576,59 @@ def test_storeCachedRecord_isolates_sites_for_the_same_dataId(
         == "2026-06-03T00:42:43.632000"
     )
     base = tmp_path / "exposure-times"
-    assert (base / "bts.json").exists()
-    assert not (base / "summit.json").exists()
+    assert (base / "bts" / "20260602.json").exists()
+    assert not (base / "summit").exists()
+
+
+def test_records_are_filed_under_their_own_night(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """One file per night, named by the dayObs the dataId embeds. A single
+    per-site file grew by a night's records every night and was re-read
+    whole for every lookup; the summit's had reached tens of megabytes."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    exposureTimes.storeCachedRecords(
+        {2026051900722: {"obs_end": "iso-a"}, 2026052000001: {"obs_end": "iso-b"}}, siteName="summit"
+    )
+    base = tmp_path / "exposure-times" / "summit"
+    assert sorted(p.name for p in base.iterdir()) == ["20260519.json", "20260520.json"]
+    assert list(json.loads((base / "20260520.json").read_text())) == ["2026052000001"]
+
+
+def test_lookupCachedRecords_reads_each_night_once(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A night view resolves hundreds of ids at once; looping over the
+    single lookup re-parsed the same file per id, which is what made a
+    summit night load spend minutes in ``json.loads``."""
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    ids = list(range(2026051900001, 2026051900301)) + [2026052000001]
+    exposureTimes.storeCachedRecords({i: {"obs_end": f"iso-{i}"} for i in ids}, siteName="summit")
+    reads: list[Path] = []
+    realRead = exposureTimes._readShard
+
+    def countingRead(p: Path) -> dict:
+        reads.append(p)
+        return realRead(p)
+
+    monkeypatch.setattr(exposureTimes, "_readShard", countingRead)
+    got = exposureTimes.lookupCachedRecords(ids + [2026052100001], siteName="summit")
+    assert set(got) == set(ids)
+    assert got[2026052000001] == {"obs_end": "iso-2026052000001"}
+    assert sorted(p.name for p in reads) == ["20260519.json", "20260520.json", "20260521.json"]
+
+
+def test_lookupCachedRecords_honours_the_instrument_pin(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
+    cam = {"obs_end": "iso-cam", "instrument": "lsstcam"}
+    exposureTimes.storeCachedRecords({2026051900722: cam}, siteName="summit")
+    assert exposureTimes.lookupCachedRecords([2026051900722], siteName="summit", instrument="latiss") == {}
+    assert exposureTimes.lookupCachedRecords([2026051900722], siteName="summit", instrument="lsstcam") == {
+        2026051900722: cam
+    }
 
 
 def test_lookupCachedRecord_tolerates_corrupt_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath("summit")
+    p = exposureTimes.cachedExposureTimesPath("summit", 20260519)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("not-json{")
     assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
@@ -592,7 +638,7 @@ def test_lookupCachedRecord_tolerates_unexpected_schema(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath("summit")
+    p = exposureTimes.cachedExposureTimesPath("summit", 20260519)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(["not", "a", "dict"]))
     assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
@@ -604,7 +650,7 @@ def test_lookupCachedRecord_returns_None_for_unexpected_value_type(
     """A corrupt cache that maps the right key to neither a dict nor a
     string (e.g. an int) must surface as a miss, not crash the caller."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    p = exposureTimes.cachedExposureTimesPath("summit")
+    p = exposureTimes.cachedExposureTimesPath("summit", 20260519)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps({"2026051900722": 12345}))
     assert exposureTimes.lookupCachedRecord(2026051900722, siteName="summit") is None
@@ -616,7 +662,7 @@ def test_storeCachedRecords_recovers_from_corrupt_existing_file(
     """If the existing cache file is corrupt, storing should silently
     overwrite it with a fresh map rather than refusing to record."""
     monkeypatch.setenv("RA_LOG_EXPLORER_CACHE", str(tmp_path))
-    cachePath = exposureTimes.cachedExposureTimesPath("summit")
+    cachePath = exposureTimes.cachedExposureTimesPath("summit", 20260519)
     cachePath.parent.mkdir(parents=True, exist_ok=True)
     cachePath.write_text("this is not json")
     exposureTimes.storeCachedRecord(
@@ -649,11 +695,11 @@ def test_concurrent_stores_all_survive(monkeypatch: pytest.MonkeyPatch, tmp_path
         t.start()
     for t in threads:
         t.join(30)
-    data = json.loads(exposureTimes.cachedExposureTimesPath("summit").read_text())
+    data = json.loads(exposureTimes.cachedExposureTimesPath("summit", 20260519).read_text())
     assert sorted(data) == sorted(str(i) for i in ids)
     # Nothing but the finished file is left behind.
-    assert [p.name for p in exposureTimes.cachedExposureTimesPath("summit").parent.iterdir()] == [
-        "summit.json"
+    assert [p.name for p in exposureTimes.cachedExposureTimesPath("summit", 20260519).parent.iterdir()] == [
+        "20260519.json"
     ]
 
 

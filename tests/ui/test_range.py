@@ -38,6 +38,10 @@ def test_stepping_moves_the_selection_and_re_anchors_the_timeline(app: Any, corp
     the reference says as well as which chip is lit."""
     openRange(app, corpus)
     chips = app.page.locator("#range-chips .range-chip")
+    # The chips render before the timeline fills #t0-info, and the text
+    # is read as a snapshot: sampled too early it is '', which every
+    # later reference "differs" from.
+    expect(app.page.locator("#t0-info")).to_contain_text("shutter close")
     firstT0 = app.page.locator("#t0-info").inner_text()
 
     app.page.locator("#range-next").click()
@@ -65,6 +69,39 @@ def test_clicking_a_chip_jumps_straight_to_that_exposure(app: Any, corpus: Stage
     app.page.locator("#range-chips .range-chip").last.click()
     expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_STOP))
     expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+
+
+def test_a_chip_picked_after_the_range_was_unloaded_opens_that_exposure(
+    app: Any, corpus: StagedCorpus
+) -> None:
+    """The server can unload a range while its tab stays open: a ninth
+    range, the loaded-views memory cap, a restart. Picking a chip then
+    lit the chip and left the previous exposure's timeline under it. The
+    page now follows the rebuild from cache and opens the range on the
+    exposure that was picked."""
+    openRange(app, corpus)
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START))
+    with app.ctx.jobs.stateLock:
+        app.ctx.rangeStates.clear()
+    app.page.locator("#range-chips .range-chip").last.click()
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_STOP), timeout=30_000)
+    expect(app.page.locator("#range-nav")).to_be_visible()
+    expect(app.page.locator("#range-chips .range-chip").last).to_have_class(re.compile(r"\bselected\b"))
+    assert f"dataId={RANGE_STOP}" in app.page.url
+    assert len(app.ctx.rangeStates) == 1
+
+
+def test_a_chip_whose_request_fails_gives_the_selection_back(app: Any, corpus: StagedCorpus) -> None:
+    """With no answer at all, the timeline is still the previous
+    exposure's, so the lit chip has to be that one too."""
+    openRange(app, corpus)
+    chips = app.page.locator("#range-chips .range-chip")
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START))
+    app.page.route("**/api/summary?*", lambda route: route.abort())
+    app.page.locator("#range-next").click()
+    expect(chips.nth(0)).to_have_class(re.compile(r"\bselected\b"))
+    expect(chips.nth(1)).not_to_have_class(re.compile(r"\bselected\b"))
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START))
 
 
 def test_a_chip_flags_an_exposure_that_failed(app: Any, corpus: StagedCorpus) -> None:

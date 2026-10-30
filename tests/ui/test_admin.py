@@ -10,7 +10,10 @@ from __future__ import annotations
 
 from typing import Any
 
+import pytest
 from playwright.sync_api import expect
+
+from ra_log_explorer import buildInfo, fetch
 
 from .corpus import DAY_OBS, RANGE_START, RANGE_STOP, SHARED_ID, StagedCorpus
 
@@ -18,6 +21,31 @@ from .corpus import DAY_OBS, RANGE_START, RANGE_STOP, SHARED_ID, StagedCorpus
 def openAdmin(app: Any) -> None:
     app.goto("/?admin=1")
     expect(app.page.locator("#admin-view")).to_be_visible()
+
+
+def test_the_build_panel_names_the_running_version_and_commit(
+    app: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sits at the top so "what is deployed?" is the first thing the page
+    answers, and links the commit so the answer is one click from the code."""
+    gitHash = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setattr(buildInfo, "VERSION", "v1.2.3-4-g0123456")
+    monkeypatch.setattr(buildInfo, "GIT_HASH", gitHash)
+    openAdmin(app)
+    expect(app.page.locator("#admin-layout > section").first).to_have_id("build-card")
+    expect(app.page.locator("#build-version")).to_have_text("v1.2.3-4-g0123456")
+    link = app.page.locator("#build-hash a")
+    expect(link).to_have_text(gitHash)
+    expect(link).to_have_attribute("href", f"https://github.com/lsst-so/ra_log_explorer/commit/{gitHash}")
+
+
+def test_an_unknown_build_says_so(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(buildInfo, "VERSION", None)
+    monkeypatch.setattr(buildInfo, "GIT_HASH", None)
+    openAdmin(app)
+    expect(app.page.locator("#build-version")).to_have_text("unknown")
+    expect(app.page.locator("#build-hash")).to_have_text("unknown")
+    expect(app.page.locator("#build-hash a")).to_have_count(0)
 
 
 def test_cached_windows_are_listed_with_their_kind(app: Any, corpus: StagedCorpus) -> None:
@@ -31,8 +59,23 @@ def test_cached_windows_are_listed_with_their_kind(app: Any, corpus: StagedCorpu
     kinds = sorted(t.lower() for t in app.page.locator("#cache-tbody .cache-kind").all_inner_texts())
     assert kinds == ["exposure", "night", "range"], kinds
     expect(app.page.locator("#cache-summary")).to_contain_text("3")
-    # A total row, so "how much is this costing me" is one glance.
-    expect(app.page.locator("#cache-tfoot .cache-total-row")).to_be_visible()
+    # A total row, so "how much is this costing me" is one glance. It is
+    # the volume's real total: summing the rows would count the AOS night
+    # twice (its window is nested in the night dir's) and miss everything
+    # that isn't a row, like the live night itself.
+    total = _jsHumanBytes(fetch.cacheDuSizeBytes(corpus.root))
+    expect(app.page.locator("#cache-tfoot .cache-total-row")).to_contain_text(total)
+    expect(app.page.locator("#cache-summary")).to_contain_text(f"{total} total")
+
+
+def _jsHumanBytes(n: int) -> str:
+    """explore.js's ``humanBytes``, for comparing against rendered text."""
+    units = ["B", "KiB", "MiB", "GiB", "TiB"]
+    x, i = float(n), 0
+    while x >= 1024 and i < len(units) - 1:
+        x /= 1024
+        i += 1
+    return f"{x:.1f} {units[i]}"
 
 
 def test_each_row_links_back_to_the_run_it_holds(app: Any, corpus: StagedCorpus) -> None:

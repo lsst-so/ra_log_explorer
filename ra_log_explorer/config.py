@@ -62,6 +62,16 @@ def _envFloat(name: str, default: float) -> float:
 # the container sets LOKI_USERNAME and nobody has to type it into the UI.
 DEFAULT_USERNAME = os.environ.get("LOKI_USERNAME") or "merlin"
 DEFAULT_WORKERS = _envInt("RA_LOG_EXPLORER_WORKERS", 8)
+# Worker processes that parse pod logs (see ``parse.summarizeAll``).
+# Parsing is CPU-bound Python, and done on a thread of the server's own
+# process it holds the GIL: every other thread's syscalls then wait out
+# the 5 ms switch interval, one by one, which made a single summit night
+# view stall every fetch, the cache listing and the live poller for half
+# an hour. Deployed, set it below the container's CPU limit so the
+# server and the poller keep a core. 0 parses in-process, for debugging.
+PARSE_WORKERS = _envInt("RA_LOG_EXPLORER_PARSE_WORKERS", min(4, os.process_cpu_count() or 1))
+if PARSE_WORKERS < 0:
+    raise ConfigError(f"RA_LOG_EXPLORER_PARSE_WORKERS must be >= 0; got {PARSE_WORKERS}")
 # Window padding around the user's t-zero. The CLI applies the TAI→UTC
 # conversion internally so t-zero is the actual shutter-close UTC moment;
 # we shouldn't ever need to look at logs from before then for a given
@@ -78,6 +88,13 @@ DEFAULT_WINDOW_AFTER_S = _envFloat("RA_LOG_EXPLORER_WINDOW_AFTER_S", 5 * 60.0)
 # never trips it but small enough that a forgotten browser tab can't fill
 # the disk over weeks.
 MAX_CACHE_BYTES = _envInt("RA_LOG_EXPLORER_MAX_CACHE_BYTES", 5 * 1024 * 1024 * 1024)
+# Ceiling on the memory parsed views (exposures, nights, ranges) hold in
+# the serving process; past it the least recently used are unloaded (see
+# ``server.ServerContext``). The SFM half of a summit night is ~1 GiB
+# parsed, so a count of loaded views bounds nothing. Deployed, keep it
+# well under the container's memory limit: a parse briefly holds a view
+# twice, and the parse workers need room as well.
+MAX_LOADED_BYTES = _envInt("RA_LOG_EXPLORER_MAX_LOADED_BYTES", 2 * 1024 * 1024 * 1024)
 DEFAULT_HTTP_PORT = 8780
 # Env var naming the URL prefix the app is served under. Empty (the local
 # default) means "served at the root"; a deployment sharing a hostname with

@@ -123,6 +123,55 @@ def test_summarizePod_captures_multiple_tracebacks(tmp_path: Path) -> None:
 # ----- night.py analyses ---------------------------------------------------
 
 
+def test_the_rollups_need_no_event_kind_outside_NIGHT_EVENT_KINDS(tmp_path: Path) -> None:
+    """A loaded night keeps only NIGHT_EVENT_KINDS, because the rest (WARN
+    lines above all) made a summit night's SFM half over 3 GiB in memory.
+    So every rollup must answer the same from the reduced summaries as
+    from the full ones; a rollup that starts reading another kind fails
+    here rather than silently seeing none of it."""
+    from .conftest import DATA_DIR
+
+    window = tmp_path / "window"
+    (window / "pods").mkdir(parents=True)
+    (window / "pods_events").mkdir()
+    logs = {
+        "s-lsstcam-run-aos-worker-aosworkerset-2": "aos_worker_sample.jsonl",
+        "s-lsstcam-run-aos-worker-aosworkerset-8": "s-lsstcam-run-aos-worker-aosworkerset-8-truncated.jsonl",
+        "s-lsstcam-run-sfm-runner-workerset-7": "sfm_worker_sample.jsonl",
+        "s-lsstcam-run-head-node-0": "head_node_sample.jsonl",
+        "s-lsstcam-run-sfm-runner-workerset-12": "traceback_sample.jsonl",
+        "s-lsstcam-run-sfm-runner-workerset-134": "pod_inplace_restart_log.jsonl",
+        "s-lsstcam-run-step-1b-aos-worker-gather1baosset-0": "aos_worker_sample.jsonl",
+    }
+    for pod, name in logs.items():
+        (window / "pods" / f"{pod}.jsonl").write_bytes((DATA_DIR / name).read_bytes())
+    for pod, name in {
+        "s-lsstcam-run-sfm-runner-workerset-134": "pod_inplace_restart_events.jsonl",
+        "s-lsstcam-run-step-1b-aos-worker-gather1baosset-0": "pod_crash_events.jsonl",
+    }.items():
+        (window / "pods_events" / f"{pod}.jsonl").write_bytes((DATA_DIR / name).read_bytes())
+
+    full = parse.summarizeAll(window)
+    kept = parse.summarizeAll(window, eventKinds=night.NIGHT_EVENT_KINDS)
+    assert sum(len(s.events) for s in kept) < sum(len(s.events) for s in full)
+    # Only meaningful if the fixture exercises each rollup.
+    assert night.firstTaskStartByDataId(full)
+    assert night.calcZernikesEndByDataId(full)
+    assert night.lifecycleRows(full, {})
+    assert night.failureRows(full, {})
+    for rollup in (
+        night.computeTopStats,
+        night.errorsByType,
+        night.errorsByPod,
+        night.firstTaskStartByDataId,
+        night.calcZernikesEndByDataId,
+        night.gatherOnlyDataIds,
+    ):
+        assert rollup(kept) == rollup(full), rollup.__name__
+    assert night.failureRows(kept, {}) == night.failureRows(full, {})
+    assert night.lifecycleRows(kept, {}) == night.lifecycleRows(full, {})
+
+
 def _stubSummary(
     pod: str,
     group: str,

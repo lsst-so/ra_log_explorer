@@ -80,6 +80,7 @@ function chipTitle(d) {
 }
 
 async function loadRangeExposure(expId) {
+  const shownExpId = rangeSelectedExpId;
   rangeSelectedExpId = expId;
   markSelectedChip();
   const idx = rangeIndex;
@@ -98,9 +99,24 @@ async function loadRangeExposure(expId) {
     const r = await fetch(apiUrl(`/api/summary?${qs}`));
     payload = await r.json();
   } catch (e) {
+    payload = null;
+  }
+  if (payload && payload.loaded === false) {
+    // The server no longer holds this range (a restart, a ninth range,
+    // the loaded-views memory cap) and is rebuilding it from its cache,
+    // or can't. Route again from a URL naming the exposure just picked:
+    // home follows the rebuild and then opens the range on it, rather
+    // than this chip staying lit over the exposure already on screen.
+    window.navigateTo(qs, { replace: true });
+    window.reroute();
     return;
   }
-  if (!payload || !payload.loaded) return;
+  if (!payload || !payload.loaded) {
+    // No answer at all: the timeline is still the one shown before.
+    rangeSelectedExpId = shownExpId;
+    markSelectedChip();
+    return;
+  }
   // Keep the URL pointed at the selected exposure so a refresh returns
   // here (bootstrap still routes ?rangeStart&rangeStop to the range view
   // and startRange reads back the dataId). A rewrite, not an entry:
