@@ -602,6 +602,27 @@ def test_lru_eviction_at_max_states(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.getExposureState(4) is not None
 
 
+def test_night_and_range_slots_are_capped_like_exposures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each kind holds at most ``_MAX_LOADED_STATES`` views, the least
+    recently used going first, however little memory they hold."""
+    monkeypatch.setattr(server, "_MAX_LOADED_STATES", 2)
+    ctx = _emptyCtx()
+    for dayObs in (20260520, 20260521):
+        ctx.putNightState(_makeNightState(dayObs))
+    ctx.getNightState(20260520)
+    ctx.putNightState(_makeNightState(20260522))
+    assert [ctx.getNightState(d) is not None for d in (20260520, 20260521, 20260522)] == [True, False, True]
+
+    for startId in (1, 2):
+        ctx.putRangeState(_makeRangeState(startId, startId + 10))
+    ctx.getRangeState(server.rangeKey(1, 11))
+    ctx.putRangeState(_makeRangeState(3, 13))
+    loaded = [ctx.getRangeState(server.rangeKey(s, s + 10)) is not None for s in (1, 2, 3)]
+    assert loaded == [True, False, True]
+    # A kind's cap leaves the other kinds alone.
+    assert ctx.getNightState(20260520) is not None
+
+
 def _weighing(eventCount: int) -> list[parse.PodSummary]:
     """Summaries a loaded view's footprint counts as holding ``eventCount`` events."""
     summary = parse.PodSummary(
@@ -946,6 +967,68 @@ def test_tracebackContextForNight_seeks_to_the_failure(
     assert out["contextSource"] == "dataId-block"
     assert [ln["raw"] for ln in out["lines"]][-1] == "RuntimeError: bang"
     assert parsed < 10, f"parsed {parsed} lines to reach a failure 5000 lines in"
+
+
+def _podRow(t: dt.datetime, raw: str, level: str = "info") -> bytes:
+    """One pod-log line as Loki's JSONL output carries it."""
+    row = {"timestamp": t.isoformat(), "labels": {"detected_level": level}, "line": raw + "\n"}
+    return (json.dumps(row) + "\n").encode()
+
+
+def _failingPodNight(cacheDir: Path, prefix: bytes = b"", chatter: int = 0) -> tuple[server.NightState, str]:
+    """A night of one AOS pod that fails dataId 2026052100050 after ``chatter``
+    lines of work, with ``prefix`` (raw bytes) earlier in its log. Returns
+    the loaded state and the failure's bodyKey."""
+    pod = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    t = dt.datetime(2026, 5, 21, 14, 40, tzinfo=dt.timezone.utc)
+    block = _podRow(
+        t, "2026-05-21 14:40:00,000 worker fn INFO   Running pipeline for 2026052100050 detector 5"
+    )
+    for i in range(chatter):
+        block += _podRow(t + dt.timedelta(seconds=1 + i), f"step {i} of the quantum")
+    tbAt = t + dt.timedelta(seconds=chatter + 10)
+    block += _podRow(tbAt, "Traceback (most recent call last):", "error")
+    block += _podRow(tbAt + dt.timedelta(milliseconds=1), "RuntimeError: bang", "error")
+    (cacheDir / "pods").mkdir()
+    (cacheDir / "pods" / f"{pod}.jsonl").write_bytes(prefix + block)
+    state = _makeNightState(20260521, cacheDir=cacheDir)
+    state.summaries = parse.summarizeAll(cacheDir)
+    return state, night.makeBodyKey(pod, state.summaries[0].tracebacks[0].t)
+
+
+def test_tracebackContextForNight_reads_from_the_top_when_the_seek_cannot(tmp_path: Path) -> None:
+    """The seek assumes every line is a Loki JSON row. One that isn't (a
+    torn write, a hand-edited file) can cost the drilldown its speed but
+    must not cost it its answer: the parser skips such lines, and the
+    drilldown falls back to reading the pod from the top."""
+    t0 = dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc)
+    earlier = b"".join(_podRow(t0 + dt.timedelta(seconds=i), f"{i} unrelated chatter") for i in range(10))
+    # Most of the file, so the bisection's first probe lands in it.
+    unreadable = b"not a loki row\n" * 2000
+    state, bodyKey = _failingPodNight(tmp_path, prefix=earlier + unreadable)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    assert out["contextSource"] == "dataId-block"
+    raws = [ln["raw"] for ln in out["lines"]]
+    assert raws[0].endswith("Running pipeline for 2026052100050 detector 5")
+    assert raws[-1] == "RuntimeError: bang"
+    assert not any("unrelated chatter" in r for r in raws)
+
+
+def test_tracebackContextForNight_caps_a_huge_block_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataId's block can run to thousands of lines; past the cap the
+    response stops and flags itself truncated, so the UI can say the
+    context is cut short rather than present a partial block as whole."""
+    monkeypatch.setattr(server, "_TB_CONTEXT_MAX_LINES", 5)
+    state, bodyKey = _failingPodNight(tmp_path, chatter=20)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    assert out["truncated"] is True
+    assert len(out["lines"]) == 5
+    # The captured traceback still rides along for the UI to fall back on.
+    assert "RuntimeError: bang" in out["body"]
 
 
 # ----- _resolveCacheWindow -------------------------------------------------
@@ -1464,6 +1547,49 @@ def test_resolveShutterCloses_manual_survives_a_missing_token(
     assert target[2026052000001] == exposureTimes.taiIsoToUtc("2026-06-24T14:38:41.380663")
     assert 2026052000002 not in target
     assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
+
+
+def _noBatch(*_a: Any, **_kw: Any) -> dict[int, exposureTimes.ExposureRecord]:
+    raise AssertionError("ConsDB was queried")
+
+
+def test_resolveShutterCloses_reports_a_blank_token_rather_than_sending_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token file that exists but is blank (a secret mounted before it
+    was filled in) is a missing token. Sent anyway, ConsDB's refusal would
+    surface as a query failure, where the progress line should say there
+    is no token."""
+    siteCatalog.writeSummitToken("  \n")
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", _noBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, {}, job, site)
+    assert target == {}
+    assert _phase(job, "empty-token")["remaining"] == 1
+
+
+def test_resolveShutterCloses_a_row_without_obs_end_stays_missing(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ConsDB can hold a row for an exposure with no ``obs_end`` (one that
+    never completed). It anchors nothing, so it is counted missing rather
+    than failing the job on a time it doesn't have."""
+    siteCatalog.writeSummitToken()
+
+    def rowWithoutEnd(*_a: Any, **_kw: Any) -> dict[int, exposureTimes.ExposureRecord]:
+        return {
+            2026052000001: {"obs_end": None, "img_type": "science"},
+            2026052000002: {"obs_end": "2026-05-20T08:46:16.267000"},
+        }
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", rowWithoutEnd)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, {}, job, site)
+    assert list(target) == [2026052000002]
+    done = _phase(job, "done")
+    assert done["consdbHits"] == 1 and done["stillMissing"] == 1
 
 
 def test_resolveShutterCloses_real_cache_hit_skips_consdb(

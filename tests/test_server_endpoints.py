@@ -1146,6 +1146,49 @@ def test_exposure_time_falls_back_to_manual_on_consdb_404(
     assert body["tZero"] == "2026-06-24T14:38:41.380663"
 
 
+@pytest.mark.parametrize(
+    "outage, status, says",
+    [
+        ("http-503", 502, "ConsDB query failed: ConsDB HTTP 503"),
+        ("unreachable", 503, "Could not reach ConsDB"),
+    ],
+)
+def test_exposure_time_reports_a_consdb_outage(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmpCacheRoot: Path,
+    siteCatalog: FakeSiteCatalog,
+    outage: str,
+    status: int,
+    says: str,
+) -> None:
+    """The home form shows this error under the dataId field, so ConsDB
+    erroring and ConsDB being unreachable each say which it is, rather
+    than the lookup failing with a bare 500. A manual stand-in for the id
+    is served through either: an outage must not strand a hand-typed t0."""
+    from email.message import Message
+    from urllib.error import HTTPError, URLError
+
+    def down(req: object, **_kw: Any) -> object:
+        if outage == "http-503":
+            raise HTTPError("https://summit-consdb.example", 503, "Service Unavailable", Message(), None)
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(exposureTimes, "urlopen", down)
+    siteCatalog.writeSummitToken()
+    host, port, _ = runningServer
+    got, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert got == status, body
+    assert says in body["error"]
+
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    got, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert got == 200, body
+    assert body["manual"] is True and body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
 def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1610,6 +1653,148 @@ def test_summary_answers_without_waiting_for_a_rebuild(
     assert _awaitJob(host, port, first["rebuildJobId"])["status"] == "done"
     assert parsedOn == [f"fetchjob-{first['rebuildJobId']}"]
     assert _get(host, port, f"/api/summary?dayObs={dayObs}")[1]["loaded"] is True
+
+
+def _plantAosNight(root: Path, dayObs: int, cluster: str = "yagan") -> Path:
+    """A completed AOS-half night cache for ``dayObs``, with no pods in it."""
+    cacheDir = root / cluster / "rapid-analysis" / f"night-{dayObs}" / "pods=__aos__"
+    (cacheDir / "pods").mkdir(parents=True)
+    fromIso = config.dayObsStartUtc(dayObs).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    toIso = config.dayObsEndUtc(dayObs).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    meta = {
+        "spec": {"fromIso": fromIso, "toIso": toIso, "podRegex": ".*aos.*"},
+        "fetched_at": "2026-05-22T15:00:00+00:00",
+        "pod_count": 0,
+        "cacheReuse": "none",
+    }
+    (cacheDir / "_meta.json").write_text(json.dumps(meta))
+    return cacheDir
+
+
+def _plantRangeCache(root: Path, startId: int, stopId: int, cluster: str = "yagan") -> Path:
+    """A completed range cache for ``[startId, stopId]`` under LSSTCam, with no pods in it."""
+    window = root / cluster / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z"
+    (window / "pods").mkdir(parents=True)
+    meta = {
+        "spec": {"fromIso": "2026-05-20T08:45:34.267000Z", "toIso": "2026-05-20T08:50:39.267000Z"},
+        "fetched_at": "2026-05-21T15:00:00+00:00",
+        "pod_count": 0,
+    }
+    (window / "_meta.json").write_text(json.dumps(meta))
+    from ra_log_explorer.fetch import markCacheRange
+
+    markCacheRange(window, startId, stopId, instrument="lsstcam")
+    return window
+
+
+def _storeShutterClose(expId: int, obsEnd: str) -> None:
+    exposureTimes.storeCachedRecord(expId, {"obs_end": obsEnd, "instrument": "lsstcam"}, siteName="summit")
+
+
+@pytest.mark.parametrize(
+    "case", ["night on an unknown cluster", "range on an unknown cluster", "range anchor gone"]
+)
+def test_a_view_that_cannot_be_rebuilt_starts_no_job(
+    runningServer: RunningServer, tmpCacheRoot: Path, case: str
+) -> None:
+    """A rebuild job is handed out only for a view it can produce. The page
+    follows a ``rebuildJobId`` and asks for the view again when it ends, so
+    one that cannot rebuild would 500 the GET, or worse, send the page
+    round that loop for good. A window from a cluster this server doesn't
+    serve has no site to resolve against, and a range is anchored on its
+    two ends' cached records."""
+    host, port, ctx = runningServer
+    startId, stopId = 2026051900722, 2026051900724
+    _storeShutterClose(startId, "2026-05-20T08:46:16.267000")
+    if case == "night on an unknown cluster":
+        _plantAosNight(tmpCacheRoot, 20260521, cluster="elsewhere")
+        path = "/api/summary?dayObs=20260521"
+    else:
+        onUnknownCluster = case == "range on an unknown cluster"
+        _plantRangeCache(tmpCacheRoot, startId, stopId, cluster="elsewhere" if onUnknownCluster else "yagan")
+        if onUnknownCluster:
+            # Both anchors cached: only the site is missing.
+            _storeShutterClose(stopId, "2026-05-20T08:46:36.267000")
+        path = f"/api/summary?rangeStart={startId}&rangeStop={stopId}"
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    assert body == {"loaded": False}
+    assert ctx.jobs.listJobs() == []
+
+
+def _heldParse(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, list[str]]:
+    """Make every parse wait for the returned event; also returns the
+    threads that parsed, one entry per parse."""
+    release = threading.Event()
+    parsedOn: list[str] = []
+
+    def held(*_a: Any, **_kw: Any) -> list:
+        parsedOn.append(threading.current_thread().name)
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(serverModule.parser, "summarizeAll", held)
+    return release, parsedOn
+
+
+def test_fetching_a_night_while_it_is_rebuilt_joins_the_rebuild(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deep link is rebuilding a night from the cache when the same night
+    is asked for from the form (another tab, another user). That is the
+    same piece of work: one job, one parse, and no trip to Loki."""
+    host, port, _ctx = runningServer
+    _plantAosNight(tmpCacheRoot, 20260521)
+
+    def noFetch(*_a: Any, **_kw: Any) -> tuple[Path, dict]:
+        raise AssertionError("joined a rebuild, but fetched anyway")
+
+    monkeypatch.setattr(jobsModule, "fetchAll", noFetch)
+    release, parsedOn = _heldParse(monkeypatch)
+    try:
+        status, summary = _get(host, port, "/api/summary?dayObs=20260521")
+        assert status == 200 and "rebuildJobId" in summary, summary
+        status, fetched = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert status == 202, fetched
+        assert fetched["jobId"] == summary["rebuildJobId"]
+    finally:
+        release.set()
+    assert _awaitJob(host, port, summary["rebuildJobId"])["status"] == "done"
+    assert len(parsedOn) == 1
+
+
+def test_a_deep_link_to_a_night_being_fetched_follows_the_fetch(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other way round: a night on disk is being fetched again (to
+    bring it up to date) when a tab asks for it. The tab follows that
+    fetch rather than starting a rebuild that parses the night a second
+    time, out of the older window."""
+    host, port, ctx = runningServer
+    cacheDir = _plantAosNight(tmpCacheRoot, 20260521)
+    release, parsedOn = _heldParse(monkeypatch)
+    fetching = threading.Event()
+    fetches: list[FetchSpec] = []
+
+    def heldFetch(spec: FetchSpec, progress: Any = None, forceRefresh: bool = False) -> tuple[Path, dict]:
+        fetches.append(spec)
+        fetching.set()
+        release.wait(10)
+        return cacheDir, json.loads((cacheDir / "_meta.json").read_text())
+
+    monkeypatch.setattr(jobsModule, "fetchAll", heldFetch)
+    try:
+        status, fetched = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert status == 202, fetched
+        assert fetching.wait(5)
+        status, summary = _get(host, port, "/api/summary?dayObs=20260521")
+        assert status == 200
+        assert summary == {"loaded": False, "rebuildJobId": fetched["jobId"]}
+    finally:
+        release.set()
+    assert _awaitJob(host, port, fetched["jobId"])["status"] == "done"
+    assert len(fetches) == 1 and len(parsedOn) == 1
+    assert [j.jobId for j in ctx.jobs.listJobs()] == [fetched["jobId"]]
 
 
 def test_delete_cache_window_clears_loaded_state_if_match(
