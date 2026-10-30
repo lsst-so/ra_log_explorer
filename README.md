@@ -320,7 +320,9 @@ The browser app has three views:
   it raised a traceback), plus ◀/▶ buttons and the ←/→ arrow keys to
   step between them. Each exposure's timeline is anchored at its own
   shutter close, so the `Δt₀ = 0` line always sits on the exposure
-  you're looking at.
+  you're looking at. If the server has unloaded the range since the tab
+  opened, picking a chip goes through *Loading from the cache...* on
+  the home page and comes back to the range on that exposure.
 - **Night view** — the dayObs-wide failure breakdown and Δshutter
   histograms, plus data-completeness banners: an incomplete-fetch
   warning, and a "gather-only" warning listing any dataIds whose

@@ -774,6 +774,11 @@ lands on home with the form prefilled from the URL, follows the job,
 and re-routes when it finishes, so a deep-linked tab (e.g. the dataId
 column in the admin view's cache table) still opens its view without
 an intervening click, and the cache stays the source of truth. The
+range navigator's per-exposure request gets the same answer once its
+range has been unloaded under an open tab, and does the same: it points
+the URL at the chip just picked and re-routes, so the page follows the
+rebuild and reopens the range on that exposure, rather than lighting the
+chip over the exposure still on screen. The
 summary request itself never parses: a summit night's SFM half is a
 minute of parsing, and done inline it once ran for 37 minutes after the
 browser had given up (see *Threading model*). For exposure caches the
