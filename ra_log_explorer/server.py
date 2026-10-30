@@ -86,6 +86,7 @@ from .fetch import (
     loadPodLogPath,
     markCacheRange,
     markCacheViewed,
+    writeCacheSchemaSentinel,
 )
 from .jobs import FetchJob, JobManager
 from .live import LiveNightManager
@@ -1901,6 +1902,11 @@ def _deleteCacheRoot(ctx: "ServerContext") -> None:
         except OSError:
             shutil.rmtree(root, ignore_errors=True)
         root.mkdir(parents=True, exist_ok=True)
+        # The tree is empty, which is the current schema. Left out, the
+        # next start would take the root for an unversioned cache and
+        # flush whatever had been rebuilt since: tonight, and the night
+        # before that the poller has just pulled again.
+        writeCacheSchemaSentinel(root)
 
 
 # ----- request handling ----------------------------------------------------

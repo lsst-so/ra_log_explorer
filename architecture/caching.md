@@ -91,6 +91,9 @@ of the **entire** cache tree:
   cluster trees, plus `exposure-times/`) and rewrites the sentinel,
   printing a one-line notice so the user understands why the next loads
   re-fetch.
+- `DELETE /api/cache` rewrites the sentinel after emptying the tree, so
+  the flush isn't repeated at the next start over whatever was rebuilt
+  in between.
 
 This is deliberately heavier than the per-cache guard, which only
 re-fetches stale windows lazily — one surprise-slow load at a time —

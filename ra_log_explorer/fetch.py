@@ -202,6 +202,18 @@ class FetchError(RuntimeError):
     pass
 
 
+def writeCacheSchemaSentinel(root: Path) -> None:
+    """Record that the cache under ``root`` is the current schema's (best-effort).
+
+    Whatever empties the cache rewrites this as well: a root without it is
+    an unversioned cache, which the next process start flushes whole.
+    """
+    try:
+        (root / CACHE_SCHEMA_SENTINEL).write_text(f"{CACHE_SCHEMA_VERSION}\n")
+    except OSError:
+        pass
+
+
 def ensureCacheSchemaCurrent() -> int:
     """Flush the entire cache tree iff it was built by a different schema.
 
@@ -248,10 +260,7 @@ def ensureCacheSchemaCurrent() -> int:
             removed += 1
         except OSError:
             pass  # best-effort; the per-cache guard still refuses stale meta
-    try:
-        sentinel.write_text(current + "\n")
-    except OSError:
-        pass
+    writeCacheSchemaSentinel(root)
     if removed:
         log.info(
             "Cache schema changed (was %s, now %s); flushed %d cached window(s). "

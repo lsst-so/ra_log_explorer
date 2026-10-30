@@ -1391,6 +1391,24 @@ def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> N
     assert tmpCacheRoot.exists()
 
 
+def test_deleting_the_cache_leaves_it_marked_current(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Emptying the cache doesn't make it a cache of unknown schema. With
+    the sentinel gone too, the next start flushed everything rebuilt since
+    the delete: tonight so far, and the previous night the poller had just
+    pulled from Loki again."""
+    from ra_log_explorer import fetch
+
+    host, port, _ = runningServer
+    fetch.ensureCacheSchemaCurrent()
+    status, _ = _delete(host, port, "/api/cache")
+    assert status == 200
+    rebuilt = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", "a__a")
+    assert fetch.ensureCacheSchemaCurrent() == 0  # the restart after
+    assert rebuilt.exists()
+
+
 def test_deleting_the_cache_drops_live_sidecars_first(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:

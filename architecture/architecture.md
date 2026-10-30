@@ -1217,7 +1217,10 @@ shows `root.totalBytes`.
 Wipe the entire cache root. Always clears every loaded state (since
 they all reference the now-gone cache). Returns the same shape as
 `GET /api/cache`. The root itself is recreated empty so subsequent
-fetches still work.
+fetches still work, with `_cache_schema_version.txt` rewritten in it:
+an empty cache is a current one, and a root without the sentinel would
+be flushed whole at the next start, taking everything rebuilt since the
+delete with it (tonight, and the previous night the poller pulls again).
 
 Every `_live.json` under the target is unlinked *before* the tree goes
 (`_dropLiveSidecars`), and only then is `shutil.rmtree` called — with
