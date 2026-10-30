@@ -24,7 +24,7 @@ every route is mounted under ``ServerContext.basePath``):
   DELETE /api/cache/<cluster>/<ns>/<slug>[/<pods=…>]  delete one cached window
   GET    /api/exposure-time/<dataId>[?instrument=<>]  dataId -> ConsDB exposure record (TAI t-zero)
   GET    /api/site                                the one site this server serves (read-only)
-  GET    /api/version                             the running build: package version + git hash
+  GET    /api/version                             the running build: git describe + git hash
   GET    /api/live                                live poller snapshot ({enabled: false} when off)
   POST   /api/fetch                               start an exposure fetch; returns {jobId}
   POST   /api/fetch-night                         start a night fetch; returns {jobId}

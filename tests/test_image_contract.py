@@ -77,13 +77,18 @@ def test_bakes_in_no_environment() -> None:
     assert envLines == [], f"image bakes in environment: {envLines}"
 
 
-def test_every_image_build_records_its_commit() -> None:
-    """The admin page names the deployed commit from a file the build
-    writes from ``GIT_HASH``. A build that forgets the arg still succeeds
-    and deploys, and the page then says "unknown" exactly when someone
-    needs to know what is running."""
-    assert re.search(r'^ARG GIT_HASH=""$', _dockerfile(), re.MULTILINE)
-    assert "> ra_log_explorer/_gitHash.txt" in _dockerfile()
+def test_every_image_build_records_its_version_and_commit() -> None:
+    """The admin page names the deployed build from files the image build
+    writes from ``VERSION`` and ``GIT_HASH``. A build that forgets an arg
+    still succeeds and deploys, and the page then says "unknown" exactly
+    when someone needs to know what is running."""
+    body = _dockerfile()
+    for arg, fileName in (("VERSION", "_version.txt"), ("GIT_HASH", "_gitHash.txt")):
+        assert re.search(rf'^ARG {arg}=""$', body, re.MULTILINE), arg
+        assert f'"${{{arg}}}" > ra_log_explorer/{fileName}' in body, arg
     workflow = (DOCKERFILE.parent / ".github" / "workflows" / "build.yaml").read_text()
-    # The smoke test's image and the pushed one.
-    assert workflow.count('build-args: "GIT_HASH=${{ github.sha }}"') == 2
+    # The smoke test's image and the pushed one, each from a checkout deep
+    # enough for git describe to find a tag.
+    assert workflow.count("VERSION=${{ steps.describe.outputs.version }}") == 2
+    assert workflow.count("GIT_HASH=${{ github.sha }}") == 2
+    assert workflow.count("fetch-depth: 0") == 2

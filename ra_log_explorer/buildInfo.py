@@ -1,10 +1,14 @@
 """Which build of the application this process is running.
 
-The image build has no ``.git`` to ask (``.dockerignore`` keeps it out of
-the context), so the Dockerfile writes the commit into the package as
-``_gitHash.txt`` from its ``GIT_HASH`` build arg. A run from a checkout
-has no such file and asks git instead. Read once, at import, so a commit
-made while a dev server is running doesn't relabel code it hasn't loaded.
+Both values come from git: the version is ``git describe --tags``, so a
+release tag names itself and anything after it reads as
+``v0.2.0-30-ge16e6c9``, with no version number to remember to bump. The
+image build has no ``.git`` to ask (``.dockerignore`` keeps it out of the
+context), so the workflow computes them and the Dockerfile writes them
+into the package as ``_version.txt`` and ``_gitHash.txt``. A run from a
+checkout has no such files and asks git itself. Read once, at import, so
+a commit made while a dev server is running doesn't relabel code it
+hasn't loaded.
 """
 
 from __future__ import annotations
@@ -12,23 +16,23 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
-from . import __version__
+PACKAGE_DIR = Path(__file__).parent
+VERSION_FILE = PACKAGE_DIR / "_version.txt"
+GIT_HASH_FILE = PACKAGE_DIR / "_gitHash.txt"
 
-GIT_HASH_FILE = Path(__file__).parent / "_gitHash.txt"
 
-
-def _readGitHash() -> str | None:
-    """The commit this code was built from, or None if nothing can say."""
+def _readBuildValue(bakedFile: Path, gitArgs: list[str]) -> str | None:
+    """The value the image build baked in, else git's answer, else None."""
     try:
-        baked = GIT_HASH_FILE.read_text().strip()
+        baked = bakedFile.read_text().strip()
     except OSError:
         baked = ""
     if baked:
         return baked
     try:
         result = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=GIT_HASH_FILE.parent,
+            ["git", *gitArgs],
+            cwd=bakedFile.parent,
             capture_output=True,
             text=True,
             timeout=5,
@@ -39,5 +43,5 @@ def _readGitHash() -> str | None:
     return result.stdout.strip() or None
 
 
-VERSION = __version__
-GIT_HASH = _readGitHash()
+VERSION = _readBuildValue(VERSION_FILE, ["describe", "--tags", "--always", "--dirty"])
+GIT_HASH = _readBuildValue(GIT_HASH_FILE, ["rev-parse", "HEAD"])

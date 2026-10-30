@@ -13,7 +13,7 @@ from typing import Any
 import pytest
 from playwright.sync_api import expect
 
-from ra_log_explorer import __version__, buildInfo, fetch
+from ra_log_explorer import buildInfo, fetch
 
 from .corpus import DAY_OBS, RANGE_START, RANGE_STOP, SHARED_ID, StagedCorpus
 
@@ -29,18 +29,21 @@ def test_the_build_panel_names_the_running_version_and_commit(
     """Sits at the top so "what is deployed?" is the first thing the page
     answers, and links the commit so the answer is one click from the code."""
     gitHash = "0123456789abcdef0123456789abcdef01234567"
+    monkeypatch.setattr(buildInfo, "VERSION", "v1.2.3-4-g0123456")
     monkeypatch.setattr(buildInfo, "GIT_HASH", gitHash)
     openAdmin(app)
     expect(app.page.locator("#admin-layout > section").first).to_have_id("build-card")
-    expect(app.page.locator("#build-version")).to_have_text(__version__)
+    expect(app.page.locator("#build-version")).to_have_text("v1.2.3-4-g0123456")
     link = app.page.locator("#build-hash a")
     expect(link).to_have_text(gitHash)
     expect(link).to_have_attribute("href", f"https://github.com/lsst-so/ra_log_explorer/commit/{gitHash}")
 
 
-def test_an_unknown_commit_says_so(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_an_unknown_build_says_so(app: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(buildInfo, "VERSION", None)
     monkeypatch.setattr(buildInfo, "GIT_HASH", None)
     openAdmin(app)
+    expect(app.page.locator("#build-version")).to_have_text("unknown")
     expect(app.page.locator("#build-hash")).to_have_text("unknown")
     expect(app.page.locator("#build-hash a")).to_have_count(0)
 

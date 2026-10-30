@@ -309,8 +309,9 @@ The browser app has three views:
   is open — see *Live mode (deployments)* below.
 - **Admin view** — `/?admin=1`, linked from the home topbar (no
   separate permissions; anyone can open it). A *Deployment* panel at
-  the top names the running build — package version and the git commit
-  it was built from, linked to that commit on GitHub. Below it, the
+  the top names the running build — its version (`git describe`, so
+  `v0.2.0` for a release and `v0.2.0-30-ge16e6c9` for a commit after
+  it) and the commit it was built from, linked on GitHub. Below it, the
   cached-windows table — every log window on disk, per-row delete — and a *flush
   entire cache* button. Caching is invisible to day-to-day use; this
   page is for operators.

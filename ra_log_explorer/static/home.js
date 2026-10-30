@@ -1398,7 +1398,7 @@ async function loadBuildInfo() {
     versionEl.textContent = hashEl.textContent = 'unavailable';
     return;
   }
-  versionEl.textContent = build.version;
+  versionEl.textContent = build.version || 'unknown';
   if (!build.gitHash) {
     hashEl.textContent = 'unknown';
     return;
