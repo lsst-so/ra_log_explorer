@@ -32,7 +32,8 @@ ra_log_explorer = ["static/*", "templates/*", "_version.txt", "_gitHash.txt"]
 # hard dependency: the runtime is stdlib-only and installing a browser
 # is not something a deployment should ever be asked to do. But once
 # selected they never skip — see tests/ui/conftest.py.
-ui-test = ["pytest-playwright", "pytest-xdist"]
+# pytest-repeat is for flushing out timing races: `--count 50` on a suspect test.
+ui-test = ["pytest-playwright", "pytest-xdist", "pytest-repeat"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

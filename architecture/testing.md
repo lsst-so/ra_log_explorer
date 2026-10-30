@@ -79,10 +79,15 @@ so they can be deselected (`-m "not ui"`), never so they can be
 forgotten.
 
 ```sh
-pip install -e '.[ui-test]'     # pytest-playwright + pytest-xdist
+pip install -e '.[ui-test]'     # pytest-playwright + pytest-xdist + pytest-repeat
 playwright install chromium     # once per machine
 pytest -n auto                  # everything, ~32 s
 ```
+
+A browser test that fails once in CI and passes locally is almost always
+a race: a value snapshotted (`inner_text()`, `count()`) before the page
+has rendered it. Wait for the thing being read with `expect(...)` first,
+and check the fix with `pytest -n auto --count 50 -k <test>`.
 
 **They fail rather than skip when Playwright or the browser is
 missing** — a UI suite that skips itself is indistinguishable from one
