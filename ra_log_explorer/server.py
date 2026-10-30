@@ -35,6 +35,7 @@ every route is mounted under ``ServerContext.basePath``):
 from __future__ import annotations
 
 import datetime as dt
+import itertools
 import json
 import logging
 import mimetypes
@@ -69,8 +70,11 @@ from .config import (
     dayObsStartUtc,
 )
 from .fetch import (
+    EXPOSURE_IDS_NAME,
+    LIVE_SIDECAR_NAME,
     META_NAME,
     PARTIAL_FLAG,
+    RANGE_NAME,
     addExposureToCache,
     cacheSizes,
     checkLokiAccess,
@@ -1434,6 +1438,11 @@ def _supersededNightSlices(job: FetchJob) -> list[Path]:
     pod failing) leaves the wider dir alone rather than deleting live
     coverage. Night mode is browser-only, so the fetch-job callback is
     the one path that needs this.
+
+    The SFM half's slices are unfiltered, so they are top-level windows,
+    alongside the night dirs themselves and every exposure and range
+    window. Only a "night so far" cut from a live night dir qualifies
+    there (see :func:`_isNightSoFarSlice`).
     """
     if job.cacheDir is None:
         return []
@@ -1447,7 +1456,8 @@ def _supersededNightSlices(job: FetchJob) -> list[Path]:
         return []
     keep = job.cacheDir.resolve()
     stale: list[Path] = []
-    for window, meta in _iterCompletedCaches(nightMode=True):
+    candidates = itertools.chain(_iterCompletedCaches(nightMode=True), _iterCompletedCaches(nightMode=False))
+    for window, meta in candidates:
         if window.resolve() == keep:
             continue
         cSpec = meta.get("spec") or {}
@@ -1460,11 +1470,34 @@ def _supersededNightSlices(job: FetchJob) -> list[Path]:
         if cSpec.get("fromIso") != fromIso:
             continue
         try:
-            if _parseClientIso(str(cSpec.get("toIso"))) < keptTo:
-                stale.append(window)
+            if _parseClientIso(str(cSpec.get("toIso"))) >= keptTo:
+                continue
         except (TypeError, ValueError):
             continue
+        if not cSpec.get("podRegex") and not _isNightSoFarSlice(window, meta):
+            continue
+        stale.append(window)
     return stale
+
+
+def _isNightSoFarSlice(window: Path, meta: dict) -> bool:
+    """Whether an unfiltered window is a "night so far" slice nothing else uses.
+
+    It has to have been cut from a live night dir, and be none of the
+    other things a top-level window can be: a night dir (live,
+    finalised, or a whole night adopted by the poller, all carrying
+    ``_live.json``); a window an exposure or range was opened from,
+    which may only happen to start at noon; or one holding a night-mode
+    cache of its own, which deleting the window would take with it.
+    """
+    if not meta.get("sliceSource"):
+        return False
+    if any((window / name).exists() for name in (LIVE_SIDECAR_NAME, EXPOSURE_IDS_NAME, RANGE_NAME)):
+        return False
+    try:
+        return not any(d.is_dir() and d.name.startswith("pods=") for d in window.iterdir())
+    except OSError:
+        return False  # gone already, or unreadable: nothing to reclaim
 
 
 def _findExposureCacheDirs(expId: int, instrument: str | None = None) -> list[Path]:

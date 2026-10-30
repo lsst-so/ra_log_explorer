@@ -382,6 +382,52 @@ def test_a_night_refetch_reclaims_the_window_it_supersedes(
     assert state is not None and state.cacheDir == secondDir
 
 
+def test_an_sfm_night_refetch_reclaims_the_window_it_supersedes(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SFM half's "night so far" is a top-level window, a copy of the
+    whole night up to the watermark: several GiB a click on the summit.
+    Through real slices and the real callback, the one a refetch
+    supersedes goes, and the night dir it was cut from stays."""
+    podTimes = {"s-lsstcam-run-sfm-runner-1": [_t(6), _t(40)]}
+    nightDir = _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes=podTimes)
+    monkeypatch.setattr(
+        fetch,
+        "_run_logcli",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must be sliced, not fetched")),
+    )
+    _pretendInProgress(monkeypatch)
+    spec = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))  # unfiltered
+
+    earlierDir, _m = fetch.fetchAll(spec)  # [nightStart, 12:30)
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    sidecar["watermarkIso"] = fetch._fmtLogcliTime(_t(45))
+    for record in sidecar["pods"].values():
+        record["watermarkIso"] = sidecar["watermarkIso"]
+    fetch.writeLiveSidecar(nightDir, sidecar)
+    laterDir, laterMeta = fetch.fetchAll(spec)  # [nightStart, 12:45)
+    assert earlierDir.parent == laterDir.parent == nightDir.parent and earlierDir != laterDir
+
+    ctx = server.ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
+    job = FetchJob(
+        jobId="night-1",
+        spec=spec,
+        siteName=siteCatalog.defaultName,
+        kind="night",
+        dayObs=20260711,
+        nightView="sfm",
+    )
+    job.cacheDir, job.meta = laterDir, laterMeta
+    server._onFetchComplete(ctx)(job)
+
+    assert not earlierDir.exists(), "the superseded SFM window survived a real refetch"
+    assert laterDir.exists() and nightDir.exists()
+    assert fetch.readLiveSidecar(nightDir) is not None
+    state = ctx.getNightState(20260711, "sfm")
+    assert state is not None and state.cacheDir == laterDir
+
+
 def test_fetchAll_does_not_clamp_arbitrary_future_windows(
     tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

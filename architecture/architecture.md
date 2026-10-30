@@ -596,8 +596,9 @@ volume holds tonight, last night and a couple of weeks of older nights
 plus slices before LRU eviction reclaims the oldest. (BTS nights are 50-150 MiB;
 its 50 GiB volume is ample.) Night mode's own "night so
 far" windows do not accumulate against that: each fetch supersedes the
-last one's, and the fetch-job callback drops the windows it contains
-(see *Night slice* in [caching.md](caching.md)).
+last one's, and the fetch-job callback drops the windows it contains,
+for the SFM half as well as the AOS one (see *Night slice* in
+[caching.md](caching.md)).
 
 The parse cost of the *night view* is deliberately left alone: opening
 the in-progress night slices the AOS subset instantly but still parses

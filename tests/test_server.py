@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -2430,6 +2430,53 @@ def test_night_fetch_drops_the_night_so_far_windows_it_supersedes(
     # directory, which would serve a summary with empty pod drilldowns.
     state = ctx.getNightState(20260711)
     assert state is not None and state.cacheDir == current
+
+
+def _plantSfmWindow(root: Path, fromIso: str, toIso: str, *, sliced: bool = True) -> Path:
+    """An unfiltered window, by default a "night so far" cut from a live night dir."""
+    windowDir = fetchModule.windowCachePath("yagan", "rapid-analysis", fromIso, toIso)
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "pods" / "s-lsstcam-run-sfm-runner-workerset-1.jsonl").write_text("")
+    meta: dict = {
+        "spec": {"cluster": "yagan", "namespace": "rapid-analysis", "fromIso": fromIso, "toIso": toIso},
+        "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+    }
+    if sliced:
+        meta["sliceSource"] = "/the/night/dir"
+    (windowDir / "_meta.json").write_text(json.dumps(meta))
+    return windowDir
+
+
+def test_an_sfm_night_fetch_drops_only_the_night_so_far_windows_it_supersedes(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """The SFM half is unfiltered, so its "night so far" slices are
+    top-level windows, several GiB each on the summit, and the sweep only
+    ever looked at nested ones. Top-level windows are also the night dirs
+    themselves and every exposure and range window, none of which may go."""
+    superseded = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # A night dir: the poller's sidecar says so, finalised or not.
+    nightDir = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T19:00:00.000000Z")
+    (nightDir / fetchModule.LIVE_SIDECAR_NAME).write_text("{}")
+    # An exposure, and a range, whose windows happen to start at noon.
+    exposure = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T12:05:00.000000Z")
+    fetchModule.addExposureToCache(exposure, 2026071100001, "lsstcam")
+    rangeDir = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T13:00:00.000000Z")
+    fetchModule.markCacheRange(rangeDir, 2026071100001, 2026071100009, instrument="lsstcam")
+    # Fetched from Loki rather than cut from the night: not ours to judge.
+    _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T14:00:00.000000Z", sliced=False)
+    # A superseded slice that an AOS night cache sits inside, which
+    # deleting the window would take with it.
+    holder = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    nested = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    assert nested.parent == holder
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    job.spec = replace(job.spec, podRegex=None)
+    job.nightView = config.NIGHT_VIEW_SFM
+    job.meta["spec"]["podRegex"] = None
+    assert server._supersededNightSlices(job) == [superseded]
 
 
 def test_a_night_that_has_ended_is_only_rebuilt_whole(tmpCacheRoot: Path) -> None:

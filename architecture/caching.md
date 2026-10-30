@@ -250,7 +250,15 @@ duplicated. It then decides in order:
    the same inversion `markCacheViewed` on the night dir guards against,
    arriving from the other side. Only strict subsets go, so a watermark
    that regressed (a cache wipe mid-night, one tick of a newly-seen pod
-   failing) leaves the wider directory alone. Any slice failure
+   failing) leaves the wider directory alone. Both halves' slices go:
+   the AOS half's nest at `<window>/pods=<slug>/`, and the SFM half's,
+   unfiltered, are top-level windows of their own, the night so far
+   copied whole, which on the summit is several GiB a click. Top-level
+   windows are also night dirs and exposure and range windows, so an
+   unfiltered one is reclaimed only when its meta records the night it
+   was cut from (`sliceSource`) and it carries no `_live.json`,
+   `_exposure_ids.txt` or `_range.txt` and no nested night cache, which
+   deleting the window would take with it. Any slice failure
    falls through to the steps below (leaving `.partial` in place, so a
    half-copied window can never pass for a hit) — worst case is the
    fetch that would have happened anyway.
