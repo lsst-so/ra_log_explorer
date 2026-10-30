@@ -11,9 +11,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from playwright.sync_api import expect
 
-from .corpus import DAY_OBS, StagedCorpus
+from .corpus import DAY_OBS, SHARED_ID, StagedCorpus
 
 
 def openNight(app: Any, corpus: StagedCorpus) -> None:
@@ -328,3 +329,85 @@ def test_a_night_on_disk_but_not_in_memory_is_rebuilt_in_view(
     expect(app.page.locator("#night-view")).to_be_visible()
     expect(app.page.locator("#night-dayobs-display")).to_contain_text(str(DAY_OBS))
     assert f"dayObs={DAY_OBS}" in app.page.url
+
+
+def test_a_rebuild_counts_its_parse_pod_by_pod(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
+    """Once a night is on disk the parse is most of the wait: about a
+    minute for a summit night. The card counts the pods as they finish,
+    so the page shows a parse moving rather than a bar standing still."""
+    import threading
+    from pathlib import Path
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def holdAfterTheFirstPod(
+        cacheDir: Path, keep: Any = None, progress: Any = None, eventKinds: Any = None
+    ) -> Any:
+        def note(i: int, n: int) -> None:
+            progress(i, n)
+            if i == 1:
+                release.wait(10)
+
+        return realParse(cacheDir, keep=keep, progress=note, eventKinds=eventKinds)
+
+    monkeypatch.setattr(parse, "summarizeAll", holdAfterTheFirstPod)
+    try:
+        app.goto(f"/?dayObs={DAY_OBS}")
+        text = app.page.locator("#night-progress .progress-text")
+        expect(text).to_contain_text(re.compile(r"parsing 1/\d+ pods"))
+        counted = re.search(r"parsing 1/(\d+) pods", text.inner_text())
+        assert counted is not None
+        width = app.page.locator("#night-progress .progress-fill").evaluate("e => e.style.width")
+        assert float(width.rstrip("%")) == pytest.approx(100 / int(counted.group(1)), abs=0.1), width
+    finally:
+        release.set()
+    expect(app.page.locator("#night-view")).to_be_visible()
+
+
+def test_a_failure_row_whose_night_was_unloaded_says_to_reload(app: Any, corpus: StagedCorpus) -> None:
+    """Rows outlive their night in the server's memory (opening a ninth
+    view, or the loaded-views memory cap, unloads it). Expanding one then
+    says what happened and what to do, in the server's words, rather than
+    a bare status code."""
+    openNight(app, corpus)
+    with app.ctx.jobs.stateLock:
+        app.ctx.nightStates.clear()
+    app.page.locator("#night-failures .night-failure-row").first.click()
+    expect(app.page.locator("#night-failures tr.night-failure-detail")).to_contain_text(
+        "This night is no longer loaded; reload the page"
+    )
+
+
+def test_a_failed_rebuild_gives_the_form_back(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
+    """A rebuild that fails says so on the night card and gives the page
+    back. The page must also stop following it: the next fetch it starts
+    has to open what that fetch fetched, not re-route to the night the
+    URL still names."""
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    realParse = parse.summarizeAll
+    parses = 0
+
+    def failingFirst(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parses
+        parses += 1
+        if parses == 1:
+            raise RuntimeError("cannot read the night")
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", failingFirst)
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-message")).to_contain_text("cannot read the night")
+    expect(app.page.locator("#night-submit")).to_be_enabled()
+
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("shutter close (TAI)")
+    app.page.locator("#fetch-submit").click()
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=30_000)
+    expect(app.page.locator("#expId-display")).to_contain_text(str(SHARED_ID))
+    assert f"dataId={SHARED_ID}" in app.page.url
