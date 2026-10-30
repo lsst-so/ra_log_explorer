@@ -2254,3 +2254,143 @@ def test_a_re_pull_with_consdb_down_still_finalises_the_night(
     pulled = mgr._backfill
     mgr.tick(now=_t(20))
     assert mgr._backfill is pulled
+
+
+def _plantFetchedNight(dayObs: int, podTimes: dict[str, list[dt.datetime]]) -> Path:
+    """What POST /api/fetch-night (sfm) leaves at the night's path: a
+    completed ordinary window with pods, their events, and no sidecar."""
+    fromIso = fetch._fmtLogcliTime(dayObsStartUtc(dayObs))
+    toIso = fetch._fmtLogcliTime(dayObsEndUtc(dayObs))
+    nightDir = windowCachePath("yagan", "rapid-analysis", fromIso, toIso)
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    (nightDir / fetch.PODS_EVENTS_DIR_NAME).mkdir()
+    for pod, times in podTimes.items():
+        _writeLines(nightDir / fetch.PODS_DIR_NAME / f"{pod}.jsonl", times)
+        (nightDir / fetch.PODS_EVENTS_DIR_NAME / f"{pod}.jsonl").write_bytes(_eventLine(times[0], pod))
+    meta = {
+        "spec": {
+            "lokiAddr": "x",
+            "username": "u",
+            "cluster": "yagan",
+            "namespace": "rapid-analysis",
+            "fromIso": fromIso,
+            "toIso": toIso,
+            "workers": 8,
+            "podRegex": None,
+        },
+        "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
+        "fetched_at": dt.datetime.now(UTC).isoformat(),
+        "pod_count": len(podTimes),
+        "pod_lines": {pod: len(times) for pod, times in podTimes.items()},
+        "pod_event_lines": {pod: 1 for pod in podTimes},
+        "errors": {},
+        "incomplete_pods": {},
+        "fetchComplete": True,
+        "cacheReuse": "none",
+    }
+    (nightDir / fetch.META_NAME).write_text(json.dumps(meta))
+    return nightDir
+
+
+def test_a_previous_night_already_fetched_whole_is_adopted_not_re_pulled(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last night fetched from the form (after deleting its row on the
+    admin page, say) is already what the re-pull would produce. The
+    re-pull used to open the dir as a fresh night, which destroyed the
+    window and pulled it again. It is adopted instead: a finalised
+    sidecar built from the files, so it slices like any night, and not
+    one Loki call for it."""
+    nightDir = _plantFetchedNight(_PREV, {"pod-a": [_prev(1), _prev(15, 30), _prev(23, 59)]})
+    podFile = nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl"
+    before = podFile.read_bytes()
+    metaBefore = (nightDir / fetch.META_NAME).read_text()
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    assert podFile.read_bytes() == before
+    assert (nightDir / fetch.META_NAME).read_text() == metaBefore
+    assert not [c for c in calls if c[1] < dayObsStartUtc(20260711)], "the adopted night was fetched anyway"
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert sidecar["pods"]["pod-a"]["bytes"] == len(before)
+    assert sidecar["pods"]["pod-a"]["lines"] == 3
+    assert (
+        sidecar["pods"]["pod-a"]["eventBytes"]
+        == (nightDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").stat().st_size
+    )
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is not None
+    # An exposure window inside it is now sliced rather than fetched.
+    monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no net")))
+    sliceDir, meta = fetch.fetchAll(_sliceSpec(_prev(15), _prev(16)))
+    assert meta["cacheReuse"] == "night-slice"
+    assert (sliceDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == _lokiLine(_prev(15, 30))
+    assert (sliceDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").exists() is False  # event at 13:00
+    # Adopted is finalised: the next poll leaves it alone.
+    adopted = mgr._backfill
+    mgr.tick(now=_t(20))
+    assert mgr._backfill is adopted
+
+
+def test_the_re_pull_never_opens_a_night_dir_a_fetch_is_writing(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch of last night's own window from the form writes into the
+    very dir the re-pull opens. Opening it then rmtree'd pods/ under the
+    fetch, and both wrote the same files afterwards: the night held the
+    fetch's lines and the re-pull's hours, the sidecar vouched for the
+    fetch's prefix as hour one. The re-pull takes the window's write
+    lock without waiting and leaves a dir someone holds, or has left a
+    .partial in, until the next poll."""
+    spec = _backfillManager(monkeypatch, [], backfillPrevious=True)._nightSpec(_PREV)
+    nightDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    (nightDir / fetch.PARTIAL_FLAG).write_text("")
+    podFile = nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl"
+    _writeLines(podFile, [_prev(1)])
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+
+    def untouched() -> None:
+        assert (nightDir / fetch.PARTIAL_FLAG).exists()
+        assert podFile.read_bytes() == _lokiLine(_prev(1))
+        assert fetch.readLiveSidecar(nightDir) is None
+        assert not [c for c in calls if c[1] < dayObsStartUtc(20260711)]
+        assert mgr._backfillError is None
+
+    # The fetch holds the window's lock, mid-write.
+    lock = fetch.windowWriteLock(nightDir)
+    assert lock.acquire(blocking=False)
+    try:
+        mgr.tick(now=_t(10))
+        _awaitBackfill(mgr)
+        untouched()
+    finally:
+        lock.release()
+    # The fetch died: its lock is free but its .partial remains.
+    mgr.tick(now=_t(20))
+    _awaitBackfill(mgr)
+    untouched()
+    # The fetch finished: the window is whole, and the next poll adopts it.
+    (nightDir / fetch.PARTIAL_FLAG).unlink()
+    (nightDir / fetch.PODS_EVENTS_DIR_NAME).mkdir()
+    meta = json.loads((_plantFetchedNight(20260101, {"x": [_prev(1)]}) / fetch.META_NAME).read_text())
+    meta["spec"].update(fromIso=spec.fromIso, toIso=spec.toIso)
+    meta["pod_lines"], meta["pod_event_lines"] = {"pod-a": 1}, {}
+    (nightDir / fetch.META_NAME).write_text(json.dumps(meta))
+    mgr.tick(now=_t(30))
+    _awaitBackfill(mgr)
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert sidecar["pods"] == {
+        "pod-a": {
+            "watermarkIso": spec.toIso,
+            "bytes": len(_lokiLine(_prev(1))),
+            "lines": 1,
+            "eventBytes": 0,
+            "eventLines": 0,
+        }
+    }
+    assert podFile.read_bytes() == _lokiLine(_prev(1))

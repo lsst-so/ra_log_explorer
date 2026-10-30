@@ -676,8 +676,11 @@ be tidied up.
 The night before tonight is kept on disk too. Whenever it isn't there
 (after a deploy that changes the cache format, after *flush entire
 cache* on the admin page, on a new volume), the server re-pulls it from
-Loki in the background, an hour at a time, while tonight carries on. The
-pod log says when it starts and finishes (`Live: re-pulling dayObs …`,
+Loki in the background, an hour at a time, while tonight carries on. A
+night you already fetched whole from the form is adopted as it is
+(`Live: adopted dayObs …`) rather than pulled again, and a fetch of it
+that is still running is left alone until the next poll. The pod log
+says when a re-pull starts and finishes (`Live: re-pulling dayObs …`,
 `Live: re-pulled dayObs … in N min`), and `/api/live` shows it as
 `backfillDayObs` / `backfillError`. Until it finishes, an exposure from
 last night beyond what has arrived is fetched from Loki as it would be

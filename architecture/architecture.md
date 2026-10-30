@@ -512,6 +512,21 @@ Each tick (every `LIVE_POLL_S` seconds):
    night stands in for tonight, and its real neighbour isn't ours to
    fetch.
 
+   The night's path is also where a fetch of its own window from the
+   form (the SFM night view) lands, so the re-pull writes only under
+   that window's write lock (`fetch.windowWriteLock`), taken without
+   waiting and held across the open and each increment. A fetch
+   holding the lock, or a `.partial` one left behind, defers the
+   re-pull to the next poll. A window already fetched whole (a
+   current-schema `_meta.json`, no `.partial`) is *adopted* rather than
+   replaced: it gets a finalised `_live.json` built from its files (byte
+   counts from the files themselves, line counts and fall-short maps
+   from the meta), so it slices like any night. Without a sidecar it
+   would be excluded from slicing and reachable only by superset
+   reuse, which parses the whole night to answer a five-minute
+   exposure window; opened as a fresh night it would have been
+   destroyed and pulled again.
+
 Serving leans on one mechanism: `fetch.fetchAll` tries the night dir
 before the superset path, and any request whose window ends at or
 before the watermark is **sliced** out of it (`materializeNightSlice`:

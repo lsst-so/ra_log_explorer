@@ -69,9 +69,11 @@ from .config import (
     windowCachePath,
 )
 from .fetch import (
+    CACHE_SCHEMA_VERSION,
     LIVE_SIDECAR_NAME,
     LIVE_SIDECAR_VERSION,
     META_NAME,
+    PARTIAL_FLAG,
     PODS_DIR_NAME,
     PODS_EVENTS_DIR_NAME,
     PODS_LIST_NAME,
@@ -83,8 +85,10 @@ from .fetch import (
     fetchPodWindowInto,
     listPods,
     liveNightMeta,
+    loadCacheMeta,
     markCacheViewed,
     readLiveSidecar,
+    windowWriteLock,
     writeLiveSidecar,
 )
 from .sites import Site
@@ -485,27 +489,111 @@ class LiveNightManager:
         than starting over, and the night is sliceable up to its
         watermark while the rest arrives. A failure is logged and left
         for the next tick to retry, resuming the same way.
+
+        The night's path is also where a fetch of its own window from
+        the form lands, so every write here happens under that window's
+        write lock (see :func:`fetch.windowWriteLock`), taken without
+        waiting: a fetch holding it, or a ``.partial`` it left, defers
+        the re-pull to the next poll rather than opening the dir over
+        it. A window already fetched whole is adopted, not replaced.
         """
         started = time.time()
+        nightDir = self._nightDir(dayObs)
+        lock = windowWriteLock(nightDir)
         try:
-            night = self._openNightDir(dayObs)
-            log.info("Live: re-pulling dayObs %d from %s", dayObs, night.sidecar["watermarkIso"])
+            if not lock.acquire(blocking=False):
+                log.info("Live: dayObs %d is being fetched; re-pull deferred to the next poll", dayObs)
+                return
+            try:
+                if (nightDir / PARTIAL_FLAG).exists():
+                    log.info(
+                        "Live: dayObs %d has a fetch half done; re-pull deferred to the next poll", dayObs
+                    )
+                    return
+                night = self._adoptWindow(dayObs) or self._openNightDir(dayObs)
+            finally:
+                lock.release()
             end = dayObsEndUtc(dayObs)
             target = _parseIso(night.sidecar["watermarkIso"])
+            pulled = target < end
+            if pulled:
+                log.info("Live: re-pulling dayObs %d from %s", dayObs, night.sidecar["watermarkIso"])
             while target < end and not self._stopEvent.is_set():
                 target = min(end, target + _BACKFILL_STEP)
-                self._fetchIncrement(night, target)
+                with lock:
+                    self._fetchIncrement(night, target)
             if self._stopEvent.is_set():
                 return
-            self._finaliseNight(night)
+            with lock:
+                self._finaliseNight(night)
             self._storeNightRecords(dayObs)
             self._backfillError = None
-            log.info("Live: re-pulled dayObs %d in %.1f min", dayObs, (time.time() - started) / 60)
+            if pulled:
+                log.info("Live: re-pulled dayObs %d in %.1f min", dayObs, (time.time() - started) / 60)
         except Exception as e:  # noqa: BLE001 — retried next tick; tonight must not notice
             self._backfillError = f"dayObs {dayObs}: {e}"
             log.exception("Live: re-pulling dayObs %d failed; retrying next poll", dayObs)
         finally:
             self._backfillDayObs = None
+
+    def _adoptWindow(self, dayObs: int) -> _Night | None:
+        """Adopt a completed ordinary window at the night's path, or return ``None``.
+
+        A whole night fetched from the form (after deleting the night's
+        row on the admin page, say) is already what the re-pull would
+        produce. Opened as a fresh night it would be destroyed and pulled
+        again; left with no sidecar it is excluded from slicing and
+        reachable only by superset reuse, which parses the whole night
+        to answer a five-minute exposure window. So it gets the
+        finalised sidecar it lacks, built from the files themselves: the
+        byte counts are what the slicer bisects within, and under the
+        window's lock the files are static. Called under that lock.
+        """
+        nightDir = self._nightDir(dayObs)
+        if readLiveSidecar(nightDir) is not None:
+            return None
+        try:
+            meta = loadCacheMeta(nightDir)
+        except (OSError, json.JSONDecodeError):
+            return None
+        spec = self._nightSpec(dayObs)
+        metaSpec = meta.get("spec") or {}
+        if meta.get("fetchSchemaVersion") != CACHE_SCHEMA_VERSION or metaSpec.get("podRegex"):
+            return None
+        if (metaSpec.get("fromIso"), metaSpec.get("toIso")) != (spec.fromIso, spec.toIso):
+            return None
+        podLines = meta.get("pod_lines") or {}
+        eventLines = meta.get("pod_event_lines") or {}
+        pods: dict[str, dict[str, Any]] = {}
+        for f in sorted((nightDir / PODS_DIR_NAME).glob("*.jsonl")):
+            record = _emptyPodRecord(spec.toIso)
+            record["bytes"] = f.stat().st_size
+            record["lines"] = int(podLines.get(f.stem) or 0)
+            evFile = nightDir / PODS_EVENTS_DIR_NAME / f.name
+            if evFile.exists():
+                record["eventBytes"] = evFile.stat().st_size
+                record["eventLines"] = int(eventLines.get(f.stem) or 0)
+            pods[f.stem] = record
+        sidecar = {
+            "version": LIVE_SIDECAR_VERSION,
+            "dayObs": dayObs,
+            "fromIso": spec.fromIso,
+            "toIso": spec.toIso,
+            "watermarkIso": spec.toIso,
+            "eventsWatermarkIso": spec.toIso,
+            "finalised": True,
+            "updatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "pods": pods,
+            "eventPods": {},
+            "errors": dict(meta.get("errors") or {}),
+            "incomplete_pods": dict(meta.get("incomplete_pods") or {}),
+        }
+        writeLiveSidecar(nightDir, sidecar)
+        markCacheViewed(nightDir)
+        log.info(
+            "Live: adopted dayObs %d, already fetched whole at %s (%d pods)", dayObs, nightDir, len(pods)
+        )
+        return _Night(dayObs=dayObs, dir=nightDir, sidecar=sidecar)
 
     def _storeNightRecords(self, dayObs: int) -> None:
         """Cache a past night's ConsDB exposure records (best-effort)."""
