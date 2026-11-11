@@ -12,6 +12,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from playwright.sync_api import expect
 
 from .corpus import RANGE_START, RANGE_STOP, StagedCorpus
@@ -102,6 +103,41 @@ def test_a_chip_whose_request_fails_gives_the_selection_back(app: Any, corpus: S
     expect(chips.nth(0)).to_have_class(re.compile(r"\bselected\b"))
     expect(chips.nth(1)).not_to_have_class(re.compile(r"\bselected\b"))
     expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START))
+
+
+@pytest.mark.parametrize("late", ["answered", "failed"])
+def test_an_answer_to_a_superseded_step_changes_nothing(app: Any, corpus: StagedCorpus, late: str) -> None:
+    """Stepping can outrun the server. The answer to a step already
+    stepped past used to render over the newer exposure, under the newer
+    exposure's chip and URL; a late failure put the lit chip back on an
+    exposure that was never on screen. Only the latest request counts."""
+    openRange(app, corpus)
+    chips = app.page.locator("#range-chips .range-chip")
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START))
+    # Held, not slept on: the first step's request stays unanswered while
+    # the second step is asked and answered.
+    held: list[Any] = []
+    app.page.route(
+        re.compile(rf"/api/summary\?.*dataId={RANGE_START + 1}\b"), lambda route: held.append(route)
+    )
+    app.page.locator("#range-next").click()
+    expect(chips.nth(1)).to_have_class(re.compile(r"\bselected\b"))
+    app.page.locator("#range-next").click()
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START + 2))
+    assert len(held) == 1
+
+    if late == "answered":
+        with app.page.expect_response(re.compile(rf"dataId={RANGE_START + 1}\b")):
+            held[0].continue_()
+    else:
+        with app.page.expect_event("requestfailed"):
+            held[0].abort()
+    # Let the page act on it, as far as it is going to.
+    app.page.evaluate("() => new Promise((resolve) => setTimeout(resolve, 100))")
+    expect(app.page.locator("#expId-display")).to_contain_text(str(RANGE_START + 2))
+    expect(chips.nth(2)).to_have_class(re.compile(r"\bselected\b"))
+    expect(chips.nth(1)).not_to_have_class(re.compile(r"\bselected\b"))
+    assert f"dataId={RANGE_START + 2}" in app.page.url
 
 
 def test_a_chip_flags_an_exposure_that_failed(app: Any, corpus: StagedCorpus) -> None:

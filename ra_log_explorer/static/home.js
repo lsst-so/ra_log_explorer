@@ -977,6 +977,10 @@ let activeEventSource = null;
 // The active job is rebuilding the view the URL already names, so when it
 // finishes the router opens it; nothing about the URL needs working out.
 let followingRebuild = false;
+// The URL's query when that rebuild was picked up. The rebuild takes up to
+// a minute, and the user may have gone Back to another view by the time it
+// ends; routing again then would re-render that view under them.
+let followedSearch = null;
 // Which card launched the active fetch. The inline progress region for
 // each form is rendered next to its own submit button, so when an SSE
 // update comes in we know which DOM element to update without having
@@ -1056,6 +1060,7 @@ window.followRebuild = function followRebuild(jobId, kind) {
   resetInlineProgress(kind);
   activeJobId = jobId;
   followingRebuild = true;
+  followedSearch = window.location.search;
   openProgressStream(jobId);
 };
 
@@ -1159,7 +1164,14 @@ function openProgressStream(jobId) {
         // Nothing else takes "Loading from the cache..." off the card,
         // and it would still be there whenever the user came back home.
         cardMessageEl(activeProgressKind).textContent = '';
-        window.reroute();
+        if (window.location.search === followedSearch) {
+          window.reroute();
+        } else {
+          // The view it was for is no longer the one asked for. It is
+          // loaded now, so going back to its URL opens it directly.
+          showInlineProgress(activeProgressKind, false);
+          activeProgressKind = null;
+        }
         return;
       }
       transitionToExplore({

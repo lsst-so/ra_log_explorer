@@ -398,6 +398,52 @@ def test_a_failure_row_whose_night_was_unloaded_says_to_reload(app: Any, corpus:
     )
 
 
+def test_a_rebuild_finishing_after_the_user_moved_on_leaves_their_view_alone(
+    app: Any, corpus: StagedCorpus, monkeypatch: Any
+) -> None:
+    """A night's rebuild takes up to a minute, and the page used to route
+    again from whatever URL was current when it ended. Someone who had
+    gone Back to an exposure meanwhile had it re-rendered under them:
+    drawer closed, scroll and selection gone."""
+    import threading
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def held(*args: Any, **kwargs: Any) -> Any:
+        release.wait(10)
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", held)
+    try:
+        # In this document, as Back onto a night the server has since
+        # unloaded would be: a new entry, routed from its URL.
+        app.page.evaluate(f"() => {{ window.navigateTo('dayObs={DAY_OBS}'); window.reroute(); }}")
+        expect(app.page.locator("#night-progress")).to_be_visible()
+        app.page.go_back()
+        expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+        app.page.evaluate("() => { document.querySelector('#timeline .tl-row').dataset.kept = '1'; }")
+    finally:
+        release.set()
+    # The page has seen the job end once it puts the night card's progress away.
+    app.page.wait_for_function("() => document.getElementById('night-progress').hidden")
+    assert app.page.evaluate("() => document.getElementById('night-message').textContent") == ""
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    assert app.page.locator("#timeline .tl-row").first.get_attribute("data-kept") == "1"
+    assert f"dataId={SHARED_ID}" in app.page.url
+    # The night was loaded all the same: Forward opens it without another rebuild.
+    app.page.go_forward()
+    expect(app.page.locator("#night-view")).to_be_visible()
+    assert len([j for j in app.ctx.jobs.listJobs() if j.kind == "night"]) == 1
+
+
 def test_a_failed_rebuild_gives_the_form_back(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
     """A rebuild that fails says so on the night card and gives the page
     back. The page must also stop following it: the next fetch it starts

@@ -791,7 +791,13 @@ range navigator's per-exposure request gets the same answer once its
 range has been unloaded under an open tab, and does the same: it points
 the URL at the chip just picked and re-routes, so the page follows the
 rebuild and reopens the range on that exposure, rather than lighting the
-chip over the exposure still on screen. The
+chip over the exposure still on screen. Two guards keep answers that
+arrive late from acting on a page that has moved on: the page re-routes
+at the end of a rebuild only if the URL is still the one it picked the
+rebuild up on (someone who went Back to another view keeps it as it
+is), and the navigator acts only on the answer to its latest
+per-exposure request, so a step already stepped past neither renders,
+re-routes, nor moves the lit chip. The
 summary request itself never parses: a summit night's SFM half is a
 minute of parsing, and done inline it once ran for 37 minutes after the
 browser had given up (see *Threading model*). For exposure caches the
