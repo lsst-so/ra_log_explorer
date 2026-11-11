@@ -47,6 +47,11 @@ def _eventLine(ts: dt.datetime, name: str, body: str = "reason=Started kind=Pod 
     return (json.dumps({"labels": {"name": name}, "line": body, "timestamp": stamp}) + "\n").encode()
 
 
+def _pretendInProgress(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make fetch's clock read 12:59 on 20260711, so that night is still in progress."""
+    monkeypatch.setattr(fetch, "_utcNow", lambda: _t(59))
+
+
 def _t(minute: int, second: int = 0) -> dt.datetime:
     """A timestamp inside the 20260711 night (12:xx UTC)."""
     return dt.datetime(2026, 7, 11, 12, minute, second, tzinfo=UTC)
@@ -278,10 +283,10 @@ def test_fetchAll_serves_inprogress_night_clamped_to_watermark(
         raise AssertionError("in-progress night should be sliced, not fetched")
 
     monkeypatch.setattr(fetch, "_run_logcli", boom)
+    _pretendInProgress(monkeypatch)
     # The night's own window, exactly as the night-mode fetch path
-    # builds it. The clamping logic keys off "request == the night's own
-    # window, watermark short of its end" and never consults the clock,
-    # so this exercises the in-progress-night path as production runs it.
+    # builds it: the clamp keys off "request == the night's own window,
+    # watermark short of its end, night not over".
     spec = replace(
         _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711)),
         podRegex=".*aos.*",
@@ -336,6 +341,7 @@ def test_a_night_refetch_reclaims_the_window_it_supersedes(
         "_run_logcli",
         lambda *a, **k: (_ for _ in ()).throw(AssertionError("must be sliced, not fetched")),
     )
+    _pretendInProgress(monkeypatch)
     spec = replace(_sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711)), podRegex=".*aos.*")
 
     def watermarkTo(when: dt.datetime) -> None:
@@ -376,6 +382,52 @@ def test_a_night_refetch_reclaims_the_window_it_supersedes(
     assert state is not None and state.cacheDir == secondDir
 
 
+def test_an_sfm_night_refetch_reclaims_the_window_it_supersedes(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The SFM half's "night so far" is a top-level window, a copy of the
+    whole night up to the watermark: several GiB a click on the summit.
+    Through real slices and the real callback, the one a refetch
+    supersedes goes, and the night dir it was cut from stays."""
+    podTimes = {"s-lsstcam-run-sfm-runner-1": [_t(6), _t(40)]}
+    nightDir = _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes=podTimes)
+    monkeypatch.setattr(
+        fetch,
+        "_run_logcli",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("must be sliced, not fetched")),
+    )
+    _pretendInProgress(monkeypatch)
+    spec = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))  # unfiltered
+
+    earlierDir, _m = fetch.fetchAll(spec)  # [nightStart, 12:30)
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None
+    sidecar["watermarkIso"] = fetch._fmtLogcliTime(_t(45))
+    for record in sidecar["pods"].values():
+        record["watermarkIso"] = sidecar["watermarkIso"]
+    fetch.writeLiveSidecar(nightDir, sidecar)
+    laterDir, laterMeta = fetch.fetchAll(spec)  # [nightStart, 12:45)
+    assert earlierDir.parent == laterDir.parent == nightDir.parent and earlierDir != laterDir
+
+    ctx = server.ServerContext(jobs=JobManager(), sites=siteCatalog.catalog, siteName=siteCatalog.defaultName)
+    job = FetchJob(
+        jobId="night-1",
+        spec=spec,
+        siteName=siteCatalog.defaultName,
+        kind="night",
+        dayObs=20260711,
+        nightView="sfm",
+    )
+    job.cacheDir, job.meta = laterDir, laterMeta
+    server._onFetchComplete(ctx)(job)
+
+    assert not earlierDir.exists(), "the superseded SFM window survived a real refetch"
+    assert laterDir.exists() and nightDir.exists()
+    assert fetch.readLiveSidecar(nightDir) is not None
+    state = ctx.getNightState(20260711, "sfm")
+    assert state is not None and state.cacheDir == laterDir
+
+
 def test_fetchAll_does_not_clamp_arbitrary_future_windows(
     tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -393,6 +445,30 @@ def test_fetchAll_does_not_clamp_arbitrary_future_windows(
     _, meta = fetch.fetchAll(spec)
     assert meta["cacheReuse"] == "none"
     assert calls  # it really went to Loki
+
+
+def test_a_slice_that_fails_falls_back_to_a_fetch(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """In live mode nearly every view is a slice of the night. Slicing is
+    an optimisation, so one that fails (the volume filling up, say) costs
+    the fetch that would have happened without it, not the view."""
+    _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"sfm-runner-1": [_t(7)]})
+
+    def volumeFull(nightDir: Path, spec: FetchSpec) -> tuple[Path, dict]:
+        raise OSError(28, "No space left on device")
+
+    calls: list[str] = []
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        calls.append(extraArgs[0])
+        return b""
+
+    monkeypatch.setattr(fetch, "materializeNightSlice", volumeFull)
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    _, meta = fetch.fetchAll(_sliceSpec(_t(5), _t(10)))
+    assert meta["cacheReuse"] == "none"
+    assert calls
 
 
 def test_findSupersetCache_skips_live_dirs(tmpCacheRoot: Path) -> None:
@@ -495,9 +571,45 @@ def test_fetchAll_refuses_to_fetch_over_a_live_night_dir(
     poller is appending to that is silent corruption, so it is refused."""
     _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"pod-a": [_t(3)]})
     monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: b"")
+    _pretendInProgress(monkeypatch)
     spec = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))
     with pytest.raises(fetch.FetchError, match="live night directory"):
         fetch.fetchAll(spec, forceRefresh=True)
+
+
+def test_a_night_that_has_ended_is_not_served_clamped(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Clamping is for the night in progress. A night that is over with
+    its watermark short of its end is being re-pulled from Loki (or
+    awaits the orphan sweep), and whoever asks for it wants all of it:
+    the AOS half goes to Loki like any other fetch, into its own nested
+    dir, and the SFM half, which is the night dir itself, is refused
+    with the re-pull named rather than handed a truncated night marked
+    complete."""
+    nightDir = _makeNightDir(
+        tmpCacheRoot, watermark=_t(30), podTimes={"s-lsstcam-run-aos-worker-1": [_t(6), _t(40)]}
+    )
+    monkeypatch.setattr(fetch, "_utcNow", lambda: dayObsEndUtc(20260711) + dt.timedelta(hours=1))
+    calls: list[str] = []
+
+    def fakeRunLogcli(_spec: FetchSpec, extraArgs: list[str], **_kw: Any) -> bytes:
+        calls.append(extraArgs[0])
+        return b""
+
+    monkeypatch.setattr(fetch, "_run_logcli", fakeRunLogcli)
+    own = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))
+    aosDir, aosMeta = fetch.fetchAll(replace(own, podRegex=".*aos.*"))
+    assert aosMeta["cacheReuse"] == "none" and calls, "the AOS half did not go to Loki"
+    assert aosDir.parent == nightDir and aosDir.name.startswith("pods=")
+    with pytest.raises(fetch.FetchError, match="still being pulled from Loki") as refused:
+        fetch.fetchAll(own)
+    assert fetch._fmtLogcliTime(_t(30)) in str(refused.value)
+    clamped = windowCachePath(
+        "yagan", "rapid-analysis", own.fromIso, fetch._fmtLogcliTime(_t(30)), podRegex=None
+    )
+    assert not clamped.exists(), "a slice of the ended night was written after all"
+    assert (nightDir / fetch.PODS_DIR_NAME / "s-lsstcam-run-aos-worker-1.jsonl").exists()
 
 
 def test_fetchAll_prefers_an_exact_cache_over_slicing(
@@ -622,6 +734,7 @@ def test_clamped_slice_and_direct_window_fetch_are_serialised(
     import threading
 
     _makeNightDir(tmpCacheRoot, watermark=_t(30), podTimes={"pod-a": [_t(6), _t(7), _t(8)]})
+    _pretendInProgress(monkeypatch)
     nightOwn = _sliceSpec(dayObsStartUtc(20260711), dayObsEndUtc(20260711))  # clamps to the watermark
     direct = _sliceSpec(dayObsStartUtc(20260711), _t(30))  # the clamped target, asked for directly
     inFlight = {"n": 0, "maxConcurrent": 0}
@@ -1134,7 +1247,7 @@ def test_evictToFit_drops_the_live_sidecar_before_removing_a_night(
         realRmtree(path, *a, **k)
 
     monkeypatch.setattr(fetch.shutil, "rmtree", wedgedRmtree)
-    removed = fetch.evictToFit(maxBytes=0)
+    removed, _ = fetch.evictToFit(maxBytes=0)
     assert removed == []  # the rmtree failed...
     assert nightDir.exists()
     # ...but the sidecar went first, so the survivor can't pass for a
@@ -1983,3 +2096,599 @@ def test_a_consdb_outage_is_logged_once_and_its_end_noted(
         manager.tick(now=_t(30))
     assert caplog.text.count("ConsDB query for dayObs 20260711 failed") == 1
     assert "ConsDB reachable again" in caplog.text
+
+
+# ----- the previous night ---------------------------------------------------
+
+_PREV = 20260710
+
+
+def _prev(hour: int, minute: int = 0) -> dt.datetime:
+    """A timestamp inside the 20260710 night, ``hour`` hours after its noon start."""
+    return dayObsStartUtc(_PREV) + dt.timedelta(hours=hour, minutes=minute)
+
+
+def _backfillManager(
+    monkeypatch: pytest.MonkeyPatch, calls: list[Any], **kwargs: Any
+) -> live.LiveNightManager:
+    """A manager that keeps the previous night, over a Loki holding one pod on both nights."""
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    monkeypatch.setattr(
+        live, "fetchPodWindowInto", _podFetchStub([_prev(1), _prev(15, 30), _prev(23, 59), _t(3)], calls)
+    )
+    monkeypatch.setattr(live, "fetchEventsWindowInto", lambda spec, a, b, fh: (0, True, ""))
+    monkeypatch.setattr(live, "countPodWindow", lambda spec, pod, a, b: 1)
+    monkeypatch.setattr(
+        live.exposureTimes,
+        "queryExposureRecordsForDayObs",
+        lambda dayObs, token, *, consdbUrl: [
+            {
+                "exposure_id": dayObs * 100000 + 1,
+                "obs_end": "2026-07-11T01:00:00.000000",
+                "instrument": "lsstcam",
+            }
+        ],
+    )
+    return live.LiveNightManager(site=_site(), username="u", workers=2, pollS=60.0, lagS=0.0, **kwargs)
+
+
+def _awaitBackfill(mgr: live.LiveNightManager) -> None:
+    assert mgr._backfill is not None, "no re-pull was started"
+    mgr._backfill.join(30)
+    assert not mgr._backfill.is_alive()
+
+
+def test_a_missing_previous_night_is_re_pulled_beside_tonight(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a cache flush (a schema bump on deploy, the admin page's
+    button, a new volume) last night would be gone, and it is the night
+    people are still asking about. It comes back whole and finalised, an
+    hour per increment so a restart resumes it, while tonight's poll goes
+    on as usual."""
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    prevDir = mgr._nightDir(_PREV)
+    meta = json.loads((prevDir / fetch.META_NAME).read_text())
+    assert meta["pod_lines"] == {"pod-a": 3}
+    sidecar = fetch.readLiveSidecar(prevDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows == [(_prev(h), _prev(h + 1)) for h in range(24)]
+    # Its exposures are cached too, so the night's views resolve offline.
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is not None
+    # Tonight was polled as usual.
+    mgr._publishSnapshot()
+    snap = mgr.snapshot()
+    assert snap["dayObs"] == 20260711 and fetch._parseIso(snap["watermark"]) == _t(10)
+    assert snap["backfillDayObs"] is None and snap["backfillError"] is None
+
+
+def test_a_finalised_previous_night_is_left_alone(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    prevDir = _makeNightDir(tmpCacheRoot, dayObs=_PREV, podTimes={"pod-a": [_prev(1)]})
+    sidecar = fetch.readLiveSidecar(prevDir)
+    assert sidecar is not None
+    sidecar["finalised"] = True
+    fetch.writeLiveSidecar(prevDir, sidecar)
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    assert mgr._backfill is None
+
+
+def test_a_half_pulled_previous_night_is_resumed_not_swept(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A restart mid re-pull leaves the night unfinalised, which also makes
+    it look like an orphan. Exactly one thread may finish it: the re-pull,
+    from where it stopped."""
+    _makeNightDir(tmpCacheRoot, dayObs=_PREV, watermark=_prev(6), podTimes={"pod-a": [_prev(1)]})
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    assert mgr._orphanDirs == []
+    _awaitBackfill(mgr)
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows[0] == (_prev(6), _prev(7))
+    assert json.loads((mgr._nightDir(_PREV) / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+
+
+def test_a_failed_re_pull_is_retried_on_the_next_tick(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    tonight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+
+    def lokiDownForLastNight(spec: FetchSpec) -> list[str]:
+        if spec.fromIso < tonight:
+            raise fetch.FetchError("502 from Loki")
+        return ["pod-a"]
+
+    monkeypatch.setattr(live, "listPods", lokiDownForLastNight)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    mgr._publishSnapshot()
+    assert "502 from Loki" in mgr.snapshot()["backfillError"]
+    assert not (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    mgr.tick(now=_t(20))
+    _awaitBackfill(mgr)
+    assert (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+
+
+def test_no_re_pull_by_default_or_with_a_pinned_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned to a staged dayObs, the night before it is real data nobody
+    asked for; and the capture tool and tests drive the poller directly."""
+    for kwargs in ({}, {"backfillPrevious": True, "fixedDayObs": 20260711}):
+        mgr = _backfillManager(monkeypatch, [], **kwargs)
+        mgr.tick(now=_t(10))
+        assert mgr._backfill is None, kwargs
+
+
+def test_a_re_pull_running_across_noon_is_not_also_swept_as_an_orphan(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit night takes the re-pull about an hour, so the noon rollover
+    can land in the middle of one. By then the night it is pulling is two
+    nights back and looks like any other unfinalised orphan; were the
+    sweep to finish it too, two threads would append to the same pod
+    files. The re-pull stays its only writer."""
+    import threading
+
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    stub = live.fetchPodWindowInto
+    pulling, release = threading.Event(), threading.Event()
+
+    def heldMidNight(
+        spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+    ) -> tuple[int, bool, str]:
+        if fromT == _prev(6) and not pulling.is_set():
+            pulling.set()
+            release.wait(10)
+        return stub(spec, pod, fromT, toT, fh)
+
+    monkeypatch.setattr(live, "fetchPodWindowInto", heldMidNight)
+    prevDir = mgr._nightDir(_PREV)
+    try:
+        mgr.tick(now=_t(10))
+        assert pulling.wait(10)
+        mgr.tick(now=dayObsStartUtc(20260712) + dt.timedelta(minutes=10))
+        assert mgr.snapshot()["dayObs"] == 20260712
+        assert mgr.snapshot()["backfillDayObs"] == _PREV
+        assert not (prevDir / fetch.META_NAME).exists(), "the sweep finalised a night still being pulled"
+    finally:
+        release.set()
+    _awaitBackfill(mgr)
+    assert json.loads((prevDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+
+
+def test_a_re_pull_that_fails_after_noon_is_retried_on_its_own_thread(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-pull still running at the noon rollover is kept from the orphan
+    sweep. If it then failed, nobody owned its night: no longer the
+    previous night, and not in the sweep's list, it stayed unfinalised
+    (unlisted, unevictable, "still being pulled") until the next rollover.
+    The re-pull retries it, on its own thread, once the previous night
+    is on disk: the sweep finalises on the poller's, and a mostly
+    unpulled night there would hold tonight's polling up for the length
+    of the pull."""
+    import threading
+
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    stub = live.fetchPodWindowInto
+    pulling, release = threading.Event(), threading.Event()
+
+    def heldMidNight(
+        spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+    ) -> tuple[int, bool, str]:
+        if fromT == _prev(6) and not pulling.is_set():
+            pulling.set()
+            release.wait(10)
+        return stub(spec, pod, fromT, toT, fh)
+
+    monkeypatch.setattr(live, "fetchPodWindowInto", heldMidNight)
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    prevDir = mgr._nightDir(_PREV)
+    afterNoon = dayObsStartUtc(20260712)
+    lastNight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+    try:
+        mgr.tick(now=_t(10))
+        assert pulling.wait(10)
+        mgr.tick(now=afterNoon + dt.timedelta(minutes=10))
+        # Loki starts failing the night being re-pulled, after the rollover.
+        monkeypatch.setattr(
+            live,
+            "listPods",
+            lambda spec: (
+                ["pod-a"] if spec.fromIso >= lastNight else _raise(fetch.FetchError("502 from Loki"))
+            ),
+        )
+    finally:
+        release.set()
+    _awaitBackfill(mgr)
+    failed = mgr._backfill
+    assert mgr._backfillError is not None and "502 from Loki" in mgr._backfillError
+    assert not (prevDir / fetch.META_NAME).exists()
+
+    # While Loki is down the retry keeps failing, and the sweep still leaves the night alone.
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=20))
+    _awaitBackfill(mgr)
+    assert mgr._backfill is not failed and mgr._backfill is not None
+    assert mgr._backfill.name == f"live-backfill-{_PREV}"
+    assert mgr._orphanDirs == [] and _PREV not in finalisedOn
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=30))
+    _awaitBackfill(mgr)
+    assert finalisedOn[_PREV] == f"live-backfill-{_PREV}"
+    assert json.loads((prevDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    assert mgr._backfillError is None and mgr._backfillRetries == []
+    # Nothing left to retry: the next poll starts no re-pull at all.
+    done = mgr._backfill
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=40))
+    assert mgr._backfill is done
+
+
+def test_a_failed_re_pull_is_not_swept_as_an_orphan_at_the_next_rollover(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night whose re-pull failed is unfinalised with nothing running on
+    it, which is what an orphan looks like once noon has passed. It stays
+    the re-pull's to retry; the sweep and the retry never both have it."""
+    import threading
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    lastNight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+    monkeypatch.setattr(
+        live,
+        "listPods",
+        lambda spec: ["pod-a"] if spec.fromIso >= lastNight else _raise(fetch.FetchError("502 from Loki")),
+    )
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    assert mgr._backfillError is not None
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    afterNoon = dayObsStartUtc(20260712) + dt.timedelta(minutes=10)
+    assert mgr._findOrphanNights(20260712, afterNoon) == []
+    mgr.tick(now=afterNoon)
+    _awaitBackfill(mgr)
+    assert finalisedOn[_PREV] == f"live-backfill-{_PREV}"
+    assert fetch.readLiveSidecar(mgr._nightDir(_PREV))["finalised"] is True  # type: ignore[index]
+
+
+def _finalisingThreads(mgr: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch) -> dict[int, str]:
+    """Record, per dayObs, the thread that finalises it."""
+    import threading
+
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    return finalisedOn
+
+
+def _lokiDownBefore(monkeypatch: pytest.MonkeyPatch, dayObs: int | None) -> None:
+    """Fail every pod listing for a window starting before ``dayObs`` (none, if ``None``)."""
+    cutoff = fetch._fmtLogcliTime(dayObsStartUtc(dayObs)) if dayObs is not None else ""
+    monkeypatch.setattr(
+        live,
+        "listPods",
+        lambda spec: ["pod-a"] if spec.fromIso >= cutoff else _raise(fetch.FetchError("502 from Loki")),
+    )
+
+
+def test_a_night_that_always_fails_does_not_hold_up_the_previous_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed re-pull is retried, but after the previous night, never
+    ahead of it: a night Loki fails on every attempt would otherwise keep
+    every later last night off the disk until a restart."""
+    import shutil
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    finalisedOn = _finalisingThreads(mgr, monkeypatch)
+    _lokiDownBefore(monkeypatch, 20260711)  # 20260710 can never be pulled
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    afterNoon = dayObsStartUtc(20260712)
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=10))
+    _awaitBackfill(mgr)
+    assert mgr._backfillRetries == [_PREV]
+
+    # Last night goes missing (its row deleted on the admin page).
+    shutil.rmtree(mgr._nightDir(20260711))
+    del finalisedOn[20260711]
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=20))
+    _awaitBackfill(mgr)
+    assert finalisedOn[20260711] == "live-backfill-20260711"
+    assert fetch.readLiveSidecar(mgr._nightDir(20260711))["finalised"] is True  # type: ignore[index]
+    # The failing night is still tried, and still the re-pull's alone.
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=30))
+    _awaitBackfill(mgr)
+    assert mgr._backfill is not None and mgr._backfill.name == f"live-backfill-{_PREV}"
+    assert mgr._backfillRetries == [_PREV]
+    assert mgr._findOrphanNights(20260712, afterNoon + dt.timedelta(minutes=30)) == []
+
+
+def test_two_failed_re_pulls_are_both_kept_for_the_re_pull_thread(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous night's re-pull can fail while an older night is still
+    waiting for its retry. Remembering only the latest failure dropped the
+    older night to the orphan sweep, which finalises on the poller's
+    thread. Every failed night stays queued until it is on disk."""
+    import shutil
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    finalisedOn = _finalisingThreads(mgr, monkeypatch)
+    afterNoon = dayObsStartUtc(20260712)
+    orphansSeen: list[Path] = []
+
+    def tick(minutes: int) -> None:
+        now = afterNoon + dt.timedelta(minutes=minutes)
+        mgr.tick(now=now)
+        _awaitBackfill(mgr)
+        orphansSeen.extend(mgr._findOrphanNights(20260712, now))
+
+    _lokiDownBefore(monkeypatch, 20260711)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    tick(10)  # the rollover; 20260710 has failed twice by now
+    shutil.rmtree(mgr._nightDir(20260711))
+    del finalisedOn[20260711]
+    _lokiDownBefore(monkeypatch, 20260712)  # now last night can't be pulled either
+    tick(20)
+    assert mgr._backfillRetries == [_PREV, 20260711]
+    tick(30)
+    assert mgr._backfillRetries == [_PREV, 20260711]
+
+    _lokiDownBefore(monkeypatch, None)
+    tick(40)
+    tick(50)
+    assert finalisedOn == {20260711: "live-backfill-20260711", _PREV: f"live-backfill-{_PREV}"}
+    assert mgr._backfillRetries == [] and mgr._backfillError is None
+    assert orphansSeen == []
+    done = mgr._backfill
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=60))
+    assert mgr._backfill is done
+
+
+def _raise(e: Exception) -> Any:
+    raise e
+
+
+def test_a_re_pull_with_consdb_down_still_finalises_the_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The night's ConsDB records only spare its views a lookup later; the
+    logs are the night. ConsDB being down costs the records, with a
+    warning, and never the finalised night, nor a re-pull of all of it."""
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+
+    def consdbDown(dayObs: int, token: str, *, consdbUrl: str) -> list:
+        raise exposureTimes.ConsDbError("ConsDB HTTP 503: Service Unavailable")
+
+    monkeypatch.setattr(live.exposureTimes, "queryExposureRecordsForDayObs", consdbDown)
+    with caplog.at_level(logging.WARNING, logger="ra_log_explorer.live"):
+        mgr.tick(now=_t(10))
+        _awaitBackfill(mgr)
+    assert (mgr._nightDir(_PREV) / fetch.META_NAME).exists()
+    mgr._publishSnapshot()
+    assert mgr.snapshot()["backfillError"] is None
+    assert f"ConsDB records for dayObs {_PREV} not cached" in caplog.text
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is None
+    # Finalised, so the next poll leaves it alone.
+    pulled = mgr._backfill
+    mgr.tick(now=_t(20))
+    assert mgr._backfill is pulled
+
+
+def _plantFetchedNight(dayObs: int, podTimes: dict[str, list[dt.datetime]]) -> Path:
+    """What POST /api/fetch-night (sfm) leaves at the night's path: a
+    completed ordinary window with pods, their events, and no sidecar."""
+    fromIso = fetch._fmtLogcliTime(dayObsStartUtc(dayObs))
+    toIso = fetch._fmtLogcliTime(dayObsEndUtc(dayObs))
+    nightDir = windowCachePath("yagan", "rapid-analysis", fromIso, toIso)
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    (nightDir / fetch.PODS_EVENTS_DIR_NAME).mkdir()
+    for pod, times in podTimes.items():
+        _writeLines(nightDir / fetch.PODS_DIR_NAME / f"{pod}.jsonl", times)
+        (nightDir / fetch.PODS_EVENTS_DIR_NAME / f"{pod}.jsonl").write_bytes(_eventLine(times[0], pod))
+    meta = {
+        "spec": {
+            "lokiAddr": "x",
+            "username": "u",
+            "cluster": "yagan",
+            "namespace": "rapid-analysis",
+            "fromIso": fromIso,
+            "toIso": toIso,
+            "workers": 8,
+            "podRegex": None,
+        },
+        "fetchSchemaVersion": fetch.CACHE_SCHEMA_VERSION,
+        "fetched_at": dt.datetime.now(UTC).isoformat(),
+        "pod_count": len(podTimes),
+        "pod_lines": {pod: len(times) for pod, times in podTimes.items()},
+        "pod_event_lines": {pod: 1 for pod in podTimes},
+        "errors": {},
+        "incomplete_pods": {},
+        "fetchComplete": True,
+        "cacheReuse": "none",
+    }
+    (nightDir / fetch.META_NAME).write_text(json.dumps(meta))
+    return nightDir
+
+
+def test_a_previous_night_already_fetched_whole_is_adopted_not_re_pulled(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Last night fetched from the form (after deleting its row on the
+    admin page, say) is already what the re-pull would produce. The
+    re-pull used to open the dir as a fresh night, which destroyed the
+    window and pulled it again. It is adopted instead: a finalised
+    sidecar built from the files, so it slices like any night, and not
+    one Loki call for it."""
+    nightDir = _plantFetchedNight(_PREV, {"pod-a": [_prev(1), _prev(15, 30), _prev(23, 59)]})
+    podFile = nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl"
+    before = podFile.read_bytes()
+    metaBefore = (nightDir / fetch.META_NAME).read_text()
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    assert podFile.read_bytes() == before
+    assert (nightDir / fetch.META_NAME).read_text() == metaBefore
+    assert not [c for c in calls if c[1] < dayObsStartUtc(20260711)], "the adopted night was fetched anyway"
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert sidecar["pods"]["pod-a"]["bytes"] == len(before)
+    assert sidecar["pods"]["pod-a"]["lines"] == 3
+    assert (
+        sidecar["pods"]["pod-a"]["eventBytes"]
+        == (nightDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").stat().st_size
+    )
+    assert exposureTimes.lookupCachedRecord(_PREV * 100000 + 1, siteName="summit") is not None
+    # An exposure window inside it is now sliced rather than fetched.
+    monkeypatch.setattr(fetch, "_run_logcli", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no net")))
+    sliceDir, meta = fetch.fetchAll(_sliceSpec(_prev(15), _prev(16)))
+    assert meta["cacheReuse"] == "night-slice"
+    assert (sliceDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == _lokiLine(_prev(15, 30))
+    assert (sliceDir / fetch.PODS_EVENTS_DIR_NAME / "pod-a.jsonl").exists() is False  # event at 13:00
+    # Adopted is finalised: the next poll leaves it alone.
+    adopted = mgr._backfill
+    mgr.tick(now=_t(20))
+    assert mgr._backfill is adopted
+
+
+def test_the_re_pull_never_opens_a_night_dir_a_fetch_is_writing(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A fetch of last night's own window from the form writes into the
+    very dir the re-pull opens. Opening it then rmtree'd pods/ under the
+    fetch, and both wrote the same files afterwards: the night held the
+    fetch's lines and the re-pull's hours, the sidecar vouched for the
+    fetch's prefix as hour one. The re-pull takes the window's write
+    lock without waiting and leaves a dir someone holds until the next
+    poll, by when the fetch has finished and its window is adopted."""
+    spec = _backfillManager(monkeypatch, [], backfillPrevious=True)._nightSpec(_PREV)
+    nightDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
+    (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
+    (nightDir / fetch.PARTIAL_FLAG).write_text("")
+    podFile = nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl"
+    _writeLines(podFile, [_prev(1)])
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+
+    def untouched() -> None:
+        assert (nightDir / fetch.PARTIAL_FLAG).exists()
+        assert podFile.read_bytes() == _lokiLine(_prev(1))
+        assert fetch.readLiveSidecar(nightDir) is None
+        assert not [c for c in calls if c[1] < dayObsStartUtc(20260711)]
+        assert mgr._backfillError is None
+
+    # The fetch holds the window's lock, mid-write.
+    lock = fetch.windowWriteLock(nightDir)
+    assert lock.acquire(blocking=False)
+    try:
+        mgr.tick(now=_t(10))
+        _awaitBackfill(mgr)
+        untouched()
+    finally:
+        lock.release()
+    # The fetch finished: the window is whole, and the next poll adopts it.
+    (nightDir / fetch.PARTIAL_FLAG).unlink()
+    (nightDir / fetch.PODS_EVENTS_DIR_NAME).mkdir()
+    meta = json.loads((_plantFetchedNight(20260101, {"x": [_prev(1)]}) / fetch.META_NAME).read_text())
+    meta["spec"].update(fromIso=spec.fromIso, toIso=spec.toIso)
+    meta["pod_lines"], meta["pod_event_lines"] = {"pod-a": 1}, {}
+    (nightDir / fetch.META_NAME).write_text(json.dumps(meta))
+    mgr.tick(now=_t(30))
+    _awaitBackfill(mgr)
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    assert sidecar["pods"] == {
+        "pod-a": {
+            "watermarkIso": spec.toIso,
+            "bytes": len(_lokiLine(_prev(1))),
+            "lines": 1,
+            "eventBytes": 0,
+            "eventLines": 0,
+        }
+    }
+    assert podFile.read_bytes() == _lokiLine(_prev(1))
+
+
+@pytest.mark.parametrize("staleMeta", [False, True])
+def test_a_dead_fetchs_dir_is_re_pulled_over_and_never_adopted(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, staleMeta: bool
+) -> None:
+    """A fetch that died (Loki failed it, the pod restarted) leaves its
+    ``.partial`` behind. Every writer of one holds the window's lock, so
+    found with the lock free it belongs to nobody, and only another fetch
+    of that exact window would ever clear it: deferring to it kept last
+    night off the disk for good. The re-pull opens the dir afresh
+    instead. It never adopts it, even over a ``_meta.json`` an earlier,
+    completed fetch of the window left there: the files beside it are
+    the dead fetch's."""
+    nightDir = _plantFetchedNight(_PREV, {"pod-a": [_prev(2)], "pod-dead": [_prev(3)]})
+    if not staleMeta:
+        (nightDir / fetch.META_NAME).unlink()
+    (nightDir / fetch.PARTIAL_FLAG).write_text("")
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    assert mgr._backfillError is None
+    assert not (nightDir / fetch.PARTIAL_FLAG).exists()
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows == [(_prev(h), _prev(h + 1)) for h in range(24)]
+    # Only what the re-pull fetched: nothing of the dead fetch's survives.
+    assert [f.name for f in (nightDir / fetch.PODS_DIR_NAME).iterdir()] == ["pod-a.jsonl"]
+    assert (nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    assert list((nightDir / fetch.PODS_EVENTS_DIR_NAME).iterdir()) == []
+    assert json.loads((nightDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}

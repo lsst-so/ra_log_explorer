@@ -50,6 +50,8 @@ from .config import (
     LIVE_POLL_S,
     LOG_LEVEL,
     MAX_CACHE_BYTES,
+    MAX_LOADED_BYTES,
+    PARSE_WORKERS,
     FetchSpec,
     cache_root,
     defaultBasePath,
@@ -65,6 +67,7 @@ from .config import (
 from .exposureTimes import INSTRUMENTS_BY_PROBE_ORDER, TAI_MINUS_UTC_S
 from .fetch import (
     cacheDuSizeBytes,
+    cacheSizes,
     dropLiveSidecarsUnder,
     ensureCacheSchemaCurrent,
     fetchAll,
@@ -286,10 +289,13 @@ def _logConfiguration(args: argparse.Namespace, site: Site) -> None:
         site.consdbUrl,
     )
     log.info(
-        "Cache %s (cap %s); %d fetch workers; window -%gs/+%gs; log level %s",
+        "Cache %s (cap %s); %d fetch workers, %d parse workers; loaded views cap %s; window -%gs/+%gs;"
+        " log level %s",
         cache_root(),
         humanBytes(MAX_CACHE_BYTES).strip(),
         args.workers,
+        PARSE_WORKERS,
+        humanBytes(MAX_LOADED_BYTES).strip(),
         args.window_before,
         args.window_after,
         LOG_LEVEL,
@@ -333,6 +339,7 @@ def cmdRun(args: argparse.Namespace) -> int:
             pollS=args.live_poll_s,
             lagS=LIVE_LAG_S,
             fixedDayObs=args.live_day_obs,
+            backfillPrevious=True,
         )
         ctx.live.start()
         pinned = f" (pinned to dayObs {args.live_day_obs})" if args.live_day_obs else ""
@@ -366,7 +373,7 @@ def cmdRun(args: argparse.Namespace) -> int:
 
 def cmdCacheInfo(args: argparse.Namespace) -> int:
     root = cache_root()
-    total = cacheDuSizeBytes(root)
+    total, sizes = cacheSizes(root)
     print(f"Cache root: {root}")
     print(f"Total size: {humanBytes(total)}")
     print()
@@ -391,10 +398,10 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
                     if inner.is_dir() and inner.name.startswith("pods=") and (inner / "_meta.json").exists()
                 ]
                 if outerHasMeta:
-                    size = cacheDuSizeBytes(window)
+                    size = sizes.get(window, 0)
                     print(f"  [ok ] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
                 for inner in nightInners:
-                    size = cacheDuSizeBytes(inner)
+                    size = sizes.get(inner, 0)
                     print(
                         f"  [ok ] {humanBytes(size):>10}  "
                         f"{cluster.name}/{ns.name}/{window.name}/{inner.name}"
@@ -402,7 +409,7 @@ def cmdCacheInfo(args: argparse.Namespace) -> int:
                 if not outerHasMeta and not nightInners:
                     # Neither layer has a usable meta — a half-finished
                     # fetch. Show one partial row for the window.
-                    size = cacheDuSizeBytes(window)
+                    size = sizes.get(window, 0)
                     print(f"  [partial] {humanBytes(size):>10}  {cluster.name}/{ns.name}/{window.name}")
     return 0
 

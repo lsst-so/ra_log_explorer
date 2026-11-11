@@ -150,6 +150,23 @@ def test_fetching_an_exposure_end_to_end(app: Any, corpus: StagedCorpus, fakeLog
     assert f"dataId={SHARED_ID}" in app.page.url
 
 
+def test_a_finished_fetch_leaves_no_progress_on_its_card(
+    app: Any, corpus: StagedCorpus, fakeLogcli: list[str]
+) -> None:
+    """A finished fetch's progress line was still on its card whenever
+    the user came back home."""
+    corpus.dropLiveSidecar()
+    app.goto("/")
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("shutter close (TAI)")
+    app.page.locator("#fetch-submit").click()
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=60_000)
+    app.page.locator("#back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    expect(app.page.locator("#fetch-progress")).to_be_hidden()
+    expect(app.page.locator("#fetch-progress .progress-text")).to_have_text("")
+
+
 def test_a_fetched_window_lands_in_the_cache(app: Any, corpus: StagedCorpus, fakeLogcli: list[str]) -> None:
     """The fetch is only useful if the next person gets it for free."""
     corpus.dropLiveSidecar()

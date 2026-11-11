@@ -5,7 +5,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -13,9 +13,9 @@ import pytest
 
 from ra_log_explorer import config, exposureTimes
 from ra_log_explorer import fetch as fetchModule
-from ra_log_explorer import parse, server, sites
+from ra_log_explorer import night, parse, server, sites
 from ra_log_explorer.jobs import FetchJob, JobManager
-from ra_log_explorer.server import ServerContext, _loadExposureFromCache
+from ra_log_explorer.server import ServerContext, ServerState
 
 from .conftest import FakeSiteCatalog
 
@@ -602,6 +602,75 @@ def test_lru_eviction_at_max_states(monkeypatch: pytest.MonkeyPatch) -> None:
     assert ctx.getExposureState(4) is not None
 
 
+def test_night_and_range_slots_are_capped_like_exposures(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each kind holds at most ``_MAX_LOADED_STATES`` views, the least
+    recently used going first, however little memory they hold."""
+    monkeypatch.setattr(server, "_MAX_LOADED_STATES", 2)
+    ctx = _emptyCtx()
+    for dayObs in (20260520, 20260521):
+        ctx.putNightState(_makeNightState(dayObs))
+    ctx.getNightState(20260520)
+    ctx.putNightState(_makeNightState(20260522))
+    assert [ctx.getNightState(d) is not None for d in (20260520, 20260521, 20260522)] == [True, False, True]
+
+    for startId in (1, 2):
+        ctx.putRangeState(_makeRangeState(startId, startId + 10))
+    ctx.getRangeState(server.rangeKey(1, 11))
+    ctx.putRangeState(_makeRangeState(3, 13))
+    loaded = [ctx.getRangeState(server.rangeKey(s, s + 10)) is not None for s in (1, 2, 3)]
+    assert loaded == [True, False, True]
+    # A kind's cap leaves the other kinds alone.
+    assert ctx.getNightState(20260520) is not None
+
+
+def _weighing(eventCount: int) -> list[parse.PodSummary]:
+    """Summaries a loaded view's footprint counts as holding ``eventCount`` events."""
+    summary = parse.PodSummary(
+        pod="p",
+        group="sfm",
+        instrument=None,
+        ordinal=None,
+        nLines=0,
+        nWarn=0,
+        nError=0,
+        nTraceback=0,
+        firstTs=None,
+        lastTs=None,
+    )
+    t = dt.datetime(2026, 5, 20, tzinfo=dt.timezone.utc)
+    summary.events = [parse.Event(pod="p", t=t, kind="WARN", level="warn")] * eventCount
+    return [summary]
+
+
+def test_loaded_views_are_unloaded_to_fit_the_memory_ceiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A count of loaded views bounds nothing when one summit night's SFM
+    half is ~1 GiB: eight of them OOM-kill the pod, and with it the live
+    poller and every user. Past MAX_LOADED_BYTES the least recently used
+    go, whatever their kind, and the view just loaded always stays."""
+    perView = 1000 * server._BYTES_PER_EVENT
+    monkeypatch.setattr(server, "MAX_LOADED_BYTES", int(2.5 * perView))
+    ctx = _emptyCtx()
+    a = _makeExposureState(1)
+    a.summaries = _weighing(1000)
+    n = _makeNightState(20260521)
+    n.summaries = _weighing(1000)
+    ctx.putExposureState(a)
+    ctx.putNightState(n)
+    ctx.getExposureState(1)  # the night is now the least recently used
+    r = _makeRangeState(2026051900722, 2026051900750)
+    r.summaries = _weighing(1000)
+    ctx.putRangeState(r)
+    assert ctx.getNightState(20260521) is None
+    assert ctx.getExposureState(1) is a
+    # Alone over the ceiling: kept, everything else goes.
+    huge = _makeExposureState(2)
+    huge.summaries = _weighing(5000)
+    ctx.putExposureState(huge)
+    assert ctx.getExposureState(2) is huge
+    assert ctx.getExposureState(1) is None
+    assert ctx.getRangeState(server.rangeKey(2026051900722, 2026051900750)) is None
+
+
 def test_evictByCacheDir_drops_matching_states(tmp_path: Path) -> None:
     """Deleting a cache window drops any state pointed at it."""
     ctx = _emptyCtx()
@@ -850,6 +919,130 @@ def test_tracebackContextForNight_returns_None_for_unknown_key(tmp_path: Path) -
         endTime=dt.datetime(2026, 5, 22, 12, 0, tzinfo=dt.timezone.utc),
     )
     assert server._tracebackContextForNight(state, "nope") is None
+
+
+def test_tracebackContextForNight_seeks_to_the_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit pod's night is up to ~200k lines. Reading from the top to a
+    failure late in it is seconds of CPU per click, on a request thread,
+    holding the GIL the whole time; the drilldown seeks there instead."""
+    pod = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    (tmp_path / "pods").mkdir()
+    t0 = dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc)
+    rows = [(t0 + dt.timedelta(seconds=i), "info", f"{i} unrelated chatter") for i in range(5000)]
+    late = t0 + dt.timedelta(seconds=6000)
+    rows += [
+        (
+            late,
+            "info",
+            "2026-05-21 14:40:00,000 worker fn INFO   Running pipeline for 2026052100050 detector 5",
+        ),
+        (late + dt.timedelta(seconds=10), "error", "Traceback (most recent call last):"),
+        (late + dt.timedelta(seconds=10, milliseconds=1), "error", "RuntimeError: bang"),
+    ]
+    with open(tmp_path / "pods" / f"{pod}.jsonl", "w") as fh:
+        for t, level, raw in rows:
+            fh.write(
+                json.dumps(
+                    {"timestamp": t.isoformat(), "labels": {"detected_level": level}, "line": raw + "\n"}
+                )
+                + "\n"
+            )
+    state = _makeNightState(20260521, cacheDir=tmp_path)
+    state.summaries = parse.summarizeAll(tmp_path)
+    tb = state.summaries[0].tracebacks[0]
+
+    parsed = 0
+    realParse = parse.parseLogLine
+
+    def countingParse(*args: Any) -> Any:
+        nonlocal parsed
+        parsed += 1
+        return realParse(*args)
+
+    monkeypatch.setattr(parse, "parseLogLine", countingParse)
+    out = server._tracebackContextForNight(state, night.makeBodyKey(pod, tb.t))
+    assert out is not None
+    assert out["contextSource"] == "dataId-block"
+    assert [ln["raw"] for ln in out["lines"]][-1] == "RuntimeError: bang"
+    assert parsed < 10, f"parsed {parsed} lines to reach a failure 5000 lines in"
+
+
+def _podRow(t: dt.datetime, raw: str, level: str = "info") -> bytes:
+    """One pod-log line as Loki's JSONL output carries it."""
+    row = {"timestamp": t.isoformat(), "labels": {"detected_level": level}, "line": raw + "\n"}
+    return (json.dumps(row) + "\n").encode()
+
+
+def _failingPodNight(cacheDir: Path, prefix: bytes = b"", chatter: int = 0) -> tuple[server.NightState, str]:
+    """A night of one AOS pod that fails dataId 2026052100050 after ``chatter``
+    lines of work, with ``prefix`` (raw bytes) earlier in its log. Returns
+    the loaded state and the failure's bodyKey."""
+    pod = "s-lsstcam-run-aos-worker-aosworkerset-3"
+    t = dt.datetime(2026, 5, 21, 14, 40, tzinfo=dt.timezone.utc)
+    block = _podRow(
+        t, "2026-05-21 14:40:00,000 worker fn INFO   Running pipeline for 2026052100050 detector 5"
+    )
+    for i in range(chatter):
+        block += _podRow(t + dt.timedelta(seconds=1 + i), f"step {i} of the quantum")
+    tbAt = t + dt.timedelta(seconds=chatter + 10)
+    block += _podRow(tbAt, "Traceback (most recent call last):", "error")
+    block += _podRow(tbAt + dt.timedelta(milliseconds=1), "RuntimeError: bang", "error")
+    (cacheDir / "pods").mkdir()
+    (cacheDir / "pods" / f"{pod}.jsonl").write_bytes(prefix + block)
+    state = _makeNightState(20260521, cacheDir=cacheDir)
+    state.summaries = parse.summarizeAll(cacheDir)
+    return state, night.makeBodyKey(pod, state.summaries[0].tracebacks[0].t)
+
+
+def test_tracebackContextForNight_reads_from_the_top_when_the_seek_cannot(tmp_path: Path) -> None:
+    """The seek assumes every line is a Loki JSON row. One that isn't (a
+    torn write, a hand-edited file) can cost the drilldown its speed but
+    must not cost it its answer: the parser skips such lines, and the
+    drilldown falls back to reading the pod from the top."""
+    t0 = dt.datetime(2026, 5, 21, 13, 0, tzinfo=dt.timezone.utc)
+    earlier = b"".join(_podRow(t0 + dt.timedelta(seconds=i), f"{i} unrelated chatter") for i in range(10))
+    # Most of the file, so the bisection's first probe lands in it.
+    unreadable = b"not a loki row\n" * 2000
+    state, bodyKey = _failingPodNight(tmp_path, prefix=earlier + unreadable)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    assert out["contextSource"] == "dataId-block"
+    raws = [ln["raw"] for ln in out["lines"]]
+    assert raws[0].endswith("Running pipeline for 2026052100050 detector 5")
+    assert raws[-1] == "RuntimeError: bang"
+    assert not any("unrelated chatter" in r for r in raws)
+
+
+def test_tracebackContextForNight_survives_a_row_with_no_timestamp(tmp_path: Path) -> None:
+    """A JSON row whose timestamp is null is a row the parser skips, but
+    the seek's bisection indexes it and gets a TypeError, not the
+    JSONDecodeError the unreadable-line case raises. The same fallback
+    applies: read from the top."""
+    nullStamped = (json.dumps({"timestamp": None, "line": "no stamp\n"}) + "\n").encode() * 2000
+    state, bodyKey = _failingPodNight(tmp_path, prefix=nullStamped)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    raws = [ln["raw"] for ln in out["lines"]]
+    assert raws[0].endswith("Running pipeline for 2026052100050 detector 5")
+    assert raws[-1] == "RuntimeError: bang"
+
+
+def test_tracebackContextForNight_caps_a_huge_block_and_says_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A dataId's block can run to thousands of lines; past the cap the
+    response stops and flags itself truncated, so the UI can say the
+    context is cut short rather than present a partial block as whole."""
+    monkeypatch.setattr(server, "_TB_CONTEXT_MAX_LINES", 5)
+    state, bodyKey = _failingPodNight(tmp_path, chatter=20)
+    out = server._tracebackContextForNight(state, bodyKey)
+    assert out is not None
+    assert out["truncated"] is True
+    assert len(out["lines"]) == 5
+    # The captured traceback still rides along for the UI to fall back on.
+    assert "RuntimeError: bang" in out["body"]
 
 
 # ----- _resolveCacheWindow -------------------------------------------------
@@ -1370,6 +1563,49 @@ def test_resolveShutterCloses_manual_survives_a_missing_token(
     assert _phase(job, "no-token")["remaining"] == 1  # only the un-anchored id
 
 
+def _noBatch(*_a: Any, **_kw: Any) -> dict[int, exposureTimes.ExposureRecord]:
+    raise AssertionError("ConsDB was queried")
+
+
+def test_resolveShutterCloses_reports_a_blank_token_rather_than_sending_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token file that exists but is blank (a secret mounted before it
+    was filled in) is a missing token. Sent anyway, ConsDB's refusal would
+    surface as a query failure, where the progress line should say there
+    is no token."""
+    siteCatalog.writeSummitToken("  \n")
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", _noBatch)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    server._resolveShutterClosesInto({2026052000001}, target, {}, job, site)
+    assert target == {}
+    assert _phase(job, "empty-token")["remaining"] == 1
+
+
+def test_resolveShutterCloses_a_row_without_obs_end_stays_missing(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ConsDB can hold a row for an exposure with no ``obs_end`` (one that
+    never completed). It anchors nothing, so it is counted missing rather
+    than failing the job on a time it doesn't have."""
+    siteCatalog.writeSummitToken()
+
+    def rowWithoutEnd(*_a: Any, **_kw: Any) -> dict[int, exposureTimes.ExposureRecord]:
+        return {
+            2026052000001: {"obs_end": None, "img_type": "science"},
+            2026052000002: {"obs_end": "2026-05-20T08:46:16.267000"},
+        }
+
+    monkeypatch.setattr(exposureTimes, "queryExposureRecordBatch", rowWithoutEnd)
+    job, site = _prefetchJob(siteCatalog)
+    target: dict[int, dt.datetime] = {}
+    server._resolveShutterClosesInto({2026052000001, 2026052000002}, target, {}, job, site)
+    assert list(target) == [2026052000002]
+    done = _phase(job, "done")
+    assert done["consdbHits"] == 1 and done["stillMissing"] == 1
+
+
 def test_resolveShutterCloses_real_cache_hit_skips_consdb(
     tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1732,6 +1968,22 @@ def test_resolveShutterCloses_lsstcam_pin_still_writes_the_bare_key(
 # ----- instrument on the cache-rebuild path ---------------------------------
 
 
+def _awaitJob(job: FetchJob) -> None:
+    with job.condition:
+        job.condition.wait_for(job.isTerminal, timeout=30)
+    assert job.status == "done", job.error
+
+
+def _rebuildExposure(ctx: ServerContext, expId: int, instrument: str | None) -> ServerState | None:
+    """Run the rebuild a deep link would start; ``None`` if there's nothing to rebuild."""
+    job = server._startExposureRebuild(ctx, expId, instrument)
+    if job is None:
+        return None
+    _awaitJob(job)
+    with ctx.jobs.stateLock:
+        return ctx.getExposureState(expId)
+
+
 def _plantExposureCache(
     root: Path,
     expId: int,
@@ -1758,7 +2010,7 @@ def _plantExposureCache(
     return windowDir
 
 
-def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
+def test_exposure_rebuild_refuses_a_window_that_misses_the_pinned_t0(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
 ) -> None:
     """Being recorded under an instrument is not enough on its own: the
@@ -1789,15 +2041,15 @@ def test_loadExposureFromCache_refuses_a_window_that_misses_the_pinned_t0(
     )
     ctx = _ctxWithSites(siteCatalog)
     # LATISS pin: its 04:58 t0 is outside the window on disk -> refuse.
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
+    assert _rebuildExposure(ctx, collidingId, "latiss") is None
     # LSSTCam pin: t0 inside the window -> rebuilt, stamped with the pin.
-    state = server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam")
+    state = _rebuildExposure(ctx, collidingId, "lsstcam")
     assert state is not None
     assert state.instrument == "lsstcam"
     assert state.tZero == dt.datetime(2026, 7, 12, 3, 58, 15, 91000, tzinfo=dt.timezone.utc)
 
 
-def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument(
+def test_exposure_rebuild_refuses_a_window_fetched_for_the_other_instrument(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
 ) -> None:
     """The recorded pin rules a window out even when the t0 falls inside
@@ -1824,8 +2076,8 @@ def test_loadExposureFromCache_refuses_a_window_fetched_for_the_other_instrument
         siteName=site.name,
     )
     ctx = _ctxWithSites(siteCatalog)
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="latiss") is None
-    assert server._loadExposureFromCache(ctx, collidingId, instrument="lsstcam") is not None
+    assert _rebuildExposure(ctx, collidingId, "latiss") is None
+    assert _rebuildExposure(ctx, collidingId, "lsstcam") is not None
 
 
 # ----- instrument through the range per-exposure view -----------------------
@@ -1899,7 +2151,7 @@ def test_exposure_cache_lookup_picks_the_window_holding_this_t_zero(
         )
 
     for instrument, (fromIso, _toIso, _obsEnd) in windows.items():
-        state = _loadExposureFromCache(ctx, expId, instrument=instrument)
+        state = _rebuildExposure(ctx, expId, instrument)
         assert state is not None, f"{instrument} deep link fell back to a re-fetch"
         assert state.cacheDir.name.startswith(fromIso.replace(":", "")[:17])
         assert state.instrument == instrument
@@ -1938,16 +2190,16 @@ def test_exposure_cache_lookup_tries_the_next_sites_window(
         siteName="summit",
     )
 
-    state = _loadExposureFromCache(ctx, expId, instrument="lsstcam")
+    state = _rebuildExposure(ctx, expId, "lsstcam")
     assert state is not None, "the resolvable yagan window was abandoned"
     assert state.siteName == "summit"
 
 
-def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
+def test_night_rebuild_pins_shutter_lookups_to_lsstcam(
     tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
 ) -> None:
-    """The rebuild path resolves the same lookups _prefetchNightShutterCloses
-    does, and must pin them the same way: AOS is LSSTCam-only, and the bare
+    """The rebuild resolves its shutter closes through
+    _prefetchNightShutterCloses, and must pin them the same way: AOS is LSSTCam-only, and the bare
     key can legitimately hold the other instrument's record for a colliding
     id (probe order is evaluated at query time, and the LSSTCam row can
     land later). An unpinned rebuild would anchor the histograms an hour
@@ -2011,7 +2263,11 @@ def test_loadNightFromCache_pins_shutter_lookups_to_lsstcam(
     )
 
     ctx = _ctxWithSites(siteCatalog)
-    state = server._loadNightFromCache(ctx, dayObs)
+    job = server._startNightRebuild(ctx, dayObs)
+    assert job is not None
+    _awaitJob(job)
+    with ctx.jobs.stateLock:
+        state = ctx.getNightState(dayObs)
     assert state is not None
     # Anchored to the LSSTCam shutter close (TAI -37 s), not the bare key's.
     assert state.shutterCloseByExpId[collidingId] == dt.datetime(
@@ -2046,7 +2302,8 @@ def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
 
     newDir = tmpCacheRoot / "summit-cluster" / "ra" / "new-window"
     (newDir / "pods").mkdir(parents=True)
-    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): [oldDir])
+    (newDir / "_meta.json").write_text("{}")
+    monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): ([oldDir], 0))
     job = FetchJob(
         jobId="j1",
         spec=config.FetchSpec(
@@ -2176,6 +2433,78 @@ def test_night_fetch_drops_the_night_so_far_windows_it_supersedes(
     assert state is not None and state.cacheDir == current
 
 
+def _plantSfmWindow(root: Path, fromIso: str, toIso: str, *, sliced: bool = True) -> Path:
+    """An unfiltered window, by default a "night so far" cut from a live night dir."""
+    windowDir = fetchModule.windowCachePath("yagan", "rapid-analysis", fromIso, toIso)
+    (windowDir / "pods").mkdir(parents=True)
+    (windowDir / "pods" / "s-lsstcam-run-sfm-runner-workerset-1.jsonl").write_text("")
+    meta: dict = {
+        "spec": {"cluster": "yagan", "namespace": "rapid-analysis", "fromIso": fromIso, "toIso": toIso},
+        "fetchSchemaVersion": fetchModule.CACHE_SCHEMA_VERSION,
+    }
+    if sliced:
+        meta["sliceSource"] = "/the/night/dir"
+    (windowDir / "_meta.json").write_text(json.dumps(meta))
+    return windowDir
+
+
+def test_an_sfm_night_fetch_drops_only_the_night_so_far_windows_it_supersedes(
+    siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path
+) -> None:
+    """The SFM half is unfiltered, so its "night so far" slices are
+    top-level windows, several GiB each on the summit, and the sweep only
+    ever looked at nested ones. Top-level windows are also the night dirs
+    themselves and every exposure and range window, none of which may go."""
+    superseded = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T18:00:00.000000Z")
+    current = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    # A night dir: the poller's sidecar says so, finalised or not.
+    nightDir = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T19:00:00.000000Z")
+    (nightDir / fetchModule.LIVE_SIDECAR_NAME).write_text("{}")
+    # An exposure, and a range, whose windows happen to start at noon.
+    exposure = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T12:05:00.000000Z")
+    fetchModule.addExposureToCache(exposure, 2026071100001, "lsstcam")
+    rangeDir = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T13:00:00.000000Z")
+    fetchModule.markCacheRange(rangeDir, 2026071100001, 2026071100009, instrument="lsstcam")
+    # Fetched from Loki rather than cut from the night: not ours to judge.
+    _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T14:00:00.000000Z", sliced=False)
+    # A superseded slice that an AOS night cache sits inside, which
+    # deleting the window would take with it.
+    holder = _plantSfmWindow(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    nested = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T20:00:00.000000Z")
+    assert nested.parent == holder
+
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    job.spec = replace(job.spec, podRegex=None)
+    job.nightView = config.NIGHT_VIEW_SFM
+    job.meta["spec"]["podRegex"] = None
+    assert server._supersededNightSlices(job) == [superseded]
+
+
+def test_a_night_that_has_ended_is_only_rebuilt_whole(tmpCacheRoot: Path) -> None:
+    """The "night so far" slices a night leaves behind are the newest AOS
+    caches for its dayObs. While it is in progress the newest is the
+    right rebuild source; after noon it is a truncated night, and a deep
+    link would rebuild it as the night until someone fetched again."""
+    start, end = config.dayObsStartUtc(20260711), config.dayObsEndUtc(20260711)
+    clamped = _plantNightSlice(
+        tmpCacheRoot, server._isoForLogcli(start), server._isoForLogcli(start + dt.timedelta(hours=3))
+    )
+    assert server._findNightCacheDir(20260711, "aos") is None, "a slice stood in for the whole night"
+    whole = _plantNightSlice(tmpCacheRoot, server._isoForLogcli(start), server._isoForLogcli(end))
+    assert server._findNightCacheDir(20260711, "aos") == whole
+    assert clamped.exists()
+    # Tonight's slices are still what a reload rebuilds.
+    now = dt.datetime.now(dt.timezone.utc)
+    tonight = config.currentDayObs(now)
+    tonightStart = config.dayObsStartUtc(tonight)
+    tonightSlice = _plantNightSlice(
+        tmpCacheRoot,
+        server._isoForLogcli(tonightStart),
+        server._isoForLogcli(min(now, tonightStart + dt.timedelta(minutes=1))),
+    )
+    assert server._findNightCacheDir(tonight, "aos") == tonightSlice
+
+
 def test_the_superseded_window_is_reclaimed_before_eviction_looks(
     siteCatalog: FakeSiteCatalog, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2193,9 +2522,9 @@ def test_the_superseded_window_is_reclaimed_before_eviction_looks(
     current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
     sawStale: list[bool] = []
 
-    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+    def recordingEvict(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], int]:
         sawStale.append(stale.exists())
-        return []
+        return [], 0
 
     monkeypatch.setattr(server, "evictToFit", recordingEvict)
     job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
@@ -2244,6 +2573,169 @@ def test_night_fetch_keeps_windows_it_does_not_contain(
 
     for survivor in (wider, otherNight, otherSite, current, exposureWindow):
         assert survivor.exists(), survivor
+
+
+def test_onFetchComplete_reports_parse_progress_per_pod(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A summit night is ~a minute of parsing after the fetch. The job's
+    progress stream says how far through it is, one event per pod, so the
+    page shows movement rather than a full bar and nothing happening."""
+    ctx = _ctxWithSites(siteCatalog)
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    (current / "pods" / "s-lsstcam-run-aos-worker-2.jsonl").write_text("")
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    parsed = [(e["i"], e["total"]) for e in job.events if e["type"] == "parsed"]
+    assert parsed == [(1, 2), (2, 2)]
+
+
+# ----- a window deleted under a loaded or loading view -----------------------
+
+_OLDER_NIGHT = ("2026-07-10T12:00:00.000000Z", "2026-07-11T12:00:00.000000Z")
+
+
+def _loadNightNestedInItsWindow(ctx: ServerContext, root: Path) -> Path:
+    """Load the AOS half of an older night, cached where it really lives:
+    nested in the night's own window dir. Returns that window dir."""
+    nested = _plantNightSlice(root, *_OLDER_NIGHT)
+    window = nested.parent
+    (window / "pods").mkdir()
+    (window / "_meta.json").write_text(json.dumps({"spec": {"fromIso": _OLDER_NIGHT[0]}}))
+    with ctx.jobs.stateLock:
+        ctx.putNightState(_makeNightState(20260710, cacheDir=nested))
+    return window
+
+
+def test_evicting_a_window_unloads_the_night_nested_in_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night-mode cache is ``<window>/pods=<slug>``. LRU eviction removes
+    the window (viewing the nested cache never stamps it, so it looks
+    cold) and reports only the window. The nested night stayed loaded
+    over a directory that was gone: its summary still served, every pod
+    drilldown and traceback from it empty."""
+    ctx = _ctxWithSites(siteCatalog)
+    window = _loadNightNestedInItsWindow(ctx, tmpCacheRoot)
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    monkeypatch.setattr(server, "MAX_CACHE_BYTES", 1)
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert not window.exists(), "the older night's window was not evicted"
+    assert ctx.getNightState(20260710) is None
+    assert ctx.getNightState(20260711) is not None
+
+
+def test_deleting_a_window_unloads_the_night_nested_in_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """The same from the admin page: deleting the window's row takes the
+    night cache nested in it, so its loaded state has to go too."""
+    ctx = _ctxWithSites(siteCatalog)
+    window = _loadNightNestedInItsWindow(ctx, tmpCacheRoot)
+    server._deleteCacheDir(ctx, window)
+    assert not window.exists()
+    assert ctx.getNightState(20260710) is None
+
+
+def _exposureJob(cacheDir: Path, siteName: str) -> FetchJob:
+    job = FetchJob(
+        jobId="e1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="2026-07-11T20:00:00.000000Z",
+            toIso="2026-07-11T20:05:00.000000Z",
+        ),
+        siteName=siteName,
+        instrument="lsstcam",
+        expId=2026071100005,
+        tZero=dt.datetime(2026, 7, 11, 20, 0, 30, tzinfo=dt.timezone.utc),
+    )
+    job.cacheDir = cacheDir
+    return job
+
+
+def _rangeJob(cacheDir: Path, siteName: str) -> FetchJob:
+    job = _exposureJob(cacheDir, siteName)
+    job.kind, job.expId, job.tZero = "range", None, None
+    job.startId, job.stopId = 2026071100005, 2026071100006
+    job.tZeroStart = dt.datetime(2026, 7, 11, 20, 0, 30, tzinfo=dt.timezone.utc)
+    job.tZeroStop = dt.datetime(2026, 7, 11, 20, 1, 30, tzinfo=dt.timezone.utc)
+    return job
+
+
+@pytest.mark.parametrize("kind", ["exposure", "night", "range"])
+def test_a_window_deleted_during_the_parse_fails_the_job(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Parsing a summit night takes a minute, and another job's eviction
+    pass or the admin page can remove the window meanwhile. The job used
+    to publish what it had read by then, possibly no pods at all, as the
+    view, with no error. It fails instead, saying why, and loads nothing."""
+    import shutil
+
+    ctx = _ctxWithSites(siteCatalog)
+    cacheDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    job = {
+        "exposure": _exposureJob(cacheDir, siteCatalog.defaultName),
+        "range": _rangeJob(cacheDir, siteCatalog.defaultName),
+        "night": _nightJob(cacheDir, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName),
+    }[kind]
+
+    def deletedMidParse(*_a: Any, **_kw: Any) -> list[parse.PodSummary]:
+        shutil.rmtree(cacheDir)
+        return []
+
+    monkeypatch.setattr(server.parser, "summarizeAll", deletedMidParse)
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    monkeypatch.setattr(server, "_prefetchRangeShutterCloses", lambda *a: None)
+    with pytest.raises(RuntimeError, match="was deleted while it was being loaded"):
+        server._onFetchComplete(ctx)(job)
+    assert not ctx.exposureStates and not ctx.nightStates and not ctx.rangeStates
+
+
+def test_a_live_night_not_yet_finalised_still_publishes(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between its watermark reaching night end and finalisation, a live
+    night dir is served as the night with no ``_meta.json`` of its own
+    (see ``fetch._tryNightSlice``). Its sidecar is what says it is there."""
+    ctx = _ctxWithSites(siteCatalog)
+    nightDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-12T12:00:00.000000Z")
+    (nightDir / "_meta.json").unlink()
+    (nightDir / fetchModule.LIVE_SIDECAR_NAME).write_text("{}")
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(nightDir, NIGHT_START, "2026-07-12T12:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert ctx.getNightState(20260711) is not None
+
+
+def test_a_state_published_while_its_window_is_being_deleted_is_dropped(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete evicts loaded states, then removes the files. A job can
+    publish in between, its own check still finding the window on disk,
+    so the delete evicts again once the files are gone."""
+    import shutil
+
+    ctx = _ctxWithSites(siteCatalog)
+    cacheDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    realRmtree = shutil.rmtree
+
+    def publishThenRemove(path: Any, *a: Any, **kw: Any) -> None:
+        with ctx.jobs.stateLock:
+            ctx.putNightState(_makeNightState(20260711, cacheDir=cacheDir))
+        realRmtree(path, *a, **kw)
+
+    monkeypatch.setattr(server.shutil, "rmtree", publishThenRemove)
+    server._deleteCacheDir(ctx, cacheDir)
+    assert not cacheDir.exists()
+    assert ctx.getNightState(20260711) is None
 
 
 # ----- the night's two views -----------------------------------------------

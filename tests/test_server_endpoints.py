@@ -24,7 +24,7 @@ from typing import Any
 
 import pytest
 
-from ra_log_explorer import config, exposureTimes
+from ra_log_explorer import buildInfo, config, exposureTimes
 from ra_log_explorer import jobs as jobsModule
 from ra_log_explorer import parse
 from ra_log_explorer import server as serverModule
@@ -111,6 +111,30 @@ def _post(host: str, port: int, path: str, body: dict) -> tuple[int, dict]:
     return resp.status, parsed
 
 
+def _awaitJob(host: str, port: int, jobId: str) -> dict:
+    """Poll a job's status until it finishes; return the final status."""
+    body: dict = {}
+    for _ in range(250):
+        status, body = _get(host, port, f"/api/fetch/{jobId}/status")
+        assert status == 200, body
+        if body["status"] in ("done", "error"):
+            return body
+        time.sleep(0.02)
+    raise AssertionError(f"job {jobId} still {body.get('status')} after 5 s")
+
+
+def _getRebuilt(host: str, port: int, path: str) -> dict:
+    """GET a summary that isn't in memory: it answers with a rebuild job,
+    and once that job is done the same GET answers with the view."""
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    assert body["loaded"] is False and "rebuildJobId" in body, body
+    assert _awaitJob(host, port, body["rebuildJobId"])["status"] == "done"
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    return body
+
+
 def _delete(host: str, port: int, path: str) -> tuple[int, dict]:
     conn = http.client.HTTPConnection(host, port, timeout=2.0)
     conn.request("DELETE", path)
@@ -131,8 +155,9 @@ def test_summary_empty_when_no_exposure(runningServer: RunningServer) -> None:
     host, port, _ctx = runningServer
     status, body = _get(host, port, "/api/summary")
     assert status == 200
-    assert body["loaded"] is False
-    assert "cache" in body
+    # Nothing else: this answers every home-page load, and the cache's size
+    # costs a walk of the whole tree.
+    assert body == {"loaded": False}
 
 
 # ----- /api/cache --------------------------------------------------------
@@ -230,6 +255,7 @@ def test_fetch_starts_job_and_completes(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "fake"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -293,6 +319,7 @@ def test_night_fetch_starts_job_and_populates_NightState(
         assert spec.podRegex == ".*aos.*"
         cacheDir = tmpCacheRoot / "fake-night"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -392,6 +419,7 @@ def test_range_fetch_starts_job_and_populates_RangeState(
         assert spec.podRegex is None
         cacheDir = tmpCacheRoot / "fake-range"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -697,10 +725,10 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
     Exercises the deep-link / post-eviction path end to end:
     ``_findRangeCacheDir`` (matches the ``_range.txt`` bounds),
     ``_siteForCacheDir`` (derives the site from the ``yagan`` cluster
-    path component), and ``_loadRangeFromCache`` (reads each in-range
-    shutter close from the per-site exposure-time cache only — no
-    ConsDB call on a sync request). None of this is touched by the
-    in-memory range tests above.
+    path component), and the rebuild job ``_startRangeRebuild`` starts
+    (anchored on the cached start/stop records, resolving the rest the
+    way a fetch does; with no token, from the per-site cache only).
+    None of this is touched by the in-memory range tests above.
     """
     from ra_log_explorer.fetch import markCacheRange
 
@@ -761,8 +789,7 @@ def test_range_summary_rehydrates_from_disk(runningServer: RunningServer, tmpCac
 
     # Fresh server: nothing loaded in memory, so this must rebuild from disk.
     assert ctx.getRangeState(serverModule.rangeKey(startId, stopId)) is None
-    status, body = _get(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
-    assert status == 200, body
+    body = _getRebuilt(host, port, f"/api/summary?rangeStart={startId}&rangeStop={stopId}")
     assert body["loaded"] is True
     assert body["mode"] == "range"
     assert body["site"] == "summit"  # derived from the yagan cluster path component
@@ -1122,6 +1149,49 @@ def test_exposure_time_falls_back_to_manual_on_consdb_404(
     assert body["tZero"] == "2026-06-24T14:38:41.380663"
 
 
+@pytest.mark.parametrize(
+    "outage, status, says",
+    [
+        ("http-503", 502, "ConsDB query failed: ConsDB HTTP 503"),
+        ("unreachable", 503, "Could not reach ConsDB"),
+    ],
+)
+def test_exposure_time_reports_a_consdb_outage(
+    runningServer: RunningServer,
+    monkeypatch: pytest.MonkeyPatch,
+    tmpCacheRoot: Path,
+    siteCatalog: FakeSiteCatalog,
+    outage: str,
+    status: int,
+    says: str,
+) -> None:
+    """The home form shows this error under the dataId field, so ConsDB
+    erroring and ConsDB being unreachable each say which it is, rather
+    than the lookup failing with a bare 500. A manual stand-in for the id
+    is served through either: an outage must not strand a hand-typed t0."""
+    from email.message import Message
+    from urllib.error import HTTPError, URLError
+
+    def down(req: object, **_kw: Any) -> object:
+        if outage == "http-503":
+            raise HTTPError("https://summit-consdb.example", 503, "Service Unavailable", Message(), None)
+        raise URLError("connection refused")
+
+    monkeypatch.setattr(exposureTimes, "urlopen", down)
+    siteCatalog.writeSummitToken()
+    host, port, _ = runningServer
+    got, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert got == status, body
+    assert says in body["error"]
+
+    exposureTimes.storeCachedRecord(
+        2026051900722, exposureTimes.manualRecord("2026-06-24T14:38:41.380663"), siteName="summit"
+    )
+    got, body = _get(host, port, "/api/exposure-time/2026051900722")
+    assert got == 200, body
+    assert body["manual"] is True and body["tZero"] == "2026-06-24T14:38:41.380663"
+
+
 def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1139,6 +1209,7 @@ def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "fake-manual"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -1193,6 +1264,17 @@ def test_site_endpoint_returns_the_served_site(runningServer: RunningServer) -> 
     assert body["consdbUrl"]
     assert "consdbTokenFile" not in body
     assert "tokenFile" not in body
+
+
+def test_version_endpoint_reports_the_build(
+    runningServer: RunningServer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(buildInfo, "VERSION", "v1.2.3-4-g0123abcd")
+    monkeypatch.setattr(buildInfo, "GIT_HASH", "0123abcd")
+    host, port, _ = runningServer
+    status, body = _get(host, port, "/api/version")
+    assert status == 200
+    assert body == {"version": "v1.2.3-4-g0123abcd", "gitHash": "0123abcd"}
 
 
 def test_sites_endpoint_is_gone(runningServer: RunningServer) -> None:
@@ -1322,6 +1404,24 @@ def test_delete_all_cache(runningServer: RunningServer, tmpCacheRoot: Path) -> N
     assert body["windows"] == []
     # The root itself should still exist (we recreate it).
     assert tmpCacheRoot.exists()
+
+
+def test_deleting_the_cache_leaves_it_marked_current(
+    runningServer: RunningServer, tmpCacheRoot: Path
+) -> None:
+    """Emptying the cache doesn't make it a cache of unknown schema. With
+    the sentinel gone too, the next start flushed everything rebuilt since
+    the delete: tonight so far, and the previous night the poller had just
+    pulled from Loki again."""
+    from ra_log_explorer import fetch
+
+    host, port, _ = runningServer
+    fetch.ensureCacheSchemaCurrent()
+    status, _ = _delete(host, port, "/api/cache")
+    assert status == 200
+    rebuilt = _plantCacheDir(tmpCacheRoot, "yagan", "rapid-analysis", "a__a")
+    assert fetch.ensureCacheSchemaCurrent() == 0  # the restart after
+    assert rebuilt.exists()
 
 
 def test_deleting_the_cache_drops_live_sidecars_first(
@@ -1465,17 +1565,17 @@ def test_night_traceback_endpoint_returns_dataId_block(
     assert not any("2026052100013" in r for r in rawTexts)
 
 
-def test_night_traceback_rebuilds_the_night_from_disk(
+def test_night_traceback_waits_for_the_summary_to_rebuild_the_night(
     runningServer: RunningServer, tmpCacheRoot: Path
 ) -> None:
-    """The drilldown survives its night being evicted.
+    """The drilldown never parses a night itself.
 
     Failure rows are the whole point of the night view, and the state
-    behind them is an LRU slot capped at 8. Opening a ninth night — or
-    any window — evicted the first, and every row already on that page
-    then 404'd until the user happened to reload the summary, which is
-    not a connection anyone would make. Every other keyed route already
-    rebuilt from the cache; this one just never tried.
+    behind them is an LRU slot capped at 8, so a row can outlive its
+    night in memory. Rebuilding inline here is what a GET must not do (a
+    summit night is a minute of parsing), so the route says to reload;
+    the summary route then rebuilds the night as a job, after which the
+    drilldown answers.
     """
     from ra_log_explorer import parse as _parse
 
@@ -1526,14 +1626,223 @@ def test_night_traceback_rebuilds_the_night_from_disk(
     with ctx.jobs.stateLock:
         assert ctx.getNightState(dayObs) is None
 
-    status, body = _get(host, port, f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}")
+    tracebackPath = f"/api/night/traceback/{bodyKey.replace(':', '%3A')}?dayObs={dayObs}"
+    status, body = _get(host, port, tracebackPath)
+    assert status == 404
+    assert "reload" in body["error"]
+    with ctx.jobs.stateLock:
+        assert ctx.getNightState(dayObs) is None
+
+    assert _getRebuilt(host, port, f"/api/summary?dayObs={dayObs}")["loaded"] is True
+    status, body = _get(host, port, tracebackPath)
     assert status == 200, body
     assert body["expId"] == 2026052100012
     assert body["excClass"] == "RuntimeError"
-    # And the rebuilt night is resident, so the rest of the page's rows
-    # do not each pay for their own reparse.
-    with ctx.jobs.stateLock:
-        assert ctx.getNightState(dayObs) is not None
+
+
+def test_summary_answers_without_waiting_for_a_rebuild(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night on disk but not in memory must not be parsed inside the
+    request. On 2026-10-28 one such GET (a summit night's SFM half, 22.6M
+    lines) parsed for 37 minutes, the browser gave up long before, and a
+    reload would have started a second parse. The GET answers at once with
+    the job doing the work, and asking again joins that same job."""
+    import threading
+
+    host, port, ctx = runningServer
+    dayObs = 20260521
+    cacheDir = tmpCacheRoot / "yagan" / "rapid-analysis" / "night-win" / "pods=__aos__"
+    (cacheDir / "pods").mkdir(parents=True)
+    (cacheDir / "_meta.json").write_text(
+        json.dumps(
+            {
+                "spec": {
+                    "fromIso": "2026-05-21T12:00:00.000000Z",
+                    "toIso": "2026-05-22T12:00:00.000000Z",
+                    "podRegex": ".*aos.*",
+                },
+                "fetched_at": "2026-05-22T15:00:00+00:00",
+                "pod_count": 0,
+            }
+        )
+    )
+    release = threading.Event()
+    parsedOn: list[str] = []
+
+    def slowParse(*_a: Any, **_kw: Any) -> list:
+        parsedOn.append(threading.current_thread().name)
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(serverModule.parser, "summarizeAll", slowParse)
+    try:
+        status, first = _get(host, port, f"/api/summary?dayObs={dayObs}")
+        assert status == 200 and first["loaded"] is False
+        status, second = _get(host, port, f"/api/summary?dayObs={dayObs}")
+        assert second["rebuildJobId"] == first["rebuildJobId"]
+    finally:
+        release.set()
+    assert _awaitJob(host, port, first["rebuildJobId"])["status"] == "done"
+    assert parsedOn == [f"fetchjob-{first['rebuildJobId']}"]
+    assert _get(host, port, f"/api/summary?dayObs={dayObs}")[1]["loaded"] is True
+
+
+def _plantAosNight(root: Path, dayObs: int, cluster: str = "yagan") -> Path:
+    """A completed AOS-half night cache for ``dayObs``, with no pods in it."""
+    cacheDir = root / cluster / "rapid-analysis" / f"night-{dayObs}" / "pods=__aos__"
+    (cacheDir / "pods").mkdir(parents=True)
+    fromIso = config.dayObsStartUtc(dayObs).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    toIso = config.dayObsEndUtc(dayObs).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    meta = {
+        "spec": {"fromIso": fromIso, "toIso": toIso, "podRegex": ".*aos.*"},
+        "fetched_at": "2026-05-22T15:00:00+00:00",
+        "pod_count": 0,
+        "cacheReuse": "none",
+    }
+    (cacheDir / "_meta.json").write_text(json.dumps(meta))
+    return cacheDir
+
+
+def _plantRangeCache(root: Path, startId: int, stopId: int, cluster: str = "yagan") -> Path:
+    """A completed range cache for ``[startId, stopId]`` under LSSTCam, with no pods in it."""
+    window = root / cluster / "rapid-analysis" / "2026-05-20T084534_267000Z__2026-05-20T085039_267000Z"
+    (window / "pods").mkdir(parents=True)
+    meta = {
+        "spec": {"fromIso": "2026-05-20T08:45:34.267000Z", "toIso": "2026-05-20T08:50:39.267000Z"},
+        "fetched_at": "2026-05-21T15:00:00+00:00",
+        "pod_count": 0,
+    }
+    (window / "_meta.json").write_text(json.dumps(meta))
+    from ra_log_explorer.fetch import markCacheRange
+
+    markCacheRange(window, startId, stopId, instrument="lsstcam")
+    return window
+
+
+def _storeShutterClose(expId: int, obsEnd: str) -> None:
+    exposureTimes.storeCachedRecord(expId, {"obs_end": obsEnd, "instrument": "lsstcam"}, siteName="summit")
+
+
+@pytest.mark.parametrize(
+    "case", ["night on an unknown cluster", "range on an unknown cluster", "range anchor gone"]
+)
+def test_a_view_that_cannot_be_rebuilt_starts_no_job(
+    runningServer: RunningServer, tmpCacheRoot: Path, case: str
+) -> None:
+    """A rebuild job is handed out only for a view it can produce. The page
+    follows a ``rebuildJobId`` and asks for the view again when it ends, so
+    one that cannot rebuild would 500 the GET, or worse, send the page
+    round that loop for good. A window from a cluster this server doesn't
+    serve has no site to resolve against, and a range is anchored on its
+    two ends' cached records."""
+    host, port, ctx = runningServer
+    startId, stopId = 2026051900722, 2026051900724
+    _storeShutterClose(startId, "2026-05-20T08:46:16.267000")
+    if case == "night on an unknown cluster":
+        _plantAosNight(tmpCacheRoot, 20260521, cluster="elsewhere")
+        path = "/api/summary?dayObs=20260521"
+    else:
+        onUnknownCluster = case == "range on an unknown cluster"
+        _plantRangeCache(tmpCacheRoot, startId, stopId, cluster="elsewhere" if onUnknownCluster else "yagan")
+        if onUnknownCluster:
+            # Both anchors cached: only the site is missing.
+            _storeShutterClose(stopId, "2026-05-20T08:46:36.267000")
+        path = f"/api/summary?rangeStart={startId}&rangeStop={stopId}"
+    status, body = _get(host, port, path)
+    assert status == 200, body
+    assert body == {"loaded": False}
+    assert ctx.jobs.listJobs() == []
+
+
+def _heldParse(monkeypatch: pytest.MonkeyPatch) -> tuple[threading.Event, list[str]]:
+    """Make every parse wait for the returned event; also returns the
+    threads that parsed, one entry per parse."""
+    release = threading.Event()
+    parsedOn: list[str] = []
+
+    def held(*_a: Any, **_kw: Any) -> list:
+        parsedOn.append(threading.current_thread().name)
+        release.wait(10)
+        return []
+
+    monkeypatch.setattr(serverModule.parser, "summarizeAll", held)
+    return release, parsedOn
+
+
+def test_fetching_a_night_while_it_is_rebuilt_runs_after_the_rebuild(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deep link is rebuilding a night from the cache when the same night
+    is asked for from the form (another tab, another user). The rebuild
+    re-parses whatever is on disk, which for tonight is the last fetch's
+    "night so far"; the form asked for the night now. So the fetch is its
+    own job, run once the rebuild is done, and what it fetched is what is
+    published last."""
+    host, port, _ctx = runningServer
+    cacheDir = _plantAosNight(tmpCacheRoot, 20260521)
+    fetches: list[str] = []
+
+    def fetchAfter(spec: FetchSpec, progress: Any = None, forceRefresh: bool = False) -> tuple[Path, dict]:
+        fetches.append(threading.current_thread().name)
+        return cacheDir, json.loads((cacheDir / "_meta.json").read_text())
+
+    monkeypatch.setattr(jobsModule, "fetchAll", fetchAfter)
+    release, parsedOn = _heldParse(monkeypatch)
+    try:
+        status, summary = _get(host, port, "/api/summary?dayObs=20260521")
+        assert status == 200 and "rebuildJobId" in summary, summary
+        status, fetched = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert status == 202, fetched
+        assert fetched["jobId"] != summary["rebuildJobId"]
+        assert not fetches, "the fetch ran alongside the rebuild"
+        # Asked for again from either side meanwhile, it is the fetch they follow.
+        status, again = _get(host, port, "/api/summary?dayObs=20260521")
+        assert again == {"loaded": False, "rebuildJobId": fetched["jobId"]}
+        status, twice = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert twice["jobId"] == fetched["jobId"]
+    finally:
+        release.set()
+    rebuilt = _awaitJob(host, port, summary["rebuildJobId"])
+    done = _awaitJob(host, port, fetched["jobId"])
+    assert rebuilt["status"] == done["status"] == "done"
+    assert done["finishedAt"] > rebuilt["finishedAt"]
+    assert fetches == [f"fetchjob-{fetched['jobId']}"]
+    assert len(parsedOn) == 2
+
+
+def test_a_deep_link_to_a_night_being_fetched_follows_the_fetch(
+    runningServer: RunningServer, tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other way round: a night on disk is being fetched again (to
+    bring it up to date) when a tab asks for it. The tab follows that
+    fetch rather than starting a rebuild that parses the night a second
+    time, out of the older window."""
+    host, port, ctx = runningServer
+    cacheDir = _plantAosNight(tmpCacheRoot, 20260521)
+    release, parsedOn = _heldParse(monkeypatch)
+    fetching = threading.Event()
+    fetches: list[FetchSpec] = []
+
+    def heldFetch(spec: FetchSpec, progress: Any = None, forceRefresh: bool = False) -> tuple[Path, dict]:
+        fetches.append(spec)
+        fetching.set()
+        release.wait(10)
+        return cacheDir, json.loads((cacheDir / "_meta.json").read_text())
+
+    monkeypatch.setattr(jobsModule, "fetchAll", heldFetch)
+    try:
+        status, fetched = _post(host, port, "/api/fetch-night", {"dayObs": 20260521})
+        assert status == 202, fetched
+        assert fetching.wait(5)
+        status, summary = _get(host, port, "/api/summary?dayObs=20260521")
+        assert status == 200
+        assert summary == {"loaded": False, "rebuildJobId": fetched["jobId"]}
+    finally:
+        release.set()
+    assert _awaitJob(host, port, fetched["jobId"])["status"] == "done"
+    assert len(fetches) == 1 and len(parsedOn) == 1
+    assert [j.jobId for j in ctx.jobs.listJobs()] == [fetched["jobId"]]
 
 
 def test_delete_cache_window_clears_loaded_state_if_match(
@@ -2279,6 +2588,7 @@ def test_progress_sse_replays_history_then_terminates(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "sse-fake"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         # Drive a handful of progress callbacks so the event log has body.
         for i, name in enumerate(["a", "b", "c"], 1):
             if progress is not None:
@@ -2665,6 +2975,7 @@ def test_healthz_is_unaffected_by_a_running_fetch(
         release.wait(timeout=10.0)
         cacheDir = tmpCacheRoot / "slow"
         (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
 
     monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
@@ -2777,6 +3088,7 @@ def _completeFetch(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / slug
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -2994,6 +3306,7 @@ def test_the_sfm_night_fetch_asks_loki_for_every_pod(
         seen.append(spec.podRegex)
         cacheDir = tmpCacheRoot / "fake-night-sfm"
         (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
 
     monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)

@@ -12,11 +12,18 @@
 'use strict';
 
 let rangeIndex = null;          // the index summary: {startId, stopId, dataIds[], nMissing, ...}
-let rangeSelectedExpId = null;  // currently-shown dataId
+let rangeSelectedExpId = null;  // the dataId whose chip is lit: the one last picked
+let rangeShownExpId = null;     // the dataId whose timeline is actually on screen
+// Which per-exposure request is the current one. Stepping can outrun the
+// server, and an answer to a superseded request must change nothing: its
+// timeline would land over the newer one, under the newer one's chip.
+let rangeRequestToken = 0;
 let rangeListenersWired = false;
 
 function startRange(indexSummary) {
   rangeIndex = indexSummary;
+  rangeShownExpId = null;
+  rangeRequestToken++;
   if (!rangeListenersWired) wireRangeListeners();
   renderRangeNav();
   const ids = indexSummary.dataIds || [];
@@ -80,6 +87,7 @@ function chipTitle(d) {
 }
 
 async function loadRangeExposure(expId) {
+  const token = ++rangeRequestToken;
   rangeSelectedExpId = expId;
   markSelectedChip();
   const idx = rangeIndex;
@@ -98,15 +106,32 @@ async function loadRangeExposure(expId) {
     const r = await fetch(apiUrl(`/api/summary?${qs}`));
     payload = await r.json();
   } catch (e) {
+    payload = null;
+  }
+  if (token !== rangeRequestToken) return;
+  if (payload && payload.loaded === false) {
+    // The server no longer holds this range (a restart, a ninth range,
+    // the loaded-views memory cap) and is rebuilding it from its cache,
+    // or can't. Route again from a URL naming the exposure just picked:
+    // home follows the rebuild and then opens the range on it, rather
+    // than this chip staying lit over the exposure already on screen.
+    window.navigateTo(qs, { replace: true });
+    window.reroute();
     return;
   }
-  if (!payload || !payload.loaded) return;
+  if (!payload || !payload.loaded) {
+    // No answer at all: the timeline is still the one shown before.
+    rangeSelectedExpId = rangeShownExpId;
+    markSelectedChip();
+    return;
+  }
   // Keep the URL pointed at the selected exposure so a refresh returns
   // here (bootstrap still routes ?rangeStart&rangeStop to the range view
   // and startRange reads back the dataId). A rewrite, not an entry:
   // stepping the navigator is moving within one view, and a run of forty
   // exposures would otherwise take forty Back presses to escape.
   window.navigateTo(qs, { replace: true });
+  rangeShownExpId = expId;
   window.startExplore(payload);
 }
 

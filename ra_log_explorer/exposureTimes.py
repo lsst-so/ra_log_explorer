@@ -77,9 +77,9 @@ def utcToTaiIso(t: dt.datetime) -> str:
     return tai.strftime("%Y-%m-%dT%H:%M:%S.%f")
 
 
-# On-disk cache: per-site JSON file mapping ``dataId (as string) ->
-# exposure record (a JSON object of the columns below, including
-# ``obs_end``)``. Exposure properties are immutable once a row exists,
+# On-disk cache: one JSON file per site per night, mapping ``dataId (as
+# string) -> exposure record (a JSON object of the columns below,
+# including ``obs_end``)``. Exposure properties are immutable once a row exists,
 # so caching is free of staleness concerns. The cache files live next
 # to the Loki window cache so a ``rm -rf ~/.cache/ra_log_explorer``
 # still resets everything.
@@ -317,8 +317,8 @@ def queryExposureRecordsForDayObs(
     id. Callers that need a bare-id view collapse it themselves with
     :func:`probeOrderWinners`. Ordered by (probe order, exposure id).
     """
-    lo = dayObs * 100000
-    hi = lo + 99999
+    lo = dayObs * DATA_ID_DAY_OBS_FACTOR
+    hi = lo + DATA_ID_DAY_OBS_FACTOR - 1
     out: list[ExposureRecord] = []
     for instrument in INSTRUMENTS_BY_PROBE_ORDER:
         sql = f"SELECT * FROM cdb_{instrument}.exposure WHERE exposure_id BETWEEN {lo} AND {hi}"
@@ -461,15 +461,32 @@ def loadTokenForSite(site: Site) -> str:
 
 # ----- on-disk cache --------------------------------------------------------
 
+# Every dataId is ``dayObs * DATA_ID_DAY_OBS_FACTOR + seqNum`` (see
+# :data:`INSTRUMENT_RECORD_KEY`), which is what lets the on-disk cache be
+# sharded by night without storing the night anywhere.
+DATA_ID_DAY_OBS_FACTOR = 100000
 
-def cachedExposureTimesPath(siteName: str) -> Path:
-    """Where we persist the per-site dataId → exposure-record map across runs.
 
-    Sites have separate files so a colliding bare dataId can't return
+def dayObsOfDataId(dataId: int) -> int:
+    """The dayObs a dataId belongs to (its leading eight digits)."""
+    return int(dataId) // DATA_ID_DAY_OBS_FACTOR
+
+
+def cachedExposureTimesPath(siteName: str, dayObs: int) -> Path:
+    """Where one night's dataId → exposure-record map is persisted for a site.
+
+    Sites have separate trees so a colliding bare dataId can't return
     the wrong site's record (real-camera vs BTS-simulated values can
     share a 13-digit id and *do not* share an immutable truth).
+
+    Sharded by dayObs because the alternative, one file per site, grows
+    by every night the live poller sees and is re-read whole for each
+    lookup and rewritten whole for each store. On the summit that was
+    tens of megabytes of JSON parsed while holding the GIL, once per
+    dataId of a night view, and a full rewrite on every poll that
+    brought a new exposure.
     """
-    return cache_root() / EXPOSURE_TIME_CACHE_DIR / f"{siteName}.json"
+    return cache_root() / EXPOSURE_TIME_CACHE_DIR / siteName / f"{dayObs}.json"
 
 
 def cacheKey(dataId: int, instrument: str | None = None) -> str:
@@ -501,17 +518,39 @@ def lookupCachedRecord(dataId: int, *, siteName: str, instrument: str | None = N
     older build wrote) is a miss, not something to interpret. Caches are
     a convenience, and the schema flush is the upgrade path.
     """
-    p = cachedExposureTimesPath(siteName)
-    if not p.exists():
-        return None
+    return lookupCachedRecords([dataId], siteName=siteName, instrument=instrument).get(int(dataId))
+
+
+def lookupCachedRecords(
+    dataIds: Iterable[int], *, siteName: str, instrument: str | None = None
+) -> dict[int, ExposureRecord]:
+    """:func:`lookupCachedRecord` for many dataIds, reading each night's file once.
+
+    Returns ``{dataId: record}`` for the hits; misses are simply absent.
+    Anything resolving a whole night or range goes through here rather
+    than looping over the single lookup, which would re-parse the same
+    file per id.
+    """
+    byNight: dict[int, list[int]] = {}
+    for dataId in dataIds:
+        byNight.setdefault(dayObsOfDataId(dataId), []).append(int(dataId))
+    out: dict[int, ExposureRecord] = {}
+    for dayObs, ids in byNight.items():
+        shard = _readShard(cachedExposureTimesPath(siteName, dayObs))
+        for dataId in ids:
+            val = shard.get(cacheKey(dataId, instrument))
+            if isinstance(val, dict):
+                out[dataId] = val
+    return out
+
+
+def _readShard(p: Path) -> dict:
+    """One night's cache file as a dict; ``{}`` if missing or unreadable."""
     try:
         d = json.loads(p.read_text())
     except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(d, dict):
-        return None
-    val = d.get(cacheKey(dataId, instrument))
-    return val if isinstance(val, dict) else None
+        return {}
+    return d if isinstance(d, dict) else {}
 
 
 def storeCachedRecord(dataId: int, record: ExposureRecord, *, siteName: str, bareKey: bool = True) -> None:
@@ -533,13 +572,14 @@ def storeCachedRecords(records: dict[int, ExposureRecord], *, siteName: str, bar
     lookup resolves to, and writing it there would make the same dataId
     answer differently depending on who asked last.
     """
-    entries: dict[str, ExposureRecord] = {}
+    entries: dict[int, dict[str, ExposureRecord]] = {}
     for eid, rec in records.items():
+        shard = entries.setdefault(dayObsOfDataId(eid), {})
         instrument = recordInstrument(rec)
         if instrument:
-            entries[cacheKey(int(eid), instrument)] = rec
+            shard[cacheKey(int(eid), instrument)] = rec
         if bareKey:
-            entries[cacheKey(int(eid))] = rec
+            shard[cacheKey(int(eid))] = rec
     _mergeIntoCache(entries, siteName=siteName)
 
 
@@ -566,19 +606,19 @@ def storeCachedRecordList(records: Iterable[ExposureRecord], *, siteName: str) -
     once (see :func:`queryExposureRecordsForDayObs`).
     """
     records = list(records)
-    entries: dict[str, ExposureRecord] = {}
+    entries: dict[int, dict[str, ExposureRecord]] = {}
     for rec in records:
         eid = recordExposureId(rec)
         instrument = recordInstrument(rec)
         if eid is None or not instrument:
             continue
-        entries[cacheKey(eid, instrument)] = rec
+        entries.setdefault(dayObsOfDataId(eid), {})[cacheKey(eid, instrument)] = rec
     for eid, rec in probeOrderWinners(records).items():
-        entries[cacheKey(eid)] = rec
+        entries.setdefault(dayObsOfDataId(eid), {})[cacheKey(eid)] = rec
     _mergeIntoCache(entries, siteName=siteName)
 
 
-# Serialises the read-modify-write below. Several threads write this file
+# Serialises the read-modify-write below. Several threads write these files
 # in one process: request threads resolving a dataId, a fetch job's
 # night/range prefetch, and — every tick — the live poller's exposure
 # list. Without the lock two of them interleave their writes into one
@@ -587,45 +627,39 @@ def storeCachedRecordList(records: Iterable[ExposureRecord], *, siteName: str) -
 _cacheWriteLock = threading.Lock()
 
 
-def _mergeIntoCache(entries: dict[str, ExposureRecord], *, siteName: str) -> None:
-    """Merge pre-keyed entries into the per-site cache file.
+def _mergeIntoCache(entries: dict[int, dict[str, ExposureRecord]], *, siteName: str) -> None:
+    """Merge pre-keyed entries, grouped by dayObs, into the site's night files.
 
     Best-effort: any I/O error is swallowed (the cache is purely an
     optimisation). Records never need to be invalidated — once a
     ``cdb_*.exposure`` row exists in ConsDB, it's immutable. They are
     plainly overwritten, though, which is how a real record supersedes a
     ``_manual`` stand-in (see :func:`manualRecord`). Taking the whole
-    batch in one rewrite keeps a night-prefetch of hundreds of dataIds
-    from re-serialising the file once per id.
+    batch in one rewrite per night keeps a night-prefetch of hundreds of
+    dataIds from re-serialising the file once per id.
 
     Written via a temp file and ``os.replace`` under a process-wide lock,
     so a reader only ever sees a whole file and a crash or a concurrent
-    writer cannot leave a truncated one. Losing this file is not the
+    writer cannot leave a truncated one. Losing a file is not the
     harmless cache miss it looks like: a ``_manual`` stand-in exists
     nowhere else, so a hand-typed shutter close would be gone for good.
     """
-    if not entries:
-        return
-    p = cachedExposureTimesPath(siteName)
     with _cacheWriteLock:
-        try:
-            p.parent.mkdir(parents=True, exist_ok=True)
-            existing: dict = {}
-            if p.exists():
-                try:
-                    raw = json.loads(p.read_text())
-                    if isinstance(raw, dict):
-                        existing = raw
-                except (OSError, json.JSONDecodeError):
-                    existing = {}
-            existing.update(entries)
-            fd, tmpName = tempfile.mkstemp(prefix=f"{p.stem}-", suffix=".json", dir=p.parent)
-            tmpPath = Path(tmpName)
+        for dayObs, shardEntries in entries.items():
+            if not shardEntries:
+                continue
+            p = cachedExposureTimesPath(siteName, dayObs)
             try:
-                with os.fdopen(fd, "w") as fh:
-                    json.dump(existing, fh, sort_keys=True, indent=2)
-                os.replace(tmpPath, p)
-            finally:
-                tmpPath.unlink(missing_ok=True)
-        except OSError:
-            pass
+                p.parent.mkdir(parents=True, exist_ok=True)
+                existing = _readShard(p)
+                existing.update(shardEntries)
+                fd, tmpName = tempfile.mkstemp(prefix=f"{p.stem}-", suffix=".json", dir=p.parent)
+                tmpPath = Path(tmpName)
+                try:
+                    with os.fdopen(fd, "w") as fh:
+                        json.dump(existing, fh, sort_keys=True, indent=2)
+                    os.replace(tmpPath, p)
+                finally:
+                    tmpPath.unlink(missing_ok=True)
+            except OSError:
+                pass

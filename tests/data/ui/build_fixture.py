@@ -48,7 +48,7 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[3]
 sys.path.insert(0, str(REPO))
 
-from ra_log_explorer import parse  # noqa: E402
+from ra_log_explorer import exposureTimes, parse  # noqa: E402
 from ra_log_explorer.fetch import (  # noqa: E402
     LIVE_SIDECAR_VERSION,
     PODS_DIR_NAME,
@@ -180,7 +180,8 @@ def main() -> int:
     ap.add_argument(
         "--exposure-times",
         type=Path,
-        default=Path("/Users/merlin/temp/log_explorer_data/app-cache/exposure-times/summit.json"),
+        default=Path("/Users/merlin/temp/log_explorer_data/app-cache/exposure-times/summit"),
+        help="a site's exposure-time cache dir (one <dayObs>.json per night)",
     )
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "july11")
     args = ap.parse_args()
@@ -248,7 +249,9 @@ def main() -> int:
     # Exposure records for every exposure whose shutter close lands in
     # the app-log window, both instruments, keyed exactly as the app
     # keys them (bare id = probe-order winner, plus per-instrument).
-    src = json.loads(args.exposure_times.read_text())
+    src: dict[str, dict] = {}
+    for shard in sorted(args.exposure_times.glob("*.json")):
+        src.update(json.loads(shard.read_text()))
     keep: dict[str, dict] = {}
     inWindow: dict[str, list[int]] = collections.defaultdict(list)
     for key, rec in src.items():
@@ -261,8 +264,14 @@ def main() -> int:
         keep[key] = rec
         if ":" in key:
             inWindow[rec["instrument"]].append(rec["exposure_id"])
-    (out / "exposure-times").mkdir(parents=True)
-    (out / "exposure-times" / "summit.json").write_text(json.dumps(keep, indent=2, sort_keys=True))
+    byNight: dict[int, dict[str, dict]] = collections.defaultdict(dict)
+    for key, rec in keep.items():
+        byNight[exposureTimes.dayObsOfDataId(int(key.rsplit(":", 1)[-1]))][key] = rec
+    (out / "exposure-times" / "summit").mkdir(parents=True)
+    for dayObs, shard in byNight.items():
+        (out / "exposure-times" / "summit" / f"{dayObs}.json").write_text(
+            json.dumps(shard, indent=2, sort_keys=True)
+        )
 
     total = sum(f.stat().st_size for f in out.rglob("*") if f.is_file())
     print(f"\nwrote {out}")

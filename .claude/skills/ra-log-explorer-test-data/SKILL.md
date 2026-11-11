@@ -58,7 +58,7 @@ master/
   aug11-night-bts/            a finalised live-night dir: pods/, pods_events/,
                               pods.txt, _live.json, _meta.json
   aug12-night-bts/
-  exposure-times/bts.json     ConsDB records for every night captured, shared
+  exposure-times/bts/         ConsDB records for every night captured, one <dayObs>.json each
 ```
 
 Check `_meta.json`'s `fetchComplete`, `errors` and `incomplete_pods`

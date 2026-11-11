@@ -19,11 +19,21 @@ This module:
 from __future__ import annotations
 
 import datetime as dt
+import functools
+import heapq
+import io
+import itertools
 import json
+import multiprocessing
 import re
+import threading
+from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable, Iterator
+
+from .config import PARSE_WORKERS
 
 # ----- pod flavor classification -------------------------------------------
 
@@ -246,11 +256,14 @@ def parseLogLine(pod: str, jsonObj: dict) -> LogLine | None:
     )
 
 
-def iterPodLines(podLogPath: Path) -> Iterator[LogLine]:
+def iterPodLines(podLogPath: Path, offset: int = 0) -> Iterator[LogLine]:
+    """Parse a pod's JSONL log, from byte ``offset`` (a line start) onwards."""
     pod = podLogPath.stem
     if not podLogPath.exists():
         return
-    with podLogPath.open("r", encoding="utf-8", errors="replace") as fh:
+    with podLogPath.open("rb") as raw:
+        raw.seek(offset)
+        fh = io.TextIOWrapper(raw, encoding="utf-8", errors="replace")
         for line in fh:
             line = line.strip()
             if not line:
@@ -267,7 +280,7 @@ def iterPodLines(podLogPath: Path) -> Iterator[LogLine]:
 # ----- event classification -------------------------------------------------
 
 
-@dataclass
+@dataclass(slots=True)
 class Event:
     pod: str
     t: dt.datetime
@@ -1261,7 +1274,12 @@ def _finaliseTraceback(record: TracebackRecord, lines: list[str], summary: PodSu
     summary.tracebacks.append(record)
 
 
-def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> list[PodSummary]:
+def summarizeAll(
+    cacheDir: Path,
+    keep: Callable[[str], bool] | None = None,
+    progress: Callable[[int, int], None] | None = None,
+    eventKinds: frozenset[str] | None = None,
+) -> list[PodSummary]:
     """Summarize every pod in a window; ``keep`` filters by pod name.
 
     The filter is applied before parsing, not after, because the caller
@@ -1269,12 +1287,21 @@ def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> l
     night unfiltered (see :data:`config.NIGHT_VIEWS`), and parsing the
     AOS pods only to discard them would be most of a minute on a summit
     night.
+
+    ``eventKinds``, if given, is the only :class:`Event` kinds the
+    summaries keep. Applied in the worker, before a summary is sent back,
+    because a summary's events are most of its size, and so most of what
+    a loaded view holds in memory.
+
+    Pods are parsed in the worker processes of :func:`_parsePool`, never
+    on the calling thread, and returned in pod-name order. ``progress``
+    is called with ``(done, total)`` as each pod finishes.
     """
     podsDir = cacheDir / "pods"
     eventsDir = cacheDir / "pods_events"
-    summaries: list[PodSummary] = []
     if not podsDir.exists():
-        return summaries
+        return []
+    work: list[tuple[Path, Path | None]] = []
     for podFile in sorted(podsDir.iterdir()):
         if podFile.suffix != ".jsonl":
             continue
@@ -1283,9 +1310,174 @@ def summarizeAll(cacheDir: Path, keep: Callable[[str], bool] | None = None) -> l
         # The sibling pods_events/<pod>.jsonl is optional: absent for a pod
         # that had no lifecycle events in the window. (Not for an older
         # cache: those don't survive the schema flush — see caching.md.)
-        eventsFile = eventsDir / podFile.name
-        summaries.append(summarizePod(podFile, eventsFile if eventsFile.exists() else None))
-    return summaries
+        events = eventsDir / podFile.name
+        work.append((podFile, events if events.exists() else None))
+    dispatcher = _parsePool()
+    if dispatcher is None:
+        summaries = []
+        for i, (podFile, eventsFile) in enumerate(work, 1):
+            summaries.append(_summarizePodKeeping(podFile, eventsFile, eventKinds))
+            if progress is not None:
+                progress(i, len(work))
+        return summaries
+    sizes = [podFile.stat().st_size for podFile, _ in work]
+    futures = {
+        dispatcher.submit((sum(sizes), -sizes[i]), (podFile, eventsFile, eventKinds)): i
+        for i, (podFile, eventsFile) in enumerate(work)
+    }
+    results: list[PodSummary | None] = [None] * len(work)
+    try:
+        for done, future in enumerate(as_completed(futures), 1):
+            results[futures[future]] = future.result()
+            if progress is not None:
+                progress(done, len(work))
+    except BrokenProcessPool:
+        # A worker died mid-parse (OOM-killed, most likely), which leaves
+        # the executor refusing all further work. Drop it so the next
+        # parse starts a fresh one rather than every parse failing until
+        # the service is restarted.
+        _discardParsePool(dispatcher)
+        raise
+    finally:
+        # A pod that failed fails the parse; don't parse the rest for nobody.
+        for future in futures:
+            future.cancel()
+    return [r for r in results if r is not None]
+
+
+def _summarizePodKeeping(
+    podLogPath: Path, eventsLogPath: Path | None, eventKinds: frozenset[str] | None
+) -> PodSummary:
+    """:func:`summarizePod`, keeping only ``eventKinds`` (all, if ``None``)."""
+    summary = summarizePod(podLogPath, eventsLogPath)
+    if eventKinds is not None:
+        summary.events = [ev for ev in summary.events if ev.kind in eventKinds]
+    return summary
+
+
+_PodTask = tuple[Path, Path | None, frozenset[str] | None]
+
+
+class _ParseDispatcher:
+    """Feeds the parse pool a pod per free worker, the smallest parse first.
+
+    The executor's own queue is first-in first-out. With every pod of
+    every parse submitted straight to it, an exposure opened while a
+    summit night was parsing waited for the night (25 s for a 0.5 s
+    parse, measured): its 2 ms pods queued behind the night's
+    multi-second ones, and every worker was always busy with one of
+    those. Held here instead, and released only as workers free up, the
+    next pod is always from the queued parse with the least total work,
+    and within a parse the biggest pod goes first so it doesn't end on
+    one long pod while the other workers idle.
+    """
+
+    def __init__(self, pool: ProcessPoolExecutor, slots: int) -> None:
+        self.pool = pool
+        self._slots = slots
+        self._inFlight = 0
+        self._queue: list[tuple[tuple[int, int], int, Future[PodSummary], _PodTask]] = []
+        self._seq = itertools.count()
+        self._ready = threading.Condition()
+        self._closed = False
+        threading.Thread(target=self._dispatch, name="parse-dispatch", daemon=True).start()
+
+    def submit(self, priority: tuple[int, int], task: _PodTask) -> Future[PodSummary]:
+        """Queue one pod; lower ``priority`` is handed to a worker sooner."""
+        future: Future[PodSummary] = Future()
+        with self._ready:
+            if not self._closed:
+                heapq.heappush(self._queue, (priority, next(self._seq), future, task))
+                self._ready.notify()
+                return future
+        # Closed between a parse picking this dispatcher up and submitting
+        # to it (another parse found the pool broken). Nothing would ever
+        # hand the pod to a worker, so fail it as close() fails the queue.
+        future.set_running_or_notify_cancel()
+        future.set_exception(BrokenProcessPool("the parse pool was replaced"))
+        return future
+
+    def close(self) -> None:
+        """Shut the pool down, failing whatever was still queued."""
+        with self._ready:
+            if self._closed:
+                return
+            self._closed = True
+            queued = [entry[2] for entry in self._queue]
+            self._queue.clear()
+            self._ready.notify()
+        for future in queued:
+            if future.set_running_or_notify_cancel():
+                future.set_exception(BrokenProcessPool("the parse pool was replaced"))
+        self.pool.shutdown(wait=False, cancel_futures=True)
+
+    def _dispatch(self) -> None:
+        while True:
+            with self._ready:
+                while not self._closed and (not self._queue or self._inFlight >= self._slots):
+                    self._ready.wait()
+                if self._closed:
+                    return
+                _, _, future, task = heapq.heappop(self._queue)
+                if not future.set_running_or_notify_cancel():
+                    continue
+                self._inFlight += 1
+            try:
+                inner = self.pool.submit(_summarizePodKeeping, *task)
+            except Exception as e:  # noqa: BLE001 — a broken or shut-down pool; the caller decides
+                self._release()
+                future.set_exception(e)
+                continue
+            inner.add_done_callback(functools.partial(self._relay, future))
+
+    def _relay(self, future: Future[PodSummary], inner: Future[PodSummary]) -> None:
+        self._release()
+        try:
+            future.set_result(inner.result())
+        except Exception as e:  # noqa: BLE001 — relayed to whoever is waiting on it
+            future.set_exception(e)
+
+    def _release(self) -> None:
+        with self._ready:
+            self._inFlight -= 1
+            self._ready.notify()
+
+
+# Shared by every parse in the process, so concurrent jobs queue for the
+# same few cores rather than each starting its own and starving the server
+# process and the live poller of CPU. Started lazily: most CLI commands
+# never parse.
+_pool: _ParseDispatcher | None = None
+_poolLock = threading.Lock()
+
+
+def _parsePool() -> _ParseDispatcher | None:
+    """The process pool parses run on, or ``None`` to parse in-process.
+
+    ``spawn``, not the platform default: on Linux that is ``fork``, and
+    forking the threaded server would copy whatever locks its other
+    threads held at that instant into a child that can never release
+    them. One pod more than there are workers is in the pool at a time,
+    so a worker never waits on the dispatcher between pods.
+    """
+    global _pool
+    if PARSE_WORKERS == 0:
+        return None
+    with _poolLock:
+        if _pool is None:
+            executor = ProcessPoolExecutor(
+                max_workers=PARSE_WORKERS, mp_context=multiprocessing.get_context("spawn")
+            )
+            _pool = _ParseDispatcher(executor, slots=PARSE_WORKERS + 1)
+        return _pool
+
+
+def _discardParsePool(dispatcher: _ParseDispatcher) -> None:
+    global _pool
+    with _poolLock:
+        if _pool is dispatcher:
+            _pool = None
+    dispatcher.close()
 
 
 # ----- filtering by exposure id --------------------------------------------

@@ -105,7 +105,7 @@ chmod 600 ~/.lsst/manke-token.txt
 ```
 
 Once a dataId has been resolved on this machine it is cached on disk
-per-site (under `~/.cache/ra_log_explorer/exposure-times/<site>.json`),
+per site and night (under `~/.cache/ra_log_explorer/exposure-times/<site>/<dayObs>.json`),
 so subsequent lookups for the same id work without the token. Exposure
 end-times are immutable once recorded, so the cache never goes stale.
 Sites have separate cache files so a colliding bare dataId between
@@ -297,14 +297,22 @@ The browser app has three views:
   with a single *advanced options* disclosure holding the shared window
   pads and the range-of-exposures form) and **Night processing**
   (investigate a whole night, AOS pods or everything else), each with
-  its own inline progress bar.
+  its own inline progress bar. A link or reload to a view the server
+  has cached but not loaded (after a restart, or once other views have
+  pushed it out of memory) also lands here, showing *Loading from the
+  cache...* on the matching card while the server re-reads it, then
+  opens the view. On the summit the SFM half of a night takes about a
+  minute.
   Below them, on a deployment running live mode, sits the **Tonight**
   panel: every exposure taken so far tonight, newest first, with a
   ready/wait status chip, refreshing itself every 30 s while the page
   is open — see *Live mode (deployments)* below.
 - **Admin view** — `/?admin=1`, linked from the home topbar (no
-  separate permissions; anyone can open it). Hosts the cached-windows
-  table — every log window on disk, per-row delete — and a *flush
+  separate permissions; anyone can open it). A *Deployment* panel at
+  the top names the running build — its version (`git describe`, so
+  `v0.2.0` for a release and `v0.2.0-30-ge16e6c9` for a commit after
+  it) and the commit it was built from, linked on GitHub. Below it, the
+  cached-windows table — every log window on disk, per-row delete — and a *flush
   entire cache* button. Caching is invisible to day-to-day use; this
   page is for operators.
 - **Explore view** — the timeline + detail drawer for one loaded
@@ -315,7 +323,9 @@ The browser app has three views:
   it raised a traceback), plus ◀/▶ buttons and the ←/→ arrow keys to
   step between them. Each exposure's timeline is anchored at its own
   shutter close, so the `Δt₀ = 0` line always sits on the exposure
-  you're looking at.
+  you're looking at. If the server has unloaded the range since the tab
+  opened, picking a chip goes through *Loading from the cache...* on
+  the home page and comes back to the range on that exposure.
 - **Night view** — the dayObs-wide failure breakdown and Δshutter
   histograms, plus data-completeness banners: an incomplete-fetch
   warning, and a "gather-only" warning listing any dataIds whose
@@ -603,7 +613,9 @@ last change how everyone else's fetches behave.
 | `LOKI_USERNAME` | Loki basic-auth user | `merlin` |
 | `RA_LOG_EXPLORER_CACHE` | cache root | `~/.cache/ra_log_explorer` |
 | `RA_LOG_EXPLORER_MAX_CACHE_BYTES` | LRU eviction ceiling | 5 GiB |
+| `RA_LOG_EXPLORER_MAX_LOADED_BYTES` | memory parsed views may hold before the least recently used are unloaded | 2 GiB |
 | `RA_LOG_EXPLORER_WORKERS` | parallel fetch workers | `8` |
+| `RA_LOG_EXPLORER_PARSE_WORKERS` | processes that parse pod logs; keep below the CPU limit; `0` parses in-process | `min(4, CPUs)` |
 | `RA_LOG_EXPLORER_WINDOW_BEFORE_S` | starting value of the window-before field | `5` |
 | `RA_LOG_EXPLORER_WINDOW_AFTER_S` | starting value of the window-after field | `300` |
 | `RA_LOG_EXPLORER_SITES_FILE` | which site catalog to load | the packaged `sites.toml` |
@@ -666,6 +678,23 @@ while it backfills from noon UTC; a red banner appears if any pod's
 fetch is failing, ConsDB can't be reached, or an earlier night couldn't
 be tidied up.
 
+The night before tonight is kept on disk too. Whenever it isn't there
+(after a deploy that changes the cache format, after *flush entire
+cache* on the admin page, on a new volume), the server re-pulls it from
+Loki in the background, an hour at a time, while tonight carries on. A
+night you already fetched whole from the form is adopted as it is
+(`Live: adopted dayObs …`) rather than pulled again, and a fetch of it
+that is still running is left alone until the next poll; one that died
+part-way is pulled over. The pod log
+says when a re-pull starts and finishes (`Live: re-pulling dayObs …`,
+`Live: re-pulled dayObs … in N min`), and `/api/live` shows it as
+`backfillDayObs` / `backfillError`. Until it finishes, an exposure from
+last night beyond what has arrived is fetched from Loki as it would be
+without live mode, and so is last night's AOS night view; its SFM view
+answers *"dayObs N has ended but its logs are still being pulled from
+Loki"* until the re-pull is done, rather than showing part of the night
+as if it were all of it.
+
 The night view benefits too: opening the *current* night's dayObs no
 longer re-fetches hours of AOS logs from Loki — it slices "the night so
 far" out of the live cache (the parse still takes a little while for a
@@ -709,6 +738,14 @@ and user. Check also that the window is inside Loki's retention (about
 lines from the pod's log in Grafana/Loki or Argo CD. Set
 `RA_LOG_EXPLORER_LOG_LEVEL=DEBUG` to also log every `logcli` call and
 HTTP request.
+
+**"dayObs N has ended but its logs are still being pulled from Loki
+(on disk through …); try again in a few minutes"** — the server is
+re-pulling that night in the background (see [Live mode](#live-mode-deployments))
+and the SFM night view needs all of it. The message names how far the
+re-pull has got; `/api/live` shows the same as `backfillDayObs`. Wait
+for it to finish, or look at the AOS view or an exposure, which fetch
+what they need from Loki directly.
 
 **"No exposure-time record for dataId=N" / ConsDB unreachable** — ConsDB
 either has no row for that id yet or is down. The **manual shutter close**

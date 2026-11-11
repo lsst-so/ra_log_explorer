@@ -11,9 +11,10 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import pytest
 from playwright.sync_api import expect
 
-from .corpus import DAY_OBS, StagedCorpus
+from .corpus import DAY_OBS, SHARED_ID, StagedCorpus
 
 
 def openNight(app: Any, corpus: StagedCorpus) -> None:
@@ -295,3 +296,180 @@ def test_a_night_that_found_no_pods_says_so(app: Any, corpus: StagedCorpus) -> N
     expect(banner).to_contain_text("No pods found")
     # It names the likely cause rather than just the symptom.
     expect(banner).to_contain_text("other site")
+
+
+def test_a_night_on_disk_but_not_in_memory_is_rebuilt_in_view(
+    app: Any, corpus: StagedCorpus, monkeypatch: Any
+) -> None:
+    """A deep link (or a reload after a restart) to a night the server has
+    cached but not loaded is rebuilt by a job, not inside the request. The
+    page shows that job's progress on the night card, then opens the night
+    the URL named. A summit night is a minute of parsing, and the page used
+    to show nothing at all while the request did it."""
+    import threading
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def heldParse(*args: Any, **kwargs: Any) -> Any:
+        release.wait(10)
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", heldParse)
+    try:
+        app.goto(f"/?dayObs={DAY_OBS}")
+        expect(app.page.locator("#night-progress")).to_be_visible()
+        expect(app.page.locator("#night-message")).to_contain_text("Loading from the cache")
+        expect(app.page.locator("#night-submit")).to_be_disabled()
+    finally:
+        release.set()
+    expect(app.page.locator("#night-view")).to_be_visible()
+    expect(app.page.locator("#night-dayobs-display")).to_contain_text(str(DAY_OBS))
+    assert f"dayObs={DAY_OBS}" in app.page.url
+
+
+def test_a_followed_rebuild_leaves_nothing_on_its_card(app: Any, corpus: StagedCorpus) -> None:
+    """The night card says "Loading from the cache..." while the page
+    follows a rebuild, over a progress line ending "done in N s". Nothing
+    took either down when the night opened, so the card still showed them
+    whenever the user came back home."""
+    corpus.stageNight()
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-view")).to_be_visible()
+    assert any(j.rebuildFrom is not None for j in app.ctx.jobs.listJobs()), "no rebuild was followed"
+    app.page.locator("#night-back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    expect(app.page.locator("#night-form")).to_be_visible()
+    expect(app.page.locator("#night-message")).to_have_text("")
+    expect(app.page.locator("#night-progress")).to_be_hidden()
+
+
+def test_a_rebuild_counts_its_parse_pod_by_pod(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
+    """Once a night is on disk the parse is most of the wait: about a
+    minute for a summit night. The card counts the pods as they finish,
+    so the page shows a parse moving rather than a bar standing still."""
+    import threading
+    from pathlib import Path
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def holdAfterTheFirstPod(
+        cacheDir: Path, keep: Any = None, progress: Any = None, eventKinds: Any = None
+    ) -> Any:
+        def note(i: int, n: int) -> None:
+            progress(i, n)
+            if i == 1:
+                release.wait(10)
+
+        return realParse(cacheDir, keep=keep, progress=note, eventKinds=eventKinds)
+
+    monkeypatch.setattr(parse, "summarizeAll", holdAfterTheFirstPod)
+    try:
+        app.goto(f"/?dayObs={DAY_OBS}")
+        text = app.page.locator("#night-progress .progress-text")
+        expect(text).to_contain_text(re.compile(r"parsing 1/\d+ pods"))
+        counted = re.search(r"parsing 1/(\d+) pods", text.inner_text())
+        assert counted is not None
+        width = app.page.locator("#night-progress .progress-fill").evaluate("e => e.style.width")
+        assert float(width.rstrip("%")) == pytest.approx(100 / int(counted.group(1)), abs=0.1), width
+    finally:
+        release.set()
+    expect(app.page.locator("#night-view")).to_be_visible()
+
+
+def test_a_failure_row_whose_night_was_unloaded_says_to_reload(app: Any, corpus: StagedCorpus) -> None:
+    """Rows outlive their night in the server's memory (opening a ninth
+    view, or the loaded-views memory cap, unloads it). Expanding one then
+    says what happened and what to do, in the server's words, rather than
+    a bare status code."""
+    openNight(app, corpus)
+    with app.ctx.jobs.stateLock:
+        app.ctx.nightStates.clear()
+    app.page.locator("#night-failures .night-failure-row").first.click()
+    expect(app.page.locator("#night-failures tr.night-failure-detail")).to_contain_text(
+        "This night is no longer loaded; reload the page"
+    )
+
+
+def test_a_rebuild_finishing_after_the_user_moved_on_leaves_their_view_alone(
+    app: Any, corpus: StagedCorpus, monkeypatch: Any
+) -> None:
+    """A night's rebuild takes up to a minute, and the page used to route
+    again from whatever URL was current when it ended. Someone who had
+    gone Back to an exposure meanwhile had it re-rendered under them:
+    drawer closed, scroll and selection gone."""
+    import threading
+
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    corpus.stageExposure(SHARED_ID, "lsstcam")
+    app.goto(f"/?dataId={SHARED_ID}&instrument=lsstcam")
+    expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+
+    release = threading.Event()
+    realParse = parse.summarizeAll
+
+    def held(*args: Any, **kwargs: Any) -> Any:
+        release.wait(10)
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", held)
+    try:
+        # In this document, as Back onto a night the server has since
+        # unloaded would be: a new entry, routed from its URL.
+        app.page.evaluate(f"() => {{ window.navigateTo('dayObs={DAY_OBS}'); window.reroute(); }}")
+        expect(app.page.locator("#night-progress")).to_be_visible()
+        app.page.go_back()
+        expect(app.page.locator("#timeline .tl-row").first).to_be_visible()
+        app.page.evaluate("() => { document.querySelector('#timeline .tl-row').dataset.kept = '1'; }")
+    finally:
+        release.set()
+    # The page has seen the job end once it puts the night card's progress away.
+    app.page.wait_for_function("() => document.getElementById('night-progress').hidden")
+    assert app.page.evaluate("() => document.getElementById('night-message').textContent") == ""
+    expect(app.page.locator("#explore-view")).to_be_visible()
+    assert app.page.locator("#timeline .tl-row").first.get_attribute("data-kept") == "1"
+    assert f"dataId={SHARED_ID}" in app.page.url
+    # The night was loaded all the same: Forward opens it without another rebuild.
+    app.page.go_forward()
+    expect(app.page.locator("#night-view")).to_be_visible()
+    assert len([j for j in app.ctx.jobs.listJobs() if j.kind == "night"]) == 1
+
+
+def test_a_failed_rebuild_gives_the_form_back(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
+    """A rebuild that fails says so on the night card and gives the page
+    back. The page must also stop following it: the next fetch it starts
+    has to open what that fetch fetched, not re-route to the night the
+    URL still names."""
+    from ra_log_explorer import parse
+
+    corpus.stageNight()
+    realParse = parse.summarizeAll
+    parses = 0
+
+    def failingFirst(*args: Any, **kwargs: Any) -> Any:
+        nonlocal parses
+        parses += 1
+        if parses == 1:
+            raise RuntimeError("cannot read the night")
+        return realParse(*args, **kwargs)
+
+    monkeypatch.setattr(parse, "summarizeAll", failingFirst)
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-message")).to_contain_text("cannot read the night")
+    expect(app.page.locator("#night-submit")).to_be_enabled()
+
+    app.page.locator("#fetch-form input[name=exposureId]").fill(str(SHARED_ID))
+    expect(app.page.locator("#tzero-status")).to_contain_text("shutter close (TAI)")
+    app.page.locator("#fetch-submit").click()
+    expect(app.page.locator("#explore-view")).to_be_visible(timeout=30_000)
+    expect(app.page.locator("#expId-display")).to_contain_text(str(SHARED_ID))
+    assert f"dataId={SHARED_ID}" in app.page.url

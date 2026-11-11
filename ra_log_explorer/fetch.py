@@ -113,11 +113,13 @@ log = logging.getLogger(__name__)
 # no-backwards-compatibility rule in caching.md, and this flush is what
 # makes that safe; v6 qualifies every _exposure_ids.txt entry with the
 # instrument it was fetched under, since a bare id names a different
-# exposure on each and the cache listing links back to one of them.
+# exposure on each and the cache listing links back to one of them; v7
+# splits the per-site exposure-time file into one file per dayObs
+# (``exposure-times/<site>/<dayObs>.json``).
 # Bumping this value flushes the whole cache (see
 # ``ensureCacheSchemaCurrent``) and, as a second line of defence, any
 # individual cache lacking this exact value is re-fetched, not re-served.
-CACHE_SCHEMA_VERSION = 6
+CACHE_SCHEMA_VERSION = 7
 
 # Sentinel at the cache root recording the schema version its contents were
 # built with. A mismatch (or its absence) means a version bump happened, so
@@ -200,6 +202,18 @@ class FetchError(RuntimeError):
     pass
 
 
+def writeCacheSchemaSentinel(root: Path) -> None:
+    """Record that the cache under ``root`` is the current schema's (best-effort).
+
+    Whatever empties the cache rewrites this as well: a root without it is
+    an unversioned cache, which the next process start flushes whole.
+    """
+    try:
+        (root / CACHE_SCHEMA_SENTINEL).write_text(f"{CACHE_SCHEMA_VERSION}\n")
+    except OSError:
+        pass
+
+
 def ensureCacheSchemaCurrent() -> int:
     """Flush the entire cache tree iff it was built by a different schema.
 
@@ -246,10 +260,7 @@ def ensureCacheSchemaCurrent() -> int:
             removed += 1
         except OSError:
             pass  # best-effort; the per-cache guard still refuses stale meta
-    try:
-        sentinel.write_text(current + "\n")
-    except OSError:
-        pass
+    writeCacheSchemaSentinel(root)
     if removed:
         log.info(
             "Cache schema changed (was %s, now %s); flushed %d cached window(s). "
@@ -1257,6 +1268,33 @@ def liveNightMeta(
     }
 
 
+def _utcNow() -> dt.datetime:
+    """The wall clock, as one function so tests can stand in for it."""
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def _nightHasEnded(sidecar: dict) -> bool:
+    """True once the night a sidecar describes is over by the clock."""
+    try:
+        return _parseIso(sidecar["toIso"]) <= _utcNow()
+    except (KeyError, ValueError):
+        return False
+
+
+def _liveDirRefusal(requestedDir: Path) -> str:
+    """Why a fresh fetch into ``requestedDir``, a live night dir, is refused."""
+    sidecar = readLiveSidecar(requestedDir)
+    if sidecar is not None and not sidecar.get("finalised") and _nightHasEnded(sidecar):
+        return (
+            f"dayObs {sidecar.get('dayObs')} has ended but its logs are still being pulled from Loki "
+            f"(on disk through {sidecar.get('watermarkIso')}); try again in a few minutes"
+        )
+    return (
+        f"{requestedDir} is a live night directory maintained by the poller; "
+        "refusing to overwrite it with a fresh fetch"
+    )
+
+
 def _findNightDirTouching(cluster: str, namespace: str, fromT: dt.datetime) -> tuple[Path, dict] | None:
     """Return the ``(dir, sidecar)`` of the night dir whose span holds ``fromT``.
 
@@ -1319,7 +1357,13 @@ def _tryNightSlice(spec: FetchSpec) -> tuple[Path, dict] | None:
         return None
     if _parseIso(spec.toIso) <= watermark:
         sliceSpec = spec
-    elif spec.fromIso == sidecar["fromIso"] and spec.toIso == sidecar["toIso"]:
+    elif (
+        spec.fromIso == sidecar["fromIso"] and spec.toIso == sidecar["toIso"] and not _nightHasEnded(sidecar)
+    ):
+        # Only while the night is in progress. A night that has ended
+        # with its watermark short of its end is being re-pulled from
+        # Loki (or awaits the orphan sweep); the user asked for the whole
+        # night, and a clamped slice would be served as it, complete.
         if watermark <= _parseIso(spec.fromIso):
             return None  # nothing fetched yet
         sliceSpec = replace(spec, toIso=sidecar["watermarkIso"])
@@ -1474,8 +1518,7 @@ def _fetchAllLocked(
     partialPath = requestedDir / PARTIAL_FLAG
 
     windowEnd = _parseIso(spec.toIso)
-    now = dt.datetime.now(dt.timezone.utc)
-    windowInPast = now > windowEnd
+    windowInPast = _utcNow() > windowEnd
 
     # Cache eligibility is the same for both modes: only honour a cache
     # if the window is fully in the past. For night mode this means the
@@ -1541,10 +1584,7 @@ def _fetchAllLocked(
     # night. (Normally unreachable — the slice path above serves these —
     # but forceRefresh skips it, and so does an unparseable sidecar.)
     if (requestedDir / LIVE_SIDECAR_NAME).exists():
-        raise FetchError(
-            f"{requestedDir} is a live night directory maintained by the poller; "
-            "refusing to overwrite it with a fresh fetch"
-        )
+        raise FetchError(_liveDirRefusal(requestedDir))
     ensureWindowCacheDir(spec.cluster, spec.namespace, spec.fromIso, spec.toIso, spec.podRegex)
     podsDir = requestedDir / PODS_DIR_NAME
     podsEventsDir = requestedDir / PODS_EVENTS_DIR_NAME
@@ -1683,14 +1723,49 @@ def loadCacheMeta(cacheDir: Path) -> dict:
 
 def cacheDuSizeBytes(root: Path) -> int:
     """Return on-disk size of the entire cache tree under `root`."""
+    return cacheSizes(root)[0]
+
+
+def cacheSizes(root: Path) -> tuple[int, dict[Path, int]]:
+    """Total bytes under the cache root, and per cache window, in one walk.
+
+    The per-window map is keyed by every ``<cluster>/<ns>/<window>`` dir
+    (inclusive of any night caches nested in it) and every
+    ``.../<window>/pods=<slug>`` dir. Callers needing several sizes take
+    them all from one call: a summit night is over a thousand files and
+    an exposure slice several hundred, so the walk is the expensive part
+    of a cache listing or an eviction pass.
+
+    ``os.scandir`` rather than ``Path.rglob``: the file type comes from
+    the directory entry, so each file costs one ``stat`` instead of two.
+    """
     total = 0
-    for p in root.rglob("*"):
-        if p.is_file():
-            try:
-                total += p.stat().st_size
-            except OSError:
-                pass
-    return total
+    sizes: dict[Path, int] = {}
+    stack: list[tuple[str, int, tuple[Path, ...]]] = [(str(root), 0, ())]
+    while stack:
+        path, depth, owners = stack.pop()
+        try:
+            it = os.scandir(path)
+        except OSError:
+            continue
+        with it:
+            for entry in it:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        inner = owners
+                        if depth == 2 or (depth == 3 and entry.name.startswith("pods=")):
+                            key = Path(entry.path)
+                            sizes[key] = 0
+                            inner = owners + (key,)
+                        stack.append((entry.path, depth + 1, inner))
+                    elif entry.is_file(follow_symlinks=False):
+                        n = entry.stat(follow_symlinks=False).st_size
+                        total += n
+                        for owner in owners:
+                            sizes[owner] += n
+                except OSError:
+                    pass
+    return total, sizes
 
 
 def humanBytes(n: int) -> str:
@@ -1912,41 +1987,66 @@ def dropLiveSidecarsUnder(target: Path) -> None:
             pass
 
 
-def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
+def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], int]:
     """Evict the least-recently-viewed cache windows until the on-disk
     total is at or below ``maxBytes``.
 
     Caches in ``exempt`` are never removed — used to spare the cache
     that was just fetched. (It would just be re-fetched on the next
-    request, which defeats the point of having any limit at all.)
+    request, which defeats the point of having any limit at all.) Nor
+    is any window holding one: a night-mode cache is nested in its
+    night's window dir, and removing that removes it too.
 
     Caches without a ``_last_viewed.txt`` sidecar are treated as
     oldest — they've never been opened, so they're the safest to drop.
+    A window is as recently viewed as the latest of itself and the
+    night caches nested in it, since removing it removes them; a nested
+    cache keeps its own recency and can go while its window stays. At
+    equal recency the nested cache goes first.
 
-    Returns the list of directories that were removed, for logging
-    / debugging.
+    Returns the directories that were removed and the cache's total
+    size afterwards, so a caller that wants the total needn't walk the
+    tree a second time.
     """
     root = cache_root()
     exemptR = {p.resolve() for p in exempt}
-    total = cacheDuSizeBytes(root)
+    total, sizes = cacheSizes(root)
     if total <= maxBytes:
-        return []
-    # Sort by (last-viewed ASC, dir name) so untouched caches go first
-    # and ties are broken stably. Untouched caches get an epoch-zero
-    # sentinel so they precede everything.
+        return [], total
+    # Sort by (last-viewed ASC, nested before its window, dir name) so
+    # untouched caches go first and ties are broken stably. Untouched
+    # caches get an epoch-zero sentinel so they precede everything. A
+    # nested cache goes before its window on a tie because removing it
+    # alone may be enough, where removing the window takes both.
     epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-    candidates: list[tuple[dt.datetime, Path]] = []
+    candidates: list[tuple[dt.datetime, bool, Path]] = []
     for d in _iterCacheDirs(root):
-        if d.resolve() in exemptR:
+        dR = d.resolve()
+        if any(e.is_relative_to(dR) for e in exemptR):
             continue
         lv = getCacheLastViewed(d) or epoch
-        candidates.append((lv, d))
-    candidates.sort(key=lambda x: (x[0], x[1].name))
+        isWindow = not d.name.startswith("pods=")
+        if isWindow:
+            # Evicting a window takes the night caches nested in it, so it
+            # is as recent as the most recent of them. Read here rather
+            # than stamped on the window at each view: that would cost a
+            # write per view, and the window's own stamp is the one the
+            # admin table shows.
+            try:
+                for inner in d.iterdir():
+                    if inner.is_dir() and inner.name.startswith("pods="):
+                        lv = max(lv, getCacheLastViewed(inner) or epoch)
+            except OSError:
+                pass  # deleted since it was listed (an admin delete); its own stamp will do
+        candidates.append((lv, isWindow, d))
+    candidates.sort(key=lambda x: (x[0], x[1], x[2].name))
     removed: list[Path] = []
-    for _, d in candidates:
+    for _, _, d in candidates:
         if total <= maxBytes:
             break
-        sz = cacheDuSizeBytes(d)
+        if not d.exists():
+            continue  # a night cache nested in a window evicted before it
+        sz = sizes.get(d, 0)
         # Sidecar first: a finalised live night is an ordinary evictable
         # window, but if its rmtree fails part-way the surviving sidecar
         # would vouch for files that are gone — and every slice taken
@@ -1958,6 +2058,9 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
             continue
         removed.append(d)
         total -= sz
+        if d.parent in sizes:
+            # The enclosing window's size counts its nested night caches.
+            sizes[d.parent] -= sz
         # Tidy up newly-empty parents (cluster/, namespace/, and the
         # window dir for night caches whose pods= subdir we just
         # removed).
@@ -1968,4 +2071,4 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> list[Path]:
             except OSError:
                 break
             parent = parent.parent
-    return removed
+    return removed, total

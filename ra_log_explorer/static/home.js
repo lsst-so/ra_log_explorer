@@ -120,6 +120,15 @@ function startHome() {
   // Whatever was armed belongs to the visit we just left; this one
   // re-arms below if its own URL asks for it.
   cancelAutoFetch();
+  // So does a finished job's progress line. A job still running keeps
+  // its card's.
+  if (!activeJobId) {
+    for (const kind of ['exposure', 'night', 'range']) {
+      showInlineProgress(kind, false);
+      resetInlineProgress(kind);
+    }
+    activeProgressKind = null;
+  }
   if (!homeListenersWired) wireHomeListeners();
   prefillForm();
   loadSite();
@@ -748,10 +757,11 @@ async function refreshCache() {
 }
 
 function renderCache(data) {
-  const sumBytes = data.windows.reduce((acc, w) => acc + (w.sizeOnDisk || 0), 0);
+  // The server's own total, not a sum of the rows: a window's size
+  // includes the night caches nested in it, which are rows of their own.
   document.getElementById('cache-summary').textContent =
     `${data.windows.length} cached window${data.windows.length === 1 ? '' : 's'}`
-    + ` · ${humanBytes(sumBytes)} total`;
+    + ` · ${humanBytes(data.root.totalBytes)} total`;
   const tbody = document.getElementById('cache-tbody');
   tbody.innerHTML = '';
   const tfoot = document.getElementById('cache-tfoot');
@@ -839,7 +849,7 @@ function renderCache(data) {
     tr.innerHTML =
       `<td colspan="5" class="total-label">total</td>`
       + `<td>${data.windows.length}</td>`
-      + `<td>${humanBytes(sumBytes)}</td>`
+      + `<td>${humanBytes(data.root.totalBytes)}</td>`
       + `<td></td>`;
     tfoot.appendChild(tr);
   }
@@ -964,6 +974,13 @@ function useCacheSettings(w) {
 
 let activeJobId = null;
 let activeEventSource = null;
+// The active job is rebuilding the view the URL already names, so when it
+// finishes the router opens it; nothing about the URL needs working out.
+let followingRebuild = false;
+// The URL's query when that rebuild was picked up. The rebuild takes up to
+// a minute, and the user may have gone Back to another view by the time it
+// ends; routing again then would re-render that view under them.
+let followedSearch = null;
 // Which card launched the active fetch. The inline progress region for
 // each form is rendered next to its own submit button, so when an SSE
 // update comes in we know which DOM element to update without having
@@ -1020,6 +1037,33 @@ async function startFetch(ev) {
   openProgressStream(jobId);
 }
 
+function cardMessageEl(kind) {
+  const msgId = kind === 'night' ? 'night-message' : kind === 'range' ? 'range-message' : 'fetch-message';
+  return document.getElementById(msgId);
+}
+
+// A view the server has on disk but not in memory comes back from
+// /api/summary as {loaded: false, rebuildJobId}: it is being rebuilt by a
+// job (parsing a summit night takes about a minute), which this page
+// follows exactly as it follows a fetch the user started, and which opens
+// the view when it is done.
+window.followRebuild = function followRebuild(jobId, kind) {
+  if (activeJobId) return;
+  const msgEl = cardMessageEl(kind);
+  msgEl.textContent = 'Loading from the cache...';
+  msgEl.classList.remove('error');
+  for (const id of ['fetch-submit', 'night-submit', 'range-submit']) {
+    document.getElementById(id).disabled = true;
+  }
+  activeProgressKind = kind;
+  showInlineProgress(kind, true);
+  resetInlineProgress(kind);
+  activeJobId = jobId;
+  followingRebuild = true;
+  followedSearch = window.location.search;
+  openProgressStream(jobId);
+};
+
 function showMessage(text, isError) {
   const el = document.getElementById('fetch-message');
   el.textContent = text;
@@ -1065,6 +1109,7 @@ function openProgressStream(jobId) {
   activeEventSource = es;
   let total = 0, done = 0;
   let windowStr = '';  // remembered between events so each pod-count update can re-include the window
+  let parsingStr = '';
   es.onmessage = (msg) => {
     let ev;
     try { ev = JSON.parse(msg.data); } catch (_) { return; }
@@ -1080,9 +1125,14 @@ function openProgressStream(jobId) {
       setProgressFill(pct.toFixed(1) + '%');
       setProgressText(`${windowStr}  ·  ${done}/${total} pods fetched`);
     } else if (ev.type === 'parsing') {
-      setProgressText(
-        `${windowStr}  ·  parsing (${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse})`,
-      );
+      parsingStr = `${ev.podCount} pods, ${humanBytes(ev.totalBytes)}; ${ev.cacheReuse}`;
+      setProgressFill('0%');
+      setProgressText(`${windowStr}  ·  parsing (${parsingStr})`);
+    } else if (ev.type === 'parsed') {
+      // A whole summit night is a minute of parsing; without this the bar
+      // would sit full from the fetch while nothing appeared to happen.
+      setProgressFill(`${((ev.i / ev.total) * 100).toFixed(1)}%`);
+      setProgressText(`${windowStr}  ·  parsing ${ev.i}/${ev.total} pods (${parsingStr})`);
     } else if (ev.type === 'shutter-close') {
       // Night-mode only: post-parse pass resolving shutter close times for
       // each dataId. May involve a batched ConsDB call.
@@ -1109,6 +1159,21 @@ function openProgressStream(jobId) {
       updateSubmitButton();
       document.getElementById('night-submit').disabled = false;
       document.getElementById('range-submit').disabled = false;
+      if (followingRebuild) {
+        followingRebuild = false;
+        // Nothing else takes "Loading from the cache..." off the card,
+        // and it would still be there whenever the user came back home.
+        cardMessageEl(activeProgressKind).textContent = '';
+        if (window.location.search === followedSearch) {
+          window.reroute();
+        } else {
+          // The view it was for is no longer the one asked for. It is
+          // loaded now, so going back to its URL opens it directly.
+          showInlineProgress(activeProgressKind, false);
+          activeProgressKind = null;
+        }
+        return;
+      }
       transitionToExplore({
         kind: ev.kind, expId: ev.expId, dayObs: ev.dayObs, startId: ev.startId, stopId: ev.stopId,
         instrument: ev.instrument, nightView: ev.nightView,
@@ -1129,6 +1194,7 @@ function openProgressStream(jobId) {
       activeEventSource = null;
       activeJobId = null;
       activeProgressKind = null;
+      followingRebuild = false;
       updateSubmitButton();
     }
   };
@@ -1341,6 +1407,34 @@ function startAdmin() {
     adminListenersWired = true;
   }
   loadSite();
+  loadBuildInfo();
   refreshCache();
 }
 window.startAdmin = startAdmin;
+
+const REPO_URL = 'https://github.com/lsst-so/ra_log_explorer';
+
+async function loadBuildInfo() {
+  const versionEl = document.getElementById('build-version');
+  const hashEl = document.getElementById('build-hash');
+  let build;
+  try {
+    const r = await fetch(apiUrl('/api/version'));
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    build = await r.json();
+  } catch (_) {
+    versionEl.textContent = hashEl.textContent = 'unavailable';
+    return;
+  }
+  versionEl.textContent = build.version || 'unknown';
+  if (!build.gitHash) {
+    hashEl.textContent = 'unknown';
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = `${REPO_URL}/commit/${build.gitHash}`;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = build.gitHash;
+  hashEl.replaceChildren(a);
+}
