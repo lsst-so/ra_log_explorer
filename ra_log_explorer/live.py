@@ -493,9 +493,13 @@ class LiveNightManager:
         The night's path is also where a fetch of its own window from
         the form lands, so every write here happens under that window's
         write lock (see :func:`fetch.windowWriteLock`), taken without
-        waiting: a fetch holding it, or a ``.partial`` it left, defers
-        the re-pull to the next poll rather than opening the dir over
-        it. A window already fetched whole is adopted, not replaced.
+        waiting: a fetch holding it defers the re-pull to the next poll
+        rather than opening the dir over it. A window already fetched
+        whole is adopted, not replaced. A ``.partial`` found with the
+        lock free is a dead fetch's (every writer of one holds the lock
+        while it is there), and nothing but another fetch of that exact
+        window would ever clear it, so the dir is opened afresh over it
+        and never adopted, whatever ``_meta.json`` it holds.
         """
         started = time.time()
         nightDir = self._nightDir(dayObs)
@@ -506,11 +510,14 @@ class LiveNightManager:
                 return
             try:
                 if (nightDir / PARTIAL_FLAG).exists():
-                    log.info(
-                        "Live: dayObs %d has a fetch half done; re-pull deferred to the next poll", dayObs
-                    )
-                    return
-                night = self._adoptWindow(dayObs) or self._openNightDir(dayObs)
+                    log.info("Live: dayObs %d holds a fetch that died half done; re-pulling over it", dayObs)
+                    # Opened before the flag goes: until the sidecar is
+                    # written the flag is all that keeps the dead fetch's
+                    # files from passing for a whole window.
+                    night = self._openNightDir(dayObs)
+                    (nightDir / PARTIAL_FLAG).unlink(missing_ok=True)
+                else:
+                    night = self._adoptWindow(dayObs) or self._openNightDir(dayObs)
             finally:
                 lock.release()
             end = dayObsEndUtc(dayObs)

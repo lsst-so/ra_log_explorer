@@ -2388,8 +2388,8 @@ def test_the_re_pull_never_opens_a_night_dir_a_fetch_is_writing(
     fetch, and both wrote the same files afterwards: the night held the
     fetch's lines and the re-pull's hours, the sidecar vouched for the
     fetch's prefix as hour one. The re-pull takes the window's write
-    lock without waiting and leaves a dir someone holds, or has left a
-    .partial in, until the next poll."""
+    lock without waiting and leaves a dir someone holds until the next
+    poll, by when the fetch has finished and its window is adopted."""
     spec = _backfillManager(monkeypatch, [], backfillPrevious=True)._nightSpec(_PREV)
     nightDir = windowCachePath(spec.cluster, spec.namespace, spec.fromIso, spec.toIso)
     (nightDir / fetch.PODS_DIR_NAME).mkdir(parents=True)
@@ -2415,10 +2415,6 @@ def test_the_re_pull_never_opens_a_night_dir_a_fetch_is_writing(
         untouched()
     finally:
         lock.release()
-    # The fetch died: its lock is free but its .partial remains.
-    mgr.tick(now=_t(20))
-    _awaitBackfill(mgr)
-    untouched()
     # The fetch finished: the window is whole, and the next poll adopts it.
     (nightDir / fetch.PARTIAL_FLAG).unlink()
     (nightDir / fetch.PODS_EVENTS_DIR_NAME).mkdir()
@@ -2440,3 +2436,39 @@ def test_the_re_pull_never_opens_a_night_dir_a_fetch_is_writing(
         }
     }
     assert podFile.read_bytes() == _lokiLine(_prev(1))
+
+
+@pytest.mark.parametrize("staleMeta", [False, True])
+def test_a_dead_fetchs_dir_is_re_pulled_over_and_never_adopted(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, staleMeta: bool
+) -> None:
+    """A fetch that died (Loki failed it, the pod restarted) leaves its
+    ``.partial`` behind. Every writer of one holds the window's lock, so
+    found with the lock free it belongs to nobody, and only another fetch
+    of that exact window would ever clear it: deferring to it kept last
+    night off the disk for good. The re-pull opens the dir afresh
+    instead. It never adopts it, even over a ``_meta.json`` an earlier,
+    completed fetch of the window left there: the files beside it are
+    the dead fetch's."""
+    nightDir = _plantFetchedNight(_PREV, {"pod-a": [_prev(2)], "pod-dead": [_prev(3)]})
+    if not staleMeta:
+        (nightDir / fetch.META_NAME).unlink()
+    (nightDir / fetch.PARTIAL_FLAG).write_text("")
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+
+    assert mgr._backfillError is None
+    assert not (nightDir / fetch.PARTIAL_FLAG).exists()
+    sidecar = fetch.readLiveSidecar(nightDir)
+    assert sidecar is not None and sidecar["finalised"] is True
+    prevWindows = [(a, b) for _, a, b in calls if a < dayObsStartUtc(20260711)]
+    assert prevWindows == [(_prev(h), _prev(h + 1)) for h in range(24)]
+    # Only what the re-pull fetched: nothing of the dead fetch's survives.
+    assert [f.name for f in (nightDir / fetch.PODS_DIR_NAME).iterdir()] == ["pod-a.jsonl"]
+    assert (nightDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    assert list((nightDir / fetch.PODS_EVENTS_DIR_NAME).iterdir()) == []
+    assert json.loads((nightDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}

@@ -518,8 +518,12 @@ Each tick (every `LIVE_POLL_S` seconds):
    form (the SFM night view) lands, so the re-pull writes only under
    that window's write lock (`fetch.windowWriteLock`), taken without
    waiting and held across the open and each increment. A fetch
-   holding the lock, or a `.partial` one left behind, defers the
-   re-pull to the next poll. A window already fetched whole (a
+   holding the lock defers the re-pull to the next poll. A `.partial`
+   found with the lock free belongs to a fetch that died (every writer
+   of one holds the lock while it is there), and only another fetch of
+   that exact window would ever clear it, so the re-pull opens the dir
+   afresh over it: files and any `_meta.json` wiped, never adopted. A
+   window already fetched whole (a
    current-schema `_meta.json`, no `.partial`) is *adopted* rather than
    replaced: it gets a finalised `_live.json` built from its files (byte
    counts from the files themselves, line counts and fall-short maps
