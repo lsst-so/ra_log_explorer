@@ -1545,6 +1545,121 @@ def test_evictToFit_spares_the_window_an_exempt_cache_is_nested_in(tmpCacheRoot:
     assert inner.exists() and outer.exists()
 
 
+def _plantNestedNightCache(window: Path, bodyBytes: int, lastViewed: dt.datetime) -> Path:
+    """A night-mode cache nested in ``window``, as the AOS half of a night is."""
+    inner = window / "pods=__aos__"
+    (inner / "pods").mkdir(parents=True)
+    (inner / "_meta.json").write_text(json.dumps({"spec": {"podRegex": ".*aos.*"}}))
+    (inner / "pods" / "fake.jsonl").write_bytes(b"x" * bodyBytes)
+    fetch.markCacheViewed(inner, when=lastViewed)
+    return inner
+
+
+_EVICT_BASE = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
+
+
+def _plantNightWindow(root: Path, bodyBytes: int, lastViewed: dt.datetime) -> Path:
+    return _plantWindowWithBody(
+        root,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T12:00:00Z",
+        "2026-05-21T12:00:00Z",
+        bodyBytes,
+        lastViewed=lastViewed,
+    )
+
+
+def test_evictToFit_keeps_a_window_as_fresh_as_the_cache_nested_in_it(tmpCacheRoot: Path) -> None:
+    """Opening a night's AOS half stamps the nested cache, never the night
+    dir it sits in. Ordered on its own stamp, a night dir nobody opens
+    directly looked cold and was evicted, taking the half in daily use
+    with it. A window is as recent as the latest of itself and what is
+    nested in it."""
+    outer = _plantNightWindow(tmpCacheRoot, 3000, _EVICT_BASE - dt.timedelta(days=3))
+    inner = _plantNestedNightCache(outer, 100, _EVICT_BASE)
+    other = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        2000,
+        lastViewed=_EVICT_BASE - dt.timedelta(days=1),
+    )
+    removed, total = fetch.evictToFit(maxBytes=4000)
+    assert removed == [other]
+    assert inner.exists() and outer.exists()
+    assert total == fetch.cacheDuSizeBytes(tmpCacheRoot) <= 4000
+
+
+def test_evictToFit_takes_a_cold_nested_cache_and_leaves_its_window(tmpCacheRoot: Path) -> None:
+    """The other way round nothing is shared: the nested cache has its own
+    recency, so one nobody opens goes alone while the night dir people
+    are slicing stays."""
+    outer = _plantNightWindow(tmpCacheRoot, 1000, _EVICT_BASE)
+    inner = _plantNestedNightCache(outer, 3000, _EVICT_BASE - dt.timedelta(days=3))
+    other = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        500,
+        lastViewed=_EVICT_BASE - dt.timedelta(days=1),
+    )
+    removed, total = fetch.evictToFit(maxBytes=2500)
+    assert removed == [inner]
+    assert outer.exists() and other.exists()
+    assert total == fetch.cacheDuSizeBytes(tmpCacheRoot) <= 2500
+
+
+def test_evictToFit_takes_the_nested_cache_before_its_window_on_a_tie(tmpCacheRoot: Path) -> None:
+    """At equal recency the nested cache goes first: that alone may fit the
+    cap, where removing the window would take both. Sorted by name the
+    window came first, digits sorting before ``pods=``."""
+    outer = _plantNightWindow(tmpCacheRoot, 1000, _EVICT_BASE)
+    inner = _plantNestedNightCache(outer, 3000, _EVICT_BASE)
+    removed, total = fetch.evictToFit(maxBytes=2000)
+    assert removed == [inner]
+    assert outer.exists()
+    assert total == fetch.cacheDuSizeBytes(tmpCacheRoot) <= 2000
+    # Still over: the window goes next, and its size no longer counts the cache.
+    removed, total = fetch.evictToFit(maxBytes=100)
+    assert removed == [outer]
+    assert total == fetch.cacheDuSizeBytes(tmpCacheRoot) == 0
+
+
+def test_evictToFit_survives_a_window_deleted_under_it(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An admin delete can remove a window between its being listed and
+    the look inside it for nested caches. The pass runs in a job's
+    completion callback, so raising there would fail a fetch that had
+    succeeded."""
+    import shutil
+
+    gone = _plantNightWindow(tmpCacheRoot, 1000, _EVICT_BASE - dt.timedelta(days=2))
+    other = _plantWindowWithBody(
+        tmpCacheRoot,
+        "yagan",
+        "rapid-analysis",
+        "2026-05-20T08:00:00Z",
+        "2026-05-20T08:05:00Z",
+        2000,
+        lastViewed=_EVICT_BASE - dt.timedelta(days=1),
+    )
+    listed = fetch._iterCacheDirs(tmpCacheRoot)
+
+    def listThenDelete(root: Path) -> list[Path]:
+        shutil.rmtree(gone)
+        return listed
+
+    monkeypatch.setattr(fetch, "_iterCacheDirs", listThenDelete)
+    removed, _ = fetch.evictToFit(maxBytes=100)
+    assert removed == [other]
+
+
 def test_evictToFit_treats_unviewed_as_oldest(tmpCacheRoot: Path) -> None:
     base = dt.datetime(2026, 5, 21, tzinfo=dt.timezone.utc)
     unviewed = _plantWindowWithBody(

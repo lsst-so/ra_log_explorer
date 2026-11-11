@@ -473,9 +473,18 @@ the exempt cache with it.
   has more room than the PVC actually gives it. It is not settable at
   runtime and there is no UI for it — see
   [architecture.md](architecture.md#configuration).
-- Order: `(last-viewed ASC, dir name)`. Caches without a
-  `_last_viewed.txt` sidecar are treated as oldest — they've never
-  been opened, so they're the safest to drop.
+- Order: `(last-viewed ASC, nested before its window, dir name)`.
+  Caches without a `_last_viewed.txt` sidecar are treated as oldest:
+  they've never been opened, so they're the safest to drop. Removing a
+  window removes the night caches nested in it (`pods=<slug>/`), so a
+  window's recency is the latest of its own stamp and theirs. A night
+  dir nobody opens directly is therefore not cold while its AOS half
+  is in daily use. This is read from the nested sidecars at eviction
+  time rather than stamped on the window at each view, which would cost
+  a write per view and change the window's own `_last_viewed`, the one
+  the admin table shows. A nested cache is ordered by its own stamp, so
+  a cold one is evicted alone and its window stays. At equal recency
+  the nested cache goes first, since removing it alone may be enough.
 - The eviction pass runs as part of the post-fetch callback
   (`_onFetchComplete`), exempting the just-fetched cache. Brief
   over-cap states during a fetch are acceptable. Loaded states over an

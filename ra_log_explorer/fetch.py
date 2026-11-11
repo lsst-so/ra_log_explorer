@@ -1999,6 +1999,10 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], 
 
     Caches without a ``_last_viewed.txt`` sidecar are treated as
     oldest — they've never been opened, so they're the safest to drop.
+    A window is as recently viewed as the latest of itself and the
+    night caches nested in it, since removing it removes them; a nested
+    cache keeps its own recency and can go while its window stays. At
+    equal recency the nested cache goes first.
 
     Returns the directories that were removed and the cache's total
     size afterwards, so a caller that wants the total needn't walk the
@@ -2009,20 +2013,35 @@ def evictToFit(maxBytes: int, exempt: Iterable[Path] = ()) -> tuple[list[Path], 
     total, sizes = cacheSizes(root)
     if total <= maxBytes:
         return [], total
-    # Sort by (last-viewed ASC, dir name) so untouched caches go first
-    # and ties are broken stably. Untouched caches get an epoch-zero
-    # sentinel so they precede everything.
+    # Sort by (last-viewed ASC, nested before its window, dir name) so
+    # untouched caches go first and ties are broken stably. Untouched
+    # caches get an epoch-zero sentinel so they precede everything. A
+    # nested cache goes before its window on a tie because removing it
+    # alone may be enough, where removing the window takes both.
     epoch = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
-    candidates: list[tuple[dt.datetime, Path]] = []
+    candidates: list[tuple[dt.datetime, bool, Path]] = []
     for d in _iterCacheDirs(root):
         dR = d.resolve()
         if any(e.is_relative_to(dR) for e in exemptR):
             continue
         lv = getCacheLastViewed(d) or epoch
-        candidates.append((lv, d))
-    candidates.sort(key=lambda x: (x[0], x[1].name))
+        isWindow = not d.name.startswith("pods=")
+        if isWindow:
+            # Evicting a window takes the night caches nested in it, so it
+            # is as recent as the most recent of them. Read here rather
+            # than stamped on the window at each view: that would cost a
+            # write per view, and the window's own stamp is the one the
+            # admin table shows.
+            try:
+                for inner in d.iterdir():
+                    if inner.is_dir() and inner.name.startswith("pods="):
+                        lv = max(lv, getCacheLastViewed(inner) or epoch)
+            except OSError:
+                pass  # deleted since it was listed (an admin delete); its own stamp will do
+        candidates.append((lv, isWindow, d))
+    candidates.sort(key=lambda x: (x[0], x[1], x[2].name))
     removed: list[Path] = []
-    for _, d in candidates:
+    for _, _, d in candidates:
         if total <= maxBytes:
             break
         if not d.exists():
