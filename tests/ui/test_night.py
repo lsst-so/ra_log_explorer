@@ -331,6 +331,22 @@ def test_a_night_on_disk_but_not_in_memory_is_rebuilt_in_view(
     assert f"dayObs={DAY_OBS}" in app.page.url
 
 
+def test_a_followed_rebuild_leaves_nothing_on_its_card(app: Any, corpus: StagedCorpus) -> None:
+    """The night card says "Loading from the cache..." while the page
+    follows a rebuild, over a progress line ending "done in N s". Nothing
+    took either down when the night opened, so the card still showed them
+    whenever the user came back home."""
+    corpus.stageNight()
+    app.goto(f"/?dayObs={DAY_OBS}")
+    expect(app.page.locator("#night-view")).to_be_visible()
+    assert any(j.rebuildFrom is not None for j in app.ctx.jobs.listJobs()), "no rebuild was followed"
+    app.page.locator("#night-back-home").click()
+    expect(app.page.locator("#home-view")).to_be_visible()
+    expect(app.page.locator("#night-form")).to_be_visible()
+    expect(app.page.locator("#night-message")).to_have_text("")
+    expect(app.page.locator("#night-progress")).to_be_hidden()
+
+
 def test_a_rebuild_counts_its_parse_pod_by_pod(app: Any, corpus: StagedCorpus, monkeypatch: Any) -> None:
     """Once a night is on disk the parse is most of the wait: about a
     minute for a summit night. The card counts the pods as they finish,

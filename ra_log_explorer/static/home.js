@@ -120,6 +120,15 @@ function startHome() {
   // Whatever was armed belongs to the visit we just left; this one
   // re-arms below if its own URL asks for it.
   cancelAutoFetch();
+  // So does a finished job's progress line. A job still running keeps
+  // its card's.
+  if (!activeJobId) {
+    for (const kind of ['exposure', 'night', 'range']) {
+      showInlineProgress(kind, false);
+      resetInlineProgress(kind);
+    }
+    activeProgressKind = null;
+  }
   if (!homeListenersWired) wireHomeListeners();
   prefillForm();
   loadSite();
@@ -1024,6 +1033,11 @@ async function startFetch(ev) {
   openProgressStream(jobId);
 }
 
+function cardMessageEl(kind) {
+  const msgId = kind === 'night' ? 'night-message' : kind === 'range' ? 'range-message' : 'fetch-message';
+  return document.getElementById(msgId);
+}
+
 // A view the server has on disk but not in memory comes back from
 // /api/summary as {loaded: false, rebuildJobId}: it is being rebuilt by a
 // job (parsing a summit night takes about a minute), which this page
@@ -1031,8 +1045,7 @@ async function startFetch(ev) {
 // the view when it is done.
 window.followRebuild = function followRebuild(jobId, kind) {
   if (activeJobId) return;
-  const msgId = kind === 'night' ? 'night-message' : kind === 'range' ? 'range-message' : 'fetch-message';
-  const msgEl = document.getElementById(msgId);
+  const msgEl = cardMessageEl(kind);
   msgEl.textContent = 'Loading from the cache...';
   msgEl.classList.remove('error');
   for (const id of ['fetch-submit', 'night-submit', 'range-submit']) {
@@ -1143,6 +1156,9 @@ function openProgressStream(jobId) {
       document.getElementById('range-submit').disabled = false;
       if (followingRebuild) {
         followingRebuild = false;
+        // Nothing else takes "Loading from the cache..." off the card,
+        // and it would still be there whenever the user came back home.
+        cardMessageEl(activeProgressKind).textContent = '';
         window.reroute();
         return;
       }
