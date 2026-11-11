@@ -1397,28 +1397,36 @@ def test_a_small_parse_is_not_queued_behind_a_big_one(
     }
     _plantWindow(tmp_path / "night", big, copies=60)
     _plantWindow(tmp_path / "exposure", dict(list(_SAMPLE_PODS.items())[:2]))
+    # A pool of its own with exactly one worker. The shared pool is built
+    # once per process, by whichever test parses first and at that test's
+    # worker count; on several workers the last night pods and the
+    # exposure's run side by side, and first-in first-out passes too.
     monkeypatch.setattr(parse, "PARSE_WORKERS", 1)
+    monkeypatch.setattr(parse, "_pool", None)
     dispatcher = parse._parsePool()
     assert dispatcher is not None
-    dispatcher.pool.submit(int).result()
+    try:
+        dispatcher.pool.submit(int).result()
 
-    finished: dict[str, float] = {}
-    nightStarted = threading.Event()
+        finished: dict[str, float] = {}
+        nightStarted = threading.Event()
 
-    def parseInto(name: str, **kwargs: Any) -> None:
-        parse.summarizeAll(tmp_path / name, **kwargs)
-        finished[name] = time.perf_counter()
+        def parseInto(name: str, **kwargs: Any) -> None:
+            parse.summarizeAll(tmp_path / name, **kwargs)
+            finished[name] = time.perf_counter()
 
-    night = threading.Thread(
-        target=parseInto, args=("night",), kwargs={"progress": lambda i, n: nightStarted.set()}
-    )
-    night.start()
-    assert nightStarted.wait(30)
-    exposure = threading.Thread(target=parseInto, args=("exposure",))
-    exposure.start()
-    night.join(60)
-    exposure.join(60)
-    assert finished["exposure"] < finished["night"]
+        night = threading.Thread(
+            target=parseInto, args=("night",), kwargs={"progress": lambda i, n: nightStarted.set()}
+        )
+        night.start()
+        assert nightStarted.wait(30)
+        exposure = threading.Thread(target=parseInto, args=("exposure",))
+        exposure.start()
+        night.join(60)
+        exposure.join(60)
+        assert finished["exposure"] < finished["night"]
+    finally:
+        dispatcher.close()
 
 
 def test_summarizeAll_does_not_stall_other_threads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
