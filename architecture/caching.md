@@ -478,7 +478,11 @@ the exempt cache with it.
   been opened, so they're the safest to drop.
 - The eviction pass runs as part of the post-fetch callback
   (`_onFetchComplete`), exempting the just-fetched cache. Brief
-  over-cap states during a fetch are acceptable.
+  over-cap states during a fetch are acceptable. Loaded states over an
+  evicted window are unloaded with it, including a night cache nested
+  in it, and a job whose own window is evicted (or deleted from the
+  admin page) while it is still parsing fails instead of publishing a
+  view of a directory that is gone.
 - Empty per-cluster, per-namespace, and (for night mode) per-window
   parent directories are pruned as their child windows go away.
 - The tree is walked **once** per pass (`fetch.cacheSizes`, which sizes

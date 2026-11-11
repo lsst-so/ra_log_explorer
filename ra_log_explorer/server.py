@@ -414,20 +414,26 @@ class ServerContext:
             )
 
     def evictByCacheDir(self, target: Path) -> None:
-        """Evict any loaded state whose cacheDir matches ``target``.
+        """Evict any loaded state whose cacheDir is ``target`` or lies inside it.
 
         Used when a cache window is deleted from disk — keeping the
         stale parse around would surface 404s and stale data to any
-        tab still pointed at that key.
+        tab still pointed at that key. Inside it, because a night-mode
+        cache is nested in its window dir (``<window>/pods=<slug>``) and
+        goes when the window does.
         """
         targetR = target.resolve()
-        staleExp = [k for k, v in self.exposureStates.items() if v.cacheDir.resolve() == targetR]
+
+        def gone(cacheDir: Path) -> bool:
+            return cacheDir.resolve().is_relative_to(targetR)
+
+        staleExp = [k for k, v in self.exposureStates.items() if gone(v.cacheDir)]
         for k in staleExp:
             del self.exposureStates[k]
-        staleNight = [nk for nk, v in self.nightStates.items() if v.cacheDir.resolve() == targetR]
+        staleNight = [nk for nk, v in self.nightStates.items() if gone(v.cacheDir)]
         for nk in staleNight:
             del self.nightStates[nk]
-        staleRange = [rk for rk, v in self.rangeStates.items() if v.cacheDir.resolve() == targetR]
+        staleRange = [rk for rk, v in self.rangeStates.items() if gone(v.cacheDir)]
         for rk in staleRange:
             del self.rangeStates[rk]
 
@@ -1906,6 +1912,11 @@ def _deleteCacheDir(ctx: "ServerContext", target: Path) -> None:
         shutil.rmtree(target)
     except OSError:
         shutil.rmtree(target, ignore_errors=True)
+    # Again, now the files are gone: a job that was parsing this window
+    # can have published its state between the eviction above and the
+    # rmtree, when its own check still found the window on disk.
+    with ctx.jobs.stateLock:
+        ctx.evictByCacheDir(target)
     # Tidy up empty parents — best-effort for the same reason.
     parent = target.parent
     while parent != cache_root() and parent.exists() and not any(parent.iterdir()):
@@ -1952,6 +1963,26 @@ def _readJsonBody(handler: BaseHTTPRequestHandler) -> Any:
         return {}
     raw = handler.rfile.read(length)
     return json.loads(raw)
+
+
+def _requireCacheOnDisk(cacheDir: Path) -> None:
+    """Fail a job whose window was deleted while it was being parsed.
+
+    Parsing a night takes a minute, in which another job's eviction pass
+    or the admin page can remove the window. Published anyway, the view
+    would be whatever had been read by then (possibly no pods at all)
+    and every drilldown from it would come back empty, with no error.
+    Call under ``stateLock``, immediately before the put: every delete
+    evicts under that lock once the files are gone, so a state is either
+    refused here or evicted there.
+
+    A live night dir not yet finalised has no ``_meta.json``; its
+    sidecar vouches for it instead, and every delete removes that first.
+    """
+    if not any((cacheDir / name).exists() for name in (META_NAME, LIVE_SIDECAR_NAME)):
+        raise RuntimeError(
+            f"the cached window {cacheDir.name} was deleted while it was being loaded; fetch it again"
+        )
 
 
 def _onFetchComplete(ctx: ServerContext) -> Any:
@@ -2035,6 +2066,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             # we work.
             _prefetchNightShutterCloses(newNight, summaries, job, site)
             with ctx.jobs.stateLock:
+                _requireCacheOnDisk(job.cacheDir)
                 ctx.putNightState(newNight)
             return
         if job.kind == "range":
@@ -2061,6 +2093,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             _prefetchRangeShutterCloses(newRange, job, site)
             markCacheRange(job.cacheDir, job.startId, job.stopId, instrument=job.instrument)
             with ctx.jobs.stateLock:
+                _requireCacheOnDisk(job.cacheDir)
                 ctx.putRangeState(newRange)
             return
         assert job.expId is not None and job.tZero is not None
@@ -2093,6 +2126,7 @@ def _onFetchComplete(ctx: ServerContext) -> Any:
             ],
         )
         with ctx.jobs.stateLock:
+            _requireCacheOnDisk(job.cacheDir)
             ctx.putExposureState(newState)
 
     return cb

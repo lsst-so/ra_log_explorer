@@ -1258,8 +1258,12 @@ Remove one cached window. The optional 4th segment targets the
 nested night-mode `pods=<regex-slug>` subdir; it must start with
 `pods=`. Each component is validated against `[A-Za-z0-9._=-]+` so
 the URL can't escape `cache_root()`. If any loaded state's `cacheDir`
-matches the directory being deleted, that state is evicted first
-(the UI gets booted back to the home view on next summary fetch), and
+is the directory being deleted or lies inside it (a night-mode cache
+nested in a deleted window), that state is evicted first
+(the UI gets booted back to the home view on next summary fetch) and
+again once the files are gone, in case a job published one in between;
+a job still parsing the window fails rather than publish a view of a
+directory that is no longer there (`_requireCacheOnDisk`). Also,
 any `_live.json` beneath it is unlinked before the tree, for the reason
 above. Empty per-cluster / per-namespace parent directories are pruned.
 Returns the same shape as `GET /api/cache`. 404 on a path mismatch.

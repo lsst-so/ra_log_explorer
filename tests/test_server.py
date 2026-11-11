@@ -2302,6 +2302,7 @@ def test_fetch_completion_evicts_loaded_states_for_LRU_removed_windows(
 
     newDir = tmpCacheRoot / "summit-cluster" / "ra" / "new-window"
     (newDir / "pods").mkdir(parents=True)
+    (newDir / "_meta.json").write_text("{}")
     monkeypatch.setattr(server, "evictToFit", lambda maxBytes, exempt=(): ([oldDir], 0))
     job = FetchJob(
         jobId="j1",
@@ -2588,6 +2589,153 @@ def test_onFetchComplete_reports_parse_progress_per_pod(
     server._onFetchComplete(ctx)(job)
     parsed = [(e["i"], e["total"]) for e in job.events if e["type"] == "parsed"]
     assert parsed == [(1, 2), (2, 2)]
+
+
+# ----- a window deleted under a loaded or loading view -----------------------
+
+_OLDER_NIGHT = ("2026-07-10T12:00:00.000000Z", "2026-07-11T12:00:00.000000Z")
+
+
+def _loadNightNestedInItsWindow(ctx: ServerContext, root: Path) -> Path:
+    """Load the AOS half of an older night, cached where it really lives:
+    nested in the night's own window dir. Returns that window dir."""
+    nested = _plantNightSlice(root, *_OLDER_NIGHT)
+    window = nested.parent
+    (window / "pods").mkdir()
+    (window / "_meta.json").write_text(json.dumps({"spec": {"fromIso": _OLDER_NIGHT[0]}}))
+    with ctx.jobs.stateLock:
+        ctx.putNightState(_makeNightState(20260710, cacheDir=nested))
+    return window
+
+
+def test_evicting_a_window_unloads_the_night_nested_in_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night-mode cache is ``<window>/pods=<slug>``. LRU eviction removes
+    the window (viewing the nested cache never stamps it, so it looks
+    cold) and reports only the window. The nested night stayed loaded
+    over a directory that was gone: its summary still served, every pod
+    drilldown and traceback from it empty."""
+    ctx = _ctxWithSites(siteCatalog)
+    window = _loadNightNestedInItsWindow(ctx, tmpCacheRoot)
+    current = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    monkeypatch.setattr(server, "MAX_CACHE_BYTES", 1)
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(current, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert not window.exists(), "the older night's window was not evicted"
+    assert ctx.getNightState(20260710) is None
+    assert ctx.getNightState(20260711) is not None
+
+
+def test_deleting_a_window_unloads_the_night_nested_in_it(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog
+) -> None:
+    """The same from the admin page: deleting the window's row takes the
+    night cache nested in it, so its loaded state has to go too."""
+    ctx = _ctxWithSites(siteCatalog)
+    window = _loadNightNestedInItsWindow(ctx, tmpCacheRoot)
+    server._deleteCacheDir(ctx, window)
+    assert not window.exists()
+    assert ctx.getNightState(20260710) is None
+
+
+def _exposureJob(cacheDir: Path, siteName: str) -> FetchJob:
+    job = FetchJob(
+        jobId="e1",
+        spec=config.FetchSpec(
+            lokiAddr="x",
+            username="u",
+            cluster="yagan",
+            namespace="rapid-analysis",
+            fromIso="2026-07-11T20:00:00.000000Z",
+            toIso="2026-07-11T20:05:00.000000Z",
+        ),
+        siteName=siteName,
+        instrument="lsstcam",
+        expId=2026071100005,
+        tZero=dt.datetime(2026, 7, 11, 20, 0, 30, tzinfo=dt.timezone.utc),
+    )
+    job.cacheDir = cacheDir
+    return job
+
+
+def _rangeJob(cacheDir: Path, siteName: str) -> FetchJob:
+    job = _exposureJob(cacheDir, siteName)
+    job.kind, job.expId, job.tZero = "range", None, None
+    job.startId, job.stopId = 2026071100005, 2026071100006
+    job.tZeroStart = dt.datetime(2026, 7, 11, 20, 0, 30, tzinfo=dt.timezone.utc)
+    job.tZeroStop = dt.datetime(2026, 7, 11, 20, 1, 30, tzinfo=dt.timezone.utc)
+    return job
+
+
+@pytest.mark.parametrize("kind", ["exposure", "night", "range"])
+def test_a_window_deleted_during_the_parse_fails_the_job(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    """Parsing a summit night takes a minute, and another job's eviction
+    pass or the admin page can remove the window meanwhile. The job used
+    to publish what it had read by then, possibly no pods at all, as the
+    view, with no error. It fails instead, saying why, and loads nothing."""
+    import shutil
+
+    ctx = _ctxWithSites(siteCatalog)
+    cacheDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    job = {
+        "exposure": _exposureJob(cacheDir, siteCatalog.defaultName),
+        "range": _rangeJob(cacheDir, siteCatalog.defaultName),
+        "night": _nightJob(cacheDir, NIGHT_START, "2026-07-11T22:00:00.000000Z", siteCatalog.defaultName),
+    }[kind]
+
+    def deletedMidParse(*_a: Any, **_kw: Any) -> list[parse.PodSummary]:
+        shutil.rmtree(cacheDir)
+        return []
+
+    monkeypatch.setattr(server.parser, "summarizeAll", deletedMidParse)
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    monkeypatch.setattr(server, "_prefetchRangeShutterCloses", lambda *a: None)
+    with pytest.raises(RuntimeError, match="was deleted while it was being loaded"):
+        server._onFetchComplete(ctx)(job)
+    assert not ctx.exposureStates and not ctx.nightStates and not ctx.rangeStates
+
+
+def test_a_live_night_not_yet_finalised_still_publishes(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Between its watermark reaching night end and finalisation, a live
+    night dir is served as the night with no ``_meta.json`` of its own
+    (see ``fetch._tryNightSlice``). Its sidecar is what says it is there."""
+    ctx = _ctxWithSites(siteCatalog)
+    nightDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-12T12:00:00.000000Z")
+    (nightDir / "_meta.json").unlink()
+    (nightDir / fetchModule.LIVE_SIDECAR_NAME).write_text("{}")
+    monkeypatch.setattr(server, "_prefetchNightShutterCloses", lambda *a: None)
+    job = _nightJob(nightDir, NIGHT_START, "2026-07-12T12:00:00.000000Z", siteCatalog.defaultName)
+    server._onFetchComplete(ctx)(job)
+    assert ctx.getNightState(20260711) is not None
+
+
+def test_a_state_published_while_its_window_is_being_deleted_is_dropped(
+    tmpCacheRoot: Path, siteCatalog: FakeSiteCatalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delete evicts loaded states, then removes the files. A job can
+    publish in between, its own check still finding the window on disk,
+    so the delete evicts again once the files are gone."""
+    import shutil
+
+    ctx = _ctxWithSites(siteCatalog)
+    cacheDir = _plantNightSlice(tmpCacheRoot, NIGHT_START, "2026-07-11T22:00:00.000000Z")
+    realRmtree = shutil.rmtree
+
+    def publishThenRemove(path: Any, *a: Any, **kw: Any) -> None:
+        with ctx.jobs.stateLock:
+            ctx.putNightState(_makeNightState(20260711, cacheDir=cacheDir))
+        realRmtree(path, *a, **kw)
+
+    monkeypatch.setattr(server.shutil, "rmtree", publishThenRemove)
+    server._deleteCacheDir(ctx, cacheDir)
+    assert not cacheDir.exists()
+    assert ctx.getNightState(20260711) is None
 
 
 # ----- the night's two views -----------------------------------------------

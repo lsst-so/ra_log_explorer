@@ -255,6 +255,7 @@ def test_fetch_starts_job_and_completes(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "fake"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -318,6 +319,7 @@ def test_night_fetch_starts_job_and_populates_NightState(
         assert spec.podRegex == ".*aos.*"
         cacheDir = tmpCacheRoot / "fake-night"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -417,6 +419,7 @@ def test_range_fetch_starts_job_and_populates_RangeState(
         assert spec.podRegex is None
         cacheDir = tmpCacheRoot / "fake-range"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -1206,6 +1209,7 @@ def test_fetch_with_manual_tZero_persists_tagged_record_and_labels_refpoint(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "fake-manual"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -2584,6 +2588,7 @@ def test_progress_sse_replays_history_then_terminates(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / "sse-fake"
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         # Drive a handful of progress callbacks so the event log has body.
         for i, name in enumerate(["a", "b", "c"], 1):
             if progress is not None:
@@ -2970,6 +2975,7 @@ def test_healthz_is_unaffected_by_a_running_fetch(
         release.wait(timeout=10.0)
         cacheDir = tmpCacheRoot / "slow"
         (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
 
     monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
@@ -3082,6 +3088,7 @@ def _completeFetch(
     ) -> tuple[Path, dict]:
         cacheDir = tmpCacheRoot / slug
         (cacheDir / "pods").mkdir(parents=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {
             "spec": {},
             "cacheReuse": "none",
@@ -3299,6 +3306,7 @@ def test_the_sfm_night_fetch_asks_loki_for_every_pod(
         seen.append(spec.podRegex)
         cacheDir = tmpCacheRoot / "fake-night-sfm"
         (cacheDir / "pods").mkdir(parents=True, exist_ok=True)
+        (cacheDir / "_meta.json").write_text("{}")  # what marks a window as on disk
         return cacheDir, {"spec": {}, "cacheReuse": "none", "pod_count": 0, "total_bytes": 0}
 
     monkeypatch.setattr(jobsModule, "fetchAll", fakeFetchAll)
