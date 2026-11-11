@@ -510,9 +510,16 @@ Each tick (every `LIVE_POLL_S` seconds):
    finishes. The orphan sweep leaves that night (and any night a re-pull
    is still working on) alone, since two threads finishing one night
    would interleave bytes in the same files. A failure is retried on the
-   next tick, resuming the same way. Off with `--live-day-obs`: a staged
-   night stands in for tonight, and its real neighbour isn't ours to
-   fetch.
+   next tick, resuming the same way. That holds across a noon rollover
+   too. A night whose re-pull failed is queued (`_backfillRetries`; a
+   failure goes to the back) until a re-pull of it succeeds, and the
+   orphan sweep leaves queued nights alone: the sweep finalises on the
+   poller's thread, where topping up a mostly unpulled night would hold
+   tonight's polling up for the length of the pull. The previous night
+   always goes first and the queue only once it is on disk, so a night
+   Loki fails on every attempt can't keep last night from being
+   re-pulled. Off with `--live-day-obs`: a staged night stands in for
+   tonight, and its real neighbour isn't ours to fetch.
 
    The night's path is also where a fetch of its own window from the
    form (the SFM night view) lands, so the re-pull writes only under

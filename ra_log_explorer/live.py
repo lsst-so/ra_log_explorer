@@ -221,6 +221,9 @@ class LiveNightManager:
         self._backfill: threading.Thread | None = None
         self._backfillDayObs: int | None = None
         self._backfillError: str | None = None
+        # Nights whose re-pull failed, retried in turn until each succeeds
+        # (see _ensurePreviousNight).
+        self._backfillRetries: list[int] = []
         self._lock = threading.Lock()
         self._stopEvent = threading.Event()
         self._thread: threading.Thread | None = None
@@ -405,8 +408,9 @@ class LiveNightManager:
 
         The night before ``dayObs`` is left out when the backfill owns it
         (see :meth:`_ensurePreviousNight`), and so is any night a backfill
-        is still pulling (one started before a noon rollover): two threads
-        finishing one night would interleave bytes in the same pod files.
+        is still pulling, or failed to pull and will retry (one started
+        before a noon rollover): two threads finishing one night would
+        interleave bytes in the same pod files.
         """
         base = cache_root() / self._site.cluster / self._site.namespace
         out: list[Path] = []
@@ -415,9 +419,9 @@ class LiveNightManager:
         skip = {self._nightDir(dayObs)}
         if self._backfillPrevious:
             skip.add(self._nightDir(_previousDayObs(dayObs)))
-        backfilling = self._backfillDayObs
-        if backfilling is not None:
-            skip.add(self._nightDir(backfilling))
+        for owned in (self._backfillDayObs, *self._backfillRetries):
+            if owned is not None:
+                skip.add(self._nightDir(owned))
         for window in sorted(base.iterdir()):
             if not window.is_dir() or window in skip:
                 continue
@@ -468,18 +472,35 @@ class LiveNightManager:
     # with tonight.
 
     def _ensurePreviousNight(self, dayObs: int) -> None:
-        """Start re-pulling the night before ``dayObs`` if it isn't finalised on disk."""
+        """Start re-pulling the night before ``dayObs`` if it isn't finalised on disk.
+
+        With that night on disk, the turn goes to an older night whose
+        re-pull failed (``_backfillRetries``). A noon rollover can leave
+        one behind, and nothing else would finish it: it is no longer
+        the previous night, and the orphan sweep must not have it, since
+        finalising a mostly unpulled night on the poller's thread would
+        hold tonight's polling up for as long as the pull takes. The
+        previous night goes first so that a night failing on every
+        attempt can't keep last night off the disk.
+        """
         if not self._backfillPrevious or (self._backfill is not None and self._backfill.is_alive()):
             return
-        previous = _previousDayObs(dayObs)
-        sidecar = readLiveSidecar(self._nightDir(previous))
-        if sidecar is not None and sidecar.get("finalised"):
-            return
-        self._backfillDayObs = previous
+        target = _previousDayObs(dayObs)
+        if self._isFinalised(target):
+            # No re-pull is running, so nothing else is touching the queue.
+            self._backfillRetries = [d for d in self._backfillRetries if not self._isFinalised(d)]
+            if not self._backfillRetries:
+                return
+            target = self._backfillRetries[0]
+        self._backfillDayObs = target
         self._backfill = threading.Thread(
-            target=self._backfillNight, args=(previous,), name=f"live-backfill-{previous}", daemon=True
+            target=self._backfillNight, args=(target,), name=f"live-backfill-{target}", daemon=True
         )
         self._backfill.start()
+
+    def _isFinalised(self, dayObs: int) -> bool:
+        sidecar = readLiveSidecar(self._nightDir(dayObs))
+        return sidecar is not None and bool(sidecar.get("finalised"))
 
     def _backfillNight(self, dayObs: int) -> None:
         """Fetch and finalise a whole past night. Runs on its own thread.
@@ -535,10 +556,15 @@ class LiveNightManager:
                 self._finaliseNight(night)
             self._storeNightRecords(dayObs)
             self._backfillError = None
+            if dayObs in self._backfillRetries:
+                self._backfillRetries.remove(dayObs)
             if pulled:
                 log.info("Live: re-pulled dayObs %d in %.1f min", dayObs, (time.time() - started) / 60)
         except Exception as e:  # noqa: BLE001 — retried next tick; tonight must not notice
             self._backfillError = f"dayObs {dayObs}: {e}"
+            # To the back, so one night failing over and over doesn't
+            # keep the others queued behind it from their turn.
+            self._backfillRetries = [d for d in self._backfillRetries if d != dayObs] + [dayObs]
             log.exception("Live: re-pulling dayObs %d failed; retrying next poll", dayObs)
         finally:
             self._backfillDayObs = None
@@ -987,11 +1013,11 @@ class LiveNightManager:
         self._consdbError = None
         self._exposures = records
         # Persist only when something new turned up — records are
-        # immutable, and rewriting the whole per-site cache file every
-        # tick for no change is pointless churn on the cache volume. The
-        # *whole* list goes in, not just the new records: the bare-id
-        # keys hold the probe-order winner across every instrument, which
-        # can't be decided from a subset.
+        # immutable, and rewriting the night's cache file every tick for
+        # no change is pointless churn on the cache volume. The *whole*
+        # list goes in, not just the new records: the bare-id keys hold
+        # the probe-order winner across every instrument, which can't be
+        # decided from a subset.
         keys = {k for k in (_exposureKey(r) for r in records) if k is not None}
         if keys - self._storedExposureKeys:
             exposureTimes.storeCachedRecordList(records, siteName=self._site.name)

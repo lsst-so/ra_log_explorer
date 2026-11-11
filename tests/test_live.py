@@ -2276,6 +2276,226 @@ def test_a_re_pull_running_across_noon_is_not_also_swept_as_an_orphan(
     )
 
 
+def test_a_re_pull_that_fails_after_noon_is_retried_on_its_own_thread(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A re-pull still running at the noon rollover is kept from the orphan
+    sweep. If it then failed, nobody owned its night: no longer the
+    previous night, and not in the sweep's list, it stayed unfinalised
+    (unlisted, unevictable, "still being pulled") until the next rollover.
+    The re-pull retries it, on its own thread, once the previous night
+    is on disk: the sweep finalises on the poller's, and a mostly
+    unpulled night there would hold tonight's polling up for the length
+    of the pull."""
+    import threading
+
+    calls: list[Any] = []
+    mgr = _backfillManager(monkeypatch, calls, backfillPrevious=True)
+    stub = live.fetchPodWindowInto
+    pulling, release = threading.Event(), threading.Event()
+
+    def heldMidNight(
+        spec: FetchSpec, pod: str, fromT: dt.datetime, toT: dt.datetime, fh: BinaryIO
+    ) -> tuple[int, bool, str]:
+        if fromT == _prev(6) and not pulling.is_set():
+            pulling.set()
+            release.wait(10)
+        return stub(spec, pod, fromT, toT, fh)
+
+    monkeypatch.setattr(live, "fetchPodWindowInto", heldMidNight)
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    prevDir = mgr._nightDir(_PREV)
+    afterNoon = dayObsStartUtc(20260712)
+    lastNight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+    try:
+        mgr.tick(now=_t(10))
+        assert pulling.wait(10)
+        mgr.tick(now=afterNoon + dt.timedelta(minutes=10))
+        # Loki starts failing the night being re-pulled, after the rollover.
+        monkeypatch.setattr(
+            live,
+            "listPods",
+            lambda spec: (
+                ["pod-a"] if spec.fromIso >= lastNight else _raise(fetch.FetchError("502 from Loki"))
+            ),
+        )
+    finally:
+        release.set()
+    _awaitBackfill(mgr)
+    failed = mgr._backfill
+    assert mgr._backfillError is not None and "502 from Loki" in mgr._backfillError
+    assert not (prevDir / fetch.META_NAME).exists()
+
+    # While Loki is down the retry keeps failing, and the sweep still leaves the night alone.
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=20))
+    _awaitBackfill(mgr)
+    assert mgr._backfill is not failed and mgr._backfill is not None
+    assert mgr._backfill.name == f"live-backfill-{_PREV}"
+    assert mgr._orphanDirs == [] and _PREV not in finalisedOn
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=30))
+    _awaitBackfill(mgr)
+    assert finalisedOn[_PREV] == f"live-backfill-{_PREV}"
+    assert json.loads((prevDir / fetch.META_NAME).read_text())["pod_lines"] == {"pod-a": 3}
+    assert (prevDir / fetch.PODS_DIR_NAME / "pod-a.jsonl").read_bytes() == b"".join(
+        _lokiLine(t) for t in (_prev(1), _prev(15, 30), _prev(23, 59))
+    )
+    assert mgr._backfillError is None and mgr._backfillRetries == []
+    # Nothing left to retry: the next poll starts no re-pull at all.
+    done = mgr._backfill
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=40))
+    assert mgr._backfill is done
+
+
+def test_a_failed_re_pull_is_not_swept_as_an_orphan_at_the_next_rollover(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A night whose re-pull failed is unfinalised with nothing running on
+    it, which is what an orphan looks like once noon has passed. It stays
+    the re-pull's to retry; the sweep and the retry never both have it."""
+    import threading
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    lastNight = fetch._fmtLogcliTime(dayObsStartUtc(20260711))
+    monkeypatch.setattr(
+        live,
+        "listPods",
+        lambda spec: ["pod-a"] if spec.fromIso >= lastNight else _raise(fetch.FetchError("502 from Loki")),
+    )
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    assert mgr._backfillError is not None
+
+    monkeypatch.setattr(live, "listPods", lambda spec: ["pod-a"])
+    afterNoon = dayObsStartUtc(20260712) + dt.timedelta(minutes=10)
+    assert mgr._findOrphanNights(20260712, afterNoon) == []
+    mgr.tick(now=afterNoon)
+    _awaitBackfill(mgr)
+    assert finalisedOn[_PREV] == f"live-backfill-{_PREV}"
+    assert fetch.readLiveSidecar(mgr._nightDir(_PREV))["finalised"] is True  # type: ignore[index]
+
+
+def _finalisingThreads(mgr: live.LiveNightManager, monkeypatch: pytest.MonkeyPatch) -> dict[int, str]:
+    """Record, per dayObs, the thread that finalises it."""
+    import threading
+
+    finalisedOn: dict[int, str] = {}
+    finalise = mgr._finaliseNight
+
+    def recordingFinalise(night: live._Night) -> None:
+        finalisedOn[night.dayObs] = threading.current_thread().name
+        finalise(night)
+
+    monkeypatch.setattr(mgr, "_finaliseNight", recordingFinalise)
+    return finalisedOn
+
+
+def _lokiDownBefore(monkeypatch: pytest.MonkeyPatch, dayObs: int | None) -> None:
+    """Fail every pod listing for a window starting before ``dayObs`` (none, if ``None``)."""
+    cutoff = fetch._fmtLogcliTime(dayObsStartUtc(dayObs)) if dayObs is not None else ""
+    monkeypatch.setattr(
+        live,
+        "listPods",
+        lambda spec: ["pod-a"] if spec.fromIso >= cutoff else _raise(fetch.FetchError("502 from Loki")),
+    )
+
+
+def test_a_night_that_always_fails_does_not_hold_up_the_previous_night(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failed re-pull is retried, but after the previous night, never
+    ahead of it: a night Loki fails on every attempt would otherwise keep
+    every later last night off the disk until a restart."""
+    import shutil
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    finalisedOn = _finalisingThreads(mgr, monkeypatch)
+    _lokiDownBefore(monkeypatch, 20260711)  # 20260710 can never be pulled
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    afterNoon = dayObsStartUtc(20260712)
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=10))
+    _awaitBackfill(mgr)
+    assert mgr._backfillRetries == [_PREV]
+
+    # Last night goes missing (its row deleted on the admin page).
+    shutil.rmtree(mgr._nightDir(20260711))
+    del finalisedOn[20260711]
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=20))
+    _awaitBackfill(mgr)
+    assert finalisedOn[20260711] == "live-backfill-20260711"
+    assert fetch.readLiveSidecar(mgr._nightDir(20260711))["finalised"] is True  # type: ignore[index]
+    # The failing night is still tried, and still the re-pull's alone.
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=30))
+    _awaitBackfill(mgr)
+    assert mgr._backfill is not None and mgr._backfill.name == f"live-backfill-{_PREV}"
+    assert mgr._backfillRetries == [_PREV]
+    assert mgr._findOrphanNights(20260712, afterNoon + dt.timedelta(minutes=30)) == []
+
+
+def test_two_failed_re_pulls_are_both_kept_for_the_re_pull_thread(
+    tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The previous night's re-pull can fail while an older night is still
+    waiting for its retry. Remembering only the latest failure dropped the
+    older night to the orphan sweep, which finalises on the poller's
+    thread. Every failed night stays queued until it is on disk."""
+    import shutil
+
+    mgr = _backfillManager(monkeypatch, [], backfillPrevious=True)
+    finalisedOn = _finalisingThreads(mgr, monkeypatch)
+    afterNoon = dayObsStartUtc(20260712)
+    orphansSeen: list[Path] = []
+
+    def tick(minutes: int) -> None:
+        now = afterNoon + dt.timedelta(minutes=minutes)
+        mgr.tick(now=now)
+        _awaitBackfill(mgr)
+        orphansSeen.extend(mgr._findOrphanNights(20260712, now))
+
+    _lokiDownBefore(monkeypatch, 20260711)
+    mgr.tick(now=_t(10))
+    _awaitBackfill(mgr)
+    tick(10)  # the rollover; 20260710 has failed twice by now
+    shutil.rmtree(mgr._nightDir(20260711))
+    del finalisedOn[20260711]
+    _lokiDownBefore(monkeypatch, 20260712)  # now last night can't be pulled either
+    tick(20)
+    assert mgr._backfillRetries == [_PREV, 20260711]
+    tick(30)
+    assert mgr._backfillRetries == [_PREV, 20260711]
+
+    _lokiDownBefore(monkeypatch, None)
+    tick(40)
+    tick(50)
+    assert finalisedOn == {20260711: "live-backfill-20260711", _PREV: f"live-backfill-{_PREV}"}
+    assert mgr._backfillRetries == [] and mgr._backfillError is None
+    assert orphansSeen == []
+    done = mgr._backfill
+    mgr.tick(now=afterNoon + dt.timedelta(minutes=60))
+    assert mgr._backfill is done
+
+
+def _raise(e: Exception) -> Any:
+    raise e
+
+
 def test_a_re_pull_with_consdb_down_still_finalises_the_night(
     tmpCacheRoot: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
